@@ -399,6 +399,26 @@ def test_v2v_video_generation_with_video_reference_form(test_client, mocker: Moc
     assert input_video[0].size == (32, 24)
 
 
+def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
+    request = VideoGenerationRequest(
+        prompt="Continue this motion.",
+        num_frames=189,
+        extra_params={"condition_frame_indexes_vision": [0, 2]},
+    )
+
+    assert api_server._reference_video_frame_limit(request, "nvidia/Cosmos3-Nano") == 9
+
+
+def test_cosmos3_reference_video_limit_preserves_action_frames():
+    request = VideoGenerationRequest(
+        prompt="Predict the action.",
+        num_frames=17,
+        extra_params={"action_mode": "inverse_dynamics", "action_chunk_size": 16},
+    )
+
+    assert api_server._reference_video_frame_limit(request, "nvidia/Cosmos3-Nano") == 17
+
+
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
     fps_values = []
 

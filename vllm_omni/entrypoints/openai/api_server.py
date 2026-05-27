@@ -2548,12 +2548,33 @@ def _parse_video_condition_frame_indexes(value: Any) -> list[int] | None:
 
 
 def _reference_video_frame_limit(req: VideoGenerationRequest, model_name: str | None) -> int | None:
+    # Imported lazily so the generic video endpoint doesn't gain a hard
+    # cosmos3 dependency at module load; the model-specific branch below is
+    # the only reason this helper knows about cosmos3 at all.
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES,
+        _condition_pixel_frame_count,
+    )
+
     extra_params = req.extra_params if isinstance(req.extra_params, dict) else {}
+    action_mode = str(extra_params.get("action_mode") or "").strip().lower()
+    if action_mode:
+        video_params = req.resolve_video_params()
+        if video_params.num_frames is not None:
+            return video_params.num_frames
+        action_chunk_size = extra_params.get("action_chunk_size")
+        if action_chunk_size is not None:
+            try:
+                return int(action_chunk_size) + 1
+            except (TypeError, ValueError):
+                pass
+        return None
+
     condition_indexes = _parse_video_condition_frame_indexes(extra_params.get("condition_frame_indexes_vision"))
     if condition_indexes is not None:
-        return max(condition_indexes) * 4 + 1
+        return _condition_pixel_frame_count(condition_indexes)
     if model_name is not None and "cosmos3" in model_name.lower():
-        return 5
+        return COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES
     return req.resolve_video_params().num_frames
 
 

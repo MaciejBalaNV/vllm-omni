@@ -67,6 +67,15 @@ logger = init_logger(__name__)
 
 COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
 COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
+# Mirrors the WAN VAE's temporal compression. Authoritative value is
+# ``self.vae.config.scale_factor_temporal`` at runtime; this constant exists so
+# off-line / API code that runs before the pipeline is constructed can compute
+# pixel-frame budgets without instantiating the VAE.
+COSMOS3_VAE_TEMPORAL_COMPRESSION = 4
+COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
+    max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
+)
+COSMOS3_V2V_DEFAULT_FLOW_SHIFT = 10.0
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
@@ -118,7 +127,10 @@ def _normalize_condition_frame_indexes_vision(value: Any) -> tuple[int, ...]:
     return indexes
 
 
-def _condition_pixel_frame_count(condition_frame_indexes_vision: tuple[int, ...], temporal_compression: int) -> int:
+def _condition_pixel_frame_count(
+    condition_frame_indexes_vision: Iterable[int],
+    temporal_compression: int = COSMOS3_VAE_TEMPORAL_COMPRESSION,
+) -> int:
     return max(condition_frame_indexes_vision) * int(temporal_compression) + 1
 
 
@@ -246,7 +258,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 if tensor.shape[0] != 1:
                     raise TypeError("Cosmos3 video preprocessing supports only batch size 1.")
                 tensor = tensor[0]
-            if tensor.ndim == 4 and tensor.shape[0] in (3, 4):
+            if tensor.ndim == 4 and tensor.shape[0] in (3, 4) and tensor.shape[-1] not in (3, 4):
                 return [tensor[:, i] for i in range(tensor.shape[1])]
             if tensor.ndim == 4 and tensor.shape[-1] in (3, 4):
                 return [tensor[i] for i in range(tensor.shape[0])]
@@ -303,10 +315,14 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
 
-            if raw_image is None and raw_video is not None:
+            raw_video_frames: list[Any] | None = None
+            if raw_video is not None:
                 raw_video_frames = _video_payload_to_frames(raw_video)
                 if not raw_video_frames:
                     raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
+
+            if raw_image is None:
+                assert raw_video_frames is not None  # raw_image and raw_video can't both be None here
                 image = _pil_to_rgb(raw_video_frames[0])
             else:
                 image = _pil_to_rgb(raw_image)
@@ -341,6 +357,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                     int(target_w),
                 )
             else:
+                assert raw_video_frames is not None
                 extra = _extra_args(request)
                 condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
                     extra.get(
@@ -351,7 +368,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 keep = _normalize_condition_video_keep(
                     extra.get("condition_video_keep", prompt.get("condition_video_keep"))
                 )
-                max_frames = _condition_pixel_frame_count(condition_frame_indexes_vision, temporal_compression=4)
+                max_frames = _condition_pixel_frame_count(condition_frame_indexes_vision)
                 prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
                     raw_video_frames,
                     int(target_h),
@@ -362,11 +379,9 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                 prompt["additional_information"]["condition_frame_indexes_vision"] = list(
                     condition_frame_indexes_vision
                 )
-            if action_mode is not None and raw_video is not None:
-                if not isinstance(raw_video, list):
-                    raise TypeError("Cosmos3 action video input must be a list of PIL images or image paths.")
+            if action_mode is not None and raw_video_frames is not None:
                 prompt["additional_information"]["preprocessed_video"] = _preprocess_action_video(
-                    raw_video,
+                    raw_video_frames,
                     int(target_h),
                     int(target_w),
                 )
@@ -1824,7 +1839,7 @@ class Cosmos3OmniDiffusersPipeline(
             # Fall back to the engine-init shift, NOT None: passing None
             # to ``_set_flow_shift`` would leak a prior T2I rebuild
             # (shift=3.0) into a subsequent video request.
-            default_flow_shift = 10.0 if is_v2v else self._engine_init_flow_shift
+            default_flow_shift = COSMOS3_V2V_DEFAULT_FLOW_SHIFT if is_v2v else self._engine_init_flow_shift
             default_guidance_interval = None
             batch_size = 1  # Existing video pipeline assumes B=1.
 
