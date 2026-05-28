@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import re
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -39,6 +40,58 @@ def _warn_deprecated_kwargs(kwargs: dict[str, Any]) -> None:
 
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+
+def _diffusion_parallel_field_names() -> frozenset[str]:
+    """Names of the fields on ``DiffusionParallelConfig``.
+
+    Lazy-imported because ``vllm_omni.diffusion.data`` pulls in heavy
+    diffusion-only dependencies that we don't want loaded just to construct
+    LLM stage configs.
+    """
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    return frozenset(f.name for f in fields(DiffusionParallelConfig))
+
+
+def _fold_flat_parallel_keys(engine_args: dict[str, Any]) -> dict[str, Any]:
+    """Fold flat parallelism keys in *engine_args* into a nested ``parallel_config``.
+
+    Diffusion stages express parallelism via ``OmniDiffusionConfig.parallel_config``
+    (a ``DiffusionParallelConfig``), not via top-level engine args. CLI flags
+    like ``--ulysses-degree`` land as flat keys in ``engine_args`` and would be
+    silently dropped by ``OmniDiffusionConfig.from_kwargs`` (which filters
+    kwargs to ``OmniDiffusionConfig``'s own field set), leaving
+    ``parallel_config`` at its default with ``world_size=1``.
+
+    Returns the merged parallel_config dict so callers can use it to derive
+    ``runtime.devices`` without instantiating ``DiffusionParallelConfig`` twice.
+    """
+    parallel_field_names = _diffusion_parallel_field_names()
+    parallel_dict: dict[str, Any] = {}
+
+    existing = engine_args.get("parallel_config")
+    if isinstance(existing, Mapping):
+        parallel_dict.update(dict(existing))
+    elif dataclasses.is_dataclass(existing) and not isinstance(existing, type):
+        parallel_dict.update(asdict(existing))
+
+    flat_keys = parallel_field_names & engine_args.keys()
+    for key in flat_keys:
+        value = engine_args.pop(key)
+        if value is not None:
+            parallel_dict[key] = value
+
+    if parallel_dict:
+        engine_args["parallel_config"] = parallel_dict
+    return parallel_dict
+
+
+def _diffusion_world_size(parallel_dict: dict[str, Any]) -> int:
+    """Build a ``DiffusionParallelConfig`` from *parallel_dict* and return ``world_size``."""
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+    return max(1, int(DiffusionParallelConfig.from_dict(parallel_dict).world_size))
 
 
 def build_stage_runtime_overrides(
@@ -950,6 +1003,16 @@ class StageConfig:
         runtime.setdefault("process", True)
         if self.runtime_overrides.get("devices") is not None:
             runtime["devices"] = self.runtime_overrides["devices"]
+
+        if StageType(self.stage_type) == StageType.DIFFUSION:
+            parallel_dict = _fold_flat_parallel_keys(engine_args)
+            # Mirror the legacy ``_create_default_diffusion_stage_cfg`` factory:
+            # when neither the deploy YAML nor CLI set ``runtime.devices``,
+            # derive it from ``parallel_config.world_size`` so the orchestrator
+            # spawns the right number of GPU workers.
+            if "devices" not in runtime:
+                world_size = _diffusion_world_size(parallel_dict)
+                runtime["devices"] = ",".join(str(i) for i in range(world_size))
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
         legacy_mbs = runtime.pop("max_batch_size", None)

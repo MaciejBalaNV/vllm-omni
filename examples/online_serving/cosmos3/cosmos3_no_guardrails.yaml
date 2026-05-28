@@ -1,0 +1,20 @@
+# Cosmos3 stage config that disables guardrails at server startup.
+#
+# Usage:
+#   vllm serve nvidia/Cosmos3-Nano --omni \
+#     --model-class-name Cosmos3OmniDiffusersPipeline \
+#     --deploy-config examples/online_serving/cosmos3/cosmos3_no_guardrails.yaml \
+#     --port 8091
+#
+
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    model_class_name: Cosmos3OmniDiffusersPipeline
+    model_config:
+      guardrails: false
+      offload_guardrail_models: false

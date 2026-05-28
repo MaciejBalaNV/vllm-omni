@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.20.0
+ARG BASE_IMAGE=vllm/vllm-openai:v0.21.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
@@ -13,9 +13,12 @@ RUN apt-get update && \
 
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
+RUN git clone -b mbala/cosmos3-v0.21.0 https://github.com/MaciejBalaNV/vllm.git; cd vllm; VLLM_VERSION_OVERRIDE=0.21.0 VLLM_USE_PRECOMPILED=1 uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "." --torch-backend=cu130
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+RUN cd ${COMMON_WORKDIR}/vllm-omni && VLLM_OMNI_VERSION_OVERRIDE=0.21.0 uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+
+RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" cosmos-guardrail
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

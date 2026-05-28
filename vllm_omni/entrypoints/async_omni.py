@@ -520,7 +520,7 @@ class AsyncOmni(EngineClient, OmniBase):
                         result.error,
                         error_stage_id=result.stage_id,
                     )
-                self._raise_nonfatal_error_message(result)
+                raise RuntimeError(result.error)
 
             if not isinstance(result, OutputMessage):
                 logger.warning("[AsyncOmni] Dropping unexpected per-request message %r", result)
@@ -589,15 +589,6 @@ class AsyncOmni(EngineClient, OmniBase):
                         tid = getattr(msg, "task_id")
                         logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
                         await self.event_resolver.resolve(msg)
-                        continue
-
-                    if isinstance(msg, ErrorMessage) and msg.request_id is not None:
-                        req_state = self.request_states.get(msg.request_id)
-                        if req_state is None:
-                            logger.debug("[AsyncOmni] Dropping error for unknown req %s", msg.request_id)
-                            continue
-                        req_state.stage_id = msg.stage_id
-                        await req_state.queue.put(msg)
                         continue
 
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)

@@ -273,7 +273,9 @@ class Cosmos3AVAEAudioTokenizer(nn.Module):
         )
         state_dict = _load_checkpoint(checkpoint_path, self.device)
         _validate_diffusers_state_dict(state_dict)
-        self.load_state_dict(state_dict, strict=True)
+
+        # The checkpoint also contains encoder weights, which we do not support here, hence strict=False
+        self.load_state_dict(state_dict, strict=False)
 
         self.eval()
         for param in self.parameters():

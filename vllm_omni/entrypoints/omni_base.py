@@ -13,7 +13,6 @@ import huggingface_hub
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.diffusion.data import DiffusionErrorType, GuardrailViolationError
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -326,7 +325,7 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
-            self._raise_nonfatal_error_message(msg)
+            raise RuntimeError(msg.error)
 
         if not isinstance(msg, OutputMessage):
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
@@ -348,15 +347,6 @@ class OmniBase(PDDisaggregationMixin):
 
         return False, req_id, stage_id, req_state
 
-    @staticmethod
-    def _is_guardrail_violation(error_type: str | None) -> bool:
-        return error_type == DiffusionErrorType.GUARDRAIL_VIOLATION
-
-    def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
-        if self._is_guardrail_violation(msg.error_type):
-            raise GuardrailViolationError(msg.error)
-        raise RuntimeError(msg.error)
-
     def _check_engine_output_error(
         self,
         result: OutputMessage,
@@ -366,15 +356,13 @@ class OmniBase(PDDisaggregationMixin):
         """Raise if ``engine_outputs`` carries an error field.
 
         Raises :class:`EngineDeadError` when ``self.errored`` indicates the
-        engine is unrecoverable. For recoverable, single-request failures,
-        raises :class:`GuardrailViolationError` when the error metadata marks
-        a guardrail block, otherwise :class:`EngineGenerateError`.
+        engine is unrecoverable, otherwise raises :class:`EngineGenerateError`
+        (recoverable, single-request failure).
         """
         engine_outputs = result.engine_outputs
         error_text = getattr(engine_outputs, "error", None)
         if error_text is None:
             return
-        error_type = getattr(engine_outputs, "error_type", None)
         logger.error(
             "[%s] Stage error for req=%s stage-%s: %s",
             self.__class__.__name__,
@@ -388,8 +376,6 @@ class OmniBase(PDDisaggregationMixin):
                 error_text,
                 error_stage_id=stage_id,
             )
-        if self._is_guardrail_violation(error_type):
-            raise GuardrailViolationError(error_text)
         raise EngineGenerateError(error_text)
 
     def _process_single_result(

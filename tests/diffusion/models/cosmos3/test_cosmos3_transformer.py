@@ -133,13 +133,13 @@ def test_sound_and_action_modules_follow_config() -> None:
 
     assert no_modal.sound_gen is False
     assert no_modal.action_gen is False
-    assert not hasattr(no_modal, "sound2llm")
-    assert not hasattr(no_modal, "action2llm")
+    assert not hasattr(no_modal, "audio_proj_in")
+    assert not hasattr(no_modal, "action_proj_in")
     assert with_sound.sound_dim == 5
     assert with_sound.sound_latent_fps == 40.0
-    assert with_sound.sound2llm.in_features == 5
+    assert with_sound.audio_proj_in.in_features == 5
     assert with_action.action_dim == 6
-    assert with_action.action2llm.num_domains == 9
+    assert with_action.action_proj_in.num_domains == 9
 
 
 def test_sound_and_action_pack_unpack_validate_shapes() -> None:

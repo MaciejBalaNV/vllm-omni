@@ -13,10 +13,6 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.diffusion.data import (
-    DiffusionErrorType,
-    GuardrailViolationError,
-)
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -413,17 +409,6 @@ def _enqueue_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> 
             request_id=msg["request_id"],
             stage_id=0,
             error="engine boom",
-        )
-    )
-
-
-def _enqueue_guardrail_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
-    engine.output_q.put_nowait(
-        ErrorMessage(
-            request_id=msg["request_id"],
-            stage_id=0,
-            error="Guardrail blocked prompt: unsafe",
-            error_type=DiffusionErrorType.GUARDRAIL_VIOLATION,
         )
     )
 
@@ -862,7 +847,6 @@ def _enqueue_stage_error(
     *,
     error_text: str,
     kill_engine: bool = False,
-    error_type: str | None = None,
 ):
     """Enqueue a stage error output, optionally killing the engine."""
     if kill_engine:
@@ -870,7 +854,6 @@ def _enqueue_stage_error(
     engine_output = OmniRequestOutput.from_error(
         msg["request_id"],
         error_text,
-        error_type=error_type,
     )
     engine_output.payload = ""
     engine.output_q.put_nowait(
@@ -918,49 +901,6 @@ async def test_async_omni_propagates_engine_generate_error(monkeypatch: pytest.M
     try:
         with pytest.raises(EngineGenerateError):
             async for _ in app.generate(prompt="hello", request_id="req-recover"):
-                pass
-    finally:
-        app.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_async_omni_rehydrates_guardrail_stage_error(monkeypatch: pytest.MonkeyPatch):
-    """Structured guardrail errors should not be flattened to EngineGenerateError."""
-
-    engine = FakeAsyncOmniEngine(
-        stage_metadata=THREE_STAGE_META,
-        on_add_request=lambda eng, msg: _enqueue_stage_error(
-            eng,
-            msg,
-            error_text="Guardrail blocked prompt: unsafe",
-            error_type=DiffusionErrorType.GUARDRAIL_VIOLATION,
-        ),
-    )
-    _patch_engine(monkeypatch, engine)
-
-    app = AsyncOmni("dummy-model")
-    try:
-        with pytest.raises(GuardrailViolationError, match="Guardrail blocked prompt"):
-            async for _ in app.generate(prompt="hello", request_id="req-guardrail-output"):
-                pass
-    finally:
-        app.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_async_omni_rehydrates_guardrail_error_message(monkeypatch: pytest.MonkeyPatch):
-    """Request-scoped ErrorMessage metadata should reach the request generator."""
-
-    engine = FakeAsyncOmniEngine(
-        stage_metadata=THREE_STAGE_META,
-        on_add_request=_enqueue_guardrail_error_message,
-    )
-    _patch_engine(monkeypatch, engine)
-
-    app = AsyncOmni("dummy-model")
-    try:
-        with pytest.raises(GuardrailViolationError, match="Guardrail blocked prompt"):
-            async for _ in app.generate(prompt="hello", request_id="req-guardrail-message"):
                 pass
     finally:
         app.shutdown()
@@ -1075,27 +1015,6 @@ def test_omni_propagates_engine_generate_error(monkeypatch: pytest.MonkeyPatch):
     app = Omni("dummy-model")
     try:
         with pytest.raises(EngineGenerateError):
-            list(app.generate(["hello"], py_generator=False, use_tqdm=False))
-    finally:
-        app.shutdown()
-
-
-def test_omni_rehydrates_guardrail_stage_error(monkeypatch: pytest.MonkeyPatch):
-    """Synchronous generation should preserve structured guardrail failures."""
-    engine = FakeAsyncOmniEngine(
-        stage_metadata=THREE_STAGE_META,
-        on_add_request=lambda eng, msg: _enqueue_stage_error(
-            eng,
-            msg,
-            error_text="Guardrail blocked video: unsafe",
-            error_type=DiffusionErrorType.GUARDRAIL_VIOLATION,
-        ),
-    )
-    _patch_engine(monkeypatch, engine)
-
-    app = Omni("dummy-model")
-    try:
-        with pytest.raises(GuardrailViolationError, match="Guardrail blocked video"):
             list(app.generate(["hello"], py_generator=False, use_tqdm=False))
     finally:
         app.shutdown()

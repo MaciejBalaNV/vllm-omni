@@ -24,7 +24,7 @@ from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.utils import shutdown
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError, diffusion_error_type_from_exception
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
@@ -399,7 +399,6 @@ class StageDiffusionProc:
                             "type": "error",
                             "request_id": request_id,
                             "error": str(e),
-                            "error_type": diffusion_error_type_from_exception(e),
                         }
                     )
                 )
@@ -483,7 +482,6 @@ class StageDiffusionProc:
                                         "type": "error",
                                         "request_id": rid,
                                         "error": str(e),
-                                        "error_type": diffusion_error_type_from_exception(e),
                                     }
                                 )
                             )

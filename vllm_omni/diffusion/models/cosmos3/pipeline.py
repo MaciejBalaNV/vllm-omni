@@ -9,7 +9,7 @@ from vllm_omni.config.stage_config import (
 )
 
 COSMOS3_PIPELINE = PipelineConfig(
-    model_type="cosmos3",
+    model_type="cosmos3_omni",
     model_arch="Cosmos3ForConditionalGeneration",
     hf_architectures=("Cosmos3ForConditionalGeneration",),
     diffusers_class_name="Cosmos3OmniDiffusersPipeline",

@@ -20,12 +20,9 @@ from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
-    DiffusionErrorType,
     DiffusionOutput,
     DiffusionRequestAbortedError,
-    GuardrailViolationError,
     OmniDiffusionConfig,
-    diffusion_error_type_from_exception,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
@@ -225,8 +222,6 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            if output.error_type == DiffusionErrorType.GUARDRAIL_VIOLATION:
-                raise GuardrailViolationError(output.error)
             raise RuntimeError(output.error)
         logger.debug("Generation completed successfully.")
 
@@ -485,17 +480,13 @@ class DiffusionEngine:
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_req_ids, exc_info=True
                 )
-                error_type = diffusion_error_type_from_exception(exc)
                 runner_output = BatchRunnerOutput.from_list(
                     [
                         RunnerOutput(
                             req_id=req_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(
-                                error=str(exc),
-                                error_type=error_type,
-                            ),
+                            result=DiffusionOutput(error=str(exc)),
                         )
                         for req_id in sched_output.scheduled_req_ids
                     ]
@@ -648,15 +639,11 @@ class DiffusionEngine:
                     raise
                 except Exception as exc:
                     logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
-                    error_type = diffusion_error_type_from_exception(exc)
                     runner_output = RunnerOutput(
                         req_id=sched_req_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(
-                            error=str(exc),
-                            error_type=error_type,
-                        ),
+                        result=DiffusionOutput(error=str(exc)),
                     )
 
                 self._process_aborts_queue()

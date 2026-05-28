@@ -173,6 +173,64 @@ class TestStageConfig:
         for name in deploy_override_field_names() - {"devices"}:
             assert name not in engine_args
 
+    def test_to_omegaconf_diffusion_folds_flat_parallel_keys(self):
+        """Flat parallelism overrides on a diffusion stage must be folded into
+        ``engine_args.parallel_config`` and reflected in ``runtime.devices``.
+
+        Without this, OmniDiffusionConfig.from_kwargs filters out flat
+        ``ulysses_degree`` / ``ring_degree`` / etc. and the diffusion pipeline
+        launches single-GPU regardless of the CLI flag.
+        """
+        config = StageConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides={"ulysses_degree": 2},
+        )
+        omega_config = config.to_omegaconf()
+
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.runtime.devices == "0,1"
+
+    def test_to_omegaconf_diffusion_default_world_size_one(self):
+        """Diffusion stages with no parallelism overrides default to a single GPU."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.runtime.devices == "0"
+
+    def test_to_omegaconf_diffusion_preserves_explicit_devices(self):
+        """When the deploy YAML or CLI sets ``runtime.devices`` explicitly, the
+        derived world-size calculation must not overwrite it."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_runtime={"devices": "2,3"},
+            runtime_overrides={"ulysses_degree": 2},
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.runtime.devices == "2,3"
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+
+    def test_to_omegaconf_diffusion_merges_yaml_parallel_config(self):
+        """CLI flat overrides win over a deploy YAML ``parallel_config`` dict."""
+        config = StageConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={"parallel_config": {"tensor_parallel_size": 1, "ulysses_degree": 1}},
+            runtime_overrides={"ulysses_degree": 4},
+        )
+        omega_config = config.to_omegaconf()
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 4
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 1
+        assert omega_config.runtime.devices == "0,1,2,3"
+
 
 class TestModelPipeline:
     """Tests for ModelPipeline class."""

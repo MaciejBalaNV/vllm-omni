@@ -1,0 +1,9 @@
+{
+    "prompt": "A medium shot of a modern robotics research laboratory with white walls and a gray floor. A robotic arm with a metallic finish is mounted on a clean white workbench, its gripper positioned above a row of small colored objects. A laptop and neatly arranged tools sit beside the robot. A large monitor on the wall behind displays a software interface. The scene is brightly lit by overhead fluorescent lights.",
+    "height": 960,
+    "width": 960,
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "fps": 24
+}

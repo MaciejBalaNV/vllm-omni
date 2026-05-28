@@ -241,7 +241,9 @@ datasets/
 *.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!examples/offline_inference/cosmos3/inputs/*.json
 *.jsonl
+!examples/offline_inference/cosmos3/inputs/*.jsonl
 *.parquet
 
 # Output files
