@@ -29,8 +29,9 @@ def _tiny_cosmos3_config(**overrides):
     return config
 
 
-def test_mrope_position_ids_cover_text_and_video() -> None:
+def test_mrope_position_ids_cover_text_video_and_sound() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        compute_mrope_position_ids_sound,
         compute_mrope_position_ids_text,
         compute_mrope_position_ids_vision,
     )
@@ -55,6 +56,10 @@ def test_mrope_position_ids_cover_text_and_video() -> None:
     )
     torch.testing.assert_close(modulated_ids[0], torch.tensor([10.0, 12.0]))
     assert modulated_offset == 13
+
+    sound_ids, sound_offset = compute_mrope_position_ids_sound(3, temporal_offset=10, sound_latent_fps=25.0)
+    torch.testing.assert_close(sound_ids[0], torch.tensor([10.0, 10.96, 11.92]))
+    assert sound_offset == 12
 
 
 @pytest.mark.parametrize(
@@ -115,12 +120,90 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
         text_mask=torch.ones(1, 2, dtype=torch.long),
         video_shape=(1, 2, 2),
         fps=24.0,
+        sound_latents=torch.zeros(1, 3, 4),
     )
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
-def test_compute_rope_freqs_places_text_and_video_positions() -> None:
+def test_sound_modules_follow_config() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    tiny = _tiny_cosmos3_config()
+    no_modal = Cosmos3VFMTransformer(SimpleNamespace(tf_model_config=tiny, dtype=torch.float32))
+    with_sound = Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config={**tiny, "sound_gen": True},
+            model_config={"sound_tokenizer": {"io_channels": 5, "sample_rate": 32000, "hop_size": 800}},
+            custom_pipeline_args={},
+            dtype=torch.float32,
+        )
+    )
+
+    assert no_modal.sound_gen is False
+    assert not hasattr(no_modal, "audio_proj_in")
+    assert with_sound.sound_dim == 5
+    assert with_sound.sound_latent_fps == 40.0
+    assert with_sound.audio_proj_in.in_features == 5
+
+
+def test_sound_pack_unpack_validate_shapes() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    model = object.__new__(Cosmos3VFMTransformer)
+    nn.Module.__init__(model)
+    model.sound_dim = 3
+
+    sound = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    torch.testing.assert_close(model.unpack_sound(model.pack_sound(sound)), sound)
+
+    with pytest.raises(ValueError, match="channel mismatch"):
+        model.pack_sound(torch.zeros(1, 4, 2))
+
+
+def test_forward_returns_video_and_sound_predictions() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    output = Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(sound_gen=True, sound_dim=3, sound_latent_fps=24.0),
+            dtype=torch.float32,
+        )
+    )(
+        hidden_states=torch.zeros(1, 2, 1, 2, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+        sound_latents=torch.zeros(1, 3, 4),
+    )
+
+    assert isinstance(output, tuple)
+    assert [tuple(tensor.shape) for tensor in output] == [(1, 2, 1, 2, 2), (1, 3, 4)]
+
+
+def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 as cosmos3_module
+
+    model = cosmos3_module.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(sound_gen=True, sound_dim=3), dtype=torch.float32)
+    )
+    monkeypatch.setattr(cosmos3_module, "_get_ulysses_state", lambda: (2, 0, None))
+
+    with pytest.raises(ValueError, match=r"GEN sequence length \(3 = video tokens 2 \+ sound tokens 1\)"):
+        model(
+            hidden_states=torch.zeros(1, 2, 1, 1, 2),
+            timestep=torch.tensor([1.0]),
+            text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            text_mask=torch.ones(1, 2, dtype=torch.long),
+            video_shape=(1, 1, 2),
+            fps=24.0,
+            sound_latents=torch.zeros(1, 3, 1),
+        )
+
+
+def test_compute_rope_freqs_places_text_video_and_sound_positions() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 
     class FakeRotary:
@@ -140,6 +223,8 @@ def test_compute_rope_freqs_places_text_and_video_positions() -> None:
     model.temporal_modality_margin = 100
     model.base_fps = 24.0
     model.temporal_compression_factor = 4
+    model.temporal_compression_factor_sound = 1
+    model.sound_latent_fps = 25.0
     model.enable_fps_modulation = False
 
     freqs_und, freqs_gen = model._compute_rope_freqs(
@@ -156,3 +241,19 @@ def test_compute_rope_freqs_places_text_and_video_positions() -> None:
     assert vision_pos[0, 0].tolist() == [102, 103]
     assert freqs_und[0].shape == (2, 3, 1, 4)
     assert freqs_gen[0].shape == (2, 2, 1, 4)
+
+    rotary.position_ids.clear()
+    model._compute_rope_freqs(
+        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        t=2,
+        hp=1,
+        wp=1,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        t_sound=1,
+    )
+
+    _, gen_pos = rotary.position_ids
+    assert gen_pos.shape == (3, 1, 3)
+    assert gen_pos[0, 0].tolist() == [102, 103, 102]
