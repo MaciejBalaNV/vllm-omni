@@ -1532,6 +1532,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
             if request.flow_shift is not None:
                 extra_body["flow_shift"] = request.flow_shift
+            if request.extra_args is not None:
+                extra_body["extra_args"] = request.extra_args
             if request.generator_device is not None:
                 extra_body["generator_device"] = request.generator_device
             if request.lora is not None:
@@ -1565,7 +1567,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-        extra_args = {}
+        extra_args = dict(request.extra_args or {})
         if request.use_system_prompt is not None:
             extra_args["use_system_prompt"] = request.use_system_prompt
         if request.system_prompt is not None:

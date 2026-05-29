@@ -125,6 +125,10 @@ class ImageGenerationRequest(BaseModel):
     flow_shift: float | None = Field(
         default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
     )
+    extra_args: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters passed directly to the model's extra_args.",
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
