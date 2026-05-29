@@ -126,6 +126,9 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
+    flow_shift: float | None = Field(
+        default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
