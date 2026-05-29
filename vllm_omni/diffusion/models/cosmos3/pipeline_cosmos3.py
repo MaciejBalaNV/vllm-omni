@@ -70,6 +70,11 @@ COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE = 7.0
 COSMOS3_T2I_DEFAULT_FLOW_SHIFT = 3.0
 COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL: tuple[float, float] = (400.0, 1000.0)
 
+# Truncation cap on the prompt token count (shared by T2I and T2V).  Prompts
+# are tokenized to their natural length (no padding); this only bounds the
+# UND pathway / GEN cross-attention cost for pathologically long prompts.
+COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+
 
 # ---------------------------------------------------------------------------
 # Post-process function (registered in registry.py)
@@ -627,9 +632,13 @@ class Cosmos3OmniDiffusersPipeline(
         token_ids.append(self.tokenizer.convert_tokens_to_ids("<|vision_start|>"))  # 151652
         seq_len = len(token_ids)
 
-        pad_len = max_sequence_length - seq_len
-        attention_mask = [1] * seq_len + [0] * pad_len
-        token_ids = token_ids + [self.tokenizer.pad_token_id or 0] * pad_len
+        # No right-padding: the prompt is tokenized to its natural length.
+        # The UND pathway uses causal self-attention with no padding mask and
+        # the GEN cross-attention K/V is trimmed to the real text length, so
+        # padding to a fixed length only added dead compute and never changed
+        # the output.  ``max_sequence_length`` is kept purely as a truncation
+        # cap (above).  The mask is therefore all ones.
+        attention_mask = [1] * seq_len
 
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         attention_mask = torch.tensor([attention_mask], dtype=torch.long, device=self.device)
@@ -1097,7 +1106,10 @@ class Cosmos3OmniDiffusersPipeline(
         guidance_interval = self._get_sp_param(sp, "guidance_interval", default_guidance_interval)
 
         frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
-        max_sequence_length = self._get_sp_param(sp, "max_sequence_length", 512) or 512
+        max_sequence_length = (
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
         use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
 
         self._guidance_scale = guidance_scale

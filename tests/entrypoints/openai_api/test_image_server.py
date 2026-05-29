@@ -1012,6 +1012,42 @@ def test_with_custom_parameters(test_client):
     assert response.status_code == 200
 
 
+def test_flow_shift_forwarded_to_extra_args(test_client):
+    """flow_shift must reach the diffusion sampling params via extra_args.
+
+    Regression: ``ImageGenerationRequest`` had no ``flow_shift`` field and the
+    single-stage handler never forwarded it, so a request like
+    ``{"flow_shift": 10.0}`` was silently dropped and Cosmos3 T2I always ran at
+    its hardcoded per-mode default shift. The pipeline reads
+    ``extra_args["flow_shift"]`` (via ``_get_sp_param``), so it must land there.
+    """
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a robot in a lab",
+            "size": "960x960",
+            "num_inference_steps": 50,
+            "guidance_scale": 4.0,
+            "flow_shift": 10.0,
+        },
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert captured.extra_args["flow_shift"] == 10.0
+
+
+def test_flow_shift_absent_when_not_requested(test_client):
+    """Omitting flow_shift must not inject an override, so the pipeline keeps
+    its per-mode default (e.g. Cosmos3 T2I shift=3.0)."""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a tree", "size": "1024x1024"},
+    )
+    assert response.status_code == 200
+    captured = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert "flow_shift" not in (captured.extra_args or {})
+
+
 def test_invalid_size(test_client):
     """Test with invalid size parameter - rejected by Pydantic"""
     response = test_client.post(
