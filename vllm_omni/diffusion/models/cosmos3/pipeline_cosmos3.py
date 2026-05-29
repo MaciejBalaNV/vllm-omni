@@ -1498,6 +1498,7 @@ class Cosmos3OmniDiffusersPipeline(
         image_latent: torch.Tensor | None = None,
         condition_latents: torch.Tensor | None = None,
         guidance_interval: tuple[float, float] | None = None,
+        raw_action_dim: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Denoising loop with 3-mode CFG support (parallel, sequential, none).
 
@@ -1599,6 +1600,8 @@ class Cosmos3OmniDiffusersPipeline(
                 video_pred = video_pred * velocity_mask
             if action_pred is not None and action_velocity_mask is not None:
                 action_pred = action_pred * action_velocity_mask
+                if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
+                    action_pred[..., raw_action_dim:] = 0
             if action_latents is None and sound_latents is None:
                 latents = self.scheduler.step(video_pred, t, latents, return_dict=False)[0]
             else:
@@ -2052,6 +2055,7 @@ class Cosmos3OmniDiffusersPipeline(
                 image_latent=image_latent,
                 condition_latents=condition_latents,
                 guidance_interval=guidance_interval,
+                raw_action_dim=raw_action_dim,
             )
 
         if is_t2i and batch_size > 1:
