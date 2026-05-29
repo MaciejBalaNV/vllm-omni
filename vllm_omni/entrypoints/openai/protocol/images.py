@@ -122,6 +122,10 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
+    extra_args: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters passed directly to the model's extra_args.",
+    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
