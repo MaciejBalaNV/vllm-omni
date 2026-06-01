@@ -125,7 +125,7 @@ class ImageGenerationRequest(BaseModel):
     flow_shift: float | None = Field(
         default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
     )
-    extra_args: dict[str, Any] | None = Field(
+    extra_params: dict[str, Any] | None = Field(
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
