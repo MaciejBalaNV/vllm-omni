@@ -13,13 +13,17 @@ ride on ``sampling_params.extra_args["guardrails"]``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -124,11 +128,10 @@ def _init_default_guardrails(offload_to_cpu: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def ensure_initialized(od_config: Any) -> None:
+def ensure_initialized(od_config: OmniDiffusionConfig) -> None:
     if not is_guardrails_enabled(od_config):
         return
-    cfg = getattr(od_config, "model_config", None) or {}
-    _init_default_guardrails(offload_to_cpu=bool(cfg.get("offload_guardrail_models", False)))
+    _init_default_guardrails(offload_to_cpu=bool(od_config.model_config.get("offload_guardrail_models", False)))
 
 
 def check_text_safety(prompt: str) -> None:
@@ -156,7 +159,10 @@ def check_video_safety(video_tensor: torch.Tensor) -> torch.Tensor:
     return result.to(video_tensor.device)
 
 
-def is_guardrails_enabled(od_config: Any, sampling_params: Any = None) -> bool:
+def is_guardrails_enabled(
+    od_config: OmniDiffusionConfig,
+    sampling_params: OmniDiffusionSamplingParams | None = None,
+) -> bool:
     """Resolve the active guardrail gate.
 
     Server-level ``od_config.model_config["guardrails"]`` decides whether the
@@ -168,12 +174,10 @@ def is_guardrails_enabled(od_config: Any, sampling_params: Any = None) -> bool:
     may override on a per-request basis: ``False`` skips the check for that
     request, anything else (or missing) keeps the default behavior.
     """
-    cfg = getattr(od_config, "model_config", None) or {}
-    if not bool(cfg.get("guardrails", True)):
+    if not bool(od_config.model_config.get("guardrails", True)):
         return False
     if sampling_params is not None:
-        extra = getattr(sampling_params, "extra_args", None) or {}
-        per_request = extra.get("guardrails")
+        per_request = sampling_params.extra_args.get("guardrails")
         if per_request is not None:
             return bool(per_request)
     return True

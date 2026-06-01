@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
@@ -482,10 +483,10 @@ class Cosmos3OmniDiffusersPipeline(
 
         Returns False when cache-dit is not active, preserving the skip speedup.
         """
-        return getattr(self, "_cache_dit_requires_paired_cfg", False)
+        return self._cache_dit_requires_paired_cfg
 
     @staticmethod
-    def _get_sp_param(sp, key: str, default=None):
+    def _get_sp_param(sp: OmniDiffusionSamplingParams, key: str, default: Any = None) -> Any:
         """Read a runtime control from sampling params.
 
         Order of precedence:
@@ -500,9 +501,8 @@ class Cosmos3OmniDiffusersPipeline(
         ``request.flow_shift`` (forwarded as ``extra_args['flow_shift']``) to
         be silently ignored.
         """
-        extra = getattr(sp, "extra_args", None)
-        if isinstance(extra, dict) and extra.get(key) is not None:
-            return extra[key]
+        if sp.extra_args.get(key) is not None:
+            return sp.extra_args[key]
         val = getattr(sp, key, None)
         if val is not None:
             return val
@@ -752,7 +752,7 @@ class Cosmos3OmniDiffusersPipeline(
         height: int,
         width: int,
         max_sequence_length: int,
-        sp,
+        sp: OmniDiffusionSamplingParams,
         use_system_prompt: bool = False,
         is_t2i: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1086,7 +1086,7 @@ class Cosmos3OmniDiffusersPipeline(
             guidance_scale = sp.guidance_scale if sp.guidance_scale else COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE
             default_flow_shift = COSMOS3_T2I_DEFAULT_FLOW_SHIFT
             default_guidance_interval: tuple[float, float] | None = COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL
-            batch_size = max(1, int(getattr(sp, "num_outputs_per_prompt", None) or 1))
+            batch_size = max(1, sp.num_outputs_per_prompt)
         else:
             height = sp.height or COSMOS3_T2V_DEFAULT_HEIGHT
             width = sp.width or COSMOS3_T2V_DEFAULT_WIDTH

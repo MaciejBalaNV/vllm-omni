@@ -154,6 +154,7 @@ def make_cosmos3_pipeline():
         pipeline._current_flow_shift = 1.0
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
+        pipeline._cache_dit_requires_paired_cfg = False
         pipeline.progress_bar = passthrough_progress_bar
         return pipeline
 
