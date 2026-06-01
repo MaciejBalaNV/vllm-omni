@@ -358,12 +358,23 @@ class Cosmos3CausalAttention(nn.Module):
         self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # skip_sequence_parallel=True because the UND pathway is
+        # computed once and replicated across SP ranks.
+        # Only the GEN pathway is sequence-sharded.
+        self.attn = FrameworkAttention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=True,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            num_kv_heads=self.num_kv_heads,
+            skip_sequence_parallel=True,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        text_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, S, _ = hidden_states.shape
 
@@ -378,36 +389,20 @@ class Cosmos3CausalAttention(nn.Module):
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        # Transpose to [B, h, S, D] for SDPA
-        q_t = q.transpose(1, 2)
-        k_t = k.transpose(1, 2)
-        v_t = v.transpose(1, 2)
-
-        if text_mask is not None:
-            causal = torch.tril(torch.ones(S, S, device=hidden_states.device, dtype=torch.bool))
-            padding = text_mask[:, None, None, :].bool()  # [B, 1, 1, S]
-            combined = causal[None, None] & padding  # [B, 1, S, S]
-            out = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=combined, enable_gqa=True)
-        else:
-            out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True, enable_gqa=True)
-
-        out = out.transpose(1, 2).contiguous().view(B, S, -1)
+        out = self.attn(q, k, v).reshape(B, S, -1)
         return self.to_out(out), k, v
 
 
 class Cosmos3CrossAttention(nn.Module):
     """Generation pathway: full attention where visual Q attends to all K/V.
 
-    Dual-path implementation:
-
-    * **Non-SP path** (single GPU): the framework ``Attention`` layer with
-      explicit ``cat([k_und, k_gen])`` concatenation.  Text conditioning is
+    * **Non-SP path**: explicit ``cat([k_und, k_gen])``.  Text conditioning is
       always present because K/V are physically concatenated.
 
-    * **SP path** (Ulysses active): the framework ``Attention`` layer with
-      ``joint_key/joint_value`` in ``AttentionMetadata``.  The Ulysses
-      wrapper head-slices the replicated UND K/V and performs all-to-all
-      on the sharded GEN Q/K/V so every query sees the full context.
+    * **SP path** (Ulysses active): ``k_und``/``v_und`` are passed as
+      ``joint_key``/``joint_value`` in ``AttentionMetadata``.  The Ulysses
+      wrapper head-slices the replicated UND K/V and performs all-to-all on the
+      sharded GEN Q/K/V so every query sees the full context.
     """
 
     def __init__(
@@ -471,28 +466,18 @@ class Cosmos3CrossAttention(nn.Module):
         self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-        self.local_attn = FrameworkAttention(
-            num_heads=self.num_heads_local,
+        self.attn = FrameworkAttention(
+            num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads_local,
-            skip_sequence_parallel=True,
+            num_kv_heads=self.num_kv_heads,
         )
 
-        # Lazy-created on first SP forward so it captures the active SP context.
-        self._sp_attn: nn.Module | None = None
-
-    def _get_sp_attn(self) -> nn.Module:
-        if self._sp_attn is None:
-            self._sp_attn = FrameworkAttention(
-                num_heads=self.num_heads,
-                head_size=self.head_dim,
-                causal=False,
-                softmax_scale=1.0 / (self.head_dim**0.5),
-                num_kv_heads=self.num_kv_heads,
-            )
-        return self._sp_attn
+    # TODO(follow-up): collapse _forward_local and _forward_sp into a single
+    # joint-based path when NoParallelAttention can process joint_key/value.
+    # Currently the non-SP path must concatenate the replicated UND K/V explicitly,
+    # while the SP path passes it as joint_*.
 
     # -- Non-SP path: explicit K/V concatenation + framework Attention --------
 
@@ -508,7 +493,7 @@ class Cosmos3CrossAttention(nn.Module):
         k_all = torch.cat([k_und, k], dim=1)
         v_all = torch.cat([v_und, v], dim=1)
 
-        out = self.local_attn(q, k_all, v_all)
+        out = self.attn(q, k_all, v_all)
         return out.reshape(B, S_gen, -1)
 
     # -- SP path: framework Attention with joint_key/value -------------------
@@ -535,7 +520,7 @@ class Cosmos3CrossAttention(nn.Module):
             joint_value=v_und,
             joint_strategy="front",
         )
-        out = self._get_sp_attn()(q, k, v, attn_metadata)
+        out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
     # -- Public forward: routes to the appropriate path ----------------------
@@ -618,14 +603,13 @@ class Cosmos3UndDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs: tuple[torch.Tensor, torch.Tensor],
-        text_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (hidden_states, K, V) where K/V are for GEN cross-attention."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         cos, sin = freqs
-        attn_out, k, v = self.self_attn(hidden_states, cos, sin, text_mask)
+        attn_out, k, v = self.self_attn(hidden_states, cos, sin)
         hidden_states = residual + attn_out
 
         residual = hidden_states
