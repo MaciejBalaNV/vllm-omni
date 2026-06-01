@@ -501,8 +501,9 @@ class Cosmos3OmniDiffusersPipeline(
         ``request.flow_shift`` (forwarded as ``extra_args['flow_shift']``) to
         be silently ignored.
         """
-        if sp.extra_args.get(key) is not None:
-            return sp.extra_args[key]
+        extra = sp.extra_args or {}
+        if extra.get(key) is not None:
+            return extra[key]
         val = getattr(sp, key, None)
         if val is not None:
             return val
@@ -1086,7 +1087,7 @@ class Cosmos3OmniDiffusersPipeline(
             guidance_scale = sp.guidance_scale if sp.guidance_scale else COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE
             default_flow_shift = COSMOS3_T2I_DEFAULT_FLOW_SHIFT
             default_guidance_interval: tuple[float, float] | None = COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL
-            batch_size = max(1, sp.num_outputs_per_prompt)
+            batch_size = max(1, int(sp.num_outputs_per_prompt or 1))
         else:
             height = sp.height or COSMOS3_T2V_DEFAULT_HEIGHT
             width = sp.width or COSMOS3_T2V_DEFAULT_WIDTH

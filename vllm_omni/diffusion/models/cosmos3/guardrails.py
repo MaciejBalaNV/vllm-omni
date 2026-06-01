@@ -131,7 +131,8 @@ def _init_default_guardrails(offload_to_cpu: bool = False) -> None:
 def ensure_initialized(od_config: OmniDiffusionConfig) -> None:
     if not is_guardrails_enabled(od_config):
         return
-    _init_default_guardrails(offload_to_cpu=bool(od_config.model_config.get("offload_guardrail_models", False)))
+    model_config = od_config.model_config or {}
+    _init_default_guardrails(offload_to_cpu=bool(model_config.get("offload_guardrail_models", False)))
 
 
 def check_text_safety(prompt: str) -> None:
@@ -174,10 +175,11 @@ def is_guardrails_enabled(
     may override on a per-request basis: ``False`` skips the check for that
     request, anything else (or missing) keeps the default behavior.
     """
-    if not bool(od_config.model_config.get("guardrails", True)):
+    model_config = od_config.model_config or {}
+    if not bool(model_config.get("guardrails", True)):
         return False
     if sampling_params is not None:
-        per_request = sampling_params.extra_args.get("guardrails")
+        per_request = (sampling_params.extra_args or {}).get("guardrails")
         if per_request is not None:
             return bool(per_request)
     return True
