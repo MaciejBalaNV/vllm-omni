@@ -257,7 +257,16 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
         height=720,
         width=1280,
         max_sequence_length=32,
-        sp=SimpleNamespace(extra_args={"negative_metadata_mode": "inverse"}),
+        sp=SimpleNamespace(
+            extra_args={
+                "negative_metadata_mode": "inverse",
+                # Duration/resolution metadata templates are off by default
+                # (commit "Change resolution and duration templates to off by
+                # default"); enable them explicitly to exercise the formatting.
+                "use_duration_template": True,
+                "use_resolution_template": True,
+            }
+        ),
         use_system_prompt=True,
         is_t2i=False,
     )
