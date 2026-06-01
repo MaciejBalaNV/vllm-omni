@@ -916,15 +916,6 @@ class Cosmos3VFMTransformer(nn.Module):
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
         self.gen_sp_gather = nn.Identity()
 
-        # SDPA backend selection for torch.nn.attention.sdpa_kernel context.
-        # Default: allow all backends; override to restrict (e.g. FlashAttention only).
-        self.sdpa_backends = [
-            torch.nn.attention.SDPBackend.CUDNN_ATTENTION,
-            torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-            torch.nn.attention.SDPBackend.MATH,
-        ]
-
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -1117,60 +1108,59 @@ class Cosmos3VFMTransformer(nn.Module):
 
         hidden_gen = hidden_video
 
-        with torch.nn.attention.sdpa_kernel(self.sdpa_backends, set_priority=True):
-            # Run UND pathway once and cache K/V (replicated across all ranks)
-            if self.cached_kv is None:
-                freqs_und, freqs_gen = self._compute_rope_freqs(
-                    text_mask,
-                    t,
-                    hp,
-                    wp,
-                    fps,
-                    hidden_states.device,
-                    hidden_states.dtype,
-                )
-                cached_kv_full = self.language_model(text_ids, freqs_und)
-                self.cached_freqs_gen = freqs_gen
-
-                # Trim to real text length (remove padding).  K/V stay replicated;
-                # the framework Attention layer head-slices them via joint_key/value.
-                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
-
-            # Run GEN layers.  UND K/V (replicated) is passed to each layer;
-            # the Cosmos3CrossAttention forwards them as joint_key/value so the
-            # framework Attention handles the Ulysses head-slicing internally.
-            if self.cached_kv is None or self.cached_freqs_gen is None:
-                raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            self._validate_gen_sequence_parallel(
-                s_gen=hidden_gen.shape[1],
-                ulysses_size=ulysses_size,
+        # Run UND pathway once and cache K/V (replicated across all ranks)
+        if self.cached_kv is None:
+            freqs_und, freqs_gen = self._compute_rope_freqs(
+                text_mask,
+                t,
+                hp,
+                wp,
+                fps,
+                hidden_states.device,
+                hidden_states.dtype,
             )
-            freqs_cos, freqs_sin = self.cached_freqs_gen
-            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-            freqs_gen = (freqs_cos, freqs_sin)
+            cached_kv_full = self.language_model(text_ids, freqs_und)
+            self.cached_freqs_gen = freqs_gen
 
-            if len(self.gen_layers) == len(self.cached_kv):
-                for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
-                    hidden_gen = layer(
-                        hidden_gen,
-                        k_und=k_und,
-                        v_und=v_und,
-                        freqs_cos=freqs_cos,
-                        freqs_sin=freqs_sin,
-                    )
-                    # Cache-dit's block wrapper may return a tuple; unwrap it.
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
-            else:
-                # Cache-dit patches gen_layers to a grouped wrapper.
-                for layer in self.gen_layers:
-                    hidden_gen = layer(
-                        hidden_gen,
-                        cached_kv=self.cached_kv,
-                        freqs_gen=freqs_gen,
-                    )
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
+            # Trim to real text length (remove padding).  K/V stay replicated;
+            # the framework Attention layer head-slices them via joint_key/value.
+            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+
+        # Run GEN layers.  UND K/V (replicated) is passed to each layer;
+        # the Cosmos3CrossAttention forwards them as joint_key/value so the
+        # framework Attention handles the Ulysses head-slicing internally.
+        if self.cached_kv is None or self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        self._validate_gen_sequence_parallel(
+            s_gen=hidden_gen.shape[1],
+            ulysses_size=ulysses_size,
+        )
+        freqs_cos, freqs_sin = self.cached_freqs_gen
+        hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        freqs_gen = (freqs_cos, freqs_sin)
+
+        if len(self.gen_layers) == len(self.cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+                hidden_gen = layer(
+                    hidden_gen,
+                    k_und=k_und,
+                    v_und=v_und,
+                    freqs_cos=freqs_cos,
+                    freqs_sin=freqs_sin,
+                )
+                # Cache-dit's block wrapper may return a tuple; unwrap it.
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+        else:
+            # Cache-dit patches gen_layers to a grouped wrapper.
+            for layer in self.gen_layers:
+                hidden_gen = layer(
+                    hidden_gen,
+                    cached_kv=self.cached_kv,
+                    freqs_gen=freqs_gen,
+                )
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
 
             hidden_gen = self.gen_sp_gather(hidden_gen)
 
