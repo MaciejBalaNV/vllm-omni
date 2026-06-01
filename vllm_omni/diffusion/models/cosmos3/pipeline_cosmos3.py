@@ -768,9 +768,9 @@ class Cosmos3OmniDiffusersPipeline(
         # Route cosmos3-specific controls through ``_get_sp_param`` so they
         # are picked up from ``extra_args`` (OpenAI endpoint path) as well
         # as from direct attributes.
-        use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", True)) and not is_t2i
+        use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False)) and not is_t2i
         dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        if bool(self._get_sp_param(sp, "use_resolution_template", True)):
+        if bool(self._get_sp_param(sp, "use_resolution_template", False)):
             res_tmpl = COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_RESOLUTION_TEMPLATE
         else:
             res_tmpl = None
