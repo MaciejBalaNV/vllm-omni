@@ -88,8 +88,6 @@ class SDPAImpl(AttentionImpl):
         self.requires_gqa = num_heads != num_kv_heads
         if backend_kwargs:
             logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
 
     def _forward_impl(
         self,
