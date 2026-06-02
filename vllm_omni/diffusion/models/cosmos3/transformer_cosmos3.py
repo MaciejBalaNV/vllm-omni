@@ -190,10 +190,8 @@ def compute_mrope_position_ids_sound(
     base_fps: float = 24.0,
     temporal_compression_factor_sound: int = 1,
     enable_fps_modulation: bool = True,
-    base_temporal_compression_factor: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate mRoPE IDs for sound tokens as a (T, 1, 1) grid."""
-    del base_temporal_compression_factor
     return compute_mrope_position_ids_vision(
         grid_t=grid_t,
         grid_h=1,
