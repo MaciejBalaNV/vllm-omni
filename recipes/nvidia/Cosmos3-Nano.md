@@ -131,7 +131,7 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F "guidance_scale=6.0" \
   -F "max_sequence_length=4096" \
   -F "flow_shift=10.0" \
-  -F "seed=42" \
+  -F "seed=0" \
   -F "generate_sound=true" \
   -F "sound_duration=7.875" \
   -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+
 import pytest
 import torch
 from torch import nn
@@ -154,6 +155,7 @@ def test_sound_modules_follow_injected_sound_dim() -> None:
 )
 def test_transformer_requires_sound_dim_and_fps_when_sound_gen_true(kwargs: dict[str, Any]) -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
     with pytest.raises(ValueError, match=r"requires an explicit sound_dim and sound_latent_fps"):
         Cosmos3VFMTransformer(
             SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32),
