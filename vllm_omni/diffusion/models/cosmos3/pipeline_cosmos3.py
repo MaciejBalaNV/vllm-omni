@@ -595,15 +595,7 @@ class Cosmos3OmniDiffusersPipeline(
 
     @classmethod
     def _is_sound_request(cls, prompt_data, sp) -> bool:
-        keys = (
-            "sound_gen",
-            "generate_sound",
-            "enable_sound_generation",
-            "return_audio",
-            "output_audio",
-            "generate_audio",
-        )
-        for key in keys:
+        for key in ("generate_sound", "sound_gen"):
             if cls._truthy(cls._get_prompt_param(prompt_data, key, None)):
                 return True
             if cls._truthy(cls._get_sp_param(sp, key, None)):
