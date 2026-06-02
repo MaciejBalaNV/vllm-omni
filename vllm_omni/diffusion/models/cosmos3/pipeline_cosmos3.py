@@ -232,13 +232,16 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             return video_processor.postprocess(image, output_type="pil")
         if is_guardrails_enabled(od_config, sampling_params):
             video = check_video_safety(video)
-        result = {"video": video_processor.postprocess_video(video, output_type=output_type)}
+        processed_video = video_processor.postprocess_video(video, output_type=output_type)
         if audio is None:
-            return result
+            return processed_video
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
-        result["audio"] = audio
-        result["fps"] = _resolve_output_fps(sampling_params)
+        result = {
+            "video": processed_video,
+            "audio": audio,
+            "fps": _resolve_output_fps(sampling_params),
+        }
         if audio_sample_rate is not None:
             result["audio_sample_rate"] = int(audio_sample_rate)
         return result

@@ -984,8 +984,6 @@ class Cosmos3VFMTransformer(nn.Module):
             self.audio_proj_out = nn.Linear(self.hidden_size, self.sound_dim)
             self.audio_modality_embed = nn.Parameter(torch.zeros(self.hidden_size))
 
-        self.time_embedder = TimestepEmbedder(self.hidden_size, target_dtype=torch.bfloat16)
-
         self.gen_layers = nn.ModuleList(
             [
                 Cosmos3GenDecoderLayer(

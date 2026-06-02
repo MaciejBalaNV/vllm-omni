@@ -120,7 +120,6 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
         text_mask=torch.ones(1, 2, dtype=torch.long),
         video_shape=(1, 2, 2),
         fps=24.0,
-        sound_latents=torch.zeros(1, 3, 4),
     )
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
@@ -161,10 +160,12 @@ def test_sound_pack_unpack_validate_shapes() -> None:
         model.pack_sound(torch.zeros(1, 4, 2))
 
 
-def test_forward_returns_video_and_sound_predictions() -> None:
-    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+def test_forward_returns_video_and_sound_predictions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
-    output = Cosmos3VFMTransformer(
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    output = transformer_cosmos3.Cosmos3VFMTransformer(
         SimpleNamespace(
             tf_model_config=_tiny_cosmos3_config(sound_gen=True, sound_dim=3, sound_latent_fps=24.0),
             dtype=torch.float32,
