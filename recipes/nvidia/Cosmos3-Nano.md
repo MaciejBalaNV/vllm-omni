@@ -6,7 +6,7 @@
 
 - Vendor: NVIDIA
 - Model: `nvidia/Cosmos3-Nano`
-- Task: Text-to-image (T2I), text-to-video (T2V), and image-to-video (I2V) generation
+- Task: Text-to-image (T2I), text-to-video (T2V), and image-to-video (I2V) generation, with optional synchronized audio (video + sound)
 - Mode: Online serving with the OpenAI-compatible image/video APIs, plus offline generation via the `Omni` API
 - Maintainer: Community
 
@@ -20,13 +20,18 @@ the mode is selected per request:
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).
-- **T2VS** — `POST /v1/videos/sync` with `num_frames > 1`, no reference image and `generate_sound=true`.
+- **Video + sound** — add `generate_sound=true` (and optional `sound_duration`)
+  to any T2V/I2V `/v1/videos/sync` request to also generate synchronized audio,
+  muxed into the mp4 as AAC 48 kHz stereo. Params and example prompts are in the
+  official model card's "Text/Image to Video + Audio" examples.
 
 ## References
 
 - Model card (authoritative usage + example assets): <https://huggingface.co/nvidia/Cosmos3-Nano>
 - Example inputs/outputs live in the repo's `assets/` (`example_t2v_prompt.json`,
-  `example_i2v_prompt.json`, `example_i2v_input.jpg`, `negative_prompt.json`).
+  `example_i2v_prompt.json`, `example_i2v_input.jpg`, `negative_prompt.json`;
+  audio examples: `example_t2vs_prompt.json`, `example_t2vs_output.mp4`,
+  `example_i2vs_output.mp4`).
 - Prompt upsampling (recommended for quality): the model expects JSON-upsampled
   structured prompts; see NVIDIA's `cosmos-framework` prompt-upsampling docs.
 - Pipeline: [`vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py`](../../vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py)
@@ -163,8 +168,8 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
     the server fails at pipeline build with a gated-repo / safety-checker error.
   - A guardrail-blocked prompt currently returns HTTP 500
     (`"Guardrail blocked prompt"`).
-  - Video + audio, and action (policy / forward- / inverse-dynamics) modalities
-    are not part of this integration yet.
+  - Action (policy / forward- / inverse-dynamics) modalities are not part of
+    this integration yet.
 
 ### 1x GPU (Offline generation)
 
