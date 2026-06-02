@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-
+from typing import Any
 import pytest
 import torch
 from torch import nn
@@ -125,18 +125,16 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
-def test_sound_modules_follow_config() -> None:
+def test_sound_modules_follow_injected_sound_dim() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 
     tiny = _tiny_cosmos3_config()
     no_modal = Cosmos3VFMTransformer(SimpleNamespace(tf_model_config=tiny, dtype=torch.float32))
     with_sound = Cosmos3VFMTransformer(
-        SimpleNamespace(
-            tf_model_config={**tiny, "sound_gen": True},
-            model_config={"sound_tokenizer": {"io_channels": 5, "sample_rate": 32000, "hop_size": 800}},
-            custom_pipeline_args={},
-            dtype=torch.float32,
-        )
+        SimpleNamespace(tf_model_config=tiny, dtype=torch.float32),
+        sound_gen=True,
+        sound_dim=5,
+        sound_latent_fps=40.0,
     )
 
     assert no_modal.sound_gen is False
@@ -144,6 +142,23 @@ def test_sound_modules_follow_config() -> None:
     assert with_sound.sound_dim == 5
     assert with_sound.sound_latent_fps == 40.0
     assert with_sound.audio_proj_in.in_features == 5
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sound_gen": True},
+        {"sound_gen": True, "sound_dim": 5},
+        {"sound_gen": True, "sound_latent_fps": 40.0},
+    ],
+)
+def test_transformer_requires_sound_dim_and_fps_when_sound_gen_true(kwargs: dict[str, Any]) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    with pytest.raises(ValueError, match=r"requires an explicit sound_dim and sound_latent_fps"):
+        Cosmos3VFMTransformer(
+            SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32),
+            **kwargs,
+        )
 
 
 def test_sound_pack_unpack_validate_shapes() -> None:
@@ -167,9 +182,12 @@ def test_forward_returns_video_and_sound_predictions(monkeypatch: pytest.MonkeyP
 
     output = transformer_cosmos3.Cosmos3VFMTransformer(
         SimpleNamespace(
-            tf_model_config=_tiny_cosmos3_config(sound_gen=True, sound_dim=3, sound_latent_fps=24.0),
+            tf_model_config=_tiny_cosmos3_config(),
             dtype=torch.float32,
-        )
+        ),
+        sound_gen=True,
+        sound_dim=3,
+        sound_latent_fps=40.0,
     )(
         hidden_states=torch.zeros(1, 2, 1, 2, 2),
         timestep=torch.tensor([1.0]),
@@ -188,7 +206,10 @@ def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch
     import vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 as cosmos3_module
 
     model = cosmos3_module.Cosmos3VFMTransformer(
-        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(sound_gen=True, sound_dim=3), dtype=torch.float32)
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32),
+        sound_gen=True,
+        sound_dim=3,
+        sound_latent_fps=40.0,
     )
     monkeypatch.setattr(cosmos3_module, "_get_ulysses_state", lambda: (2, 0, None))
 

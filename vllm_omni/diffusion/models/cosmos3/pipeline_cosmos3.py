@@ -46,7 +46,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-from .transformer_cosmos3 import Cosmos3VFMTransformer
+from .transformer_cosmos3 import Cosmos3VFMTransformer, resolve_sound_gen
 
 logger = init_logger(__name__)
 
@@ -324,10 +324,22 @@ class Cosmos3OmniDiffusersPipeline(
         self.vae_scale_factor_temporal = int(self.vae.config.scale_factor_temporal)
         self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 16)
 
+        sound_gen = resolve_sound_gen(od_config)
+        sound_dim = None
+        sound_latent_fps = None
+        self._sound_tokenizer = None
+        if sound_gen:
+            self._sound_tokenizer = self._get_sound_tokenizer()
+            sound_dim = self._sound_tokenizer.latent_ch
+            sound_latent_fps = self._sound_tokenizer.latent_fps
+
         # --- Transformer (weights loaded later via weights_sources) ---
         self.transformer = Cosmos3VFMTransformer(
             od_config=od_config,
             temporal_compression_factor=self.vae_scale_factor_temporal,
+            sound_gen=sound_gen,
+            sound_dim=sound_dim,
+            sound_latent_fps=sound_latent_fps,
         )
 
         # --- Scheduler ---
@@ -367,9 +379,6 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = None
         self._num_timesteps = None
-        self._sound_tokenizer = None
-        if getattr(self.transformer, "sound_gen", False):
-            self._get_sound_tokenizer()
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
         # this pipeline. Tells the sequential-CFG loop to keep paired
@@ -603,8 +612,6 @@ class Cosmos3OmniDiffusersPipeline(
         return False
 
     def _get_sound_tokenizer(self):
-        if not hasattr(self, "_sound_tokenizer"):
-            self._sound_tokenizer = None
         if self._sound_tokenizer is None:
             from .sound_tokenizer import Cosmos3SoundTokenizer
 

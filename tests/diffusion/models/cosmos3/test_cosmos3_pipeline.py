@@ -73,6 +73,24 @@ class StubCosmos3VAE:
         return (latents,)
 
 
+class StubCosmos3AVAE:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.sample_rate = int(kwargs["sample_rate"])
+        self.audio_channels = int(kwargs["audio_channels"])
+        self.latent_ch = int(kwargs["io_channels"])
+        self.temporal_compression_factor = int(kwargs["hop_size"])
+
+    def get_latent_num_samples(self, num_audio_samples: int) -> int:
+        return int(num_audio_samples) // self.temporal_compression_factor
+
+    def get_audio_num_samples(self, num_latent_samples: int) -> int:
+        return int(num_latent_samples) * self.temporal_compression_factor
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(latents.shape[0], self.audio_channels, 8)
+
+
 class StubCosmos3Transformer(nn.Module):
     def __init__(
         self,
@@ -80,11 +98,13 @@ class StubCosmos3Transformer(nn.Module):
         latent_channel_size: int = 2,
         sound_gen: bool = False,
         sound_dim: int = 3,
+        sound_latent_fps: float = 25.0,
     ) -> None:
         super().__init__()
         self.latent_channel_size = latent_channel_size
         self.sound_gen = sound_gen
         self.sound_dim = sound_dim
+        self.sound_latent_fps = sound_latent_fps
         self.cached_kv: Any | None = None
         self.cached_freqs_gen: Any | None = None
         self.calls: list[dict[str, Any]] = []
@@ -220,6 +240,108 @@ def test_pipeline_registered_and_exported() -> None:
     assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_post_process_func"
     assert "Cosmos3OmniDiffusersPipeline" in CUSTOM_DIT_ENABLERS
     assert "Cosmos3OmniDiffusersPipeline" in cosmos3.__all__
+
+
+@pytest.fixture
+def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    class _StubAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return SimpleNamespace()
+
+    class _StubDiffusersVAE:
+        config = SimpleNamespace(scale_factor_temporal=4, scale_factor_spatial=8)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def to(self, _device):
+            return self
+
+    class _StubDiffusersScheduler:
+        config = SimpleNamespace(flow_shift=1.0)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    class _StubVideoProcessor:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(pipeline_cosmos3, "AutoTokenizer", _StubAutoTokenizer)
+    monkeypatch.setattr(pipeline_cosmos3, "DistributedAutoencoderKLWan", _StubDiffusersVAE)
+    monkeypatch.setattr(pipeline_cosmos3, "UniPCMultistepScheduler", _StubDiffusersScheduler)
+    monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", _StubVideoProcessor)
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cpu"))
+
+
+def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
+    tf_model_config = {
+        "hidden_size": 8,
+        "num_hidden_layers": 0,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
+        "intermediate_size": 16,
+        "vocab_size": 32,
+        "latent_patch_size": 1,
+        "latent_channel": 2,
+        "rope_scaling": {"mrope_section": [1, 1, 0]},
+    }
+    if sound_gen:
+        tf_model_config["sound_gen"] = True
+    return SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_diffusion_pipeline_profiler=False,
+        model="/nonexistent/model/path",
+        dtype=torch.float32,
+        flow_shift=None,
+        quantization_config=None,
+        custom_pipeline_args={},
+        model_config={},
+        tf_model_config=tf_model_config,
+    )
+
+
+def test_pipeline_init_skips_tokenizer_when_sound_disabled(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=False))
+
+    assert pipeline._sound_tokenizer is None
+    assert pipeline.transformer.sound_gen is False
+    assert not hasattr(pipeline.transformer, "audio_proj_in")
+    assert not hasattr(pipeline.transformer, "audio_proj_out")
+
+
+def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
+    stub_real_pipeline_init,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import sound_tokenizer
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    stub_tokenizer = sound_tokenizer.Cosmos3SoundTokenizer(
+        StubCosmos3AVAE(sample_rate=32000, audio_channels=2, io_channels=5, hop_size=800)
+    )
+    monkeypatch.setattr(
+        sound_tokenizer.Cosmos3SoundTokenizer,
+        "from_config",
+        classmethod(lambda cls, od_config: stub_tokenizer),
+    )
+
+    pipeline = Cosmos3OmniDiffusersPipeline(od_config=_make_od_config(sound_gen=True))
+
+    assert pipeline._sound_tokenizer is stub_tokenizer
+    assert pipeline.transformer.sound_gen is True
+    assert pipeline.transformer.sound_dim == pipeline._sound_tokenizer.latent_ch == 5
+    assert pipeline.transformer.sound_latent_fps == pipeline._sound_tokenizer.latent_fps == 40.0
+    assert pipeline.transformer.audio_proj_in.in_features == 5
+    assert pipeline.transformer.audio_proj_out.out_features == 5
 
 
 def test_preprocess_i2v_image_input() -> None:

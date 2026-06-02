@@ -289,23 +289,6 @@ def get_sound_channels(od_config: OmniDiffusionConfig) -> int:
     )
 
 
-def get_sound_dim(od_config: OmniDiffusionConfig | None) -> int:
-    if od_config is None:
-        return DEFAULT_SOUND_DIM
-    args = _pipeline_args(od_config)
-    custom_value = _custom_arg_value(args, ("sound_dim", "io_channels", "latent_ch"))
-    if custom_value is not None:
-        return int(custom_value)
-    top_value = _top_level_model_value(od_config, ("sound_dim",))
-    if top_value is not None:
-        return int(top_value)
-    nested_value = _first_value_from_configs(
-        _nested_sound_tokenizer_configs(od_config),
-        ("io_channels", "vocoder_input_dim", "latent_ch"),
-    )
-    return int(DEFAULT_SOUND_DIM if nested_value is None else nested_value)
-
-
 def get_sound_hop_size(od_config: OmniDiffusionConfig) -> int:
     args = _pipeline_args(od_config)
     return _resolve_arch_value(
@@ -321,27 +304,6 @@ def get_sound_hop_size(od_config: OmniDiffusionConfig) -> int:
     )
 
 
-def get_sound_latent_fps(od_config: OmniDiffusionConfig | None) -> float:
-    if od_config is None:
-        return DEFAULT_SOUND_LATENT_FPS
-    args = _pipeline_args(od_config)
-    custom_value = _custom_arg_value(args, ("sound_latent_fps",))
-    if custom_value is not None:
-        return float(custom_value)
-    top_value = _top_level_model_value(od_config, ("sound_latent_fps",))
-    if top_value is not None:
-        return float(top_value)
-    nested_configs = _nested_sound_tokenizer_configs(od_config)
-    nested_fps = _first_value_from_configs(nested_configs, ("sound_latent_fps", "latent_fps"))
-    if nested_fps is not None:
-        return float(nested_fps)
-    sample_rate = _first_value_from_configs(nested_configs, ("sample_rate", "sampling_rate"))
-    hop_size = _first_value_from_configs(nested_configs, ("hop_size",))
-    if sample_rate is not None and hop_size is not None:
-        return float(sample_rate) / float(hop_size)
-    return float(DEFAULT_SOUND_LATENT_FPS)
-
-
 class Cosmos3SoundTokenizer:
     """Thin adapter around the local AVAE tokenizer implementation."""
 
@@ -351,6 +313,11 @@ class Cosmos3SoundTokenizer:
         self.audio_channels = int(getattr(tokenizer, "audio_channels", DEFAULT_SOUND_CHANNELS))
         self.latent_ch = int(getattr(tokenizer, "latent_ch", DEFAULT_SOUND_DIM))
         self.hop_size = int(getattr(tokenizer, "temporal_compression_factor", DEFAULT_SOUND_HOP_SIZE))
+        if self.hop_size <= 0:
+            raise ValueError(
+                f"Cosmos3 sound tokenizer hop_size must be positive, got {self.hop_size}."
+            )
+        self.latent_fps = float(self.sample_rate) / float(self.hop_size)
 
     @classmethod
     def from_config(cls, od_config: OmniDiffusionConfig) -> Cosmos3SoundTokenizer:
@@ -503,12 +470,14 @@ class Cosmos3SoundTokenizer:
         )
         if _is_rank_zero():
             logger.info(
-                "Loaded Cosmos3 AVAE sound tokenizer from %s (sr=%d, channels=%d, latent_ch=%d, hop=%d)",
+                "Loaded Cosmos3 AVAE sound tokenizer from %s "
+                "(sr=%d, channels=%d, latent_ch=%d, hop=%d, latent_fps=%.3f)",
                 avae_path,
                 sample_rate,
                 audio_channels,
                 sound_dim,
                 hop_size,
+                float(sample_rate) / float(hop_size),
             )
         return cls(tokenizer)
 
