@@ -1111,6 +1111,9 @@ class Cosmos3OmniDiffusersPipeline(
             lo, hi = guidance_interval
             return lo <= t_scalar <= hi
 
+        # Joint scheduler step over multiple modalities. Safe for flow-matching schedulers
+        # because the update is linear per element; revisit this if Cosmos3 adopts a
+        # scheduler with cross-element dependencies (e.g. per-modality timestep).
         def _pack_joint(
             video_tensor: torch.Tensor,
             sound_tensor: torch.Tensor | None = None,
