@@ -121,6 +121,21 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def resolve_sound_gen(od_config: Any) -> bool:
+    """Capability gate shared by the pipeline and transformer.
+
+    Explicit ``sound_gen`` flag wins (including an explicit False);
+    otherwise infer from the presence of any sound-width key in od_config.
+    """
+    sound_gen_value = _od_config_get(od_config, "sound_gen", None)
+    if sound_gen_value is not None:
+        return _as_bool(sound_gen_value)
+    for key in ("sound_dim", "io_channels", "vocoder_input_dim", "latent_ch"):
+        if _od_config_get(od_config, key, None) is not None:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Rotary Position Embeddings (mRoPE)
 # ---------------------------------------------------------------------------
@@ -906,6 +921,9 @@ class Cosmos3VFMTransformer(nn.Module):
         od_config: OmniDiffusionConfig,
         *,
         temporal_compression_factor: int | None = None,
+        sound_gen: bool = False,
+        sound_dim: int | None = None,
+        sound_latent_fps: float | None = None,
     ) -> None:
         super().__init__()
         model_config = od_config.tf_model_config
@@ -926,19 +944,16 @@ class Cosmos3VFMTransformer(nn.Module):
         self.latent_channel_size = int(_tf_config_get(model_config, "latent_channel", 48))
         self.timestep_scale = float(_tf_config_get(model_config, "timestep_scale", 0.001))
         self.base_fps = float(_tf_config_get(model_config, "base_fps", 24.0))
-        sound_gen_value = _od_config_get(od_config, "sound_gen", None)
-        sound_dim_value = _od_config_get(od_config, "sound_dim", None)
-        if sound_dim_value is None:
-            sound_dim_value = _od_config_get(od_config, "io_channels", None)
-        if sound_dim_value is None:
-            sound_dim_value = _od_config_get(od_config, "vocoder_input_dim", None)
-        if sound_dim_value is None:
-            sound_dim_value = _od_config_get(od_config, "latent_ch", None)
-        self.sound_gen = _as_bool(sound_gen_value) if sound_gen_value is not None else sound_dim_value is not None
-        from .sound_tokenizer import get_sound_dim, get_sound_latent_fps
+        self.sound_gen = sound_gen
+        self.sound_dim = sound_dim
+        self.sound_latent_fps = sound_latent_fps
 
-        self.sound_dim = int(sound_dim_value if sound_dim_value is not None else get_sound_dim(od_config))
-        self.sound_latent_fps = float(get_sound_latent_fps(od_config))
+        if self.sound_gen and (sound_dim is None or sound_latent_fps is None):
+            raise ValueError(
+                "Cosmos3VFMTransformer requires an explicit sound_dim and sound_latent_fps when sound_gen is True; "
+                "the pipeline must pass Cosmos3SoundTokenizer.latent_ch so the audio projection "
+                "layers are sized from the authoritative AVAE latent width."
+            )
         if temporal_compression_factor is None:
             temporal_compression_factor = _tf_config_get(model_config, "temporal_compression_factor", 4)
         self.temporal_compression_factor = int(temporal_compression_factor)

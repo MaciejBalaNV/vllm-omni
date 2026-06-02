@@ -72,7 +72,12 @@ def test_from_config_loads_local_diffusers_component(tmp_path, monkeypatch: pyte
 
     assert created["checkpoint_path"] == str(tokenizer_dir / DIFFUSERS_SOUND_TOKENIZER_CHECKPOINT_NAME)
     assert created["config_path"] == str(tokenizer_dir / "config.json")
-    assert (tokenizer.sample_rate, tokenizer.latent_ch, tokenizer.hop_size) == (32000, 3, 800)
+    assert (tokenizer.sample_rate, tokenizer.latent_ch, tokenizer.hop_size, tokenizer.latent_fps) == (
+        32000,
+        3,
+        800,
+        40.0,
+    )
 
 
 def test_from_config_downloads_component_from_hf_repo(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,7 +182,12 @@ def test_component_config_precedence_and_conflict_detection(tmp_path, monkeypatc
         "tanh",
         2.0,
     )
-    assert (tokenizer.sample_rate, tokenizer.latent_ch, tokenizer.hop_size) == (48000, 64, 1920)
+    assert (tokenizer.sample_rate, tokenizer.latent_ch, tokenizer.hop_size, tokenizer.latent_fps) == (
+        48000,
+        64,
+        1920,
+        25.0,
+    )
 
     with pytest.raises(ValueError, match=r"sample_rate.*48000.*32000"):
         sound_tokenizer.Cosmos3SoundTokenizer.from_config(
