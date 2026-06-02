@@ -29,6 +29,9 @@ for audio).
 
 ## GPU
 
+Requires the `vllm-omni` package (or the `vllm/vllm-omni:cosmos3` container),
+which provides the `vllm serve … --omni` entrypoint used below.
+
 ### 8x H200/H100/A100 (recommended, per model card)
 
 ```bash
@@ -71,6 +74,24 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
   -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \
   -F "seed=17" -o cosmos3_super_t2v.mp4
+
+# I2V — add an uploaded reference image
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=The scene comes to life with smooth, natural motion." \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \
+  -F "seed=1111" -F "input_reference=@/path/to/reference.jpg;type=image/jpeg" \
+  -o cosmos3_super_i2v.mp4
+
+# T2V + sound — add generate_sound/sound_duration (output muxes AAC 48 kHz stereo)
+curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Super" -F "prompt=A robot arm is cleaning a plate in the kitchen" \
+  -F "size=1280x720" -F "num_frames=189" -F "fps=24" -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" -F "max_sequence_length=4096" -F "flow_shift=10.0" \
+  -F "generate_sound=true" -F "sound_duration=7.875" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \
+  -F "seed=17" -o cosmos3_super_t2vs.mp4
 ```
 
 #### Notes

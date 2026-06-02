@@ -52,6 +52,9 @@ the mode is selected per request:
 
 #### Command
 
+Requires the `vllm-omni` package (or the `vllm/vllm-omni:cosmos3` container),
+which provides the `vllm serve … --omni` entrypoint used below.
+
 Safety guardrails are **on by default** (NVIDIA Open Model License). They load
 the **gated** `nvidia/Cosmos-1.0-Guardrail` model, so to keep them on you must:
 
@@ -126,6 +129,7 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
   -F "prompt=The video opens with a view of a well-lit indoor fruit display. A robotic arm picks up a pear, an orange, and a carambola one by one, placing each into a plastic bag in a shopping cart with red handles. The video is 7.875 seconds long, 24 FPS, and 1280x720. Audio description: soft servo whirs, gentle fruit thuds, plastic bag rustling, and a faint refrigeration hum." \
   -F "negative_prompt=blurry, distorted, low quality" \
   -F "size=1280x720" \
@@ -158,7 +162,9 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   3:4, 9:16. Defaults: T2I 1024², 50 steps, guidance 7.0; T2V/I2V 1280×720,
   189 frames, 35 steps, guidance 6.0, `flow_shift=10.0`.
 - **Key flags / params:** `--no-guardrails` (server) or
-  `extra_params={"guardrails":false}` (per request) toggles safety;
+  `extra_params={"guardrails":false}` (per request) toggles safety. The
+  per-request flag only takes effect when the server was launched **with**
+  guardrails enabled (it cannot re-enable them on a `--no-guardrails` server).
   `use_resolution_template` / `use_duration_template` are off by default and only
   needed when not using upsampled prompts that already encode resolution/duration.
 - **Known limitations:**
@@ -194,8 +200,8 @@ def main():
         model_class_name="Cosmos3OmniDiffusersPipeline",
         trust_remote_code=True,
         enforce_eager=True,
-        # Keep guardrails on by installing cosmos-guardrail + gated-repo access;
-        # this disables them for a quick local run.
+        # Guardrails are disabled here for a quick local run; install
+        # cosmos-guardrail + gated-repo access and drop this to enable them.
         model_config={"guardrails": False},
     )
     gen = torch.Generator(device="cpu").manual_seed(42)
