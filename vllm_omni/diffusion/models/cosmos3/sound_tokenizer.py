@@ -314,9 +314,7 @@ class Cosmos3SoundTokenizer:
         self.latent_ch = int(getattr(tokenizer, "latent_ch", DEFAULT_SOUND_DIM))
         self.hop_size = int(getattr(tokenizer, "temporal_compression_factor", DEFAULT_SOUND_HOP_SIZE))
         if self.hop_size <= 0:
-            raise ValueError(
-                f"Cosmos3 sound tokenizer hop_size must be positive, got {self.hop_size}."
-            )
+            raise ValueError(f"Cosmos3 sound tokenizer hop_size must be positive, got {self.hop_size}.")
         self.latent_fps = float(self.sample_rate) / float(self.hop_size)
 
     @classmethod
