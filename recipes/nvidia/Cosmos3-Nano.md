@@ -20,6 +20,7 @@ the mode is selected per request:
 - **T2V** — `POST /v1/videos/sync` with `num_frames > 1` and no reference image.
 - **I2V** — `POST /v1/videos/sync` with a reference image (`input_reference` file
   upload, or `image_reference` JSON).
+- **T2VS** — `POST /v1/videos/sync` with `num_frames > 1`, no reference image and `generate_sound=true`.
 
 ## References
 
@@ -116,6 +117,25 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F "seed=1111" \
   -F "input_reference=@/path/to/reference.jpg;type=image/jpeg" \
   -o cosmos3_i2v.mp4
+
+
+# Text-to-video-with-sound
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "prompt=The video opens with a view of a well-lit indoor fruit display. A robotic arm picks up a pear, an orange, and a carambola one by one, placing each into a plastic bag in a shopping cart with red handles. The video is 7.875 seconds long, 24 FPS, and 1280x720. Audio description: soft servo whirs, gentle fruit thuds, plastic bag rustling, and a faint refrigeration hum." \
+  -F "negative_prompt=blurry, distorted, low quality" \
+  -F "size=1280x720" \
+  -F "num_frames=189" \
+  -F "fps=24" \
+  -F "num_inference_steps=35" \
+  -F "guidance_scale=6.0" \
+  -F "max_sequence_length=4096" \
+  -F "flow_shift=10.0" \
+  -F "seed=42" \
+  -F "generate_sound=true" \
+  -F "sound_duration=7.875" \
+  -F 'extra_params={"use_resolution_template":false,"use_duration_template":false,"guardrails":true}' \
+  -o cosmos3_t2v_with_sound.mp4
 ```
 
 #### Notes
