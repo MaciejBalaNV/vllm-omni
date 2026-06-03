@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 text/image-to-video and text-to-image pipeline for vllm-omni.
+"""Cosmos3 text/image/video-to-video and text-to-image pipeline for vllm-omni.
 
-Single pipeline class supports T2V, I2V, and T2I; the mode is selected at
+Single pipeline class supports T2V, I2V, V2V, and T2I; the mode is selected at
 runtime by:
 
 * ``prompt["modalities"]`` contains ``"image"``: **T2I** (text-to-image).
@@ -10,6 +10,8 @@ runtime by:
   (text-to-video).
 * ``multi_modal_data['image']`` present on the prompt:  **I2V**
   (handled by :func:`get_cosmos3_pre_process_func`)
+* ``multi_modal_data['video']`` present on the prompt with no action mode:
+  **V2V** (handled by :func:`get_cosmos3_pre_process_func`)
 
 """
 
@@ -40,7 +42,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.interface import SupportImageInput, SupportVideoInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -63,6 +65,32 @@ from .transformer_cosmos3 import Cosmos3VFMTransformer, resolve_sound_gen
 
 logger = init_logger(__name__)
 
+COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
+COSMOS3_VIDEO_NEGATIVE_PROMPT = (
+    "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
+    "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
+    "underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, "
+    "jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, "
+    "fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. "
+    "Overall, the video is of poor quality."
+)
+COSMOS3_T2V_NEGATIVE_PROMPT = COSMOS3_VIDEO_NEGATIVE_PROMPT
+COSMOS3_I2V_NEGATIVE_PROMPT = COSMOS3_VIDEO_NEGATIVE_PROMPT
+# V2V leaves the negative prompt empty by default: the conditioning video already
+# anchors fidelity, and the verbose VIDEO negative prompt biases the model away from
+# legitimate low-motion / low-light content carried over from the source clip.
+COSMOS3_V2V_NEGATIVE_PROMPT = COSMOS3_DEFAULT_NEGATIVE_PROMPT
+COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
+COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
+# Mirrors the WAN VAE's temporal compression. Authoritative value is
+# ``self.vae.config.scale_factor_temporal`` at runtime; this constant exists so
+# off-line / API code that runs before the pipeline is constructed can compute
+# pixel-frame budgets without instantiating the VAE.
+COSMOS3_VAE_TEMPORAL_COMPRESSION = 4
+COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
+    max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
+)
+COSMOS3_V2V_DEFAULT_FLOW_SHIFT = 10.0
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
@@ -85,6 +113,44 @@ COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE = 7.0
 COSMOS3_T2I_DEFAULT_FLOW_SHIFT = 3.0
 COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL: tuple[float, float] = (400.0, 1000.0)
 
+
+def _normalize_condition_frame_indexes_vision(value: Any) -> tuple[int, ...]:
+    """Normalize Cosmos3 vision-conditioning latent frame indexes."""
+    if value is None:
+        return COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, int):
+        value = [value]
+
+    if not isinstance(value, Iterable):
+        raise TypeError(
+            "Cosmos3 condition_frame_indexes_vision must be an int, comma-separated string, "
+            f"or iterable of ints; got {type(value)!r}."
+        )
+
+    indexes = tuple(sorted({int(index) for index in value}))
+    if not indexes:
+        raise ValueError("Cosmos3 condition_frame_indexes_vision must contain at least one index.")
+    if any(index < 0 for index in indexes):
+        raise ValueError(f"Cosmos3 condition_frame_indexes_vision must be non-negative, got {indexes}.")
+    return indexes
+
+
+def _condition_pixel_frame_count(
+    condition_frame_indexes_vision: Iterable[int],
+    temporal_compression: int = COSMOS3_VAE_TEMPORAL_COMPRESSION,
+) -> int:
+    return max(condition_frame_indexes_vision) * int(temporal_compression) + 1
+
+
+def _normalize_condition_video_keep(value: Any) -> str:
+    keep = str(value or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+    if keep not in {"first", "last"}:
+        raise ValueError("Cosmos3 condition_video_keep must be either 'first' or 'last'.")
+    return keep
+
+
 # Truncation cap on the prompt token count (shared by T2I and T2V).  Prompts
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
@@ -95,12 +161,14 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 # Post-process function (registered in registry.py)
 # ---------------------------------------------------------------------------
 def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
-    """Pre-process function for both T2V and I2V.
+    """Pre-process function for T2V, I2V, V2V, and action inputs.
 
     For T2V (no image in ``multi_modal_data``), the request is returned
     unchanged after the optional guardrails check.  For I2V (image present),
     the conditioning image is loaded, aspect-resized + center-cropped, and
     stored back on the prompt as ``additional_information.preprocessed_image``.
+    For V2V (video present without action mode), source frames are cropped to
+    the target size and stored as ``additional_information.preprocessed_video``.
     """
     from .guardrails import check_text_safety, ensure_initialized, is_guardrails_enabled
 
@@ -137,7 +205,24 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
             return PIL.Image.open(value).convert("RGB")
         if isinstance(value, PIL.Image.Image):
             return value.convert("RGB")
-        raise TypeError(f"Cosmos3 action preprocessing expected PIL image or image path, got {type(value)!r}.")
+        if isinstance(value, np.ndarray):
+            array = value
+            if array.ndim == 3 and array.shape[0] in (3, 4) and array.shape[-1] not in (3, 4):
+                array = np.transpose(array, (1, 2, 0))
+            if np.issubdtype(array.dtype, np.floating):
+                if array.min() < 0.0 or array.max() > 1.0:
+                    array = np.clip(array, -1.0, 1.0) * 0.5 + 0.5
+                array = (np.clip(array, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+            return PIL.Image.fromarray(array).convert("RGB")
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().cpu()
+            if tensor.ndim == 3 and tensor.shape[0] in (3, 4):
+                tensor = tensor.permute(1, 2, 0)
+            array = tensor.numpy()
+            return _pil_to_rgb(array)
+        raise TypeError(
+            f"Cosmos3 preprocessing expected PIL image, numpy array, torch tensor, or path, got {type(value)!r}."
+        )
 
     def _resize_and_pad_action_image(image: PIL.Image.Image, target_h: int, target_w: int) -> PIL.Image.Image:
         scale = min(target_w / image.width, target_h / image.height, 1.0)
@@ -170,6 +255,61 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         processed = [_preprocess_action_image(_pil_to_rgb(frame), target_h, target_w).squeeze(0) for frame in frames]
         return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
 
+    def _preprocess_condition_image(image: PIL.Image.Image, target_h: int, target_w: int) -> torch.Tensor:
+        scale = max(target_w / image.width, target_h / image.height)
+        resize_w = int(np.ceil(scale * image.width))
+        resize_h = int(np.ceil(scale * image.height))
+        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
+        left = (resize_w - target_w) // 2
+        top = (resize_h - target_h) // 2
+        image = image.crop((left, top, left + target_w, top + target_h))
+        return video_processor.preprocess(image, height=target_h, width=target_w)
+
+    def _video_payload_to_frames(video: Any) -> list[Any]:
+        if isinstance(video, list):
+            return video
+        if isinstance(video, torch.Tensor):
+            tensor = video.detach().cpu()
+            if tensor.ndim == 5:
+                if tensor.shape[0] != 1:
+                    raise TypeError("Cosmos3 video preprocessing supports only batch size 1.")
+                tensor = tensor[0]
+            if tensor.ndim == 4 and tensor.shape[0] in (3, 4) and tensor.shape[-1] not in (3, 4):
+                return [tensor[:, i] for i in range(tensor.shape[1])]
+            if tensor.ndim == 4 and tensor.shape[-1] in (3, 4):
+                return [tensor[i] for i in range(tensor.shape[0])]
+        if isinstance(video, np.ndarray):
+            array = video
+            if array.ndim == 5:
+                if array.shape[0] != 1:
+                    raise TypeError("Cosmos3 video preprocessing supports only batch size 1.")
+                array = array[0]
+            if array.ndim == 4 and array.shape[0] in (3, 4) and array.shape[-1] not in (3, 4):
+                return [array[:, i] for i in range(array.shape[1])]
+            if array.ndim == 4 and array.shape[-1] in (3, 4):
+                return [array[i] for i in range(array.shape[0])]
+        raise TypeError("Cosmos3 video input must be a non-empty list of frames or a single video tensor/array.")
+
+    def _select_video_frames(frames: list[Any], max_frames: int, keep: str) -> list[Any]:
+        if not frames:
+            raise ValueError("Cosmos3 video input must contain at least one frame.")
+        if keep == "last":
+            return frames[-max_frames:]
+        return frames[:max_frames]
+
+    def _preprocess_condition_video(
+        frames: list[Any],
+        target_h: int,
+        target_w: int,
+        max_frames: int,
+        keep: str,
+    ) -> torch.Tensor:
+        selected = _select_video_frames(frames, max_frames, keep)
+        processed = [
+            _preprocess_condition_image(_pil_to_rgb(frame), target_h, target_w).squeeze(0) for frame in selected
+        ]
+        return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         action_mode = _request_action_mode(request)
         if is_guardrails_enabled(od_config, request.sampling_params):
@@ -183,16 +323,23 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
             multi_modal_data = prompt.get("multi_modal_data", {}) or {}
             raw_image = multi_modal_data.get("image")
             raw_video = multi_modal_data.get("video")
-            if raw_image is None and not (action_mode is not None and raw_video is not None):
+            if raw_image is None and raw_video is None:
                 continue
+            if raw_image is not None and raw_video is not None and action_mode is None:
+                raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
 
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
 
+            raw_video_frames: list[Any] | None = None
+            if raw_video is not None:
+                raw_video_frames = _video_payload_to_frames(raw_video)
+                if not raw_video_frames:
+                    raise TypeError("Cosmos3 video input must be a non-empty list of PIL images or image paths.")
+
             if raw_image is None:
-                if not isinstance(raw_video, list) or not raw_video:
-                    raise TypeError("Cosmos3 action video input must be a non-empty list of PIL images or image paths.")
-                image = _pil_to_rgb(raw_video[0])
+                assert raw_video_frames is not None  # raw_image and raw_video can't both be None here
+                image = _pil_to_rgb(raw_video_frames[0])
             else:
                 image = _pil_to_rgb(raw_image)
 
@@ -219,23 +366,38 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                     int(target_h),
                     int(target_w),
                 )
-            else:
-                scale = max(target_w / image.width, target_h / image.height)
-                resize_w = int(np.ceil(scale * image.width))
-                resize_h = int(np.ceil(scale * image.height))
-                image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
-                left = (resize_w - target_w) // 2
-                top = (resize_h - target_h) // 2
-                image = image.crop((left, top, left + target_w, top + target_h))
-
-                prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                    image, height=target_h, width=target_w
+            elif raw_video is None:
+                prompt["additional_information"]["preprocessed_image"] = _preprocess_condition_image(
+                    image,
+                    int(target_h),
+                    int(target_w),
                 )
-            if action_mode is not None and raw_video is not None:
-                if not isinstance(raw_video, list):
-                    raise TypeError("Cosmos3 action video input must be a list of PIL images or image paths.")
+            else:
+                assert raw_video_frames is not None
+                extra = _extra_args(request)
+                condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
+                    extra.get(
+                        "condition_frame_indexes_vision",
+                        prompt.get("condition_frame_indexes_vision"),
+                    )
+                )
+                keep = _normalize_condition_video_keep(
+                    extra.get("condition_video_keep", prompt.get("condition_video_keep"))
+                )
+                max_frames = _condition_pixel_frame_count(condition_frame_indexes_vision)
+                prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
+                    raw_video_frames,
+                    int(target_h),
+                    int(target_w),
+                    max_frames,
+                    keep,
+                )
+                prompt["additional_information"]["condition_frame_indexes_vision"] = list(
+                    condition_frame_indexes_vision
+                )
+            if action_mode is not None and raw_video_frames is not None:
                 prompt["additional_information"]["preprocessed_video"] = _preprocess_action_video(
-                    raw_video,
+                    raw_video_frames,
                     int(target_h),
                     int(target_w),
                 )
@@ -322,16 +484,13 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             return video_processor.postprocess(image, output_type="pil")
         if is_guardrails_enabled(od_config, sampling_params):
             video = check_video_safety(video)
-        processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        result = {"video": video_processor.postprocess_video(video, output_type=output_type)}
         if audio is None:
-            return processed_video
+            return result
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
-        result = {
-            "video": processed_video,
-            "audio": audio,
-            "fps": _resolve_output_fps(sampling_params),
-        }
+        result["audio"] = audio
+        result["fps"] = _resolve_output_fps(sampling_params)
         if audio_sample_rate is not None:
             result["audio_sample_rate"] = int(audio_sample_rate)
         return result
@@ -343,15 +502,15 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module, CFGParallelMixin, SupportImageInput, SupportVideoInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
-    """Cosmos3 text/image-to-video / text-to-image pipeline.
+    """Cosmos3 text/image/video-to-video / text-to-image pipeline.
 
     Architecture: Mixture-of-Transformers with Qwen3-VL backbone.
     - Understanding pathway: causal self-attention on text (runs once, K/V cached)
     - Generation pathway: cross-attention on noisy visual latents (runs each step)
 
-    Supports T2V, I2V, and T2I from the same class.  Mode is selected at
+    Supports T2V, I2V, V2V, and T2I from the same class.  Mode is selected at
     runtime:
 
     * **T2I** when ``prompt["modalities"]`` contains ``"image"``.  Latent
@@ -365,10 +524,15 @@ class Cosmos3OmniDiffusersPipeline(
       Frame 0 of the initial latent is set to the VAE-encoded conditioning
       image, frame-0 noise predictions are masked to zero, and the clean
       image latent is re-injected at frame 0 after each scheduler step.
+    * **V2V** when the request supplies a preprocessed video via
+      ``multi_modal_data['video']`` without an action mode. Explicit latent
+      frame indexes are kept clean with ``noisy_frame_mask`` and re-injected
+      after each scheduler step.
     * **T2V** otherwise (default video generation).
     """
 
     support_image_input: ClassVar[bool] = True
+    support_video_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
 
     def __init__(
@@ -797,21 +961,20 @@ class Cosmos3OmniDiffusersPipeline(
         resolution_template: str | None = COSMOS3_RESOLUTION_TEMPLATE,
         force_duration_template: bool = False,
     ) -> str:
+        """Append duration and resolution metadata to a prompt.
+
+        Strips trailing dot and appends ``". <template>"`` for each.
         """
-        Append duration and resolution metadata to a prompt.
-        """
-        parts: list[str] = []
-        head = prompt.rstrip(".").strip()
-        if head:
-            parts.append(head)
         if duration_template is not None and (num_frames > 1 or force_duration_template):
             duration = num_frames / frame_rate
-            parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
+            dur_text = duration_template.format(duration=duration, fps=frame_rate)
+            prompt = prompt.rstrip(".") + ". " + dur_text
+
         if resolution_template is not None:
-            parts.append(resolution_template.format(height=height, width=width).rstrip("."))
-        if not parts:
-            return ""
-        return ". ".join(parts) + "."
+            res_text = resolution_template.format(height=height, width=width)
+            prompt = prompt.rstrip(".") + ". " + res_text
+
+        return prompt
 
     # -- Tokenization --------------------------------------------------------
 
@@ -1042,9 +1205,9 @@ class Cosmos3OmniDiffusersPipeline(
         # Route cosmos3-specific controls through ``_get_sp_param`` so they
         # are picked up from ``extra_args`` (OpenAI endpoint path) as well
         # as from direct attributes.
-        use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False)) and not is_t2i
+        use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", True)) and not is_t2i
         dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        if bool(self._get_sp_param(sp, "use_resolution_template", False)):
+        if bool(self._get_sp_param(sp, "use_resolution_template", True)):
             res_tmpl = COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_RESOLUTION_TEMPLATE
         else:
             res_tmpl = None
@@ -1060,26 +1223,54 @@ class Cosmos3OmniDiffusersPipeline(
         if _is_rank_zero():
             logger.info("Final prompt: '%s'", prompt)
 
-        # Negative prompt: inverse templates ("not {duration}...", "not {height}x{width}...").
-        # Applied whenever the matching positive template is enabled; an empty
-        # negative_prompt yields output that starts with the template, not a dot.
-        inv_dur = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
-        if res_tmpl is None:
-            inv_res = None
-        elif is_t2i:
-            inv_res = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
-        else:
-            inv_res = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
-        negative_prompt = self._apply_metadata_templates(
-            negative_prompt,
-            num_frames,
-            frame_rate,
-            height,
-            width,
-            duration_template=inv_dur,
-            resolution_template=inv_res,
-            force_duration_template=True,
-        )
+        # Negative prompt metadata: "none" | "same" | "inverse".
+        # "same"    = same templates as positive (CFG guides caption only).
+        # "inverse" = inverted templates ("not {duration}...", "not {height}x{width}...").
+        # "none"    = no metadata on negative prompt.
+        # negative_prompt_keep_metadata=True upgrades "none" to "same" (compat).
+        # T2I uses a plain neg prompt by default.
+        neg_meta_default = "none" if is_t2i else "same"
+        neg_meta_mode = self._get_sp_param(sp, "negative_metadata_mode", "none")
+        keep_metadata = bool(self._get_sp_param(sp, "negative_prompt_keep_metadata", not is_t2i))
+        if keep_metadata and neg_meta_mode == "none":
+            neg_meta_mode = neg_meta_default
+
+        if neg_meta_mode == "same":
+            negative_prompt = (
+                self._apply_metadata_templates(
+                    negative_prompt,
+                    num_frames,
+                    frame_rate,
+                    height,
+                    width,
+                    duration_template=dur_tmpl,
+                    resolution_template=res_tmpl,
+                )
+                .lstrip(".")
+                .strip()
+            )
+        elif neg_meta_mode == "inverse":
+            inv_dur = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
+            if res_tmpl is None:
+                inv_res = None
+            elif is_t2i:
+                inv_res = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
+            else:
+                inv_res = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
+            negative_prompt = (
+                self._apply_metadata_templates(
+                    negative_prompt,
+                    num_frames,
+                    frame_rate,
+                    height,
+                    width,
+                    duration_template=inv_dur,
+                    resolution_template=inv_res,
+                    force_duration_template=True,
+                )
+                .lstrip(".")
+                .strip()
+            )
 
         default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
         sys_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
@@ -1187,6 +1378,62 @@ class Cosmos3OmniDiffusersPipeline(
         latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
         velocity_mask = 1.0 - condition_mask
         return latents, velocity_mask, image_latent
+
+    def _prepare_latents_v2v(
+        self,
+        video_tensor: torch.Tensor,
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: torch.Generator,
+        condition_frame_indexes_vision: Iterable[int] | int | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare V2V latents with explicit clean conditioned latent frames."""
+        del height, width
+        if video_tensor.ndim == 4:
+            video_tensor = video_tensor.unsqueeze(0)
+        if video_tensor.ndim != 5 or video_tensor.shape[0] != 1 or video_tensor.shape[1] != 3:
+            raise ValueError(f"Cosmos3 video tensor must have shape [1, 3, T, H, W], got {tuple(video_tensor.shape)}.")
+        if video_tensor.shape[2] < 1:
+            raise ValueError("Cosmos3 V2V video tensor must contain at least one frame.")
+
+        if video_tensor.shape[2] < num_frames:
+            pad = video_tensor[:, :, -1:].repeat(1, 1, num_frames - video_tensor.shape[2], 1, 1)
+            video_tensor = torch.cat([video_tensor, pad], dim=2)
+        elif video_tensor.shape[2] > num_frames:
+            video_tensor = video_tensor[:, :, :num_frames]
+
+        C = self.transformer.latent_channel_size
+        T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
+        W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
+
+        noise = randn_tensor(
+            (1, C, T_lat, H_lat, W_lat),
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        cond_latent = self._encode_video_tensor(video_tensor)
+        if cond_latent.shape != noise.shape:
+            raise ValueError(
+                f"Cosmos3 V2V latent shape mismatch: encoded={tuple(cond_latent.shape)}, expected={tuple(noise.shape)}."
+            )
+
+        indexes = _normalize_condition_frame_indexes_vision(condition_frame_indexes_vision)
+        out_of_range = [index for index in indexes if index >= T_lat]
+        if out_of_range:
+            raise ValueError(
+                "Cosmos3 condition_frame_indexes_vision contains indexes outside the latent video: "
+                f"indexes={indexes}, latent_frames={T_lat}."
+            )
+
+        condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        for index in indexes:
+            condition_mask[:, :, index, :, :] = 1.0
+        latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
+        velocity_mask = 1.0 - condition_mask
+        return latents, velocity_mask, cond_latent
 
     def _prepare_latents_action_video(
         self,
@@ -1567,19 +1814,20 @@ class Cosmos3OmniDiffusersPipeline(
             prompt = prompt_data
             negative_prompt = None
             image_tensor = None
-            action_video_tensor = None
+            video_tensor = None
         else:
             prompt = prompt_data.get("prompt", "")
             negative_prompt = prompt_data.get("negative_prompt")
             additional_info = prompt_data.get("additional_information", {}) or {}
             image_tensor = additional_info.get("preprocessed_image")
-            action_video_tensor = additional_info.get("preprocessed_video")
+            video_tensor = additional_info.get("preprocessed_video")
 
         sp = req.sampling_params
         is_t2i = self._is_t2i_request(req)
         sound_enabled = self._is_sound_request(prompt_data, sp)
         action_mode = self._get_action_mode(prompt_data, sp)
         action_enabled = action_mode is not None
+        action_video_tensor = video_tensor if action_enabled else None
         if action_enabled and is_t2i:
             raise ValueError("Cosmos3 action generation is supported only for video outputs.")
         if action_enabled and sound_enabled:
@@ -1601,8 +1849,21 @@ class Cosmos3OmniDiffusersPipeline(
                 "initialized without sound modules. Check that the checkpoint config "
                 "enables sound_gen or defines sound_dim and includes sound weights."
             )
+        if image_tensor is not None and video_tensor is not None and not action_enabled:
+            raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
+        if video_tensor is not None and is_t2i:
+            raise ValueError("Cosmos3 video-to-video generation is supported only for video outputs.")
+        is_v2v = video_tensor is not None and not is_t2i and not action_enabled
+        is_i2v = image_tensor is not None and not is_t2i and not action_enabled
         if negative_prompt is None:
-            negative_prompt = ""
+            if is_t2i or action_enabled:
+                negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
+            elif is_v2v:
+                negative_prompt = COSMOS3_V2V_NEGATIVE_PROMPT
+            elif is_i2v:
+                negative_prompt = COSMOS3_I2V_NEGATIVE_PROMPT
+            else:
+                negative_prompt = COSMOS3_T2V_NEGATIVE_PROMPT
 
         # T2I and T2V share the same model + forward path; only defaults
         # differ:
@@ -1623,10 +1884,11 @@ class Cosmos3OmniDiffusersPipeline(
             num_frames = sp.num_frames or COSMOS3_T2V_DEFAULT_NUM_FRAMES
             num_inference_steps = sp.num_inference_steps or COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS
             guidance_scale = sp.guidance_scale if sp.guidance_scale else COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE
-            # Fall back to the engine-init shift, NOT None: passing None
-            # to ``_set_flow_shift`` would leak a prior T2I rebuild
-            # (shift=3.0) into a subsequent video request.
-            default_flow_shift = self._engine_init_flow_shift
+            # V2V uses a dedicated default shift; otherwise fall back to the
+            # engine-init shift, NOT None: passing None to ``_set_flow_shift``
+            # would leak a prior T2I rebuild (shift=3.0) into a subsequent
+            # video request.
+            default_flow_shift = COSMOS3_V2V_DEFAULT_FLOW_SHIFT if is_v2v else self._engine_init_flow_shift
             default_guidance_interval = None
             batch_size = 1  # Existing video pipeline assumes B=1.
 
@@ -1775,6 +2037,23 @@ class Cosmos3OmniDiffusersPipeline(
                 generator,
             )
             image_latent = condition_latents[:, :, 0:1]
+        elif is_v2v:
+            condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
+                self._get_sp_param(
+                    sp,
+                    "condition_frame_indexes_vision",
+                    self._get_prompt_param(prompt_data, "condition_frame_indexes_vision", None),
+                )
+            )
+            latents, velocity_mask, condition_latents = self._prepare_latents_v2v(
+                video_tensor,
+                height,
+                width,
+                num_frames,
+                generator,
+                condition_frame_indexes_vision,
+            )
+            image_latent = None
         elif image_tensor is not None and not is_t2i:
             latents, velocity_mask, image_latent = self._prepare_latents_i2v(
                 image_tensor,

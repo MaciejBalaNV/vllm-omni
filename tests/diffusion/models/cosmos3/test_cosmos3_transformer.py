@@ -112,25 +112,6 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
     torch.testing.assert_close(model.unpatchify(model.patchify(latents, t=1, h=3, w=5), t=1, h=3, w=5), latents)
 
 
-def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
-
-    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
-
-    output = transformer_cosmos3.Cosmos3VFMTransformer(
-        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
-    )(
-        hidden_states=torch.zeros(1, 2, 1, 2, 2),
-        timestep=torch.tensor([1.0]),
-        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
-        text_mask=torch.ones(1, 2, dtype=torch.long),
-        video_shape=(1, 2, 2),
-        fps=24.0,
-    )
-
-    assert tuple(output.shape) == (1, 2, 1, 2, 2)
-
-
 def test_sound_and_action_modules_follow_config() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 

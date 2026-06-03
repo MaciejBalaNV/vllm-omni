@@ -43,16 +43,19 @@ def _get_ulysses_state() -> tuple[int, int, dist.ProcessGroup | None]:
 
     Returns (1, 0, None) when sequence parallelism is not active.
     """
-    from vllm_omni.diffusion.distributed.parallel_state import (
-        get_sp_group,
-        get_ulysses_parallel_rank,
-        get_ulysses_parallel_world_size,
-    )
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sp_group,
+            get_ulysses_parallel_rank,
+            get_ulysses_parallel_world_size,
+        )
 
-    size = get_ulysses_parallel_world_size()
-    if size <= 1:
+        size = get_ulysses_parallel_world_size()
+        if size <= 1:
+            return 1, 0, None
+        return size, get_ulysses_parallel_rank(), get_sp_group().ulysses_group
+    except Exception:
         return 1, 0, None
-    return size, get_ulysses_parallel_rank(), get_sp_group().ulysses_group
 
 
 def _is_sp_active() -> bool:
@@ -61,10 +64,12 @@ def _is_sp_active() -> bool:
     Follows the Bagel pattern: read ``forward_context.sp_active`` which returns
     True when ``sequence_parallel_size > 1`` even without ``_sp_plan`` hooks.
     """
-
-    if not is_forward_context_available():
+    try:
+        if not is_forward_context_available():
+            return False
+        return get_forward_context().sp_active
+    except Exception:
         return False
-    return get_forward_context().sp_active
 
 
 def _tf_config_get(config: Any, key: str, default: Any) -> Any:

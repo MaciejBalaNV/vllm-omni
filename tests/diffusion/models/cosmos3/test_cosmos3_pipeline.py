@@ -152,6 +152,25 @@ class StubCosmos3Transformer(nn.Module):
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
+def make_sampling_params(**overrides: Any) -> SimpleNamespace:
+    values = {
+        "height": None,
+        "width": None,
+        "num_frames": None,
+        "num_inference_steps": None,
+        "guidance_scale": None,
+        "generator": None,
+        "seed": 123,
+        "num_outputs_per_prompt": 1,
+        "frame_rate": None,
+        "resolved_frame_rate": None,
+        "max_sequence_length": None,
+        "extra_args": {},
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def passthrough_progress_bar(iterable):
     return iterable
 
@@ -197,25 +216,6 @@ def make_cosmos3_pipeline():
     return _make
 
 
-def make_sampling_params(**overrides: Any) -> SimpleNamespace:
-    values = {
-        "height": None,
-        "width": None,
-        "num_frames": None,
-        "num_inference_steps": None,
-        "guidance_scale": None,
-        "generator": None,
-        "seed": 123,
-        "num_outputs_per_prompt": 1,
-        "frame_rate": None,
-        "resolved_frame_rate": None,
-        "max_sequence_length": None,
-        "extra_args": {},
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
 def _ids(value: int) -> torch.Tensor:
     return torch.tensor([[value]], dtype=torch.long)
 
@@ -238,6 +238,7 @@ def test_pipeline_registered_and_exported() -> None:
     assert issubclass(Cosmos3OmniDiffusersPipeline, nn.Module)
     assert issubclass(Cosmos3OmniDiffusersPipeline, ProgressBarMixin)
     assert Cosmos3OmniDiffusersPipeline.support_image_input is True
+    assert Cosmos3OmniDiffusersPipeline.support_video_input is True
     assert _DIFFUSION_MODELS["Cosmos3OmniDiffusersPipeline"] == (
         "cosmos3",
         "pipeline_cosmos3",
@@ -374,6 +375,19 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     assert tuple(additional["preprocessed_image"].shape) == (1, 3, 16, 32)
     assert tuple(additional["preprocessed_video"].shape) == (1, 3, 3, 16, 32)
 
+    frames = [Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue", "yellow", "purple", "black")]
+    v2v = SimpleNamespace(
+        prompts=[{"prompt": "Continue.", "multi_modal_data": {"video": frames}}],
+        sampling_params=SimpleNamespace(
+            height=16,
+            width=32,
+            extra_args={"condition_frame_indexes_vision": [0, 1], "condition_video_keep": "last"},
+        ),
+    )
+    additional = preprocess(v2v).prompts[0]["additional_information"]
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
+
 
 def test_postprocess_handles_image_video_audio_and_validation() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
@@ -383,9 +397,7 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
 
     assert func(video, output_type="latent") is video
     assert func({"image": video})[0].size == (4, 4)
-    # Video-only postprocess returns the bare processed video (not a dict),
-    # matching the image/latent branches and peer audio-capable pipelines.
-    assert not isinstance(func({"video": video}), dict)
+    assert "video" in func({"video": video})
     assert (
         func(
             {"video": video, "audio": torch.ones(1, 2, 16), "audio_sample_rate": 48000},
@@ -418,9 +430,8 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
         sp=SimpleNamespace(
             extra_args={
                 "negative_metadata_mode": "inverse",
-                # Duration/resolution metadata templates are off by default
-                # (commit "Change resolution and duration templates to off by
-                # default"); enable them explicitly to exercise the formatting.
+                # Duration/resolution metadata templates are on by default;
+                # set explicitly here to document what the test exercises.
                 "use_duration_template": True,
                 "use_resolution_template": True,
             }
@@ -447,6 +458,11 @@ def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> No
         "transformer.model.layers.3.self_attn.add_k_proj.weight": (
             "transformer.gen_layers.3.cross_attention.to_k.weight"
         ),
+        "audio_proj_in.weight": "transformer.audio_proj_in.weight",
+        "audio_modality_embed.weight": "transformer.audio_modality_embed",
+        "action_proj_in.fc.weight": "transformer.action_proj_in.fc.weight",
+        "action_modality_embed.weight": "transformer.action_modality_embed",
+        "lm_head.weight": None,
     }
     assert {key: Cosmos3OmniDiffusersPipeline._remap_ckpt_key(key) for key in remaps} == remaps
 
@@ -463,6 +479,19 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(i2v_latents[:, :, 0], torch.full((1, 2, 2, 3), 5.0))
     assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]]]]]
     assert image_latent.shape == (1, 2, 1, 2, 3)
+
+    pipeline._encode_video_tensor = lambda *args, **kwargs: torch.full((1, 2, 3, 2, 3), 6.0)
+    v2v_latents, v2v_velocity_mask, v2v_condition = pipeline._prepare_latents_v2v(
+        torch.zeros(1, 3, 5, 16, 24),
+        16,
+        24,
+        9,
+        torch.Generator(device="cpu").manual_seed(0),
+        [0, 1],
+    )
+    torch.testing.assert_close(v2v_latents[:, :, 0:2], torch.full((1, 2, 2, 2, 3), 6.0))
+    assert v2v_velocity_mask.tolist() == [[[[[0.0]], [[0.0]], [[1.0]]]]]
+    assert v2v_condition.shape == (1, 2, 3, 2, 3)
 
     pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
     pipeline._sound_tokenizer = SimpleNamespace(
@@ -669,6 +698,34 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is velocity_mask
+
+        video_tensor = torch.zeros(1, 3, 5, 16, 16)
+        v2v_condition = torch.full((1, 2, 2, 1, 1), 4.0)
+        v2v_mask = torch.tensor([[[[[0.0]], [[1.0]]]]])
+        pipeline._prepare_latents_v2v = lambda *args, **kwargs: (
+            torch.zeros(1, 2, 2, 1, 1),
+            v2v_mask,
+            v2v_condition,
+        )
+        pipeline.forward(
+            SimpleNamespace(
+                prompts=[
+                    {
+                        "prompt": "continue",
+                        "modalities": ["video"],
+                        "additional_information": {
+                            "preprocessed_video": video_tensor,
+                            "condition_frame_indexes_vision": [0],
+                        },
+                    }
+                ],
+                sampling_params=make_sampling_params(height=16, width=16, num_frames=5),
+            )
+        )
+        assert captured["flow_shifts"][-1] == 10.0
+        assert captured["format"]["negative_prompt"] == ""
+        assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is v2v_mask
+        assert captured["diffuse_calls"][-1]["condition_latents"] is v2v_condition
 
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, sound_gen=True, sound_dim=3)
         sound_latents = torch.zeros(1, 3, 4)

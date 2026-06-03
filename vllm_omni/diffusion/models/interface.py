@@ -24,6 +24,12 @@ class SupportImageInput(Protocol):
 
 
 @runtime_checkable
+class SupportVideoInput(Protocol):
+    support_video_input: ClassVar[bool] = True
+    color_format: ClassVar[str] = "RGB"  # Default color format
+
+
+@runtime_checkable
 class SupportAudioInput(Protocol):
     support_audio_input: ClassVar[bool] = True
 
