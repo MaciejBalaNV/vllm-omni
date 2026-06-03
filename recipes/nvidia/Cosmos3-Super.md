@@ -107,6 +107,6 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   semantics as Nano, including the **action** modality: `forward_dynamics`
   (sync `/v1/videos/sync`) and `policy` (async `/v1/videos`, predicted action under
   the top-level `action` field) — see the Cosmos3-Nano recipe for the request shape.
-  `inverse_dynamics` online serving lands in a follow-up MR. Verified on the 64B
-  Super under `--cfg-parallel-size 2`: async `policy` returns the predicted action
-  (`[16, 10]`) and the rollout video reliably.
+  Online inference of inverse dynamics will be added in a follow-up MR. Verified on
+  the 64B Super under `--cfg-parallel-size 2`: async `policy` returns the predicted
+  action (`[16, 10]`) and the rollout video reliably.

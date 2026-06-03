@@ -39,8 +39,7 @@ the mode is selected per request:
   (`domain_name=droid_lerobot`).
 
   `inverse_dynamics` (recover the action from a given video) is supported by the
-  pipeline but **online serving for it ships in a follow-up MR** — not exposed by
-  this integration yet.
+  pipeline; **online inference of inverse dynamics will be added in a follow-up MR.**
 
 ## References
 
@@ -223,8 +222,8 @@ curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_polic
     (`"Guardrail blocked prompt"`).
   - Action `forward_dynamics` (sync `/v1/videos/sync`) and `policy` (async
     `/v1/videos`, returns the predicted action under the top-level `action`
-    field) are supported online. `inverse_dynamics` is implemented in the
-    pipeline but its **online serving lands in a follow-up MR**.
+    field) are supported online. **Online inference of inverse dynamics will be
+    added in a follow-up MR.**
 
 ### 1x GPU (Offline generation)
 
