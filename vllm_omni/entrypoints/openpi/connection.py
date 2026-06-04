@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import msgpack
+import numpy as np
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
@@ -27,24 +29,51 @@ _DEFAULT_IDLE_TIMEOUT = 30.0
 MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
-def _get_msgpack_numpy() -> Any:
-    try:
-        from openpi_client import msgpack_numpy
-    except ImportError as exc:
-        raise ImportError(
-            "The `/v1/realtime/robot/openpi` endpoint requires the optional "
-            "`openpi-client` dependency. Install it with `pip install openpi-client`."
-        ) from exc
+def _pack_array(obj: Any) -> Any:
+    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+        raise ValueError(f"Unsupported dtype: {obj.dtype}")
+    if isinstance(obj, np.ndarray):
+        return {
+            b"__ndarray__": True,
+            b"data": obj.tobytes(),
+            b"dtype": obj.dtype.str,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
+        }
+    return obj
 
-    return msgpack_numpy
+
+def _unpack_array(obj: dict[Any, Any]) -> Any:
+    if b"__ndarray__" in obj:
+        return np.ndarray(
+            buffer=obj[b"data"],
+            dtype=np.dtype(obj[b"dtype"]),
+            shape=tuple(obj[b"shape"]),
+        )
+    if "__ndarray__" in obj:
+        return np.ndarray(
+            buffer=obj["data"],
+            dtype=np.dtype(obj["dtype"]),
+            shape=tuple(obj["shape"]),
+        )
+    if b"__npgeneric__" in obj:
+        return np.dtype(obj[b"dtype"]).type(obj[b"data"])
+    if "__npgeneric__" in obj:
+        return np.dtype(obj["dtype"]).type(obj["data"])
+    return obj
 
 
 def _pack(obj: Any) -> bytes:
-    return _get_msgpack_numpy().packb(obj)
+    return msgpack.packb(obj, default=_pack_array)
 
 
 def _unpack(data: bytes) -> Any:
-    return _get_msgpack_numpy().unpackb(data)
+    return msgpack.unpackb(data, object_hook=_unpack_array)
 
 
 class RobotRealtimeConnection:
