@@ -185,6 +185,24 @@ def _lazy_action_transform_pipeline(max_action_dim: int):
     return ActionTransformPipeline(max_action_dim=max_action_dim, cfg_dropout_rate=0.0)
 
 
+def _build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.device):
+    try:
+        from cosmos_framework.model.vfm.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
+            "golden FlowUniPCMultistepScheduler can be reused."
+        ) from exc
+
+    scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=1000,
+        shift=1.0,
+        use_dynamic_shifting=False,
+    )
+    scheduler.set_timesteps(num_steps, device=device, shift=float(shift))
+    return scheduler
+
+
 def _convert_midtrain_rotation(value: Any, src: str, dst: str) -> np.ndarray:
     try:
         from cosmos_framework.data.vfm.action.pose_utils import convert_rotation
@@ -980,6 +998,7 @@ class Cosmos3OmniDiffusersPipeline(
             "fps": fps,
             "height": int(video_tensor.shape[-2]),
             "width": int(video_tensor.shape[-1]),
+            "image_size": sample.get("image_size"),
             "num_frames": int(video_tensor.shape[1]),
             "num_inference_steps": int(
                 extra_param_alias("num_inference_steps", "num_steps", ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS)
@@ -1470,7 +1489,28 @@ class Cosmos3OmniDiffusersPipeline(
 
         return latent.to(self.dtype)
 
-    def _encode_video_tensor(self, video_tensor: torch.Tensor) -> torch.Tensor:
+    def _latent_hw_from_image_size(self, image_size: Any | None) -> tuple[int, int] | None:
+        if image_size is None:
+            return None
+        if isinstance(image_size, torch.Tensor):
+            frame_size = image_size.detach().cpu().flatten()
+        else:
+            frame_size = torch.as_tensor(image_size).flatten()
+        if frame_size.numel() < 4:
+            return None
+        orig_h = int(frame_size[2].item())
+        orig_w = int(frame_size[3].item())
+        spatial_factor = int(self.vae_scale_factor_spatial)
+        return max(orig_h // spatial_factor, 1), max(orig_w // spatial_factor, 1)
+
+    def _crop_latent_to_image_size(self, latent: torch.Tensor, image_size: Any | None) -> torch.Tensor:
+        latent_hw = self._latent_hw_from_image_size(image_size)
+        if latent_hw is None:
+            return latent
+        h_latent, w_latent = latent_hw
+        return latent[:, :, :, :h_latent, :w_latent].contiguous()
+
+    def _encode_video_tensor(self, video_tensor: torch.Tensor, image_size: Any | None = None) -> torch.Tensor:
         """VAE-encode a preprocessed pixel video [1, 3, T, H, W]."""
         if video_tensor.ndim == 4:
             video_tensor = video_tensor.unsqueeze(0)
@@ -1492,6 +1532,7 @@ class Cosmos3OmniDiffusersPipeline(
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latent = latent * scaling_factor
 
+        latent = self._crop_latent_to_image_size(latent, image_size)
         return latent.to(self.dtype)
 
     def _prepare_latents_i2v(
@@ -1538,13 +1579,18 @@ class Cosmos3OmniDiffusersPipeline(
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        image_size: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare video latents for action modes with mode-specific conditioning."""
         del height, width
         C = self.transformer.latent_channel_size
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-        H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
-        W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
+        latent_hw = self._latent_hw_from_image_size(image_size)
+        if latent_hw is None:
+            H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
+            W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
+        else:
+            H_lat, W_lat = latent_hw
 
         noise = randn_tensor(
             (1, C, T_lat, H_lat, W_lat),
@@ -1552,7 +1598,7 @@ class Cosmos3OmniDiffusersPipeline(
             device=self.device,
             dtype=self.dtype,
         )
-        cond_latent = self._encode_video_tensor(video_tensor)
+        cond_latent = self._encode_video_tensor(video_tensor, image_size=image_size)
         if cond_latent.shape[2:] != noise.shape[2:]:
             raise ValueError(
                 "Cosmos3 action video latent shape mismatch: "
@@ -1665,6 +1711,7 @@ class Cosmos3OmniDiffusersPipeline(
         condition_latents: torch.Tensor | None = None,
         guidance_interval: tuple[float, float] | None = None,
         raw_action_dim: int | None = None,
+        scheduler: Any | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Denoising loop with 3-mode CFG support (parallel, sequential, none).
 
@@ -1695,6 +1742,7 @@ class Cosmos3OmniDiffusersPipeline(
         """
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
+        step_scheduler = scheduler if scheduler is not None else self.scheduler
         self.transformer.reset_cache()
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
@@ -1772,11 +1820,11 @@ class Cosmos3OmniDiffusersPipeline(
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
                     action_pred[..., raw_action_dim:] = 0
             if action_latents is None and sound_latents is None:
-                latents = self.scheduler.step(video_pred, t, latents, return_dict=False)[0]
+                latents = step_scheduler.step(video_pred, t, latents, return_dict=False)[0]
             else:
                 packed_noise, shapes, numels = _pack_joint(video_pred, action_pred, sound_pred)
                 packed_latents, _, _ = _pack_joint(latents, action_latents, sound_latents)
-                packed_next = self.scheduler.step(packed_noise, t, packed_latents, return_dict=False)[0]
+                packed_next = step_scheduler.step(packed_noise, t, packed_latents, return_dict=False)[0]
                 unpacked = _unpack_joint(packed_next, shapes, numels)
                 latents = unpacked[0]
                 idx = 1
@@ -2084,14 +2132,17 @@ class Cosmos3OmniDiffusersPipeline(
         self._num_timesteps = num_inference_steps
 
         # Always resolve to a concrete target shift for this request, then
-        # update the scheduler.  This is what guarantees mode-to-mode
-        # transitions restore the right schedule (no T2I to T2V leak).
-        self._set_flow_shift(flow_shift_target)
+        # update the shared Diffusers scheduler for non-RoboLab paths. RoboLab
+        # uses a request-local Cosmos UniPC scheduler to match the golden
+        # action server.
+        if robolab_inputs is None:
+            self._set_flow_shift(flow_shift_target)
 
         generator = sp.generator
+        robolab_seed = int(robolab_inputs["seed"]) if robolab_inputs is not None else None
         if generator is None:
-            if robolab_inputs is not None:
-                seed = int(robolab_inputs["seed"])
+            if robolab_seed is not None:
+                seed = robolab_seed
             else:
                 seed = sp.seed if sp.seed is not None else 42
             generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -2179,6 +2230,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
+                image_size=robolab_inputs.get("image_size") if robolab_inputs is not None else None,
             )
             image_latent = condition_latents[:, :, 0:1]
         elif image_tensor is not None and not is_t2i:
@@ -2221,10 +2273,14 @@ class Cosmos3OmniDiffusersPipeline(
             )
 
         def _run_diffusion(start_latents):
-            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            if robolab_inputs is not None:
+                scheduler = _build_robolab_unipc_scheduler(num_inference_steps, flow_shift_target, self.device)
+            else:
+                self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+                scheduler = self.scheduler
             return self.diffuse(
                 latents=start_latents,
-                timesteps=self.scheduler.timesteps,
+                timesteps=scheduler.timesteps,
                 cond_ids=cond_ids,
                 cond_mask=cond_mask,
                 uncond_ids=uncond_ids,
@@ -2240,6 +2296,7 @@ class Cosmos3OmniDiffusersPipeline(
                 condition_latents=condition_latents,
                 guidance_interval=guidance_interval,
                 raw_action_dim=raw_action_dim,
+                scheduler=scheduler,
             )
 
         if is_t2i and batch_size > 1:
@@ -2267,12 +2324,17 @@ class Cosmos3OmniDiffusersPipeline(
                 latents = diffusion_output
 
         # --- Decode ---
-        if _is_rank_zero():
-            logger.info("Decoding video...")
-        decode_start = time.time()
-        video = self._decode_latents(latents)
-        if _is_rank_zero():
-            logger.info("Video decoded in %.2fs", time.time() - decode_start)
+        video = None
+        should_decode_video = robolab_inputs is None
+        if should_decode_video:
+            if _is_rank_zero():
+                logger.info("Decoding video...")
+            decode_start = time.time()
+            video = self._decode_latents(latents)
+            if _is_rank_zero():
+                logger.info("Video decoded in %.2fs", time.time() - decode_start)
+                logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
+        elif _is_rank_zero():
             logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
 
         if sound_enabled:
@@ -2293,11 +2355,10 @@ class Cosmos3OmniDiffusersPipeline(
                 "action_mode": action_mode,
                 "domain_id": domain_id,
             }
-            output = {"video": video}
             if robolab_inputs is not None:
-                output["actions"] = self._postprocess_robolab_action(action, robolab_inputs)
+                custom_action_output["actions"] = self._postprocess_robolab_action(action, robolab_inputs)
             return DiffusionOutput(
-                output=output,
+                output={} if robolab_inputs is not None else {"video": video},
                 custom_output=custom_action_output,
             )
 
