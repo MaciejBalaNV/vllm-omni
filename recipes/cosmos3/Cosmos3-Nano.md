@@ -155,6 +155,8 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 # Video-to-video -> /v1/videos/sync with an uploaded reference video.
 # By default Cosmos3 conditions on latent indexes [0, 1]. For the default
 # temporal VAE stride this decodes only the first 5 input frames.
+# The model works best when the prompt describes the actual situation happening in the video.
+# Generic prompts may create sub-standard generations.
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
   -F "model=nvidia/Cosmos3-Nano" \
@@ -173,7 +175,7 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
   -F "model=nvidia/Cosmos3-Nano" \
-  -F "prompt=Use the final motion from the reference video as the visual setup." \
+  -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
   -F "size=1280x720" -F "num_frames=189" -F "fps=24" \
   -F "num_inference_steps=35" -F "guidance_scale=6.0" \
   -F "max_sequence_length=4096" -F "flow_shift=10.0" \
