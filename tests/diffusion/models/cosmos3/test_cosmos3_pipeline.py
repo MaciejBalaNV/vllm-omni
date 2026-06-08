@@ -238,7 +238,6 @@ def test_pipeline_registered_and_exported() -> None:
     assert issubclass(Cosmos3OmniDiffusersPipeline, nn.Module)
     assert issubclass(Cosmos3OmniDiffusersPipeline, ProgressBarMixin)
     assert Cosmos3OmniDiffusersPipeline.support_image_input is True
-    assert Cosmos3OmniDiffusersPipeline.support_video_input is True
     assert _DIFFUSION_MODELS["Cosmos3OmniDiffusersPipeline"] == (
         "cosmos3",
         "pipeline_cosmos3",

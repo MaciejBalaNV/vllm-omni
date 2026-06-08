@@ -91,6 +91,7 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -2531,51 +2532,82 @@ def _parse_form_json(value: str | None, expected_type: type | None = None) -> An
     return parsed
 
 
-def _parse_video_condition_frame_indexes(value: Any) -> list[int] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        value = [item.strip() for item in value.split(",") if item.strip()]
-    elif isinstance(value, Integral):
-        value = [int(value)]
-    try:
-        indexes = sorted({int(index) for index in value})
-    except (TypeError, ValueError):
-        return None
-    if not indexes or any(index < 0 for index in indexes):
-        return None
-    return indexes
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    if hasattr(config, "get"):
+        try:
+            return config.get(key, default)
+        except Exception:
+            pass
+    return getattr(config, key, default)
 
 
-def _reference_video_frame_limit(req: VideoGenerationRequest, model_name: str | None) -> int | None:
-    # Imported lazily so the generic video endpoint doesn't gain a hard
-    # cosmos3 dependency at module load; the model-specific branch below is
-    # the only reason this helper knows about cosmos3 at all.
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
-        COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES,
-        _condition_pixel_frame_count,
-    )
+def _stage_engine_args(stage_cfg: Any) -> Any:
+    return _config_get(stage_cfg, "engine_args", {}) or {}
 
+
+def _diffusion_model_classes(stage_configs: list[Any] | None) -> list[type]:
+    if not stage_configs:
+        return []
+
+    from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+    model_classes: list[type] = []
+    for stage_cfg in stage_configs:
+        if get_stage_type(stage_cfg) != "diffusion":
+            continue
+        model_class_name = _config_get(_stage_engine_args(stage_cfg), "model_class_name")
+        if not model_class_name:
+            continue
+        model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+        if model_cls is not None:
+            model_classes.append(model_cls)
+    return model_classes
+
+
+def _normalize_reference_video_decode_spec(spec: ReferenceVideoDecodeSpec) -> ReferenceVideoDecodeSpec:
+    max_frames = spec.max_frames
+    if max_frames is not None:
+        try:
+            max_frames = int(max_frames)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Invalid reference video decode spec: max_frames must be an integer.",
+            ) from exc
+        if max_frames <= 0:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="Invalid reference video decode spec: max_frames must be positive.",
+            )
+
+    keep = str(spec.keep or "first").strip().lower()
+    if keep not in {"first", "last"}:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Invalid reference video decode spec: keep must be either 'first' or 'last'.",
+        )
+    return ReferenceVideoDecodeSpec(max_frames=max_frames, keep=cast(Literal["first", "last"], keep))
+
+
+def _reference_video_decode_spec(
+    req: VideoGenerationRequest,
+    stage_configs: list[Any] | None,
+) -> ReferenceVideoDecodeSpec:
+    video_params = req.resolve_video_params()
     extra_params = req.extra_params if isinstance(req.extra_params, dict) else {}
-    action_mode = str(extra_params.get("action_mode") or "").strip().lower()
-    if action_mode:
-        video_params = req.resolve_video_params()
-        if video_params.num_frames is not None:
-            return video_params.num_frames
-        action_chunk_size = extra_params.get("action_chunk_size")
-        if action_chunk_size is not None:
-            try:
-                return int(action_chunk_size) + 1
-            except (TypeError, ValueError):
-                pass
-        return None
-
-    condition_indexes = _parse_video_condition_frame_indexes(extra_params.get("condition_frame_indexes_vision"))
-    if condition_indexes is not None:
-        return _condition_pixel_frame_count(condition_indexes)
-    if model_name is not None and "cosmos3" in model_name.lower():
-        return COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES
-    return req.resolve_video_params().num_frames
+    for model_cls in _diffusion_model_classes(stage_configs):
+        resolver = getattr(model_cls, "reference_video_decode_spec", None)
+        if resolver is None:
+            continue
+        try:
+            spec = resolver(num_frames=video_params.num_frames, extra_args=extra_params)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+        if spec is not None:
+            return _normalize_reference_video_decode_spec(spec)
+    return ReferenceVideoDecodeSpec(max_frames=video_params.num_frames, keep="first")
 
 
 def video_response_from_request(model_name: str, req: VideoGenerationRequest) -> VideoResponse:
@@ -2831,12 +2863,21 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    decode_spec = ReferenceVideoDecodeSpec()
+    if parsed_video_reference is not None or input_reference_bytes is not None:
+        stage_configs = (
+            handler.stage_configs
+            or app_stage_configs
+            or getattr(getattr(handler, "_engine_client", None), "stage_configs", None)
+        )
+        decode_spec = _reference_video_decode_spec(request, stage_configs)
     try:
         media_data = await decode_input_reference(
             request.image_reference,
             request.video_reference,
             input_reference_bytes,
-            max_video_frames=_reference_video_frame_limit(request, effective_model_name),
+            max_video_frames=decode_spec.max_frames,
+            video_keep=decode_spec.keep,
         )
     except InvalidInputReferenceError as exc:
         raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc

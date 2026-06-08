@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections import deque
 from io import BytesIO
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import numpy as np
@@ -34,22 +35,42 @@ def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
 
-def _decode_video_bytes(video_bytes: bytes, *, source: str, max_frames: int | None = None) -> list[Image.Image]:
+def _decode_video_bytes(
+    video_bytes: bytes,
+    *,
+    source: str,
+    max_frames: int | None = None,
+    keep: Literal["first", "last"] = "first",
+) -> list[Image.Image]:
     try:
         import av
     except ImportError as exc:  # pragma: no cover - av is a serving dependency via media_utils
         raise InvalidInputReferenceError(f"Invalid {source}: video decoding requires PyAV.") from exc
 
+    if keep not in {"first", "last"}:
+        raise InvalidInputReferenceError(f"Invalid {source}: video frame selection must be 'first' or 'last'.")
+    if max_frames is not None and max_frames <= 0:
+        raise InvalidInputReferenceError(f"Invalid {source}: max video frames must be positive.")
+
     frames: list[Image.Image] = []
+    tail_frames: deque[Image.Image] | None = (
+        deque(maxlen=max_frames) if keep == "last" and max_frames is not None else None
+    )
     try:
         with av.open(BytesIO(video_bytes)) as container:
             for frame in container.decode(video=0):
-                frames.append(frame.to_image().convert("RGB"))
-                if max_frames is not None and len(frames) >= max_frames:
+                image = frame.to_image().convert("RGB")
+                if tail_frames is not None:
+                    tail_frames.append(image)
+                else:
+                    frames.append(image)
+                if keep == "first" and max_frames is not None and len(frames) >= max_frames:
                     break
     except Exception as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.") from exc
 
+    if tail_frames is not None:
+        frames = list(tail_frames)
     if not frames:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid video.")
     return frames
@@ -60,12 +81,18 @@ def _decode_media_bytes(
     *,
     source: str,
     max_video_frames: int | None = None,
+    video_keep: Literal["first", "last"] = "first",
 ) -> Image.Image | list[Image.Image]:
     try:
         return _decode_image_bytes(media_bytes, source=source)
     except InvalidInputReferenceError:
         try:
-            return _decode_video_bytes(media_bytes, source=source, max_frames=max_video_frames)
+            return _decode_video_bytes(
+                media_bytes,
+                source=source,
+                max_frames=max_video_frames,
+                keep=video_keep,
+            )
         except InvalidInputReferenceError as video_exc:
             raise InvalidInputReferenceError(
                 f"Invalid {source}: provided content is not a valid image or video."
@@ -105,7 +132,13 @@ async def decode_image_url(image_url: str) -> Image.Image:
     raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
 
 
-def _decode_base64_video(video_reference: str, *, source: str, max_frames: int | None = None) -> list[Image.Image]:
+def _decode_base64_video(
+    video_reference: str,
+    *,
+    source: str,
+    max_frames: int | None = None,
+    keep: Literal["first", "last"] = "first",
+) -> list[Image.Image]:
     if video_reference:
         if video_reference.startswith("data:video"):
             _, b64_data = video_reference.split(",", 1)
@@ -116,13 +149,23 @@ def _decode_base64_video(video_reference: str, *, source: str, max_frames: int |
             video_bytes = base64.b64decode(b64_data)
         except (binascii.Error, ValueError) as exc:  # pragma: no cover - malformed base64
             raise InvalidInputReferenceError(f"Invalid {source}: video data is not valid base64.") from exc
-        return _decode_video_bytes(video_bytes, source=source, max_frames=max_frames)
+        return _decode_video_bytes(video_bytes, source=source, max_frames=max_frames, keep=keep)
     raise InvalidInputReferenceError(f"Invalid {source}: video data is empty.")
 
 
-async def decode_video_url(video_url: str, *, max_frames: int | None = None) -> list[Image.Image]:
+async def decode_video_url(
+    video_url: str,
+    *,
+    max_frames: int | None = None,
+    keep: Literal["first", "last"] = "first",
+) -> list[Image.Image]:
     if video_url.startswith("data:video"):
-        return _decode_base64_video(video_url, source="video_reference.video_url", max_frames=max_frames)
+        return _decode_base64_video(
+            video_url,
+            source="video_reference.video_url",
+            max_frames=max_frames,
+            keep=keep,
+        )
 
     if video_url.startswith(("http://", "https://")):
         async with httpx.AsyncClient(timeout=60) as client:
@@ -133,7 +176,12 @@ async def decode_video_url(video_url: str, *, max_frames: int | None = None) -> 
                 raise InvalidInputReferenceError(
                     "Invalid video_reference.video_url: failed to download video."
                 ) from exc
-        return _decode_video_bytes(response.content, source="video_reference.video_url", max_frames=max_frames)
+        return _decode_video_bytes(
+            response.content,
+            source="video_reference.video_url",
+            max_frames=max_frames,
+            keep=keep,
+        )
 
     raise InvalidInputReferenceError("Invalid video_reference.video_url: must be an http(s) URL or data URL.")
 
@@ -144,6 +192,7 @@ async def decode_input_reference(
     input_reference_bytes: bytes | None,
     *,
     max_video_frames: int | None = None,
+    video_keep: Literal["first", "last"] = "first",
 ) -> Image.Image | list[Image.Image] | None:
     """Decode media input from multipart bytes, data URLs, or typed references."""
 
@@ -152,7 +201,12 @@ async def decode_input_reference(
         raise InvalidInputReferenceError("Provide only one of input_reference, image_reference, or video_reference.")
 
     if isinstance(input_reference_bytes, bytes):
-        return _decode_media_bytes(input_reference_bytes, source="input_reference", max_video_frames=max_video_frames)
+        return _decode_media_bytes(
+            input_reference_bytes,
+            source="input_reference",
+            max_video_frames=max_video_frames,
+            video_keep=video_keep,
+        )
 
     if isinstance(image_reference, UrlImageReference):
         return await decode_image_url(image_reference.image_url)
@@ -160,7 +214,11 @@ async def decode_input_reference(
         raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
 
     if isinstance(video_reference, UrlVideoReference):
-        return await decode_video_url(video_reference.video_url, max_frames=max_video_frames)
+        return await decode_video_url(
+            video_reference.video_url,
+            max_frames=max_video_frames,
+            keep=video_keep,
+        )
     elif isinstance(video_reference, FileVideoReference):
         raise InvalidInputReferenceError("Invalid video_reference: file_id is not supported yet.")
 

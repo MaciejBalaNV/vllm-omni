@@ -13,6 +13,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -145,6 +146,15 @@ def _make_test_video_bytes(size=(32, 24), num_frames=3) -> bytes:
 def _make_test_video_data_url(size=(32, 24), num_frames=3) -> str:
     encoded = base64.b64encode(_make_test_video_bytes(size, num_frames)).decode("utf-8")
     return f"data:video/mp4;base64,{encoded}"
+
+
+def _cosmos3_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args=SimpleNamespace(model_class_name="Cosmos3OmniDiffusersPipeline"),
+        )
+    ]
 
 
 def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: float = 2.0):
@@ -399,6 +409,22 @@ def test_v2v_video_generation_with_video_reference_form(test_client, mocker: Moc
     assert input_video[0].size == (32, 24)
 
 
+def test_decode_video_bytes_can_keep_last_frames():
+    from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
+
+    frames = _decode_video_bytes(
+        _make_test_video_bytes((32, 24), num_frames=6),
+        source="input_reference",
+        max_frames=2,
+        keep="last",
+    )
+
+    assert len(frames) == 2
+    red_means = [np.asarray(frame)[:, :, 0].mean() for frame in frames]
+    assert red_means[0] > 100
+    assert red_means[1] > red_means[0]
+
+
 def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
     request = VideoGenerationRequest(
         prompt="Continue this motion.",
@@ -406,7 +432,9 @@ def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
         extra_params={"condition_frame_indexes_vision": [0, 2]},
     )
 
-    assert api_server._reference_video_frame_limit(request, "nvidia/Cosmos3-Nano") == 9
+    spec = api_server._reference_video_decode_spec(request, _cosmos3_stage_configs())
+    assert spec.max_frames == 9
+    assert spec.keep == "first"
 
 
 def test_cosmos3_reference_video_limit_preserves_action_frames():
@@ -416,7 +444,17 @@ def test_cosmos3_reference_video_limit_preserves_action_frames():
         extra_params={"action_mode": "inverse_dynamics", "action_chunk_size": 16},
     )
 
-    assert api_server._reference_video_frame_limit(request, "nvidia/Cosmos3-Nano") == 17
+    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
+
+
+def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
+    request = VideoGenerationRequest(
+        prompt="Continue this motion.",
+        num_frames=5,
+        extra_params={"condition_frame_indexes_vision": [0, 20]},
+    )
+
+    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
 
 
 def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):

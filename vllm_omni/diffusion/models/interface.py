@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    Literal,
     Protocol,
     runtime_checkable,
 )
@@ -23,10 +25,10 @@ class SupportImageInput(Protocol):
     color_format: ClassVar[str] = "RGB"  # Default color format
 
 
-@runtime_checkable
-class SupportVideoInput(Protocol):
-    support_video_input: ClassVar[bool] = True
-    color_format: ClassVar[str] = "RGB"  # Default color format
+@dataclass(frozen=True)
+class ReferenceVideoDecodeSpec:
+    max_frames: int | None = None
+    keep: Literal["first", "last"] = "first"
 
 
 @runtime_checkable

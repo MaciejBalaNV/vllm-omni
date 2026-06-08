@@ -42,7 +42,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput, SupportVideoInput
+from vllm_omni.diffusion.models.interface import (
+    ReferenceVideoDecodeSpec,
+    SupportImageInput,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -202,8 +205,11 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
             tensor = value.detach().cpu()
             if tensor.ndim == 3 and tensor.shape[0] in (3, 4):
                 tensor = tensor.permute(1, 2, 0)
-            array = tensor.numpy()
-            return _pil_to_rgb(array)
+            if tensor.is_floating_point():
+                if tensor.min().item() < 0.0 or tensor.max().item() > 1.0:
+                    tensor = tensor.clamp(-1.0, 1.0) * 0.5 + 0.5
+                tensor = (tensor.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+            return PIL.Image.fromarray(tensor.numpy()).convert("RGB")
         raise TypeError(
             f"Cosmos3 preprocessing expected PIL image, numpy array, torch tensor, or path, got {type(value)!r}."
         )
@@ -489,7 +495,7 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, SupportVideoInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
     """Cosmos3 text/image/video-to-video / text-to-image pipeline.
 
@@ -519,8 +525,36 @@ class Cosmos3OmniDiffusersPipeline(
     """
 
     support_image_input: ClassVar[bool] = True
-    support_video_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+
+    @classmethod
+    def reference_video_decode_spec(
+        cls,
+        *,
+        num_frames: int | None = None,
+        extra_args: dict[str, Any] | None = None,
+    ) -> ReferenceVideoDecodeSpec:
+        extra_args = extra_args if isinstance(extra_args, dict) else {}
+        action_mode = normalize_action_mode(extra_args.get("action_mode"))
+        if action_mode is not None:
+            if num_frames is not None:
+                return ReferenceVideoDecodeSpec(max_frames=int(num_frames), keep="first")
+            action_chunk_size = extra_args.get("action_chunk_size")
+            if action_chunk_size is not None:
+                try:
+                    max_frames = int(action_chunk_size) + 1
+                except (TypeError, ValueError):
+                    max_frames = None
+                if max_frames is not None and max_frames > 0:
+                    return ReferenceVideoDecodeSpec(max_frames=max_frames, keep="first")
+            return ReferenceVideoDecodeSpec(max_frames=None, keep="first")
+
+        condition_indexes = _normalize_condition_frame_indexes_vision(extra_args.get("condition_frame_indexes_vision"))
+        max_frames = _condition_pixel_frame_count(condition_indexes)
+        if num_frames is not None:
+            max_frames = min(max_frames, int(num_frames))
+        keep = _normalize_condition_video_keep(extra_args.get("condition_video_keep"))
+        return ReferenceVideoDecodeSpec(max_frames=max_frames, keep=keep)
 
     def __init__(
         self,
@@ -1357,29 +1391,10 @@ class Cosmos3OmniDiffusersPipeline(
         if video_tensor.shape[2] < 1:
             raise ValueError("Cosmos3 V2V video tensor must contain at least one frame.")
 
-        if video_tensor.shape[2] < num_frames:
-            pad = video_tensor[:, :, -1:].repeat(1, 1, num_frames - video_tensor.shape[2], 1, 1)
-            video_tensor = torch.cat([video_tensor, pad], dim=2)
-        elif video_tensor.shape[2] > num_frames:
-            video_tensor = video_tensor[:, :, :num_frames]
-
         C = self.transformer.latent_channel_size
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
         W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
-
-        noise = randn_tensor(
-            (1, C, T_lat, H_lat, W_lat),
-            generator=generator,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        cond_latent = self._encode_video_tensor(video_tensor)
-        if cond_latent.shape != noise.shape:
-            raise ValueError(
-                f"Cosmos3 V2V latent shape mismatch: encoded={tuple(cond_latent.shape)}, expected={tuple(noise.shape)}."
-            )
-
         indexes = _normalize_condition_frame_indexes_vision(condition_frame_indexes_vision)
         out_of_range = [index for index in indexes if index >= T_lat]
         if out_of_range:
@@ -1388,12 +1403,39 @@ class Cosmos3OmniDiffusersPipeline(
                 f"indexes={indexes}, latent_frames={T_lat}."
             )
 
+        noise = randn_tensor(
+            (1, C, T_lat, H_lat, W_lat),
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        condition_pixel_frames = _condition_pixel_frame_count(indexes, self.vae_scale_factor_temporal)
+        condition_video = video_tensor[:, :, :condition_pixel_frames]
+        if condition_video.shape[2] < condition_pixel_frames:
+            pad = condition_video[:, :, -1:].repeat(1, 1, condition_pixel_frames - condition_video.shape[2], 1, 1)
+            condition_video = torch.cat([condition_video, pad], dim=2)
+
+        cond_prefix_latent = self._encode_video_tensor(condition_video)
+        expected_prefix = (1, C, max(indexes) + 1, H_lat, W_lat)
+        if (
+            cond_prefix_latent.shape[0] != expected_prefix[0]
+            or cond_prefix_latent.shape[1] != expected_prefix[1]
+            or cond_prefix_latent.shape[2] < expected_prefix[2]
+            or cond_prefix_latent.shape[3:] != expected_prefix[3:]
+        ):
+            raise ValueError(
+                "Cosmos3 V2V condition latent shape mismatch: "
+                f"encoded={tuple(cond_prefix_latent.shape)}, expected at least {expected_prefix}."
+            )
+
         condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        condition_latents = torch.zeros_like(noise)
         for index in indexes:
             condition_mask[:, :, index, :, :] = 1.0
-        latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
+            condition_latents[:, :, index : index + 1] = cond_prefix_latent[:, :, index : index + 1]
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
         velocity_mask = 1.0 - condition_mask
-        return latents, velocity_mask, cond_latent
+        return latents, velocity_mask, condition_latents
 
     def _prepare_latents_action_video(
         self,
