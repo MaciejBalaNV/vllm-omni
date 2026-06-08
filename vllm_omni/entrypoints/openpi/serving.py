@@ -21,10 +21,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ActionOutput = np.ndarray | dict[str, np.ndarray]
-COSMOS3_DROID_POLICY_MODELS = {
-    "Cosmos3-Nano-Policy-DROID",
-    "nvidia/Cosmos3-Nano-Policy-DROID",
-}
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -78,12 +74,7 @@ class ServingRealtimeRobotOpenPI:
     ) -> None:
         self.engine_client = engine_client
         self.model_name = model_name
-        try:
-            self.policy_server_config = self._get_policy_server_config(engine_client)
-        except ValueError:
-            if model_name not in COSMOS3_DROID_POLICY_MODELS:
-                raise
-            self.policy_server_config = PolicyServerConfig({})
+        self.policy_server_config = self._get_policy_server_config(engine_client)
         self._request_counter = count()
 
     @classmethod

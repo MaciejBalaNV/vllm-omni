@@ -1531,7 +1531,6 @@ async def realtime_websocket(websocket: WebSocket):
     await connection.handle_connection()
 
 
-@router.websocket("/")
 @router.websocket("/v1/realtime/robot/openpi")
 async def realtime_robot_openpi(websocket: WebSocket):
     """WebSocket endpoint for robot policy inference via OpenPI messages."""
