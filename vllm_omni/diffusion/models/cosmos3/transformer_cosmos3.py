@@ -39,6 +39,22 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+class Cosmos3RMSNorm(nn.Module):
+    """RMSNorm matching Cosmos Framework's Qwen3VLTextRMSNorm."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
 def _get_ulysses_state() -> tuple[int, int, dist.ProcessGroup | None]:
     """Return (ulysses_size, ulysses_rank, ulysses_pg) from vllm-omni parallel state.
 
@@ -511,8 +527,8 @@ class Cosmos3CausalAttention(nn.Module):
             prefix=f"{prefix}.to_out",
         )
 
-        self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.norm_q = Cosmos3RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.norm_k = Cosmos3RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         # skip_sequence_parallel=True because the UND pathway is
         # computed once and replicated across SP ranks.
@@ -619,8 +635,8 @@ class Cosmos3CrossAttention(nn.Module):
             prefix=f"{prefix}.to_out",
         )
 
-        self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.norm_q = Cosmos3RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.norm_k = Cosmos3RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         self.attn = FrameworkAttention(
             num_heads=self.num_heads,
@@ -746,8 +762,8 @@ class Cosmos3UndDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = Cosmos3RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = Cosmos3RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = Cosmos3GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -802,8 +818,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.cross_attention",
         )
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = Cosmos3RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = Cosmos3RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = Cosmos3GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -896,7 +912,7 @@ class Cosmos3LanguageModel(nn.Module):
             ]
         )
         # TODO: Not used right now, will be used in the future for prompt upsampler.
-        self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.norm = Cosmos3RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -1111,7 +1127,7 @@ class Cosmos3VFMTransformer(nn.Module):
             ]
         )
 
-        self.norm_moe_gen = RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.norm_moe_gen = Cosmos3RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.gen_sp_prepare = Cosmos3GenSPPrepare()
         self.gen_sp_gather = nn.Identity()
 

@@ -195,18 +195,21 @@ class OmniOpenAIServingVideo:
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
 
-            # Redact the inline ``action`` array (hundreds of floats) when
-            # logging so it doesn't flood the logs; everything else is logged
-            # verbatim.
+            # Redact inline arrays when logging so RoboLab policy requests do
+            # not flood the server log with image/state payloads.
             loggable = request.extra_params
-            action_val = loggable.get("action")
-            if action_val is not None:
-                summary = (
-                    f"<{type(action_val).__name__} len={len(action_val)}>"
-                    if hasattr(action_val, "__len__")
-                    else f"<{type(action_val).__name__}>"
+            redacted = {}
+            for key in ("action", "robot_obs", "observation"):
+                value = loggable.get(key)
+                if value is None:
+                    continue
+                redacted[key] = (
+                    f"<{type(value).__name__} len={len(value)}>"
+                    if hasattr(value, "__len__")
+                    else f"<{type(value).__name__}>"
                 )
-                loggable = {**loggable, "action": summary}
+            if redacted:
+                loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
 
         self._apply_lora(request.lora, gen_params)
@@ -313,6 +316,11 @@ class OmniOpenAIServingVideo:
         if request.extra_params is not None and isinstance(request.extra_params, dict):
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
+
+        action = artifacts.actions[0]
+        if action is not None and isinstance(artifacts.videos[0], dict):
+            logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
+            return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
 
         _t_encode_start = time.perf_counter()
         video_bytes = _encode_video_bytes(
@@ -510,7 +518,8 @@ class OmniOpenAIServingVideo:
         if not custom_output or "action" not in custom_output:
             return [None] * expected_count
 
-        action_items = cls._split_action_payload(custom_output["action"], expected_count)
+        action_payload = custom_output.get("actions", custom_output["action"])
+        action_items = cls._split_action_payload(action_payload, expected_count)
         return [
             cls._make_video_action(action_item, custom_output) if action_item is not None else None
             for action_item in action_items

@@ -1062,6 +1062,7 @@ class Cosmos3OmniDiffusersPipeline(
     def _build_robolab_policy_inputs(
         self,
         sp: OmniDiffusionSamplingParams,
+        prompt_data: Any | None = None,
     ) -> dict[str, Any] | None:
         extra = sp.extra_args if isinstance(sp.extra_args, dict) else {}
         obs = extra.get("robot_obs")
@@ -1107,7 +1108,12 @@ class Cosmos3OmniDiffusersPipeline(
         if raw_action_dim <= 0:
             raise ValueError(f"RoboLab raw_action_dim must be positive, got {raw_action_dim}.")
 
-        image = _extract_robolab_image(obs)
+        try:
+            image = _extract_robolab_image(obs)
+        except ValueError as exc:
+            image = self._extract_robolab_prompt_image(prompt_data)
+            if image is None:
+                raise exc
         if image.shape[:2] != (image_h, image_w):
             image = _resize_rgb_uint8(image, (image_h, image_w))
 
@@ -1195,6 +1201,18 @@ class Cosmos3OmniDiffusersPipeline(
             "action_space": action_space,
             "observation": obs,
         }
+
+    @staticmethod
+    def _extract_robolab_prompt_image(prompt_data: Any | None) -> np.ndarray | None:
+        if not isinstance(prompt_data, dict):
+            return None
+        multi_modal_data = prompt_data.get("multi_modal_data", {}) or {}
+        image = multi_modal_data.get("image")
+        if image is None:
+            return None
+        if isinstance(image, PIL.Image.Image):
+            return np.asarray(image.convert("RGB"))
+        return _ensure_rgb_uint8_image(image, "multi_modal_data.image")
 
     @staticmethod
     def _build_action_condition_mask_from_indexes(
@@ -2227,11 +2245,12 @@ class Cosmos3OmniDiffusersPipeline(
 
         sp = req.sampling_params
         prompt_data = req.prompts[0]
-        robolab_inputs = self._build_robolab_policy_inputs(sp)
+        robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data)
         if robolab_inputs is not None:
             prompt = robolab_inputs["prompt"]
             negative_prompt = None
             image_tensor = None
+            video_tensor = None
             action_video_tensor = robolab_inputs["video_tensor"]
         elif isinstance(prompt_data, str):
             prompt = prompt_data
@@ -2249,7 +2268,8 @@ class Cosmos3OmniDiffusersPipeline(
         sound_enabled = False if robolab_inputs is not None else self._is_sound_request(prompt_data, sp)
         action_mode = ACTION_MODE_POLICY if robolab_inputs is not None else self._get_action_mode(prompt_data, sp)
         action_enabled = action_mode is not None
-        action_video_tensor = video_tensor if action_enabled else None
+        if robolab_inputs is None:
+            action_video_tensor = video_tensor if action_enabled else None
         if action_enabled and is_t2i:
             raise ValueError("Cosmos3 action generation is supported only for video outputs.")
         if action_enabled and sound_enabled:
