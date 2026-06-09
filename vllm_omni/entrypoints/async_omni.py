@@ -33,6 +33,11 @@ from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
+from vllm_omni.errors import (
+    client_error_from_metadata,
+    client_error_metadata,
+    is_client_error_status,
+)
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -483,10 +488,13 @@ class AsyncOmni(EngineClient, OmniBase):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
+                status_code, error_type = client_error_metadata(error)
                 await req_state.queue.put(
                     ErrorMessage(
                         request_id=request_id,
                         error=str(error),
+                        status_code=status_code,
+                        error_type=error_type,
                     )
                 )
             finally:
@@ -588,6 +596,12 @@ class AsyncOmni(EngineClient, OmniBase):
                     raise OmniEngineDeadError(
                         result.error,
                         error_stage_id=result.stage_id,
+                    )
+                if is_client_error_status(result.status_code):
+                    raise client_error_from_metadata(
+                        result.error,
+                        status_code=result.status_code,
+                        error_type=result.error_type,
                     )
                 raise RuntimeError(result.error)
 

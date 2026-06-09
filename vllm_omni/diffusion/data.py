@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
+from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
@@ -1062,6 +1063,8 @@ class DiffusionOutput:
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
     aborted: bool = False
     abort_message: str | None = None
 
@@ -1073,6 +1076,15 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
+        status_code, error_type = client_error_metadata(exc)
+        return cls(
+            error=str(exc),
+            error_status_code=status_code,
+            error_type=error_type,
+        )
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
