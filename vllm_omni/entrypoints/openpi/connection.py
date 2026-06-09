@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import msgspec
+import numpy as np
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from vllm.logger import init_logger
@@ -27,24 +29,55 @@ _DEFAULT_IDLE_TIMEOUT = 30.0
 MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
-def _get_msgpack_numpy() -> Any:
-    try:
-        from openpi_client import msgpack_numpy
-    except ImportError as exc:
-        raise ImportError(
-            "The `/v1/realtime/robot/openpi` endpoint requires the optional "
-            "`openpi-client` dependency. Install it with `pip install openpi-client`."
-        ) from exc
+def _pack_numpy(obj: Any) -> Any:
+    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+        raise ValueError(f"Unsupported dtype: {obj.dtype}")
+    if isinstance(obj, np.ndarray):
+        if not obj.flags.c_contiguous:
+            obj = np.ascontiguousarray(obj)
+        return {
+            b"nd": True,
+            b"data": obj.tobytes(),
+            b"type": obj.dtype.str,
+            b"kind": obj.dtype.kind,
+            b"shape": obj.shape,
+        }
+    if isinstance(obj, np.generic):
+        return {
+            b"nd": False,
+            b"data": obj.tobytes(),
+            b"type": obj.dtype.str,
+            b"kind": obj.dtype.kind,
+        }
+    raise TypeError(f"Unsupported type: {type(obj)!r}")
 
-    return msgpack_numpy
+
+def _mapping_get(obj: dict[Any, Any], key: str, default: Any = None) -> Any:
+    return obj.get(key, obj.get(key.encode(), default))
+
+
+def _unpack_numpy(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        nd = _mapping_get(obj, "nd")
+        dtype = _mapping_get(obj, "type")
+        data = _mapping_get(obj, "data")
+        if nd is not None and dtype is not None and data is not None:
+            array = np.frombuffer(data, dtype=np.dtype(dtype))
+            if nd:
+                return array.reshape(tuple(_mapping_get(obj, "shape", ())))
+            return array[0]
+        return {key: _unpack_numpy(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_unpack_numpy(value) for value in obj]
+    return obj
 
 
 def _pack(obj: Any) -> bytes:
-    return _get_msgpack_numpy().packb(obj)
+    return msgspec.msgpack.encode(obj, enc_hook=_pack_numpy)
 
 
 def _unpack(data: bytes) -> Any:
-    return _get_msgpack_numpy().unpackb(data)
+    return _unpack_numpy(msgspec.msgpack.decode(data))
 
 
 class RobotRealtimeConnection:

@@ -252,8 +252,14 @@ class DiffusionEngine:
         if self.od_config.enable_cpu_offload:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
+        custom_output = output.custom_output or {}
+        action_payload = custom_output.get("actions")
+        action_only_output = action_payload is not None and isinstance(output_data, dict) and not output_data
+
         postprocess_start_time = time.perf_counter()
-        if self.post_process_func is not None:
+        if action_only_output:
+            outputs = {}
+        elif self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
             if self._post_process_accepts_sampling_params:
@@ -263,17 +269,17 @@ class DiffusionEngine:
         else:
             outputs = output_data
         audio_payload = None
-        custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
-        action_payload = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
-            action_payload = outputs.get("actions")
+            action_payload = outputs.get("actions", action_payload)
             custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
+        if action_payload is None:
+            action_payload = custom_output.get("actions")
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
