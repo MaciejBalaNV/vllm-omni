@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -604,6 +605,39 @@ async def test_async_omni_propagates_fatal_error_context(monkeypatch: pytest.Mon
     assert getattr(exc_info.value, "error_stage_id") == 2
 
 
+def _enqueue_client_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="Input was blocked by Cosmos3 guardrails.",
+            status_code=400,
+            error_type="BadRequestError",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_client_error_status(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal client error from the orchestrator must be routed to the
+    requesting generate() call (not raised in the shared dispatcher) and
+    surface as an OmniClientError carrying status_code/error_type."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_client_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            async for _ in app.generate(prompt="blocked", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
+    assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
+
+
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):
     sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
     engine = FakeAsyncOmniEngine(
@@ -759,6 +793,25 @@ def test_non_fatal_error_raises_runtime():
 
     with pytest.raises(RuntimeError, match="something wrong"):
         base._handle_output_message(msg)
+
+
+def test_non_fatal_client_error_raises_omni_client_error():
+    """A non-fatal ErrorMessage carrying a 4xx status_code (e.g. a guardrail
+    block) must surface as an OmniClientError with the metadata intact, not a
+    bare RuntimeError. This covers the offline/sync Omni consumer path."""
+    base = _make_base()
+    msg = ErrorMessage(
+        error="Input was blocked by Cosmos3 guardrails.",
+        status_code=400,
+        error_type="BadRequestError",
+    )
+
+    with pytest.raises(OmniClientError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
+    assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
 
 
 def test_async_omni_errored_property_alive():

@@ -373,7 +373,7 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
-            raise RuntimeError(msg.error)
+            self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
@@ -408,6 +408,16 @@ class OmniBase(PDDisaggregationMixin):
                 consumed.add(msg_id)
 
         return False, req_id, stage_id, req_state
+
+    def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
+        """Raise the exception for a non-fatal, request-scoped error message."""
+        if is_client_error_status(msg.status_code):
+            raise client_error_from_metadata(
+                msg.error,
+                status_code=msg.status_code,
+                error_type=msg.error_type,
+            )
+        raise RuntimeError(msg.error)
 
     def _check_engine_output_error(
         self,
