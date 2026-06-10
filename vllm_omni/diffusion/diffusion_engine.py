@@ -262,7 +262,7 @@ class DiffusionEngine:
             output_data = _move_tensor_tree_to_cpu(output_data)
 
         custom_output = output.custom_output or {}
-        action_payload = custom_output.get("actions")
+        action_payload = None
         action_only_output = bool(custom_output.get("action_only_output"))
 
         postprocess_start_time = time.perf_counter()
@@ -282,11 +282,13 @@ class DiffusionEngine:
         model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
-            action_payload = outputs.get("actions", action_payload)
+            action_payload = outputs.get("actions")
             custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
+        if action_payload is None:
+            action_payload = custom_output.get("actions")
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 

@@ -20,8 +20,10 @@ from __future__ import annotations
 import math
 import os
 import time
+import zlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, ClassVar
 
 import numpy as np
@@ -115,6 +117,7 @@ ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS = 4
 ROBOLAB_DEFAULT_FLOW_SHIFT = 5.0
 ROBOLAB_DEFAULT_SEED = 0
 ROBOLAB_DEFAULT_ACTION_SPACE = "joint_pos"
+ROBOLAB_MIDTRAIN_RAW_ACTION_DIM = 10
 ROBOLAB_MIDTRAIN_POSE_ACTION_DIM = 9  # xyz position + rot6d orientation
 ROBOLAB_CONCAT_VIEW_DESCRIPTION = (
     "The top row is from the wrist-mounted camera. "
@@ -222,7 +225,7 @@ def _ensure_gripper_array(value: Any) -> np.ndarray:
 def _resize_rgb_uint8(image: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float()
     resized = F.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
-    return resized.squeeze(0).permute(1, 2, 0).numpy().astype(np.uint8)
+    return np.clip(np.round(resized.squeeze(0).permute(1, 2, 0).numpy()), 0, 255).astype(np.uint8)
 
 
 def _compose_robolab_views(obs: dict[str, Any]) -> np.ndarray | None:
@@ -252,25 +255,33 @@ def _extract_robolab_image(obs: dict[str, Any]) -> np.ndarray:
     raise ValueError("Observation must contain 'observation/image' or RoboLab wrist/exterior image keys.")
 
 
-def _lazy_action_transform_pipeline(max_action_dim: int):
+def _lazy_import(module_name: str, symbol_name: str, error_message: str):
     try:
-        from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
+        module = import_module(module_name)
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
-            "golden ActionTransformPipeline can be reused."
-        ) from exc
+        raise ModuleNotFoundError(error_message) from exc
+    return getattr(module, symbol_name)
+
+
+def _lazy_action_transform_pipeline(max_action_dim: int):
+    ActionTransformPipeline = _lazy_import(
+        "cosmos_framework.data.vfm.action.transforms",
+        "ActionTransformPipeline",
+        "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
+        "golden ActionTransformPipeline can be reused.",
+    )
     return ActionTransformPipeline(max_action_dim=max_action_dim, cfg_dropout_rate=0.0)
 
 
 def _build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.device):
-    try:
-        from cosmos_framework.model.vfm.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
+    FlowUniPCMultistepScheduler = _lazy_import(
+        "cosmos_framework.model.vfm.diffusion.samplers.fm_solvers_unipc",
+        "FlowUniPCMultistepScheduler",
+        (
             "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
             "golden FlowUniPCMultistepScheduler can be reused."
-        ) from exc
+        ),
+    )
 
     scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=1000,
@@ -282,42 +293,38 @@ def _build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.d
 
 
 def _convert_midtrain_rotation(value: Any, src: str, dst: str) -> np.ndarray:
-    try:
-        from cosmos_framework.data.vfm.action.pose_utils import convert_rotation
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH."
-        ) from exc
+    convert_rotation = _lazy_import(
+        "cosmos_framework.data.vfm.action.pose_utils",
+        "convert_rotation",
+        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
+    )
     return convert_rotation(value, src, dst)
 
 
 def _pose_abs_to_rel(*args, **kwargs) -> np.ndarray:
-    try:
-        from cosmos_framework.data.vfm.action.pose_utils import pose_abs_to_rel
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH."
-        ) from exc
+    pose_abs_to_rel = _lazy_import(
+        "cosmos_framework.data.vfm.action.pose_utils",
+        "pose_abs_to_rel",
+        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
+    )
     return pose_abs_to_rel(*args, **kwargs)
 
 
 def _pose_rel_to_abs(*args, **kwargs) -> np.ndarray:
-    try:
-        from cosmos_framework.data.vfm.action.pose_utils import pose_rel_to_abs
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH."
-        ) from exc
+    pose_rel_to_abs = _lazy_import(
+        "cosmos_framework.data.vfm.action.pose_utils",
+        "pose_rel_to_abs",
+        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
+    )
     return pose_rel_to_abs(*args, **kwargs)
 
 
 def _build_abs_pose_from_components(*args, **kwargs) -> np.ndarray:
-    try:
-        from cosmos_framework.data.vfm.action.pose_utils import build_abs_pose_from_components
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH."
-        ) from exc
+    build_abs_pose_from_components = _lazy_import(
+        "cosmos_framework.data.vfm.action.pose_utils",
+        "build_abs_pose_from_components",
+        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
+    )
     return build_abs_pose_from_components(*args, **kwargs)
 
 
@@ -832,7 +839,6 @@ class Cosmos3OmniDiffusersPipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._robolab_transform = None
-        self._robolab_rng = np.random.default_rng(ROBOLAB_DEFAULT_SEED)
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
         # this pipeline. Tells the sequential-CFG loop to keep paired
@@ -1075,19 +1081,29 @@ class Cosmos3OmniDiffusersPipeline(
             self._robolab_transform = _lazy_action_transform_pipeline(action_dim)
         return self._robolab_transform
 
-    def _next_robolab_seed(self, extra: dict[str, Any]) -> int:
+    def _next_robolab_seed(self, extra: dict[str, Any], obs: dict[str, Any], request_id: str | None) -> int:
         base_seed = int(extra.get("robolab_seed") or ROBOLAB_DEFAULT_SEED)
         if self._truthy(extra.get("deterministic_seed")):
             return base_seed
         explicit_seed = extra.get("seed")
         if explicit_seed is not None:
             return int(explicit_seed)
-        return int(self._robolab_rng.integers(0, 2**31))
+        seed_key = "|".join(
+            str(part)
+            for part in (
+                base_seed,
+                extra.get("session_id", ""),
+                request_id or "",
+                obs.get("prompt", ""),
+            )
+        )
+        return zlib.crc32(seed_key.encode("utf-8")) & 0x7FFFFFFF
 
     def _build_robolab_policy_inputs(
         self,
         sp: OmniDiffusionSamplingParams,
         prompt_data: Any | None = None,
+        request_id: str | None = None,
     ) -> RoboLabPolicyInputs | None:
         extra = sp.extra_args if isinstance(sp.extra_args, dict) else {}
         obs = extra.get("robot_obs")
@@ -1115,7 +1131,9 @@ class Cosmos3OmniDiffusersPipeline(
 
         action_space = self._normalize_robolab_action_space(extra_param("action_space", ROBOLAB_DEFAULT_ACTION_SPACE))
         action_chunk_size = int(extra_param("action_chunk_size", ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE))
-        raw_action_dim_default = ROBOLAB_DEFAULT_RAW_ACTION_DIM if action_space == "joint_pos" else 10
+        raw_action_dim_default = (
+            ROBOLAB_DEFAULT_RAW_ACTION_DIM if action_space == "joint_pos" else ROBOLAB_MIDTRAIN_RAW_ACTION_DIM
+        )
         raw_action_dim = int(extra_param("raw_action_dim", raw_action_dim_default))
         image_h = int(extra_param("image_height", ROBOLAB_DEFAULT_IMAGE_HEIGHT))
         image_w = int(extra_param("image_width", ROBOLAB_DEFAULT_IMAGE_WIDTH))
@@ -1222,7 +1240,7 @@ class Cosmos3OmniDiffusersPipeline(
             ),
             guidance_scale=float(extra_param_alias("guidance_scale", "guidance", ROBOLAB_DEFAULT_GUIDANCE_SCALE)),
             flow_shift=float(extra_param_alias("flow_shift", "shift", ROBOLAB_DEFAULT_FLOW_SHIFT)),
-            seed=self._next_robolab_seed(extra),
+            seed=self._next_robolab_seed(extra, obs, request_id),
             history_length=history_length,
             action_space=action_space,
             observation=obs,
@@ -1255,8 +1273,39 @@ class Cosmos3OmniDiffusersPipeline(
             mask[:, idx, :] = 1.0
         return mask
 
+    @staticmethod
+    def _log_robolab_action_summary(label: str, value: Any) -> None:
+        if not _is_rank_zero():
+            return
+        if isinstance(value, torch.Tensor):
+            array = value.detach().float().cpu().numpy()
+        else:
+            array = np.asarray(value, dtype=np.float32)
+        finite = np.isfinite(array)
+        if finite.any():
+            finite_min = float(array[finite].min())
+            finite_max = float(array[finite].max())
+        else:
+            finite_min = None
+            finite_max = None
+        if array.ndim == 0:
+            head = array.reshape(1).tolist()
+        else:
+            head = array.reshape(-1, array.shape[-1])[:3].tolist()
+        logger.info(
+            "RoboLab action summary %s: shape=%s nan=%d finite=%d finite_min=%s finite_max=%s head=%s",
+            label,
+            tuple(array.shape),
+            int(np.isnan(array).sum()),
+            int(finite.sum()),
+            finite_min,
+            finite_max,
+            head,
+        )
+
     def _postprocess_robolab_action(self, action: torch.Tensor, inputs: RoboLabPolicyInputs) -> np.ndarray:
         action_np = action[0].float().cpu().numpy()
+        self._log_robolab_action_summary("raw_model_action", action_np)
         history_length = int(inputs.history_length)
         action_np = action_np[history_length:]
         action_np[:, -1] = 1.0 - action_np[:, -1]
@@ -1278,7 +1327,140 @@ class Cosmos3OmniDiffusersPipeline(
             quat_xyzw = _convert_midtrain_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
             action_np = np.concatenate([position, quat_xyzw, action_np[:, ROBOLAB_MIDTRAIN_POSE_ACTION_DIM:]], axis=-1)
 
+        self._log_robolab_action_summary("postprocessed_robolab_action", action_np)
         return np.asarray(action_np, dtype=np.float32)
+
+    def _forward_robolab_policy(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        inputs: RoboLabPolicyInputs,
+        pipeline_start: float,
+    ) -> DiffusionOutput:
+        if not getattr(self.transformer, "action_gen", False):
+            raise ValueError(
+                "Cosmos3 RoboLab policy serving was requested, but the transformer "
+                "was initialized without action modules. Check that the checkpoint "
+                "config enables action_gen and includes action weights."
+            )
+
+        action_mode = ACTION_MODE_POLICY
+        height = inputs.height
+        width = inputs.width
+        num_frames = inputs.num_frames
+        action_chunk_size = int(inputs.action_tensor.shape[0])
+        num_inference_steps = inputs.num_inference_steps
+        guidance_scale = float(inputs.guidance_scale)
+        flow_shift_target = float(inputs.flow_shift)
+        domain_id = int(inputs.domain_id)
+        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or inputs.fps
+        max_sequence_length = (
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_inference_steps
+
+        generator = sp.generator
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(int(inputs.seed))
+
+        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+            inputs.prompt,
+            "",
+            num_frames,
+            frame_rate,
+            height,
+            width,
+            max_sequence_length,
+            sp,
+            use_system_prompt,
+            is_t2i=False,
+        )
+
+        action_video_tensor = inputs.video_tensor
+        if action_video_tensor.ndim == 4:
+            action_video_tensor = action_video_tensor.unsqueeze(0)
+        if action_video_tensor.ndim != 5:
+            raise ValueError(
+                "Cosmos3 RoboLab action video tensor must have shape [1, 3, T, H, W] "
+                f"or [3, T, H, W], got {tuple(action_video_tensor.shape)}."
+            )
+        if action_video_tensor.shape[2] < num_frames:
+            pad = action_video_tensor[:, :, -1:].repeat(1, 1, num_frames - action_video_tensor.shape[2], 1, 1)
+            action_video_tensor = torch.cat([action_video_tensor, pad], dim=2)
+        elif action_video_tensor.shape[2] > num_frames:
+            action_video_tensor = action_video_tensor[:, :, :num_frames]
+
+        action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = self._prepare_action_latents(
+            mode=action_mode,
+            action_chunk_size=action_chunk_size,
+            raw_action_dim=int(inputs.raw_action_dim),
+            generator=generator,
+            sp=sp,
+            clean_action=inputs.action_tensor,
+            condition_indexes=inputs.action_condition_indexes,
+        )
+        action_offset = int(inputs.action_start_frame_offset)
+
+        latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
+            action_video_tensor,
+            action_mode,
+            height,
+            width,
+            num_frames,
+            generator,
+            image_size=inputs.image_size,
+        )
+        image_latent = condition_latents[:, :, 0:1]
+
+        video_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+        shared_kwargs = dict(
+            video_shape=video_shape,
+            fps=frame_rate,
+            noisy_frame_mask=velocity_mask,
+            action_domain_ids=torch.tensor([domain_id], dtype=torch.long, device=self.device),
+            action_noisy_mask=action_velocity_mask,
+            action_start_frame_offset=action_offset,
+            action_fps=float(self._get_sp_param(sp, "action_fps", frame_rate) or frame_rate),
+        )
+
+        scheduler = _build_robolab_unipc_scheduler(num_inference_steps, flow_shift_target, self.device)
+        _, action_latents = self.diffuse(
+            latents=latents,
+            timesteps=scheduler.timesteps,
+            cond_ids=cond_ids,
+            cond_mask=cond_mask,
+            uncond_ids=uncond_ids,
+            uncond_mask=uncond_mask,
+            guidance_scale=guidance_scale,
+            shared_kwargs=shared_kwargs,
+            action_latents=action_latents,
+            action_velocity_mask=action_velocity_mask,
+            action_condition_latents=action_condition_latents,
+            sound_latents=None,
+            velocity_mask=velocity_mask,
+            image_latent=image_latent,
+            condition_latents=condition_latents,
+            guidance_interval=None,
+            raw_action_dim=raw_action_dim,
+            scheduler=scheduler,
+        )
+
+        if _is_rank_zero():
+            logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
+
+        action = action_latents[:, :, :raw_action_dim].detach().cpu()
+        custom_action_output: dict[str, Any] = {
+            "action": action,
+            "raw_action_dim": raw_action_dim,
+            "action_mode": action_mode,
+            "domain_id": domain_id,
+            "action_only_output": True,
+            "actions": self._postprocess_robolab_action(action, inputs),
+        }
+        return DiffusionOutput(output={}, custom_output=custom_action_output)
 
     @staticmethod
     def _truthy(value) -> bool:
@@ -2271,14 +2453,11 @@ class Cosmos3OmniDiffusersPipeline(
 
         sp = req.sampling_params
         prompt_data = req.prompts[0]
-        robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data)
+        robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
-            prompt = robolab_inputs.prompt
-            negative_prompt = None
-            image_tensor = None
-            video_tensor = None
-            action_video_tensor = robolab_inputs.video_tensor
-        elif isinstance(prompt_data, str):
+            return self._forward_robolab_policy(sp, robolab_inputs, pipeline_start)
+
+        if isinstance(prompt_data, str):
             prompt = prompt_data
             negative_prompt = None
             image_tensor = None
@@ -2290,12 +2469,11 @@ class Cosmos3OmniDiffusersPipeline(
             image_tensor = additional_info.get("preprocessed_image")
             video_tensor = additional_info.get("preprocessed_video")
 
-        is_t2i = False if robolab_inputs is not None else self._is_t2i_request(req)
-        sound_enabled = False if robolab_inputs is not None else self._is_sound_request(prompt_data, sp)
-        action_mode = ACTION_MODE_POLICY if robolab_inputs is not None else self._get_action_mode(prompt_data, sp)
+        is_t2i = self._is_t2i_request(req)
+        sound_enabled = self._is_sound_request(prompt_data, sp)
+        action_mode = self._get_action_mode(prompt_data, sp)
         action_enabled = action_mode is not None
-        if robolab_inputs is None:
-            action_video_tensor = video_tensor if action_enabled else None
+        action_video_tensor = video_tensor if action_enabled else None
         if action_enabled and is_t2i:
             raise ValueError("Cosmos3 action generation is supported only for video outputs.")
         if action_enabled and sound_enabled:
@@ -2351,16 +2529,7 @@ class Cosmos3OmniDiffusersPipeline(
             default_guidance_interval = None
             batch_size = 1  # Existing video pipeline assumes B=1.
 
-        if robolab_inputs is not None:
-            height = robolab_inputs.height
-            width = robolab_inputs.width
-            num_frames = robolab_inputs.num_frames
-            action_chunk_size = int(robolab_inputs.action_tensor.shape[0])
-            num_inference_steps = robolab_inputs.num_inference_steps
-            guidance_scale = float(robolab_inputs.guidance_scale)
-            default_flow_shift = robolab_inputs.flow_shift
-            default_guidance_interval = None
-        elif action_enabled:
+        if action_enabled:
             action_chunk_param = self._get_sp_param(sp, "action_chunk_size", None)
             if action_chunk_param is not None:
                 action_chunk_size = int(action_chunk_param)
@@ -2384,28 +2553,18 @@ class Cosmos3OmniDiffusersPipeline(
 
         domain_id = None
         if action_enabled:
-            if robolab_inputs is not None:
-                domain_id = int(robolab_inputs.domain_id)
-            else:
-                domain_id = resolve_domain_id(
-                    domain_id=self._get_sp_param(sp, "domain_id", None),
-                    domain_name=self._get_sp_param(sp, "domain_name", None),
-                    require_explicit=True,
-                )
+            domain_id = resolve_domain_id(
+                domain_id=self._get_sp_param(sp, "domain_id", None),
+                domain_name=self._get_sp_param(sp, "domain_name", None),
+                require_explicit=True,
+            )
 
         # Runtime controls: prefer ``extra_args`` (OpenAI endpoints write
         # there) over direct attrs.
-        if robolab_inputs is not None:
-            flow_shift_target = float(default_flow_shift)
-        else:
-            flow_shift_target = float(self._get_sp_param(sp, "flow_shift", default_flow_shift))
+        flow_shift_target = float(self._get_sp_param(sp, "flow_shift", default_flow_shift))
         guidance_interval = self._get_sp_param(sp, "guidance_interval", default_guidance_interval)
 
-        frame_rate = (
-            self._get_sp_param(sp, "resolved_frame_rate")
-            or self._get_sp_param(sp, "frame_rate")
-            or (robolab_inputs.fps if robolab_inputs is not None else 24.0)
-        )
+        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
         max_sequence_length = (
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
@@ -2433,19 +2592,12 @@ class Cosmos3OmniDiffusersPipeline(
         self._num_timesteps = num_inference_steps
 
         # Always resolve to a concrete target shift for this request, then
-        # update the shared Diffusers scheduler for non-RoboLab paths. RoboLab
-        # uses a request-local Cosmos UniPC scheduler to match the golden
-        # action server.
-        if robolab_inputs is None:
-            self._set_flow_shift(flow_shift_target)
+        # update the shared Diffusers scheduler.
+        self._set_flow_shift(flow_shift_target)
 
         generator = sp.generator
-        robolab_seed = int(robolab_inputs.seed) if robolab_inputs is not None else None
         if generator is None:
-            if robolab_seed is not None:
-                seed = robolab_seed
-            else:
-                seed = sp.seed if sp.seed is not None else 42
+            seed = sp.seed if sp.seed is not None else 42
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # --- Format prompts & tokenize (B=1; reused across loop iterations
@@ -2499,15 +2651,10 @@ class Cosmos3OmniDiffusersPipeline(
                     )
                 image_tensor = action_video_tensor[:, :, 0]
 
-            if robolab_inputs is not None:
-                raw_action_dim = int(robolab_inputs.raw_action_dim)
-                clean_action = robolab_inputs.action_tensor
-                action_condition_indexes = robolab_inputs.action_condition_indexes
-            else:
-                raw_action_dim_param = self._get_sp_param(sp, "raw_action_dim", None)
-                raw_action_dim = int(raw_action_dim_param) if raw_action_dim_param is not None else None
-                clean_action = None
-                action_condition_indexes = None
+            raw_action_dim_param = self._get_sp_param(sp, "raw_action_dim", None)
+            raw_action_dim = int(raw_action_dim_param) if raw_action_dim_param is not None else None
+            clean_action = None
+            action_condition_indexes = None
             action_prepared = self._prepare_action_latents(
                 mode=action_mode,
                 action_chunk_size=action_chunk_size,
@@ -2518,10 +2665,7 @@ class Cosmos3OmniDiffusersPipeline(
                 condition_indexes=action_condition_indexes,
             )
             action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = action_prepared
-            if robolab_inputs is not None:
-                action_offset = int(robolab_inputs.action_start_frame_offset)
-            else:
-                action_offset = action_start_frame_offset(action_mode, action_chunk_size, num_frames)
+            action_offset = action_start_frame_offset(action_mode, action_chunk_size, num_frames)
 
         if action_enabled and action_video_tensor is not None:
             latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
@@ -2531,7 +2675,6 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
-                image_size=robolab_inputs.image_size if robolab_inputs is not None else None,
             )
             image_latent = condition_latents[:, :, 0:1]
         elif is_v2v:
@@ -2591,11 +2734,8 @@ class Cosmos3OmniDiffusersPipeline(
             )
 
         def _run_diffusion(start_latents):
-            if robolab_inputs is not None:
-                scheduler = _build_robolab_unipc_scheduler(num_inference_steps, flow_shift_target, self.device)
-            else:
-                self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-                scheduler = self.scheduler
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            scheduler = self.scheduler
             return self.diffuse(
                 latents=start_latents,
                 timesteps=scheduler.timesteps,
@@ -2642,17 +2782,12 @@ class Cosmos3OmniDiffusersPipeline(
                 latents = diffusion_output
 
         # --- Decode ---
-        video = None
-        should_decode_video = robolab_inputs is None
-        if should_decode_video:
-            if _is_rank_zero():
-                logger.info("Decoding video...")
-            decode_start = time.time()
-            video = self._decode_latents(latents)
-            if _is_rank_zero():
-                logger.info("Video decoded in %.2fs", time.time() - decode_start)
-                logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
-        elif _is_rank_zero():
+        if _is_rank_zero():
+            logger.info("Decoding video...")
+        decode_start = time.time()
+        video = self._decode_latents(latents)
+        if _is_rank_zero():
+            logger.info("Video decoded in %.2fs", time.time() - decode_start)
             logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
 
         if sound_enabled:
@@ -2673,12 +2808,6 @@ class Cosmos3OmniDiffusersPipeline(
                 "action_mode": action_mode,
                 "domain_id": domain_id,
             }
-            if robolab_inputs is not None:
-                custom_action_output["action_only_output"] = True
-                custom_action_output["actions"] = self._postprocess_robolab_action(action, robolab_inputs)
-            return DiffusionOutput(
-                output={} if robolab_inputs is not None else {"video": video},
-                custom_output=custom_action_output,
-            )
+            return DiffusionOutput(output={"video": video}, custom_output=custom_action_output)
 
         return DiffusionOutput(output={"image": video} if is_t2i else {"video": video})

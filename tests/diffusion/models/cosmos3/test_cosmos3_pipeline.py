@@ -764,6 +764,92 @@ class TestForwardRouting:
         assert output.custom_output["action"].shape == (1, 2, 2)
         assert "action_only_output" not in output.custom_output
 
+    def test_forward_dispatches_robolab_policy_flow(
+        self,
+        make_cosmos3_pipeline,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+        pipeline = make_cosmos3_pipeline()
+        pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
+        captured = self._install_forward_stubs(pipeline)
+        video_latents = torch.zeros(1, 2, 1, 1, 1)
+        velocity_mask = torch.ones(1, 1, 1, 1, 1)
+        condition_latents = torch.zeros_like(video_latents)
+
+        inputs = pipeline_cosmos3.RoboLabPolicyInputs(
+            prompt="Pick the cube.",
+            video_tensor=torch.zeros(1, 3, 3, 16, 16),
+            action_tensor=torch.zeros(2, 2),
+            action_condition_indexes=[0],
+            action_start_frame_offset=1,
+            raw_action_dim=2,
+            domain_id=7,
+            fps=15.0,
+            height=16,
+            width=16,
+            image_size=None,
+            num_frames=3,
+            num_inference_steps=4,
+            guidance_scale=3.0,
+            flow_shift=5.0,
+            seed=11,
+            history_length=1,
+            action_space="joint_pos",
+            observation={},
+        )
+
+        def fake_prepare_action_latents(**kwargs):
+            captured["prepare_action"] = kwargs
+            action_chunk_size = kwargs["action_chunk_size"]
+            raw_action_dim = int(kwargs["raw_action_dim"])
+            return (
+                torch.zeros(1, action_chunk_size, 4),
+                torch.ones(1, action_chunk_size, 1),
+                torch.zeros(1, action_chunk_size, 4),
+                raw_action_dim,
+            )
+
+        def fake_prepare_action_video(*args, **kwargs):
+            captured["prepare_action_video"] = {"args": args, "kwargs": kwargs}
+            return video_latents, velocity_mask, condition_latents
+
+        monkeypatch.setattr(
+            pipeline_cosmos3,
+            "_build_robolab_unipc_scheduler",
+            lambda num_steps, shift, device: StubScheduler(list(range(num_steps, 0, -1)), flow_shift=shift),
+        )
+        pipeline._build_robolab_policy_inputs = lambda sp, prompt_data, request_id=None: inputs
+        pipeline._prepare_action_latents = fake_prepare_action_latents
+        pipeline._prepare_latents_action_video = fake_prepare_action_video
+        pipeline._decode_latents = lambda latents: (_ for _ in ()).throw(
+            AssertionError("RoboLab should not decode video")
+        )
+
+        output = pipeline.forward(SimpleNamespace(prompts=["ignored"], sampling_params=make_sampling_params()))
+
+        assert captured["format"] == {
+            "prompt": "Pick the cube.",
+            "negative_prompt": "",
+            "num_frames": 3,
+            "frame_rate": 15.0,
+            "height": 16,
+            "width": 16,
+            "is_t2i": False,
+        }
+        assert "flow_shifts" not in captured
+        assert pipeline.scheduler.set_timesteps_calls == []
+        assert captured["prepare_action"]["clean_action"] is inputs.action_tensor
+        assert captured["prepare_action"]["condition_indexes"] == [0]
+        assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
+        assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
+        assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
+        assert output.output == {}
+        assert output.custom_output["action_only_output"] is True
+        assert output.custom_output["action"].shape == (1, 2, 2)
+        assert output.custom_output["actions"].shape == (1, 2)
+
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),
         [
