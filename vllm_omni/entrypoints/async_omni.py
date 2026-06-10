@@ -671,8 +671,8 @@ class AsyncOmni(EngineClient, OmniBase):
                         if req_state is not None:
                             await req_state.queue.put(msg)
                         else:
-                            logger.debug(
-                                "[%s] dropping error for unknown req %s",
+                            logger.warning(
+                                "[%s] dropping non-fatal error for unknown req %s",
                                 self._name,
                                 msg.request_id,
                             )

@@ -13,7 +13,12 @@ DEFAULT_CLIENT_ERROR_TYPE = "BadRequestError"
 
 
 class OmniClientError(ValueError):
-    """Request-scoped error that should be surfaced as a 4xx response."""
+    """
+    Request-scoped error that should be surfaced as a 4xx response.
+    One example of using OmniClientError is GuardrailViolationError, which is captured and resurfaced
+    as HTTP 400 error code, instead of a generic 500. OmniClientError should be used for any exceptions
+    which need to be resurfaced as 4xx, as opposed to EngineDeadError/EngineGenerateError which are resurfaced as 500.
+    """
 
     def __init__(
         self,
