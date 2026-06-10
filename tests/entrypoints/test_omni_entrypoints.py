@@ -638,6 +638,38 @@ async def test_async_omni_propagates_client_error_status(monkeypatch: pytest.Mon
     assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
 
 
+def _enqueue_server_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="GPU exploded",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_server_error_as_runtime(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal error WITHOUT a 4xx status_code is a server fault: it must
+    surface as a RuntimeError (-> HTTP 500), not an OmniClientError (-> 400).
+    Guards against the fix over-broadly mapping every error to a client error."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_server_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        # OmniClientError subclasses ValueError, not RuntimeError, so matching
+        # RuntimeError here also proves it was NOT raised as a client error.
+        with pytest.raises(RuntimeError) as exc_info:
+            async for _ in app.generate(prompt="boom", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert not isinstance(exc_info.value, OmniClientError)
+    assert str(exc_info.value) == "GPU exploded"
+
+
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):
     sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
     engine = FakeAsyncOmniEngine(

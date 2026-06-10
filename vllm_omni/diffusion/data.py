@@ -1077,15 +1077,6 @@ class DiffusionOutput:
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
 
-    @classmethod
-    def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
-        status_code, error_type = client_error_metadata(exc)
-        return cls(
-            error=str(exc),
-            error_status_code=status_code,
-            error_type=error_type,
-        )
-
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
 
@@ -1113,6 +1104,15 @@ class DiffusionOutput:
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
         if self.custom_output:
             self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
+        status_code, error_type = client_error_metadata(exc)
+        return cls(
+            error=str(exc),
+            error_status_code=status_code,
+            error_type=error_type,
+        )
 
 
 class DiffusionRequestAbortedError(RuntimeError):

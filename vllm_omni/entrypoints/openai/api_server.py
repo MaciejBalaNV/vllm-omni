@@ -2990,6 +2990,7 @@ async def create_video_sync(
     except HTTPException:
         raise
     except OmniClientError as exc:
+        logger.info("Client error during sync video generation: %s", exc)
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except Exception as exc:
         logger.exception("Sync video generation failed for request_id=%s", request_id)
