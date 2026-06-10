@@ -263,11 +263,11 @@ class DiffusionEngine:
 
         custom_output = output.custom_output or {}
         action_payload = custom_output.get("actions")
-        action_only_output = action_payload is not None and isinstance(output_data, dict) and not output_data
+        action_only_output = bool(custom_output.get("action_only_output"))
 
         postprocess_start_time = time.perf_counter()
         if action_only_output:
-            outputs = {}
+            outputs = []
         elif self.post_process_func is not None:
             # Some video pipelines need request-level controls during
             # postprocess (for example worker-side frame interpolation).
@@ -287,8 +287,6 @@ class DiffusionEngine:
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
-        if action_payload is None:
-            action_payload = custom_output.get("actions")
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 

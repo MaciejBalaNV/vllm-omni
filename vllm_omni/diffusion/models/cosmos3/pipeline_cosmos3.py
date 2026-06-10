@@ -21,6 +21,7 @@ import math
 import os
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
@@ -114,6 +115,7 @@ ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS = 4
 ROBOLAB_DEFAULT_FLOW_SHIFT = 5.0
 ROBOLAB_DEFAULT_SEED = 0
 ROBOLAB_DEFAULT_ACTION_SPACE = "joint_pos"
+ROBOLAB_MIDTRAIN_POSE_ACTION_DIM = 9  # xyz position + rot6d orientation
 ROBOLAB_CONCAT_VIEW_DESCRIPTION = (
     "The top row is from the wrist-mounted camera. "
     "The bottom row contains two horizontally concatenated third-person perspective views of the scene from opposite "
@@ -124,6 +126,29 @@ ROBOLAB_CONCAT_VIEW_DESCRIPTION = (
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+
+
+@dataclass(frozen=True)
+class RoboLabPolicyInputs:
+    prompt: str
+    video_tensor: torch.Tensor
+    action_tensor: torch.Tensor
+    action_condition_indexes: list[int]
+    action_start_frame_offset: int
+    raw_action_dim: int
+    domain_id: int
+    fps: float
+    height: int
+    width: int
+    image_size: Any
+    num_frames: int
+    num_inference_steps: int
+    guidance_scale: float
+    flow_shift: float
+    seed: int
+    history_length: int
+    action_space: str
+    observation: dict[str, Any]
 
 
 def _normalize_condition_frame_indexes_vision(value: Any) -> tuple[int, ...]:
@@ -1063,7 +1088,7 @@ class Cosmos3OmniDiffusersPipeline(
         self,
         sp: OmniDiffusionSamplingParams,
         prompt_data: Any | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> RoboLabPolicyInputs | None:
         extra = sp.extra_args if isinstance(sp.extra_args, dict) else {}
         obs = extra.get("robot_obs")
         if obs is None:
@@ -1101,7 +1126,7 @@ class Cosmos3OmniDiffusersPipeline(
         domain_name = str(extra_param("domain_name", ROBOLAB_DEFAULT_DOMAIN_NAME))
         domain_id = resolve_domain_id(domain_name=domain_name, require_explicit=True)
 
-        if history_length < (1 if use_state else 0):
+        if use_state and history_length < 1:
             raise ValueError("RoboLab history_length must be >= 1 when use_state is true.")
         if action_chunk_size <= 0:
             raise ValueError(f"RoboLab action_chunk_size must be positive, got {action_chunk_size}.")
@@ -1160,6 +1185,7 @@ class Cosmos3OmniDiffusersPipeline(
             "ai_caption": prompt,
             "video": video,
             "action": action,
+            # Cosmos Framework consumes this as an integer conditioning bucket.
             "conditioning_fps": torch.tensor(fps, dtype=torch.long),
             "mode": ACTION_MODE_POLICY,
             "domain_id": torch.tensor(domain_id, dtype=torch.long),
@@ -1178,29 +1204,29 @@ class Cosmos3OmniDiffusersPipeline(
         else:
             transformed_raw_action_dim = raw_action_dim
 
-        return {
-            "prompt": sample["ai_caption"],
-            "video_tensor": video_tensor.unsqueeze(0),
-            "action_tensor": sample["action"].float(),
-            "action_condition_indexes": list(getattr(sequence_plan, "condition_frame_indexes_action", []) or []),
-            "action_start_frame_offset": int(getattr(sequence_plan, "action_start_frame_offset", 1)),
-            "raw_action_dim": transformed_raw_action_dim,
-            "domain_id": domain_id,
-            "fps": fps,
-            "height": int(video_tensor.shape[-2]),
-            "width": int(video_tensor.shape[-1]),
-            "image_size": sample.get("image_size"),
-            "num_frames": int(video_tensor.shape[1]),
-            "num_inference_steps": int(
+        return RoboLabPolicyInputs(
+            prompt=sample["ai_caption"],
+            video_tensor=video_tensor.unsqueeze(0),
+            action_tensor=sample["action"].float(),
+            action_condition_indexes=list(getattr(sequence_plan, "condition_frame_indexes_action", []) or []),
+            action_start_frame_offset=int(getattr(sequence_plan, "action_start_frame_offset", 1)),
+            raw_action_dim=transformed_raw_action_dim,
+            domain_id=domain_id,
+            fps=fps,
+            height=int(video_tensor.shape[-2]),
+            width=int(video_tensor.shape[-1]),
+            image_size=sample.get("image_size"),
+            num_frames=int(video_tensor.shape[1]),
+            num_inference_steps=int(
                 extra_param_alias("num_inference_steps", "num_steps", ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS)
             ),
-            "guidance_scale": float(extra_param_alias("guidance_scale", "guidance", ROBOLAB_DEFAULT_GUIDANCE_SCALE)),
-            "flow_shift": float(extra_param_alias("flow_shift", "shift", ROBOLAB_DEFAULT_FLOW_SHIFT)),
-            "seed": self._next_robolab_seed(extra),
-            "history_length": history_length,
-            "action_space": action_space,
-            "observation": obs,
-        }
+            guidance_scale=float(extra_param_alias("guidance_scale", "guidance", ROBOLAB_DEFAULT_GUIDANCE_SCALE)),
+            flow_shift=float(extra_param_alias("flow_shift", "shift", ROBOLAB_DEFAULT_FLOW_SHIFT)),
+            seed=self._next_robolab_seed(extra),
+            history_length=history_length,
+            action_space=action_space,
+            observation=obs,
+        )
 
     @staticmethod
     def _extract_robolab_prompt_image(prompt_data: Any | None) -> np.ndarray | None:
@@ -1229,28 +1255,28 @@ class Cosmos3OmniDiffusersPipeline(
             mask[:, idx, :] = 1.0
         return mask
 
-    def _postprocess_robolab_action(self, action: torch.Tensor, inputs: dict[str, Any]) -> np.ndarray:
+    def _postprocess_robolab_action(self, action: torch.Tensor, inputs: RoboLabPolicyInputs) -> np.ndarray:
         action_np = action[0].float().cpu().numpy()
-        history_length = int(inputs["history_length"])
+        history_length = int(inputs.history_length)
         action_np = action_np[history_length:]
         action_np[:, -1] = 1.0 - action_np[:, -1]
 
-        if inputs["action_space"] == "midtrain":
-            obs = inputs["observation"]
+        if inputs.action_space == "midtrain":
+            obs = inputs.observation
             eef_pos = _ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
             eef_quat = _ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4)
             initial_pose = np.eye(4, dtype=np.float32)
             initial_pose[:3, :3] = _convert_midtrain_rotation(eef_quat[-1], "quat_xyzw", "matrix")
             initial_pose[:3, 3] = eef_pos[-1]
             abs_pose = _pose_rel_to_abs(
-                action_np[:, :9],
+                action_np[:, :ROBOLAB_MIDTRAIN_POSE_ACTION_DIM],
                 rotation_format="rot6d",
                 pose_convention="backward_framewise",
                 initial_pose=initial_pose,
             )
             position = abs_pose[1:, :3, 3]
             quat_xyzw = _convert_midtrain_rotation(abs_pose[1:, :3, :3], "matrix", "quat_xyzw")
-            action_np = np.concatenate([position, quat_xyzw, action_np[:, 9:]], axis=-1)
+            action_np = np.concatenate([position, quat_xyzw, action_np[:, ROBOLAB_MIDTRAIN_POSE_ACTION_DIM:]], axis=-1)
 
         return np.asarray(action_np, dtype=np.float32)
 
@@ -2247,11 +2273,11 @@ class Cosmos3OmniDiffusersPipeline(
         prompt_data = req.prompts[0]
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data)
         if robolab_inputs is not None:
-            prompt = robolab_inputs["prompt"]
+            prompt = robolab_inputs.prompt
             negative_prompt = None
             image_tensor = None
             video_tensor = None
-            action_video_tensor = robolab_inputs["video_tensor"]
+            action_video_tensor = robolab_inputs.video_tensor
         elif isinstance(prompt_data, str):
             prompt = prompt_data
             negative_prompt = None
@@ -2326,13 +2352,13 @@ class Cosmos3OmniDiffusersPipeline(
             batch_size = 1  # Existing video pipeline assumes B=1.
 
         if robolab_inputs is not None:
-            height = robolab_inputs["height"]
-            width = robolab_inputs["width"]
-            num_frames = robolab_inputs["num_frames"]
-            action_chunk_size = int(robolab_inputs["action_tensor"].shape[0])
-            num_inference_steps = robolab_inputs["num_inference_steps"]
-            guidance_scale = float(robolab_inputs["guidance_scale"])
-            default_flow_shift = robolab_inputs["flow_shift"]
+            height = robolab_inputs.height
+            width = robolab_inputs.width
+            num_frames = robolab_inputs.num_frames
+            action_chunk_size = int(robolab_inputs.action_tensor.shape[0])
+            num_inference_steps = robolab_inputs.num_inference_steps
+            guidance_scale = float(robolab_inputs.guidance_scale)
+            default_flow_shift = robolab_inputs.flow_shift
             default_guidance_interval = None
         elif action_enabled:
             action_chunk_param = self._get_sp_param(sp, "action_chunk_size", None)
@@ -2359,7 +2385,7 @@ class Cosmos3OmniDiffusersPipeline(
         domain_id = None
         if action_enabled:
             if robolab_inputs is not None:
-                domain_id = int(robolab_inputs["domain_id"])
+                domain_id = int(robolab_inputs.domain_id)
             else:
                 domain_id = resolve_domain_id(
                     domain_id=self._get_sp_param(sp, "domain_id", None),
@@ -2378,7 +2404,7 @@ class Cosmos3OmniDiffusersPipeline(
         frame_rate = (
             self._get_sp_param(sp, "resolved_frame_rate")
             or self._get_sp_param(sp, "frame_rate")
-            or (robolab_inputs["fps"] if robolab_inputs is not None else 24.0)
+            or (robolab_inputs.fps if robolab_inputs is not None else 24.0)
         )
         max_sequence_length = (
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
@@ -2414,7 +2440,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._set_flow_shift(flow_shift_target)
 
         generator = sp.generator
-        robolab_seed = int(robolab_inputs["seed"]) if robolab_inputs is not None else None
+        robolab_seed = int(robolab_inputs.seed) if robolab_inputs is not None else None
         if generator is None:
             if robolab_seed is not None:
                 seed = robolab_seed
@@ -2474,9 +2500,9 @@ class Cosmos3OmniDiffusersPipeline(
                 image_tensor = action_video_tensor[:, :, 0]
 
             if robolab_inputs is not None:
-                raw_action_dim = int(robolab_inputs["raw_action_dim"])
-                clean_action = robolab_inputs["action_tensor"]
-                action_condition_indexes = robolab_inputs["action_condition_indexes"]
+                raw_action_dim = int(robolab_inputs.raw_action_dim)
+                clean_action = robolab_inputs.action_tensor
+                action_condition_indexes = robolab_inputs.action_condition_indexes
             else:
                 raw_action_dim_param = self._get_sp_param(sp, "raw_action_dim", None)
                 raw_action_dim = int(raw_action_dim_param) if raw_action_dim_param is not None else None
@@ -2493,7 +2519,7 @@ class Cosmos3OmniDiffusersPipeline(
             )
             action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = action_prepared
             if robolab_inputs is not None:
-                action_offset = int(robolab_inputs["action_start_frame_offset"])
+                action_offset = int(robolab_inputs.action_start_frame_offset)
             else:
                 action_offset = action_start_frame_offset(action_mode, action_chunk_size, num_frames)
 
@@ -2505,7 +2531,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 num_frames,
                 generator,
-                image_size=robolab_inputs.get("image_size") if robolab_inputs is not None else None,
+                image_size=robolab_inputs.image_size if robolab_inputs is not None else None,
             )
             image_latent = condition_latents[:, :, 0:1]
         elif is_v2v:
@@ -2648,6 +2674,7 @@ class Cosmos3OmniDiffusersPipeline(
                 "domain_id": domain_id,
             }
             if robolab_inputs is not None:
+                custom_action_output["action_only_output"] = True
                 custom_action_output["actions"] = self._postprocess_robolab_action(action, robolab_inputs)
             return DiffusionOutput(
                 output={} if robolab_inputs is not None else {"video": video},

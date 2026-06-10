@@ -83,6 +83,23 @@ def test_unpack_accepts_msgpack_numpy_marker_dicts():
     decoded = openpi_connection._unpack_numpy(payload)
 
     np.testing.assert_allclose(decoded[b"actions"], action)
+    assert decoded[b"actions"].flags.writeable is True
+    decoded[b"actions"][:, -1] = 0.0
+    np.testing.assert_allclose(decoded[b"actions"], np.asarray([[1.0, 0.0]], dtype=np.float32))
+
+
+def test_unpack_leaves_user_dict_without_numpy_kind_marker_unchanged():
+    payload = {
+        "metadata": {
+            "nd": True,
+            "type": "<f4",
+            "data": b"user payload",
+        }
+    }
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    assert decoded == payload
 
 
 def test_handle_connection_returns_structured_error_for_invalid_payload(monkeypatch):

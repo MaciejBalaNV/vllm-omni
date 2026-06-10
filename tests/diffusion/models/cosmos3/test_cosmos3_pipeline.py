@@ -762,6 +762,7 @@ class TestForwardRouting:
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert output.custom_output["action"].shape == (1, 2, 2)
+        assert "action_only_output" not in output.custom_output
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),

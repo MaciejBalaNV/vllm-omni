@@ -7,6 +7,10 @@ Protocol (compatible with OpenPI policy clients):
     Connect  -> server sends msgpack(PolicyServerConfig fields)
     Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
     Reset    -> client sends msgpack({endpoint:reset}), server sends msgpack(status)
+
+NumPy values use the msgpack-numpy marker mapping:
+    ndarray -> {nd: true, type, kind, shape, data}
+    scalar  -> {nd: false, type, kind, data}
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from vllm_omni.entrypoints.openpi.serving import (
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
 MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
+_MISSING = object()
 
 
 def _pack_numpy(obj: Any) -> Any:
@@ -56,15 +61,32 @@ def _mapping_get(obj: dict[Any, Any], key: str, default: Any = None) -> Any:
     return obj.get(key, obj.get(key.encode(), default))
 
 
+def _decode_marker_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
 def _unpack_numpy(obj: Any) -> Any:
     if isinstance(obj, dict):
-        nd = _mapping_get(obj, "nd")
-        dtype = _mapping_get(obj, "type")
-        data = _mapping_get(obj, "data")
-        if nd is not None and dtype is not None and data is not None:
-            array = np.frombuffer(data, dtype=np.dtype(dtype))
+        nd = _mapping_get(obj, "nd", _MISSING)
+        dtype = _mapping_get(obj, "type", _MISSING)
+        kind = _mapping_get(obj, "kind", _MISSING)
+        data = _mapping_get(obj, "data", _MISSING)
+        if nd is not _MISSING and dtype is not _MISSING and kind is not _MISSING and data is not _MISSING:
+            dtype_obj = np.dtype(_decode_marker_text(dtype))
+            kind_text = _decode_marker_text(kind)
+            if dtype_obj.kind != kind_text:
+                raise ValueError(f"NumPy dtype marker kind mismatch: {dtype_obj.kind!r} != {kind_text!r}")
+            if dtype_obj.kind in ("V", "O", "c"):
+                raise ValueError(f"Unsupported dtype: {dtype_obj}")
+
+            array = np.frombuffer(data, dtype=dtype_obj).copy()
             if nd:
-                return array.reshape(tuple(_mapping_get(obj, "shape", ())))
+                shape = _mapping_get(obj, "shape", _MISSING)
+                if shape is _MISSING:
+                    raise ValueError("NumPy ndarray marker is missing shape")
+                return array.reshape(tuple(shape))
             return array[0]
         return {key: _unpack_numpy(value) for key, value in obj.items()}
     if isinstance(obj, list):
