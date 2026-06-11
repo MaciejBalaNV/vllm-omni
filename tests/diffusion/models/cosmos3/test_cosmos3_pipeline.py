@@ -8,6 +8,7 @@ import types
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -130,9 +131,12 @@ class StubCosmos3Transformer(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
         sound_latents = kwargs.get("sound_latents")
+        control_latents = kwargs.get("control_latents")
+        control_bonus = 100 if control_latents is not None else 0
         self.calls.append(
             {
                 "token": token,
+                "has_control": control_latents is not None,
                 "timestep": timestep.clone(),
                 "text_mask": text_mask.clone(),
                 "cache_before": self.cached_kv,
@@ -144,7 +148,7 @@ class StubCosmos3Transformer(nn.Module):
             self.cached_kv = [(marker, marker + 100)]
             self.cached_freqs_gen = (marker + 200, marker + 300)
         action_latents = kwargs.get("action_latents")
-        outputs: list[torch.Tensor] = [torch.full_like(hidden_states, float(token))]
+        outputs: list[torch.Tensor] = [torch.full_like(hidden_states, float(token + control_bonus))]
         if action_latents is not None:
             outputs.append(torch.full_like(action_latents, float(token + 20)))
         if sound_latents is not None:
@@ -189,6 +193,7 @@ def make_cosmos3_pipeline():
         pipeline._current_flow_shift = 1.0
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
+        pipeline._cosmos3_branch_caches = None
         pipeline._cache_dit_requires_paired_cfg = False
         pipeline._sound_tokenizer = None
         pipeline.progress_bar = passthrough_progress_bar
@@ -388,6 +393,133 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
 
+def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        Cosmos3OmniDiffusersPipeline,
+        get_cosmos3_pre_process_func,
+    )
+
+    cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True}))
+    assert cfg is not None
+    assert list(cfg.hints) == ["edge"]
+    assert cfg.guidance_scale == 3.0
+    assert cfg.control_guidance == 1.5
+    assert cfg.flow_shift == 10.0
+    assert cfg.num_video_frames_per_chunk == 93
+    assert cfg.share_vision_temporal_positions is True
+    assert (
+        Cosmos3OmniDiffusersPipeline.reference_video_decode_spec(extra_args={"edge": True, "max_frames": 4}).max_frames
+        == 4
+    )
+    frames_for_pad = torch.arange(3 * 3, dtype=torch.uint8).reshape(1, 3, 1, 3)
+    assert transfer.pad_temporal_frames(frames_for_pad, 5)[0, :, 0, 0].tolist() == [0, 3, 6, 6, 3]
+
+    def raise_missing_cv2(_hint_key: str):
+        raise ImportError("missing cv2")
+
+    monkeypatch.setattr(transfer, "_import_cv2", raise_missing_cv2)
+    with pytest.raises(ImportError, match="opencv-python"):
+        transfer.load_or_compute_control_frames(
+            cfg.hints["edge"],
+            height=8,
+            width=8,
+            max_frames=1,
+            input_frames=torch.zeros(3, 1, 8, 8, dtype=torch.uint8),
+        )
+
+    precomputed = torch.zeros(3, 2, 8, 8, dtype=torch.uint8)
+    precomputed_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": {"control": precomputed}})
+    )
+    assert precomputed_cfg is not None
+    loaded = transfer.load_or_compute_control_frames(
+        precomputed_cfg.hints["edge"],
+        height=8,
+        width=8,
+        max_frames=2,
+        input_frames=None,
+    )
+    assert tuple(loaded.shape) == (3, 2, 8, 8)
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+
+    class FramesWithFps(list):
+        fps = 12.5
+
+    frames = FramesWithFps(Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue", "yellow", "black"))
+    request = SimpleNamespace(
+        prompts=[{"prompt": "transfer", "multi_modal_data": {"video": frames}}],
+        sampling_params=SimpleNamespace(
+            height=16,
+            width=32,
+            extra_args={"edge": True, "max_frames": 4, "resolution": "256"},
+        ),
+    )
+    additional = preprocess(request).prompts[0]["additional_information"]
+    assert (request.sampling_params.height, request.sampling_params.width) == (192, 320)
+    assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
+    assert additional["transfer_input_fps"] == 12.5
+    assert "preprocessed_video" not in additional
+
+
+def test_transfer_edge_uses_rgb_canny(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    class FakeCv2:
+        def __init__(self) -> None:
+            self.canny_inputs: list[np.ndarray] = []
+
+        def Canny(self, image, lower, upper):
+            assert (lower, upper) == (100, 200)
+            self.canny_inputs.append(image.copy())
+            return np.zeros(image.shape[:2], dtype=np.uint8)
+
+    fake_cv2 = FakeCv2()
+    monkeypatch.setattr(transfer, "_import_cv2", lambda _hint_key: fake_cv2)
+
+    frames = torch.zeros(3, 1, 4, 5, dtype=torch.uint8)
+    frames[0] = 255
+    edge = transfer.make_edge_control(frames, "medium")
+
+    assert tuple(edge.shape) == (3, 1, 4, 5)
+    assert len(fake_cv2.canny_inputs) == 1
+    assert fake_cv2.canny_inputs[0].shape == (4, 5, 3)
+
+
+def test_transfer_blur_uses_scaled_bilateral(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    class FakeCv2:
+        INTER_AREA = 1
+        INTER_LINEAR = 2
+        INTER_CUBIC = 3
+
+        def __init__(self) -> None:
+            self.bilateral_calls: list[tuple[tuple[int, int, int], int, float, float]] = []
+
+        def resize(self, image, size, interpolation):
+            del interpolation
+            width, height = size
+            return np.zeros((height, width, image.shape[2]), dtype=image.dtype)
+
+        def bilateralFilter(self, image, diameter, sigma_color, sigma_space):
+            self.bilateral_calls.append((image.shape, diameter, sigma_color, sigma_space))
+            return image
+
+        def GaussianBlur(self, *args, **kwargs):
+            raise AssertionError("Cosmos3 transfer blur should use bilateralFilter, not GaussianBlur.")
+
+    fake_cv2 = FakeCv2()
+    monkeypatch.setattr(transfer, "_import_cv2", lambda _hint_key: fake_cv2)
+
+    frames = torch.zeros(3, 1, 72, 72, dtype=torch.uint8)
+    blurred = transfer.make_blur_control(frames, "high")
+
+    assert tuple(blurred.shape) == (3, 1, 72, 72)
+    assert fake_cv2.bilateral_calls == [((72, 72, 3), 3, 15.0, 10.0)]
+
+
 def test_postprocess_handles_image_video_audio_and_validation() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
 
@@ -567,6 +699,152 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
     )
     torch.testing.assert_close(video_result, torch.full_like(latents, 4.0))
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
+
+
+def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.5,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == [
+        (2, True),
+        (2, False),
+        (1, True),
+    ]
+    torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+
+
+def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline) -> None:
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    control_only = make_cosmos3_pipeline()
+    control_result = control_only.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.5,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+    assert [(call["token"], call["has_control"]) for call in control_only.transformer.calls] == [
+        (2, True),
+        (2, False),
+    ]
+    torch.testing.assert_close(control_result, torch.full_like(latents, 152.0))
+
+    text_only = make_cosmos3_pipeline()
+    text_result = text_only.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+    assert [(call["token"], call["has_control"]) for call in text_only.transformer.calls] == [
+        (2, True),
+        (1, True),
+    ]
+    torch.testing.assert_close(text_result, torch.full_like(latents, 104.0))
+
+
+@pytest.mark.parametrize(("hint_key", "expected_fps"), [("edge", 8.0), ("wsm", 10.0)])
+def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint_key: str, expected_fps: float) -> None:
+    pipeline = make_cosmos3_pipeline()
+    captured: dict[str, Any] = {}
+
+    def fake_format(prompt, negative_prompt, num_frames, frame_rate, height, width, *args, **kwargs):
+        del prompt, negative_prompt, num_frames, height, width, args, kwargs
+        captured["format_frame_rate"] = frame_rate
+        return _ids(2), _mask(), _ids(1), _mask()
+
+    def fake_encode(video: torch.Tensor) -> torch.Tensor:
+        latent_frames = (video.shape[2] - 1) // pipeline.vae_scale_factor_temporal + 1
+        return torch.ones(
+            1,
+            2,
+            latent_frames,
+            max(1, video.shape[-2] // pipeline.vae_scale_factor_spatial),
+            max(1, video.shape[-1] // pipeline.vae_scale_factor_spatial),
+        )
+
+    def fake_prepare(target_norm, current_conditional_frames, generator):
+        del current_conditional_frames, generator
+        latent = fake_encode(target_norm)
+        velocity_mask = torch.ones(1, 1, latent.shape[2], 1, 1)
+        return torch.zeros_like(latent), velocity_mask, torch.zeros_like(latent)
+
+    def fake_diffuse_transfer(**kwargs):
+        captured["shared_kwargs"] = kwargs["shared_kwargs"]
+        return kwargs["latents"]
+
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
+    pipeline._format_and_tokenize_prompts = fake_format
+    pipeline._encode_video_tensor = fake_encode
+    pipeline._prepare_transfer_latents = fake_prepare
+    pipeline.diffuse_transfer = fake_diffuse_transfer
+    pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16)
+
+    control = torch.zeros(3, 5, 16, 16, dtype=torch.uint8)
+    request = SimpleNamespace(
+        prompts=[
+            {
+                "prompt": "transfer",
+                "modalities": ["video"],
+                "additional_information": {
+                    "preprocessed_transfer_video": torch.zeros(1, 3, 5, 16, 16),
+                    "transfer_input_fps": 8.0,
+                },
+            }
+        ],
+        sampling_params=make_sampling_params(
+            height=16,
+            width=16,
+            frame_rate=24.0,
+            extra_args={
+                hint_key: {"control": control},
+                "max_frames": 5,
+                "num_video_frames_per_chunk": 5,
+            },
+        ),
+    )
+
+    output = pipeline.forward(request)
+
+    assert captured["format_frame_rate"] == expected_fps
+    assert captured["shared_kwargs"]["fps"] == expected_fps
+    assert output.custom_output["fps"] == expected_fps
 
 
 def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -> None:
@@ -772,6 +1050,26 @@ class TestForwardRouting:
                 [{"prompt": "x", "modalities": ["image"], "generate_sound": True}],
                 make_sampling_params(),
                 "only for video",
+            ),
+            (
+                [{"prompt": "x", "modalities": ["image"]}],
+                make_sampling_params(extra_args={"edge": {"control_path": "/tmp/control.mp4"}}),
+                "transfer inference is supported only for video outputs",
+            ),
+            (
+                [{"prompt": "x", "modalities": ["video"], "generate_sound": True}],
+                make_sampling_params(extra_args={"edge": {"control_path": "/tmp/control.mp4"}}),
+                "cannot be combined with sound generation",
+            ),
+            (
+                [{"prompt": "x", "modalities": ["video"]}],
+                make_sampling_params(
+                    extra_args={
+                        "edge": {"control_path": "/tmp/control.mp4"},
+                        "action_mode": "policy",
+                    }
+                ),
+                "cannot be combined with action generation",
             ),
         ],
     )
