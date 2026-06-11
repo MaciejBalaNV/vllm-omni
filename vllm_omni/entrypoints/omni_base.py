@@ -434,8 +434,8 @@ class OmniBase(PDDisaggregationMixin):
         error_text = getattr(engine_outputs, "error", None)
         if error_text is None:
             return
-        status_code = getattr(engine_outputs, "error_status_code", None)
-        error_type = getattr(engine_outputs, "error_type", None)
+        status_code = engine_outputs.error_status_code
+        error_type = engine_outputs.error_type
         logger.error(
             "[%s] Stage error for req=%s stage-%s: %s",
             self.__class__.__name__,
