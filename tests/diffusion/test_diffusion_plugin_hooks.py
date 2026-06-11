@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from vllm_omni.diffusion.registry import (
+    _DIFFUSION_ACTION_POST_PROCESS_FUNCS,
     _DIFFUSION_MODELS,
     _DIFFUSION_POST_PROCESS_FUNCS,
     _DIFFUSION_PRE_PROCESS_FUNCS,
@@ -59,6 +60,7 @@ class TestRegisterDiffusionModel:
         original_models = _DIFFUSION_MODELS.copy()
         original_pre = _DIFFUSION_PRE_PROCESS_FUNCS.copy()
         original_post = _DIFFUSION_POST_PROCESS_FUNCS.copy()
+        original_action_post = _DIFFUSION_ACTION_POST_PROCESS_FUNCS.copy()
         yield
         _DIFFUSION_MODELS.clear()
         _DIFFUSION_MODELS.update(original_models)
@@ -66,6 +68,8 @@ class TestRegisterDiffusionModel:
         _DIFFUSION_PRE_PROCESS_FUNCS.update(original_pre)
         _DIFFUSION_POST_PROCESS_FUNCS.clear()
         _DIFFUSION_POST_PROCESS_FUNCS.update(original_post)
+        _DIFFUSION_ACTION_POST_PROCESS_FUNCS.clear()
+        _DIFFUSION_ACTION_POST_PROCESS_FUNCS.update(original_action_post)
 
     def test_register_new_model(self):
         """Test registering a new diffusion model with pre/post process functions."""
@@ -75,6 +79,7 @@ class TestRegisterDiffusionModel:
             class_name="TestPipeline",
             pre_process_func_name="test_pre_process",
             post_process_func_name="test_post_process",
+            action_post_process_func_name="test_action_post_process",
         )
         assert "TestPipeline" in _DIFFUSION_MODELS
         assert _DIFFUSION_MODELS["TestPipeline"] == (
@@ -84,6 +89,7 @@ class TestRegisterDiffusionModel:
         )
         assert _DIFFUSION_PRE_PROCESS_FUNCS["TestPipeline"] == "test_pre_process"
         assert _DIFFUSION_POST_PROCESS_FUNCS["TestPipeline"] == "test_post_process"
+        assert _DIFFUSION_ACTION_POST_PROCESS_FUNCS["TestPipeline"] == "test_action_post_process"
 
 
 class TestWorkerUsesHook:

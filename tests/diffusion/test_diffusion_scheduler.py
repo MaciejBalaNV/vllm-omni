@@ -607,13 +607,17 @@ class TestDiffusionEngine:
         )
         engine.pre_process_func = None
         engine.post_process_func = mocker.Mock(side_effect=AssertionError("postprocess should be skipped"))
+        engine.action_post_process_func = mocker.Mock(return_value=torch.tensor([[3.0, 4.0]]))
         engine._post_process_accepts_sampling_params = False
+        engine._action_post_process_accepts_custom_output = True
+        engine._action_post_process_accepts_sampling_params = False
         engine._check_and_start_background_loop = mocker.AsyncMock()
+        raw_action = torch.tensor([[1.0, 2.0]])
         engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
             return_value=DiffusionOutput(
                 output={},
                 custom_output={
-                    "actions": torch.tensor([[1.0, 2.0]]),
+                    "action": raw_action,
                     "action_only_output": True,
                 },
             )
@@ -629,8 +633,11 @@ class TestDiffusionEngine:
         outputs = await engine.step(request)
 
         engine.post_process_func.assert_not_called()
+        engine.action_post_process_func.assert_called_once()
+        assert engine.action_post_process_func.call_args.args[0] is raw_action
+        assert "custom_output" in engine.action_post_process_func.call_args.kwargs
         assert outputs[0].images == []
-        torch.testing.assert_close(outputs[0].multimodal_output["actions"], torch.tensor([[1.0, 2.0]]))
+        torch.testing.assert_close(outputs[0].multimodal_output["actions"], torch.tensor([[3.0, 4.0]]))
 
 
 class TestStepScheduler:
