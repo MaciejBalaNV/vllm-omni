@@ -304,7 +304,7 @@ class DiffusionEngine:
         if action_payload is None:
             action_payload = custom_output.get("actions")
         action_post_process_func = getattr(self, "action_post_process_func", None)
-        if action_post_process_func is not None:
+        if action_payload is None and action_post_process_func is not None:
             raw_action_payload = custom_output.get("action", action_payload)
             if raw_action_payload is not None:
                 action_kwargs: dict[str, Any] = {}

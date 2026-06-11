@@ -1175,7 +1175,7 @@ class Cosmos3OmniDiffusersPipeline(
             "action_mode": action_mode,
             "domain_id": domain_id,
             "action_only_output": True,
-            "robolab_policy_inputs": inputs,
+            "actions": postprocess_robolab_action(action, inputs),
         }
         return DiffusionOutput(output={}, custom_output=custom_action_output)
 

@@ -889,8 +889,8 @@ class TestForwardRouting:
         assert output.output == {}
         assert output.custom_output["action_only_output"] is True
         assert output.custom_output["action"].shape == (1, 2, 2)
-        assert output.custom_output["robolab_policy_inputs"] is inputs
-        assert "actions" not in output.custom_output
+        assert output.custom_output["actions"].shape == (1, 2)
+        assert "robolab_policy_inputs" not in output.custom_output
 
     @pytest.mark.parametrize(
         ("prompt", "sampling_params", "message"),
