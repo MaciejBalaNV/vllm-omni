@@ -814,7 +814,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     pipeline._encode_video_tensor = fake_encode
     pipeline._prepare_transfer_latents = fake_prepare
     pipeline.diffuse_transfer = fake_diffuse_transfer
-    pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16)
+    pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16, device="meta")
 
     control = torch.zeros(3, 5, 16, 16, dtype=torch.uint8)
     request = SimpleNamespace(
@@ -836,6 +836,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
                 hint_key: {"control": control},
                 "max_frames": 5,
                 "num_video_frames_per_chunk": 5,
+                "show_control_condition": True,
             },
         ),
     )
@@ -845,6 +846,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     assert captured["format_frame_rate"] == expected_fps
     assert captured["shared_kwargs"]["fps"] == expected_fps
     assert output.custom_output["fps"] == expected_fps
+    assert output.output["video"].device.type == "meta"
 
 
 def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -> None:

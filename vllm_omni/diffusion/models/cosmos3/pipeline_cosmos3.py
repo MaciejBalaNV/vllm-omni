@@ -2374,6 +2374,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         if transfer_config.show_control_condition:
             all_controls = torch.cat([full_controls[key] for key in per_hint_frames], dim=-1)
+            all_controls = all_controls.to(full_output)
             full_output = torch.cat([all_controls, full_output], dim=-1)
         if transfer_config.show_input and input_frames is not None:
             normalized_input = uint8_cthw_to_normalized_5d(input_frames[:, :total_frames], dtype=torch.float32)
