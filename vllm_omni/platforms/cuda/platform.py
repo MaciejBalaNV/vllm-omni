@@ -218,6 +218,20 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return torch.cuda.get_device_name(device_id)
 
     @classmethod
+    def _uses_cosmos3_model(cls, vllm_config: VllmConfig) -> bool:
+        model_config = getattr(vllm_config, "model_config", None)
+        model = str(getattr(model_config, "model", "") or "").lower()
+        if "cosmos3" in model:
+            return True
+
+        for config_attr in ("hf_config", "hf_text_config"):
+            hf_config = getattr(model_config, config_attr, None)
+            architectures = getattr(hf_config, "architectures", []) or []
+            if any("cosmos3" in str(arch).lower() for arch in architectures):
+                return True
+        return False
+
+    @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
         """Copied from vllm/platforms/cuda/platform.py v0.20.0 with force using vllm_c kernels"""
         default = ["vllm_c", "native"]  # Originally using "native" here when compiling
@@ -225,8 +239,11 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         # Use oink if enabled for rms_norm
         # TODO(Laurawly/luka): remove this env var,
         #  users can just use IR op priority directly
-        rms_norm = default
-        if envs.VLLM_USE_OINK_OPS:
+        if cls._uses_cosmos3_model(vllm_config):
+            rms_norm = ["native"]
+        elif envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
+        else:
+            rms_norm = default
 
         return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm, fused_add_rms_norm=rms_norm)
