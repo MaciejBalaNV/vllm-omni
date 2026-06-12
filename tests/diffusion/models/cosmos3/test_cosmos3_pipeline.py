@@ -202,6 +202,13 @@ def make_cosmos3_pipeline():
     return _make
 
 
+@pytest.fixture
+def sequential_cfg_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.distributed import cfg_parallel
+
+    monkeypatch.setattr(cfg_parallel, "get_classifier_free_guidance_world_size", lambda: 1)
+
+
 def make_sampling_params(**overrides: Any) -> SimpleNamespace:
     values = {
         "height": None,
@@ -415,10 +422,14 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     frames_for_pad = torch.arange(3 * 3, dtype=torch.uint8).reshape(1, 3, 1, 3)
     assert transfer.pad_temporal_frames(frames_for_pad, 5)[0, :, 0, 0].tolist() == [0, 3, 6, 6, 3]
 
-    def raise_missing_cv2(_hint_key: str):
-        raise ImportError("missing cv2")
+    real_import_module = transfer.importlib.import_module
 
-    monkeypatch.setattr(transfer, "_import_cv2", raise_missing_cv2)
+    def raise_missing_cv2(name: str, *args: Any, **kwargs: Any):
+        if name == "cv2":
+            raise ImportError("missing cv2")
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(transfer.importlib, "import_module", raise_missing_cv2)
     with pytest.raises(ImportError, match="opencv-python"):
         transfer.load_or_compute_control_frames(
             cfg.hints["edge"],
@@ -701,7 +712,7 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
 
-def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline) -> None:
+def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
     velocity_mask = torch.ones(1, 1, 1, 1, 1)
@@ -730,7 +741,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline) -> None:
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
 
 
-def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline) -> None:
+def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     latents = torch.zeros(1, 2, 1, 1, 1)
     velocity_mask = torch.ones(1, 1, 1, 1, 1)
 
@@ -814,6 +825,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     pipeline._encode_video_tensor = fake_encode
     pipeline._prepare_transfer_latents = fake_prepare
     pipeline.diffuse_transfer = fake_diffuse_transfer
+    pipeline._set_flow_shift = lambda target: captured.setdefault("flow_shifts", []).append(target)
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16, device="meta")
 
     control = torch.zeros(3, 5, 16, 16, dtype=torch.uint8)
@@ -845,6 +857,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
 
     assert captured["format_frame_rate"] == expected_fps
     assert captured["shared_kwargs"]["fps"] == expected_fps
+    assert captured["flow_shifts"] == [10.0]
     assert output.custom_output["fps"] == expected_fps
     assert output.output["video"].device.type == "meta"
 
