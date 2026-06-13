@@ -21,6 +21,7 @@ import math
 import os
 import time
 from collections.abc import Iterable
+from dataclasses import fields
 from typing import Any, ClassVar
 
 import numpy as np
@@ -81,6 +82,7 @@ from .utils import (
     ROBOLAB_DEFAULT_RAW_ACTION_DIM,
     ROBOLAB_DEFAULT_RESOLUTION,
     ROBOLAB_MIDTRAIN_RAW_ACTION_DIM,
+    RoboLabActionPostprocessInputs,
     RoboLabPolicyInputs,
     build_abs_pose_from_components,
     build_robolab_unipc_scheduler,
@@ -91,6 +93,7 @@ from .utils import (
     extract_robolab_image,
     extract_robolab_prompt_image,
     lazy_action_transform_pipeline,
+    make_robolab_action_postprocess_inputs,
     next_robolab_seed,
     normalize_condition_frame_indexes_vision,
     normalize_condition_video_keep,
@@ -486,12 +489,29 @@ def get_cosmos3_action_post_process_func(od_config: OmniDiffusionConfig):
 
     def action_post_process_func(action: Any, custom_output: dict[str, Any] | None = None, sampling_params=None):
         del sampling_params
-        inputs = custom_output.get("robolab_policy_inputs") if isinstance(custom_output, dict) else None
-        if isinstance(inputs, RoboLabPolicyInputs):
-            return postprocess_robolab_action(action, inputs)
+        inputs = custom_output.get("robolab_action_postprocess") if isinstance(custom_output, dict) else None
+        if isinstance(inputs, RoboLabActionPostprocessInputs):
+            processed_action = postprocess_robolab_action(action, inputs)
+            custom_output.pop("robolab_action_postprocess", None)
+            return processed_action
         return action
 
     return action_post_process_func
+
+
+def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
+    del od_config
+
+    def ir_op_priority_func(ir_op_priority, vllm_config=None):
+        del vllm_config
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        priority_kwargs = {field.name: list(getattr(ir_op_priority, field.name)) for field in fields(ir_op_priority)}
+        priority_kwargs["rms_norm"] = ["native"]
+        priority_kwargs["fused_add_rms_norm"] = ["native"]
+        return IrOpPriorityConfig(**priority_kwargs)
+
+    return ir_op_priority_func
 
 
 # ---------------------------------------------------------------------------
@@ -1175,7 +1195,7 @@ class Cosmos3OmniDiffusersPipeline(
             "action_mode": action_mode,
             "domain_id": domain_id,
             "action_only_output": True,
-            "actions": postprocess_robolab_action(action, inputs),
+            "robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs),
         }
         return DiffusionOutput(output={}, custom_output=custom_action_output)
 

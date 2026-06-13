@@ -20,7 +20,6 @@ from typing import Any
 import torch
 import zmq
 from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
-from vllm.config.kernel import IrOpPriorityConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
@@ -44,6 +43,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -96,23 +96,6 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
         enforce_eager=getattr(od_config, "enforce_eager", False),
         is_moe=bool(getattr(od_config, "is_moe", False)),
     )
-
-
-def _uses_cosmos3_diffusion_model(od_config: OmniDiffusionConfig, model_config: _DiffusionVllmModelConfig) -> bool:
-    identifiers = (
-        getattr(od_config, "model", None),
-        getattr(od_config, "model_class_name", None),
-        getattr(model_config, "model", None),
-    )
-    if any("cosmos3" in str(identifier).lower() for identifier in identifiers if identifier):
-        return True
-
-    for config_attr in ("hf_config", "hf_text_config"):
-        hf_config = getattr(model_config, config_attr, None)
-        architectures = getattr(hf_config, "architectures", []) or []
-        if any("cosmos3" in str(architecture).lower() for architecture in architectures):
-            return True
-    return False
 
 
 @contextmanager
@@ -175,6 +158,14 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds
             logger.warning("Failed to attach additional_config to worker VllmConfig: %s", set_exc)
         return vllm_config
+
+
+def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
+    ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+    ir_op_priority_func = get_diffusion_ir_op_priority_func(od_config)
+    if ir_op_priority_func is not None:
+        ir_op_priority = ir_op_priority_func(ir_op_priority, vllm_config=vllm_config)
+    return ir_op_priority
 
 
 class DiffusionWorker:
@@ -252,12 +243,7 @@ class DiffusionWorker:
         vllm_config.quant_config = self.od_config.quantization_config
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
-        ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
-        if _uses_cosmos3_diffusion_model(self.od_config, vllm_config.model_config):
-            ir_op_priority = IrOpPriorityConfig.with_default(
-                ["vllm_c", "native"], rms_norm=["native"], fused_add_rms_norm=["native"]
-            )
-        vllm_config.kernel_config.ir_op_priority = ir_op_priority
+        vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
         logger.info(
             "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
         )

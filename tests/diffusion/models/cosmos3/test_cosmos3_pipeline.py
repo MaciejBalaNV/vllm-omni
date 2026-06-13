@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -231,6 +232,7 @@ def test_pipeline_registered_and_exported() -> None:
     from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
     from vllm_omni.diffusion.registry import (
         _DIFFUSION_ACTION_POST_PROCESS_FUNCS,
+        _DIFFUSION_IR_OP_PRIORITY_FUNCS,
         _DIFFUSION_MODELS,
         _DIFFUSION_POST_PROCESS_FUNCS,
         _DIFFUSION_PRE_PROCESS_FUNCS,
@@ -249,6 +251,7 @@ def test_pipeline_registered_and_exported() -> None:
     assert (
         _DIFFUSION_ACTION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_action_post_process_func"
     )
+    assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_ir_op_priority_func"
     assert "Cosmos3OmniDiffusersPipeline" in CUSTOM_DIT_ENABLERS
     assert "Cosmos3OmniDiffusersPipeline" in cosmos3.__all__
 
@@ -421,6 +424,7 @@ def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         RoboLabPolicyInputs,
         get_cosmos3_action_post_process_func,
+        make_robolab_action_postprocess_inputs,
     )
 
     func = get_cosmos3_action_post_process_func(SimpleNamespace())
@@ -447,11 +451,40 @@ def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     )
 
     action = torch.tensor([[[0.0, 0.25], [1.0, 0.75]]])
-    processed = func(action, custom_output={"robolab_policy_inputs": inputs})
+    custom_output = {"robolab_action_postprocess": make_robolab_action_postprocess_inputs(inputs)}
+    processed = func(action, custom_output=custom_output)
 
     assert processed.shape == (1, 2)
     assert processed.dtype == torch.zeros((), dtype=torch.float32).numpy().dtype
     torch.testing.assert_close(torch.from_numpy(processed), torch.tensor([[1.0, 0.25]]))
+    assert "robolab_action_postprocess" not in custom_output
+
+
+def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_ir_op_priority_func
+
+    @dataclass
+    class FakeIrOpPriorityConfig:
+        rms_norm: list[str]
+        fused_add_rms_norm: list[str]
+        custom_op: list[str]
+
+    fake_kernel = types.ModuleType("vllm.config.kernel")
+    fake_kernel.IrOpPriorityConfig = FakeIrOpPriorityConfig
+    monkeypatch.setitem(sys.modules, fake_kernel.__name__, fake_kernel)
+
+    func = get_cosmos3_ir_op_priority_func(SimpleNamespace())
+    default_priority = FakeIrOpPriorityConfig(
+        rms_norm=["vllm_c", "native"],
+        fused_add_rms_norm=["vllm_c", "native"],
+        custom_op=["platform_kernel", "native"],
+    )
+
+    merged = func(default_priority, vllm_config=SimpleNamespace())
+
+    assert merged.rms_norm == ["native"]
+    assert merged.fused_add_rms_norm == ["native"]
+    assert merged.custom_op == ["platform_kernel", "native"]
 
 
 def test_prompt_formatting_and_checkpoint_key_remap(make_cosmos3_pipeline) -> None:
@@ -889,7 +922,8 @@ class TestForwardRouting:
         assert output.output == {}
         assert output.custom_output["action_only_output"] is True
         assert output.custom_output["action"].shape == (1, 2, 2)
-        assert output.custom_output["actions"].shape == (1, 2)
+        assert "actions" not in output.custom_output
+        assert "robolab_action_postprocess" in output.custom_output
         assert "robolab_policy_inputs" not in output.custom_output
 
     @pytest.mark.parametrize(

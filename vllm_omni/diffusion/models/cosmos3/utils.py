@@ -71,6 +71,30 @@ class RoboLabPolicyInputs:
     observation: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class RoboLabActionPostprocessInputs:
+    history_length: int
+    action_space: str
+    eef_pos: np.ndarray | None = None
+    eef_quat: np.ndarray | None = None
+
+
+def make_robolab_action_postprocess_inputs(inputs: RoboLabPolicyInputs) -> RoboLabActionPostprocessInputs:
+    if inputs.action_space != "midtrain":
+        return RoboLabActionPostprocessInputs(
+            history_length=inputs.history_length,
+            action_space=inputs.action_space,
+        )
+
+    obs = inputs.observation
+    return RoboLabActionPostprocessInputs(
+        history_length=inputs.history_length,
+        action_space=inputs.action_space,
+        eef_pos=ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3),
+        eef_quat=ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4),
+    )
+
+
 def normalize_condition_frame_indexes_vision(value: Any) -> tuple[int, ...]:
     """Normalize Cosmos3 vision-conditioning latent frame indexes."""
     if value is None:
@@ -320,7 +344,7 @@ def log_robolab_action_summary(label: str, value: Any) -> None:
     )
 
 
-def postprocess_robolab_action(action: torch.Tensor, inputs: RoboLabPolicyInputs) -> np.ndarray:
+def postprocess_robolab_action(action: torch.Tensor, inputs: RoboLabActionPostprocessInputs) -> np.ndarray:
     action_np = action[0].float().cpu().numpy()
     log_robolab_action_summary("raw_model_action", action_np)
     history_length = int(inputs.history_length)
@@ -328,12 +352,11 @@ def postprocess_robolab_action(action: torch.Tensor, inputs: RoboLabPolicyInputs
     action_np[:, -1] = 1.0 - action_np[:, -1]
 
     if inputs.action_space == "midtrain":
-        obs = inputs.observation
-        eef_pos = ensure_2d_float_array(obs["observation/eef_pos"], "observation/eef_pos", 3)
-        eef_quat = ensure_2d_float_array(obs["observation/eef_quat"], "observation/eef_quat", 4)
+        if inputs.eef_pos is None or inputs.eef_quat is None:
+            raise ValueError("RoboLab midtrain action postprocess requires eef_pos and eef_quat metadata.")
         initial_pose = np.eye(4, dtype=np.float32)
-        initial_pose[:3, :3] = convert_midtrain_rotation(eef_quat[-1], "quat_xyzw", "matrix")
-        initial_pose[:3, 3] = eef_pos[-1]
+        initial_pose[:3, :3] = convert_midtrain_rotation(inputs.eef_quat[-1], "quat_xyzw", "matrix")
+        initial_pose[:3, 3] = inputs.eef_pos[-1]
         abs_pose = pose_rel_to_abs(
             action_np[:, :ROBOLAB_MIDTRAIN_POSE_ACTION_DIM],
             rotation_format="rot6d",
