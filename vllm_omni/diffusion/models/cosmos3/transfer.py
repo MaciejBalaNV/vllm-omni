@@ -153,6 +153,21 @@ def _is_user_field(extra: Mapping[str, Any], sp: Any, prompt_data: Any, *keys: s
     return False
 
 
+# fps, frame_rate, and resolved_frame_rate are aliases for the same request-level
+# control. The serving layer leaves all of them ``None`` on the sampling params when
+# the user did not provide fps, so a non-``None`` value here unambiguously means the
+# user set it.
+_FPS_KEYS: tuple[str, ...] = ("resolved_frame_rate", "frame_rate", "fps")
+
+
+def _transfer_fps_param(extra: Mapping[str, Any], sp: Any, prompt_data: Any) -> Any:
+    # extra_args is a model-specific override and wins over the generic sampling params.
+    for key in _FPS_KEYS:
+        if extra.get(key) is not None:
+            return extra[key]
+    return _param_any(extra, sp, prompt_data, _FPS_KEYS)
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -226,6 +241,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             raise ValueError("Cosmos3 transfer options were provided, but no transfer hint was selected.")
         return None
 
+    fps_value = _transfer_fps_param(extra, sp, prompt_data)
     config = Cosmos3TransferConfig(
         hints=hints,
         guidance_scale=(
@@ -279,11 +295,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             if _param(extra, sp, prompt_data, "num_frames", None) is not None
             else None
         ),
-        fps=(
-            float(_param_any(extra, sp, prompt_data, ("fps", "frame_rate", "resolved_frame_rate")))
-            if _param_any(extra, sp, prompt_data, ("fps", "frame_rate", "resolved_frame_rate")) is not None
-            else None
-        ),
+        fps=(float(fps_value) if fps_value is not None else None),
     )
 
     if len(hints) == 1:
@@ -293,6 +305,8 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
                 user_set = _is_user_field(extra, sp, prompt_data, "guidance_scale", "guidance")
             elif field_name == "flow_shift":
                 user_set = _is_user_field(extra, sp, prompt_data, "flow_shift", "shift")
+            elif field_name == "fps":
+                user_set = _is_user_field(extra, sp, prompt_data, *_FPS_KEYS)
             else:
                 user_set = _is_user_field(extra, sp, prompt_data, field_name)
             if not user_set:

@@ -415,6 +415,14 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert cfg.flow_shift == 10.0
     assert cfg.num_video_frames_per_chunk == 93
     assert cfg.share_vision_temporal_positions is True
+    # fps omitted (no fps/frame_rate on the sampling params) -> wsm preset default (10) applies.
+    defaulted_fps_cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"wsm": True}))
+    assert defaulted_fps_cfg is not None
+    assert defaulted_fps_cfg.fps == 10
+    # fps provided (frame_rate set) -> the user value wins over the preset default.
+    explicit_fps_cfg = transfer.resolve_transfer_config(make_sampling_params(frame_rate=24.0, extra_args={"wsm": True}))
+    assert explicit_fps_cfg is not None
+    assert explicit_fps_cfg.fps == 24.0
     assert (
         Cosmos3OmniDiffusersPipeline.reference_video_decode_spec(extra_args={"edge": True, "max_frames": 4}).max_frames
         == 4
@@ -472,6 +480,21 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
+
+
+def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
+    """When fps and frame_rate differ, transfer must pick frame_rate -- the same
+    precedence as OmniDiffusionSamplingParams.resolved_frame_rate. Uses the real
+    sampling-params dataclass so the resolved_frame_rate property is exercised."""
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    sp = OmniDiffusionSamplingParams(fps=24, frame_rate=12.0, extra_args={"edge": True})
+    assert sp.resolved_frame_rate == 12.0
+    cfg = transfer.resolve_transfer_config(sp)
+    assert cfg is not None
+    # edge has no preset fps default, so cfg.fps comes straight from fps resolution.
+    assert cfg.fps == sp.resolved_frame_rate == 12.0
 
 
 def test_transfer_edge_uses_rgb_canny(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -790,6 +813,39 @@ def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline, sequent
     torch.testing.assert_close(text_result, torch.full_like(latents, 104.0))
 
 
+def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([900, 500, 100]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.5,
+        control_guidance_interval=(400.0, 1000.0),
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+        guidance_interval=(800.0, 1000.0),
+    )
+
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == [
+        (2, True),
+        (2, False),
+        (1, True),
+        (2, True),
+        (2, False),
+        (2, True),
+    ]
+    torch.testing.assert_close(result, torch.full_like(latents, 508.0))
+
+
 @pytest.mark.parametrize(("hint_key", "expected_fps"), [("edge", 8.0), ("wsm", 10.0)])
 def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint_key: str, expected_fps: float) -> None:
     pipeline = make_cosmos3_pipeline()
@@ -843,7 +899,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
         sampling_params=make_sampling_params(
             height=16,
             width=16,
-            frame_rate=24.0,
+            # fps omitted (no frame_rate) -> non-wsm uses the source video fps (8), wsm uses its preset (10).
             extra_args={
                 hint_key: {"control": control},
                 "max_frames": 5,
@@ -860,6 +916,84 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     assert captured["flow_shifts"] == [10.0]
     assert output.custom_output["fps"] == expected_fps
     assert output.output["video"].device.type == "meta"
+
+
+def test_forward_transfer_runs_multichunk_overlap_path(
+    make_cosmos3_pipeline,
+    sequential_cfg_parallel,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    captured: dict[str, Any] = {"targets": [], "conditional_frames": []}
+
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
+    pipeline._set_flow_shift = lambda target: captured.setdefault("flow_shifts", []).append(target)
+
+    original_prepare = pipeline._prepare_transfer_latents
+
+    def recording_prepare(target_norm, current_conditional_frames, generator):
+        captured["targets"].append(target_norm.detach().clone())
+        captured["conditional_frames"].append(current_conditional_frames)
+        return original_prepare(target_norm, current_conditional_frames, generator)
+
+    pipeline._prepare_transfer_latents = recording_prepare
+
+    decoded_chunks = [
+        torch.tensor([-0.6, -0.5, -0.4, -0.3, -0.2], dtype=torch.float32),
+        torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5], dtype=torch.float32),
+    ]
+
+    def fake_decode(latents):
+        chunk_values = decoded_chunks[len(captured.setdefault("decode_calls", []))]
+        captured["decode_calls"].append(latents.detach().clone())
+        return chunk_values.view(1, 1, 5, 1, 1).expand(1, 3, 5, 16, 16).clone()
+
+    pipeline._decode_latents = fake_decode
+
+    transfer_video = torch.zeros(1, 3, 8, 16, 16)
+    transfer_video[:, :, 1] = 1.0
+    control = torch.zeros(3, 8, 16, 16, dtype=torch.uint8)
+    request = SimpleNamespace(
+        prompts=[
+            {
+                "prompt": "transfer",
+                "modalities": ["video"],
+                "additional_information": {
+                    "preprocessed_transfer_video": transfer_video,
+                    "transfer_input_fps": 8.0,
+                },
+            }
+        ],
+        sampling_params=make_sampling_params(
+            height=16,
+            width=16,
+            num_inference_steps=1,
+            guidance_scale=1.0,
+            extra_args={
+                "edge": {"control": control},
+                "control_guidance": 1.0,
+                "max_frames": 8,
+                "num_video_frames_per_chunk": 5,
+                "num_conditional_frames": 1,
+                "num_first_chunk_conditional_frames": 2,
+            },
+        ),
+    )
+
+    output = pipeline.forward(request)
+
+    assert captured["conditional_frames"] == [2, 1]
+    assert len(captured["decode_calls"]) == 2
+    assert output.output["video"].shape == (1, 3, 8, 16, 16)
+    torch.testing.assert_close(
+        output.output["video"][0, 0, :, 0, 0],
+        torch.tensor([-0.6, -0.5, -0.4, -0.3, -0.2, 0.2, 0.3, 0.4]),
+    )
+    assert output.custom_output["transfer_controls"]["edge"].shape == (1, 3, 8, 16, 16)
+    torch.testing.assert_close(captured["targets"][0][:, :, 0], torch.full((1, 3, 16, 16), -1.0))
+    torch.testing.assert_close(captured["targets"][0][:, :, 1], torch.full((1, 3, 16, 16), 1.0))
+    torch.testing.assert_close(captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0))
+    torch.testing.assert_close(captured["targets"][1][:, :, 0], torch.full((1, 3, 16, 16), -0.2))
 
 
 def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -> None:

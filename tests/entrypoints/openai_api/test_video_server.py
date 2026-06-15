@@ -521,6 +521,8 @@ def test_seconds_defaults_fps_and_frames(test_client, mocker: MockerFixture):
     engine = test_client.app.state.openai_serving_video._engine_client
     captured = engine.captured_sampling_params_list[0]
     assert captured.num_frames == 72
+    # fps omitted -> sampling params carry None (the "not provided" signal); the 24
+    # default is applied only at output encoding.
     assert captured.fps is None
     assert captured.frame_rate is None
     assert fps_values == [24]
@@ -556,6 +558,7 @@ def test_model_reported_fps_wins_when_request_fps_omitted(test_client, mocker: M
     video_id = response.json()["id"]
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     captured = engine.captured_sampling_params_list[0]
+    # fps omitted -> None on the sampling params; the model-reported fps (8) wins for output.
     assert captured.fps is None
     assert captured.frame_rate is None
     assert fps_values == [8]
