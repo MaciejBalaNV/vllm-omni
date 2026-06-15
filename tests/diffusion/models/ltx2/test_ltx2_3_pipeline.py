@@ -466,16 +466,17 @@ class TestCFGParallelForwardPath:
     """Test the LTX-2.3 CFG-parallel denoising path without loading model weights."""
 
     @pytest.mark.parametrize(("cfg_rank", "expected_prompt_value"), [(0, 1.0), (1, 0.0)])
-    # frame_rate_input=None mirrors a request that omits fps: the serving layer leaves
-    # sampling_params.fps/frame_rate as None, so resolved_frame_rate is None and forward
-    # must fall back to its own 24.0 default (regression guard for the fps-handling change).
-    @pytest.mark.parametrize(("frame_rate_input", "expected_frame_rate"), [(1.0, 1.0), (None, 24.0)])
+    @pytest.mark.parametrize(
+        ("frame_rate_input", "audio_sampling_rate", "expected_frame_rate"),
+        [(1.0, 1, 1.0), (None, 24, 24.0)],
+    )
     def test_forward_cfg_parallel_steps_video_and_audio_scheduler(
         self,
         monkeypatch,
         cfg_rank,
         expected_prompt_value,
         frame_rate_input,
+        audio_sampling_rate,
         expected_frame_rate,
     ):
         from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
@@ -490,7 +491,7 @@ class TestCFGParallelForwardPath:
         pipe.vae_temporal_compression_ratio = 1
         pipe.transformer_spatial_patch_size = 1
         pipe.transformer_temporal_patch_size = 1
-        pipe.audio_sampling_rate = 1
+        pipe.audio_sampling_rate = audio_sampling_rate
         pipe.audio_hop_length = 1
         pipe.audio_vae_temporal_compression_ratio = 1
         pipe.audio_vae_mel_compression_ratio = 1
