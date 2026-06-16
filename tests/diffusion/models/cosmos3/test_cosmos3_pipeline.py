@@ -282,6 +282,10 @@ def stub_real_pipeline_init(monkeypatch: pytest.MonkeyPatch):
         def from_pretrained(cls, *args, **kwargs):
             return cls()
 
+        @classmethod
+        def from_config(cls, config, **kwargs):
+            return cls()
+
     class _StubVideoProcessor:
         def __init__(self, *args, **kwargs) -> None:
             pass
