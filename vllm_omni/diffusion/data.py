@@ -33,6 +33,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class DiffusionStepWarmupSpec:
+    """Model-declared warmup-request shape for step-execution mode.
+
+    Step execution can support only a subset of a pipeline's general
+    capabilities (e.g. Cosmos3 supports text-to-image only today), and the
+    engine's generic warmup cannot infer that subset. A step-capable pipeline
+    therefore declares — via its registered ``step_warmup_func`` — the modality
+    and conditioning inputs its step path accepts, so the engine builds a
+    warmup request the step path will actually admit. Extending step support to
+    new modalities (T2V/I2V/...) then becomes a localized model-side change
+    (return a spec with ``modalities=["video"]``, the right ``num_frames``, and
+    ``include_image_input`` for I2V) with no engine edits.
+    """
+
+    modalities: tuple[str, ...] = ("image",)
+    num_frames: int = 1
+    include_image_input: bool = False
+    include_audio_input: bool = False
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:

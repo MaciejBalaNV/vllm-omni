@@ -448,6 +448,25 @@ class TestDiffusionEngine:
 
         assert engine.scheduler.get_request_state(request_id).req.sampling_params.width == 1024
 
+    def test_step_warmup_spec_resolves_only_under_step_execution(self) -> None:
+        from vllm_omni.diffusion.data import DiffusionStepWarmupSpec
+
+        spec = DiffusionStepWarmupSpec(modalities=("image",), num_frames=1)
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.step_warmup_func = lambda: spec
+
+        # No step execution -> generic warmup path (None), even with a func set.
+        engine.step_execution = False
+        assert engine._step_warmup_spec() is None
+
+        # Step execution + registered func -> model-declared spec.
+        engine.step_execution = True
+        assert engine._step_warmup_spec() is spec
+
+        # Step execution without a registered func -> generic warmup path.
+        engine.step_warmup_func = None
+        assert engine._step_warmup_spec() is None
+
     def test_initializes_injected_scheduler(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -558,6 +558,14 @@ _DIFFUSION_PRE_ADMISSION_HOOKS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_admission_hook",
 }
 
+_DIFFUSION_STEP_WARMUP_FUNCS = {
+    # arch: step_warmup_func
+    # Returns a DiffusionStepWarmupSpec describing the modality/conditioning a
+    # pipeline's step-execution path accepts, so the engine's warmup builds a
+    # request the step path will admit.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_step_warmup_func",
+}
+
 
 def register_diffusion_model(
     model_arch: str,
@@ -568,6 +576,7 @@ def register_diffusion_model(
     action_post_process_func_name: str | None = None,
     ir_op_priority_func_name: str | None = None,
     pre_admission_hook_name: str | None = None,
+    step_warmup_func_name: str | None = None,
 ) -> None:
     """Register a diffusion model pipeline from an out-of-tree plugin.
 
@@ -595,6 +604,9 @@ def register_diffusion_model(
         pre_admission_hook_name: Optional name of the request hook located in
             *module_name*. The hook runs immediately before scheduler
             admission, after regular preprocessing.
+        step_warmup_func_name: Optional name of the step-warmup spec function
+            located in *module_name*. Used by the engine warmup to build a
+            step-execution request the model's step path accepts.
     """
     # Register model class in DiffusionModelRegistry
     DiffusionModelRegistry.register_model(
@@ -618,6 +630,8 @@ def register_diffusion_model(
         _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
     if pre_admission_hook_name is not None:
         _DIFFUSION_PRE_ADMISSION_HOOKS[model_arch] = pre_admission_hook_name
+    if step_warmup_func_name is not None:
+        _DIFFUSION_STEP_WARMUP_FUNCS[model_arch] = step_warmup_func_name
 
     logger.info(
         "Registered diffusion model %s -> %s.%s",
@@ -673,4 +687,11 @@ def get_diffusion_pre_admission_hook(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_PRE_ADMISSION_HOOKS:
         return None
     func_name = _DIFFUSION_PRE_ADMISSION_HOOKS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_step_warmup_func(od_config: OmniDiffusionConfig):
+    if od_config.model_class_name not in _DIFFUSION_STEP_WARMUP_FUNCS:
+        return None
+    func_name = _DIFFUSION_STEP_WARMUP_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)

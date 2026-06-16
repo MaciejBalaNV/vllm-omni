@@ -35,7 +35,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionStepWarmupSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -498,6 +498,27 @@ def get_cosmos3_pre_admission_hook(od_config: OmniDiffusionConfig):
         return request
 
     return pre_admission_hook
+
+
+def get_cosmos3_step_warmup_func(od_config: OmniDiffusionConfig):
+    """Describe the warmup request Cosmos3's step-execution path accepts.
+
+    Step execution currently supports text-to-image only, so the engine warms
+    up with a single-frame, conditioning-free, image-modality request. When
+    T2V/I2V step support lands, return the appropriate modality, ``num_frames``,
+    and ``include_image_input`` here — no engine changes required.
+    """
+    del od_config
+
+    def step_warmup_func() -> DiffusionStepWarmupSpec:
+        return DiffusionStepWarmupSpec(
+            modalities=("image",),
+            num_frames=1,
+            include_image_input=False,
+            include_audio_input=False,
+        )
+
+    return step_warmup_func
 
 
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):

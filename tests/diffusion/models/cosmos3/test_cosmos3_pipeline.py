@@ -270,6 +270,7 @@ def test_pipeline_registered_and_exported() -> None:
         _DIFFUSION_POST_PROCESS_FUNCS,
         _DIFFUSION_PRE_ADMISSION_HOOKS,
         _DIFFUSION_PRE_PROCESS_FUNCS,
+        _DIFFUSION_STEP_WARMUP_FUNCS,
     )
 
     assert issubclass(Cosmos3OmniDiffusersPipeline, nn.Module)
@@ -282,6 +283,7 @@ def test_pipeline_registered_and_exported() -> None:
     )
     assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_process_func"
     assert _DIFFUSION_PRE_ADMISSION_HOOKS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_admission_hook"
+    assert _DIFFUSION_STEP_WARMUP_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_step_warmup_func"
     assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_post_process_func"
     assert (
         _DIFFUSION_ACTION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_action_post_process_func"
@@ -462,6 +464,19 @@ def test_pre_admission_hook_rejects_non_t2i_cosmos3_step_requests() -> None:
 
     with pytest.raises(ValueError, match="text-to-image"):
         hook(request)
+
+
+def test_step_warmup_func_returns_t2i_spec() -> None:
+    from vllm_omni.diffusion.data import DiffusionStepWarmupSpec
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_step_warmup_func
+
+    spec = get_cosmos3_step_warmup_func(SimpleNamespace())()
+
+    assert isinstance(spec, DiffusionStepWarmupSpec)
+    assert spec.modalities == ("image",)
+    assert spec.num_frames == 1
+    assert spec.include_image_input is False
+    assert spec.include_audio_input is False
 
 
 def test_preprocess_i2v_image_and_action_video_inputs() -> None:

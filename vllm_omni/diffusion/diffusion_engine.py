@@ -22,6 +22,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
+    DiffusionStepWarmupSpec,
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
@@ -44,6 +45,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_post_process_func,
     get_diffusion_pre_admission_hook,
     get_diffusion_pre_process_func,
+    get_diffusion_step_warmup_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
@@ -122,6 +124,7 @@ class DiffusionEngine:
         self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
         self.pre_admission_hook = get_diffusion_pre_admission_hook(od_config)
+        self.step_warmup_func = get_diffusion_step_warmup_func(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
@@ -173,6 +176,15 @@ class DiffusionEngine:
         if hook is None:
             return request
         return hook(request)
+
+    def _step_warmup_spec(self) -> DiffusionStepWarmupSpec | None:
+        """Model-declared warmup shape for step execution, or None for the generic path."""
+        if not self.step_execution:
+            return None
+        func = getattr(self, "step_warmup_func", None)
+        if func is None:
+            return None
+        return func()
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -546,21 +558,36 @@ class DiffusionEngine:
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
 
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
-        if supports_image_input:
+        warmup_spec = self._step_warmup_spec()
+        if warmup_spec is not None:
+            # Step execution may accept only a subset of the pipeline's general
+            # capabilities. The model declares the warmup shape its step path
+            # admits (modality, conditioning inputs, frames) so the warmup
+            # request is valid without baking model assumptions into the engine.
+            if warmup_spec.modalities:
+                prompt["modalities"] = list(warmup_spec.modalities)
+            include_image_input = warmup_spec.include_image_input
+            include_audio_input = warmup_spec.include_audio_input
+            num_frames = warmup_spec.num_frames
+        else:
+            include_image_input = supports_image_input
+            include_audio_input = supports_audio_input
+            num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+            if num_frames <= 0:
+                logger.info("Skipping dummy warmup run (num_frames=0)")
+                return
+
+        if include_image_input:
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
             dummy_image = PIL.Image.new(color_format, (width, height))
             prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
 
-        if supports_audio_input:
+        if include_audio_input:
             audio_sr = 16000
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
-        if num_frames <= 0:
-            logger.info("Skipping dummy warmup run (num_frames=0)")
-            return
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
