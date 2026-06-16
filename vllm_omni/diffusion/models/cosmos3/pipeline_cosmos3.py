@@ -112,6 +112,7 @@ from .utils import (
     normalize_condition_video_keep,
     normalize_robolab_action_space,
     pose_abs_to_rel,
+    positive_float,
     postprocess_robolab_action,
     resize_rgb_uint8,
 )
@@ -148,57 +149,6 @@ COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL: tuple[float, float] = (400.0, 1000.0)
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
-
-
-def _positive_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if hasattr(value, "item") and not isinstance(value, (bytes, str)):
-        value = value.item()
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    if result <= 0:
-        return None
-    return result
-
-
-def _normalize_condition_frame_indexes_vision(value: Any) -> tuple[int, ...]:
-    """Normalize Cosmos3 vision-conditioning latent frame indexes."""
-    if value is None:
-        return COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION
-    if isinstance(value, str):
-        value = [item.strip() for item in value.split(",") if item.strip()]
-    elif isinstance(value, int):
-        value = [value]
-
-    if not isinstance(value, Iterable):
-        raise TypeError(
-            "Cosmos3 condition_frame_indexes_vision must be an int, comma-separated string, "
-            f"or iterable of ints; got {type(value)!r}."
-        )
-
-    indexes = tuple(sorted({int(index) for index in value}))
-    if not indexes:
-        raise ValueError("Cosmos3 condition_frame_indexes_vision must contain at least one index.")
-    if any(index < 0 for index in indexes):
-        raise ValueError(f"Cosmos3 condition_frame_indexes_vision must be non-negative, got {indexes}.")
-    return indexes
-
-
-def _condition_pixel_frame_count(
-    condition_frame_indexes_vision: Iterable[int],
-    temporal_compression: int = COSMOS3_VAE_TEMPORAL_COMPRESSION,
-) -> int:
-    return max(condition_frame_indexes_vision) * int(temporal_compression) + 1
-
-
-def _normalize_condition_video_keep(value: Any) -> str:
-    keep = str(value or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
-    if keep not in {"first", "last"}:
-        raise ValueError("Cosmos3 condition_video_keep must be either 'first' or 'last'.")
-    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +277,7 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
     def _video_payload_fps(video: Any) -> float | None:
         for key in ("fps", "frame_rate", "source_fps", "input_fps", "avg_fps", "average_fps"):
-            fps = _positive_float(_video_payload_value(video, key))
+            fps = positive_float(_video_payload_value(video, key))
             if fps is not None:
                 return fps
         for key in ("metadata", "info"):
@@ -485,16 +435,16 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
                         dtype=torch.float32,
                     )
                 else:
-                    condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
+                    condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
                         extra.get(
                             "condition_frame_indexes_vision",
                             prompt.get("condition_frame_indexes_vision"),
                         )
                     )
-                    keep = _normalize_condition_video_keep(
+                    keep = normalize_condition_video_keep(
                         extra.get("condition_video_keep", prompt.get("condition_video_keep"))
                     )
-                    max_frames = _condition_pixel_frame_count(condition_frame_indexes_vision)
+                    max_frames = condition_pixel_frame_count(condition_frame_indexes_vision)
                     prompt["additional_information"]["preprocessed_video"] = _preprocess_condition_video(
                         raw_video_frames,
                         int(target_h),
@@ -2628,12 +2578,12 @@ class Cosmos3OmniDiffusersPipeline(
         if input_frames is not None:
             input_frames = pad_temporal_frames(input_frames, padded_frames)
 
-        configured_frame_rate = _positive_float(transfer_config.fps)
-        input_frame_rate = _positive_float(transfer_input_fps)
+        configured_frame_rate = positive_float(transfer_config.fps)
+        input_frame_rate = positive_float(transfer_input_fps)
         sampling_frame_rate = (
-            _positive_float(self._get_sp_param(sp, "resolved_frame_rate"))
-            or _positive_float(self._get_sp_param(sp, "frame_rate"))
-            or _positive_float(self._get_sp_param(sp, "fps"))
+            positive_float(self._get_sp_param(sp, "resolved_frame_rate"))
+            or positive_float(self._get_sp_param(sp, "frame_rate"))
+            or positive_float(self._get_sp_param(sp, "fps"))
         )
         is_wsm_only = len(transfer_config.hints) == 1 and "wsm" in transfer_config.hints
         if is_wsm_only:
@@ -2835,7 +2785,7 @@ class Cosmos3OmniDiffusersPipeline(
             image_tensor = additional_info.get("preprocessed_image")
             video_tensor = additional_info.get("preprocessed_video")
             transfer_video_tensor = additional_info.get("preprocessed_transfer_video")
-            transfer_input_fps = _positive_float(additional_info.get("transfer_input_fps"))
+            transfer_input_fps = positive_float(additional_info.get("transfer_input_fps"))
 
         is_t2i = self._is_t2i_request(req)
         sound_enabled = self._is_sound_request(prompt_data, sp)
