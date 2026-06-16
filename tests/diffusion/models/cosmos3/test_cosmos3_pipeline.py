@@ -120,16 +120,40 @@ class StubCosmos3Transformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
+    def _pad_to_patch_size(self, h: int, w: int):
+        return h, w, 0, 0
+
+    def build_text_conditioning_cache(
+        self,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        **kwargs: Any,
+    ):
+        del kwargs
+        token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
+        seq_len = int(text_mask.shape[1])
+        key = torch.full((1, seq_len, 1, 1), float(token), dtype=torch.float32)
+        value = torch.full((1, seq_len, 1, 1), float(token + 100), dtype=torch.float32)
+        freqs = (
+            torch.full((1, 1, 1, 1), float(token + 200), dtype=torch.float32),
+            torch.full((1, 1, 1, 1), float(token + 300), dtype=torch.float32),
+        )
+        return [(key, value)], freqs, text_mask.to(dtype=torch.bool)
+
     def forward(
         self,
         *,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
-        text_ids: torch.Tensor,
+        text_ids: torch.Tensor | None,
         text_mask: torch.Tensor,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
+        if text_ids is None:
+            cached_kv = kwargs.get("cached_kv")
+            token = int(cached_kv[0][0][0, 0, 0, 0].item()) if cached_kv else 0
+        else:
+            token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
         sound_latents = kwargs.get("sound_latents")
         self.calls.append(
             {
@@ -205,8 +229,17 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "num_frames": None,
         "num_inference_steps": None,
         "guidance_scale": None,
+        "guidance_scale_provided": False,
+        "do_classifier_free_guidance": False,
+        "guidance_rescale": 0.0,
+        "cfg_normalize": False,
+        "true_cfg_scale": None,
+        "timesteps": None,
+        "sigmas": None,
+        "step_index": None,
         "generator": None,
         "seed": 123,
+        "generator_device": None,
         "num_outputs_per_prompt": 1,
         "frame_rate": None,
         "resolved_frame_rate": None,
@@ -235,6 +268,7 @@ def test_pipeline_registered_and_exported() -> None:
         _DIFFUSION_IR_OP_PRIORITY_FUNCS,
         _DIFFUSION_MODELS,
         _DIFFUSION_POST_PROCESS_FUNCS,
+        _DIFFUSION_PRE_ADMISSION_HOOKS,
         _DIFFUSION_PRE_PROCESS_FUNCS,
     )
 
@@ -247,6 +281,7 @@ def test_pipeline_registered_and_exported() -> None:
         "Cosmos3OmniDiffusersPipeline",
     )
     assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_process_func"
+    assert _DIFFUSION_PRE_ADMISSION_HOOKS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_pre_admission_hook"
     assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_post_process_func"
     assert (
         _DIFFUSION_ACTION_POST_PROCESS_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_action_post_process_func"
@@ -254,6 +289,7 @@ def test_pipeline_registered_and_exported() -> None:
     assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["Cosmos3OmniDiffusersPipeline"] == "get_cosmos3_ir_op_priority_func"
     assert "Cosmos3OmniDiffusersPipeline" in CUSTOM_DIT_ENABLERS
     assert "Cosmos3OmniDiffusersPipeline" in cosmos3.__all__
+    assert Cosmos3OmniDiffusersPipeline.supports_step_execution is True
 
 
 @pytest.fixture
@@ -318,6 +354,8 @@ def _make_od_config(*, sound_gen: bool) -> SimpleNamespace:
         custom_pipeline_args={},
         model_config={},
         tf_model_config=tf_model_config,
+        step_execution=False,
+        parallel_config=SimpleNamespace(ulysses_degree=1, ring_degree=1),
     )
 
 
@@ -356,6 +394,74 @@ def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
     assert pipeline.transformer.sound_latent_fps == pipeline._sound_tokenizer.latent_fps == 40.0
     assert pipeline.transformer.audio_proj_in.in_features == 5
     assert pipeline.transformer.audio_proj_out.out_features == 5
+
+
+def test_pipeline_init_rejects_step_sequence_parallel(stub_real_pipeline_init) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.step_execution = True
+    od_config.parallel_config = SimpleNamespace(ulysses_degree=2, ring_degree=1)
+
+    with pytest.raises(ValueError, match="Ulysses or Ring"):
+        Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+def test_pre_admission_hook_canonicalizes_cosmos3_t2i_step_key() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_admission_hook
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.base_scheduler import get_sampling_params_key
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    hook = get_cosmos3_pre_admission_hook(SimpleNamespace(step_execution=True))
+
+    implicit = hook(
+        OmniDiffusionRequest(
+            prompts=[{"prompt": "A robot painter", "modalities": ["image"]}],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=None),
+            request_id="implicit",
+        )
+    )
+    explicit = hook(
+        OmniDiffusionRequest(
+            prompts=[{"prompt": "A robot painter", "modalities": ["image"]}],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=1024,
+                width=1024,
+                num_frames=1,
+                num_inference_steps=25,
+                guidance_scale=7.0,
+                guidance_scale_provided=True,
+            ),
+            request_id="explicit",
+        )
+    )
+
+    assert implicit.sampling_params.height == 1024
+    assert implicit.sampling_params.width == 1024
+    assert implicit.sampling_params.num_frames == 1
+    assert implicit.sampling_params.num_inference_steps == 50
+    assert implicit.sampling_params.guidance_scale == 7.0
+    assert implicit.sampling_params.guidance_scale_2 == 7.0
+    assert implicit.sampling_params.guidance_scale_provided is True
+    assert implicit.sampling_params.do_classifier_free_guidance is True
+    assert get_sampling_params_key(implicit) == get_sampling_params_key(explicit)
+
+
+def test_pre_admission_hook_rejects_non_t2i_cosmos3_step_requests() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_admission_hook
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    hook = get_cosmos3_pre_admission_hook(SimpleNamespace(step_execution=True))
+    request = OmniDiffusionRequest(
+        prompts=[{"prompt": "A robot walks", "modalities": ["video"]}],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+        request_id="video",
+    )
+
+    with pytest.raises(ValueError, match="text-to-image"):
+        hook(request)
 
 
 def test_preprocess_i2v_image_and_action_video_inputs() -> None:
@@ -674,6 +780,138 @@ def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -
     # Identical result to the skip path: out-of-interval combine uses scale=1.0,
     # so combine_cfg_noise(cond=2, uncond=1, 1.0) == 2 == the skipped cond value.
     torch.testing.assert_close(result, torch.full_like(latents, 6.0))
+
+
+def test_step_t2i_batches_prompt_lengths_rows_and_guidance_interval(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline._build_request_scheduler = lambda flow_shift, num_steps: StubScheduler([900, 100], flow_shift=flow_shift)
+
+    def fake_format(prompt, negative_prompt, *args, **kwargs):
+        del args, kwargs
+        if "long" in prompt:
+            cond_ids = torch.full((1, 4), 5, dtype=torch.long)
+            cond_mask = torch.ones(1, 4, dtype=torch.long)
+            uncond_ids = torch.full((1, 3), 1, dtype=torch.long)
+            uncond_mask = torch.ones(1, 3, dtype=torch.long)
+        else:
+            cond_ids = torch.full((1, 2), 2, dtype=torch.long)
+            cond_mask = torch.ones(1, 2, dtype=torch.long)
+            uncond_ids = torch.full((1, 1), 1, dtype=torch.long)
+            uncond_mask = torch.ones(1, 1, dtype=torch.long)
+        assert negative_prompt == ""
+        return cond_ids, cond_mask, uncond_ids, uncond_mask
+
+    pipeline._format_and_tokenize_prompts = fake_format
+    pipeline._prepare_latents = lambda height, width, num_frames, generator, batch_size=1: torch.zeros(
+        batch_size, 2, 1, 1, 1
+    )
+
+    short = DiffusionRequestState(
+        request_id="short",
+        sampling=make_sampling_params(
+            num_inference_steps=2,
+            guidance_scale=3.0,
+            guidance_scale_provided=True,
+            num_outputs_per_prompt=2,
+            extra_args={"guidance_interval": (500.0, 1000.0)},
+        ),
+        prompts=[{"prompt": "short prompt", "modalities": ["image"]}],
+    )
+    long = DiffusionRequestState(
+        request_id="long",
+        sampling=make_sampling_params(
+            num_inference_steps=2,
+            guidance_scale=3.0,
+            guidance_scale_provided=True,
+            extra_args={"guidance_interval": (500.0, 1000.0)},
+        ),
+        prompts=[{"prompt": "long prompt", "modalities": ["image"]}],
+    )
+
+    pipeline.prepare_encode(short)
+    pipeline.prepare_encode(long)
+    long.step_index = 1
+
+    batch = InputBatch.make_batch([short, long])
+    pred = pipeline.denoise_step(batch)
+
+    assert tuple(pred.shape) == (3, 2, 1, 1, 1)
+    # short rows: uncond=1, cond=2, scale=3 at t=900 -> 4.
+    torch.testing.assert_close(pred[:2], torch.full((2, 2, 1, 1, 1), 4.0))
+    # long row: t=100 is outside the interval -> effective scale 1, so cond=5.
+    torch.testing.assert_close(pred[2:], torch.full((1, 2, 1, 1, 1), 5.0))
+
+    cond_call, uncond_call = pipeline.transformer.calls[-2:]
+    assert cond_call["kwargs"]["und_key_mask"].tolist() == [
+        [True, True, False, False],
+        [True, True, False, False],
+        [True, True, True, True],
+    ]
+    assert cond_call["kwargs"]["attn_key_mask"].tolist() == [
+        [True, True, False, False, True],
+        [True, True, False, False, True],
+        [True, True, True, True, True],
+    ]
+    assert uncond_call["kwargs"]["und_key_mask"].tolist() == [
+        [True, False, False],
+        [True, False, False],
+        [True, True, True],
+    ]
+    assert uncond_call["kwargs"]["attn_key_mask"].tolist() == [
+        [True, False, False, True],
+        [True, False, False, True],
+        [True, True, True, True],
+    ]
+
+    first_cache = pipeline._get_step_static_cache([short, long])
+    second_cache = pipeline._get_step_static_cache([short, long])
+    assert first_cache is second_cache
+    rebuilt = pipeline._get_step_static_cache([long])
+    assert rebuilt is not first_cache
+
+
+def test_step_t2i_skips_uncond_when_cfg_is_neutral(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline._build_request_scheduler = lambda flow_shift, num_steps: StubScheduler([900], flow_shift=flow_shift)
+
+    def fake_format(prompt, negative_prompt, *args, **kwargs):
+        del prompt, negative_prompt, args, kwargs
+        cond_ids = torch.full((1, 2), 4, dtype=torch.long)
+        cond_mask = torch.ones(1, 2, dtype=torch.long)
+        uncond_ids = torch.full((1, 1), 1, dtype=torch.long)
+        uncond_mask = torch.ones(1, 1, dtype=torch.long)
+        return cond_ids, cond_mask, uncond_ids, uncond_mask
+
+    pipeline._format_and_tokenize_prompts = fake_format
+    pipeline._prepare_latents = lambda height, width, num_frames, generator, batch_size=1: torch.zeros(
+        batch_size, 2, 1, 1, 1
+    )
+
+    state = DiffusionRequestState(
+        request_id="no-cfg",
+        sampling=make_sampling_params(
+            num_inference_steps=1,
+            guidance_scale=1.0,
+            guidance_scale_provided=True,
+        ),
+        prompts=[{"prompt": "prompt", "modalities": ["image"]}],
+    )
+
+    pipeline.prepare_encode(state)
+    pred = pipeline.denoise_step(InputBatch.make_batch([state]))
+
+    torch.testing.assert_close(pred, torch.full((1, 2, 1, 1, 1), 4.0))
+    assert len(pipeline.transformer.calls) == 1
+    assert "uncond" not in pipeline._step_static_batch_cache
+    cond_call = pipeline.transformer.calls[0]
+    assert cond_call["kwargs"]["und_key_mask"].tolist() == [[True, True]]
+    assert cond_call["kwargs"]["attn_key_mask"].tolist() == [[True, True, True]]
 
 
 class TestForwardRouting:

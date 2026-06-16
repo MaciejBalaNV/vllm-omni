@@ -5,6 +5,7 @@ from .pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
     get_cosmos3_action_post_process_func,
     get_cosmos3_post_process_func,
+    get_cosmos3_pre_admission_hook,
     get_cosmos3_pre_process_func,
 )
 from .transformer_cosmos3 import Cosmos3VFMTransformer
@@ -13,6 +14,7 @@ __all__ = [
     "Cosmos3OmniDiffusersPipeline",
     "get_cosmos3_action_post_process_func",
     "get_cosmos3_post_process_func",
+    "get_cosmos3_pre_admission_hook",
     "get_cosmos3_pre_process_func",
     "Cosmos3VFMTransformer",
 ]

@@ -102,6 +102,22 @@ vllm serve nvidia/Cosmos3-Nano \
   --init-timeout 1800
 ```
 
+For text-to-image throughput experiments, Cosmos3-Nano also supports the
+step-execution runtime with compatible-request batching:
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --step-execution \
+  --max-num-seqs 4 \
+  --init-timeout 1800
+```
+
+`--step-execution` is engine-wide for Cosmos3. A Cosmos3 step-mode engine
+accepts only T2I requests (`modalities=["image"]`); run a separate server
+without `--step-execution` for T2V, I2V, V2V, sound, or action requests.
+
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
@@ -396,5 +412,8 @@ python -c "from PIL import Image; im=Image.open('cosmos3_t2i.png'); print('image
   `multi_modal_data={"video": [<PIL frames>]}` or a video tensor/array for V2V.
   For video, frames are returned in `outputs[0].request_output.images` as an
   `(B, F, H, W, 3)` array.
+- For homogeneous T2I batching, construct a separate offline engine with
+  `Omni(model="nvidia/Cosmos3-Nano", step_execution=True, max_num_seqs=2)`.
+  That engine accepts only `modalities=["image"]`.
 - The offline entry must be guarded by `if __name__ == "__main__":` — the engine
   spawns workers with the `spawn` start method.

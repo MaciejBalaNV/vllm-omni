@@ -654,12 +654,52 @@ class Cosmos3CrossAttention(nn.Module):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
+        k_und_mask: torch.Tensor | None = None,
+        attn_key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, S_gen = q.shape[:2]
         k_all = torch.cat([k_und, k], dim=1)
         v_all = torch.cat([v_und, v], dim=1)
 
-        out = self.attn(q, k_all, v_all)
+        if attn_key_mask is None and k_und_mask is not None:
+            if k_und_mask.shape != k_und.shape[:2]:
+                raise ValueError(
+                    "Cosmos3 UND key mask must match padded UND K/V batch and sequence dimensions: "
+                    f"mask={tuple(k_und_mask.shape)}, kv={tuple(k_und.shape[:2])}."
+                )
+            gen_mask = torch.ones((B, S_gen), dtype=torch.bool, device=q.device)
+            attn_key_mask = torch.cat([k_und_mask.to(dtype=torch.bool, device=q.device), gen_mask], dim=1)
+
+        if attn_key_mask is None:
+            out = self.attn(q, k_all, v_all)
+        else:
+            if attn_key_mask.shape != (B, k_all.shape[1]):
+                raise ValueError(
+                    "Cosmos3 attention key mask must match combined UND+GEN key dimensions: "
+                    f"mask={tuple(attn_key_mask.shape)}, keys={(B, k_all.shape[1])}."
+                )
+            if attn_key_mask.dtype != torch.bool or attn_key_mask.device != q.device:
+                attn_key_mask = attn_key_mask.to(dtype=torch.bool, device=q.device)
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k_all.transpose(1, 2)
+            v_sdpa = v_all.transpose(1, 2)
+            if k_sdpa.shape[1] != q_sdpa.shape[1]:
+                if q_sdpa.shape[1] % k_sdpa.shape[1] != 0:
+                    raise ValueError(
+                        "Cosmos3 local masked attention requires query heads to be a multiple of KV heads: "
+                        f"q_heads={q_sdpa.shape[1]}, kv_heads={k_sdpa.shape[1]}."
+                    )
+                repeats = q_sdpa.shape[1] // k_sdpa.shape[1]
+                k_sdpa = k_sdpa.repeat_interleave(repeats, dim=1)
+                v_sdpa = v_sdpa.repeat_interleave(repeats, dim=1)
+            out = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=attn_key_mask[:, None, None, :],
+                dropout_p=0.0,
+            )
+            out = out.transpose(1, 2)
         return out.reshape(B, S_gen, -1)
 
     # -- SP path: framework Attention with joint_key/value -------------------
@@ -671,7 +711,11 @@ class Cosmos3CrossAttention(nn.Module):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
+        k_und_mask: torch.Tensor | None = None,
+        attn_key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if k_und_mask is not None or attn_key_mask is not None:
+            raise ValueError("Cosmos3 masked UND K/V batching is not supported with sequence parallelism yet.")
         B, S_gen = q.shape[:2]
 
         # Zero-length joint_query satisfies the Ulysses contract
@@ -698,6 +742,8 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        k_und_mask: torch.Tensor | None = None,
+        attn_key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -721,9 +767,9 @@ class Cosmos3CrossAttention(nn.Module):
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         if _is_sp_active():
-            out = self._forward_sp(q, k, v, k_und, v_und)
+            out = self._forward_sp(q, k, v, k_und, v_und, k_und_mask, attn_key_mask)
         else:
-            out = self._forward_local(q, k, v, k_und, v_und)
+            out = self._forward_local(q, k, v, k_und, v_und, k_und_mask, attn_key_mask)
 
         return self.to_out(out)
 
@@ -831,6 +877,8 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_sin: torch.Tensor | None = None,
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        k_und_mask: torch.Tensor | None = None,
+        attn_key_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -845,7 +893,13 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und=k_und, v_und=v_und, freqs_cos=freqs_cos, freqs_sin=freqs_sin
+            hidden_states,
+            k_und=k_und,
+            v_und=v_und,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            k_und_mask=k_und_mask,
+            attn_key_mask=attn_key_mask,
         )
         hidden_states = residual + hidden_states
 
@@ -1299,6 +1353,53 @@ class Cosmos3VFMTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
+    def build_text_conditioning_cache(
+        self,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        *,
+        video_shape: tuple[int, int, int],
+        fps: float | None,
+        device: torch.device,
+        dtype: torch.dtype,
+        t_action: int | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        t_sound: int | None = None,
+        return_key_mask: bool = False,
+    ) -> tuple[
+        list[tuple[torch.Tensor, torch.Tensor]],
+        tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor | None,
+    ]:
+        """Build UND K/V and GEN RoPE tensors for one text branch.
+
+        The serial path requests no key mask and keeps the historical
+        max-real-length trim. Step execution requests a key mask so padded
+        per-request caches can be merged without attending to padding.
+        """
+        t, h, w = video_shape
+        hp, wp, _, _ = self._pad_to_patch_size(h, w)
+        text_lengths = text_mask.sum(dim=1)
+        max_real_len = int(text_lengths.max().item())
+        freqs_und, freqs_gen = self._compute_rope_freqs(
+            text_mask,
+            t,
+            hp,
+            wp,
+            fps,
+            device,
+            dtype,
+            t_action=t_action,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            t_sound=t_sound,
+        )
+        cached_kv_full = self.language_model(text_ids, freqs_und)
+        cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+        key_mask = text_mask[:, :max_real_len].to(dtype=torch.bool, device=device) if return_key_mask else None
+        return cached_kv, freqs_gen, key_mask
+
     @staticmethod
     def _validate_gen_sequence_parallel(
         *,
@@ -1341,8 +1442,8 @@ class Cosmos3VFMTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
-        text_ids: torch.Tensor,
-        text_mask: torch.Tensor,
+        text_ids: torch.Tensor | None,
+        text_mask: torch.Tensor | None,
         video_shape: tuple[int, int, int],
         fps: float | None = None,
         action_latents: torch.Tensor | None = None,
@@ -1352,6 +1453,10 @@ class Cosmos3VFMTransformer(nn.Module):
         action_fps: float | None = None,
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        und_key_mask: torch.Tensor | None = None,
+        attn_key_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
@@ -1378,14 +1483,22 @@ class Cosmos3VFMTransformer(nn.Module):
         """
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
-        text_lengths = text_mask.sum(dim=1)
-        min_real_len = int(text_lengths.min().item())
-        max_real_len = int(text_lengths.max().item())
-        if min_real_len != max_real_len:
-            raise ValueError(
-                f"Cosmos3 requires identical real text lengths within a batch "
-                f"(got min={min_real_len}, max={max_real_len})."
-            )
+        explicit_cache = cached_kv is not None or cached_freqs_gen is not None
+        if explicit_cache and (cached_kv is None or cached_freqs_gen is None):
+            raise ValueError("Cosmos3 explicit GEN cache requires both cached_kv and cached_freqs_gen.")
+        if (und_key_mask is not None or attn_key_mask is not None) and _is_sp_active():
+            raise ValueError("Cosmos3 masked UND K/V batching is not supported with sequence parallelism yet.")
+        if not explicit_cache:
+            if text_ids is None or text_mask is None:
+                raise ValueError("Cosmos3 forward requires text_ids/text_mask when no explicit UND cache is supplied.")
+            text_lengths = text_mask.sum(dim=1)
+            min_real_len = int(text_lengths.min().item())
+            max_real_len = int(text_lengths.max().item())
+            if min_real_len != max_real_len:
+                raise ValueError(
+                    f"Cosmos3 requires identical real text lengths within a batch "
+                    f"(got min={min_real_len}, max={max_real_len})."
+                )
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         if has_action and not self.action_gen:
@@ -1474,32 +1587,38 @@ class Cosmos3VFMTransformer(nn.Module):
             hidden_parts.append(hidden_sound)
         hidden_gen = torch.cat(hidden_parts, dim=1)
 
-        # Run UND pathway once and cache K/V (replicated across all ranks)
-        if self.cached_kv is None:
-            freqs_und, freqs_gen = self._compute_rope_freqs(
-                text_mask,
-                t,
-                hp,
-                wp,
-                fps,
-                hidden_states.device,
-                hidden_states.dtype,
-                t_action=s_action,
-                action_start_frame_offset=action_start_frame_offset,
-                action_fps=action_fps,
-                t_sound=s_sound,
-            )
-            cached_kv_full = self.language_model(text_ids, freqs_und)
-            self.cached_freqs_gen = freqs_gen
-
-            # Trim to real text length (remove padding).  K/V stay replicated;
-            # the framework Attention layer head-slices them via joint_key/value.
-            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+        # Run UND pathway once and cache K/V (replicated across all ranks), or
+        # use explicit request-local caches supplied by step execution.
+        if explicit_cache:
+            active_cached_kv = cached_kv
+            active_cached_freqs_gen = cached_freqs_gen
+            active_und_key_mask = und_key_mask
+            active_attn_key_mask = attn_key_mask
+        else:
+            if self.cached_kv is None:
+                assert text_ids is not None and text_mask is not None
+                self.cached_kv, self.cached_freqs_gen, _ = self.build_text_conditioning_cache(
+                    text_ids,
+                    text_mask,
+                    video_shape=video_shape,
+                    fps=fps,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                    t_action=s_action,
+                    action_start_frame_offset=action_start_frame_offset,
+                    action_fps=action_fps,
+                    t_sound=s_sound,
+                    return_key_mask=False,
+                )
+            active_cached_kv = self.cached_kv
+            active_cached_freqs_gen = self.cached_freqs_gen
+            active_und_key_mask = None
+            active_attn_key_mask = None
 
         # Run GEN layers.  UND K/V (replicated) is passed to each layer;
         # the Cosmos3CrossAttention forwards them as joint_key/value so the
         # framework Attention handles the Ulysses head-slicing internally.
-        if self.cached_kv is None or self.cached_freqs_gen is None:
+        if active_cached_kv is None or active_cached_freqs_gen is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
         self._validate_gen_sequence_parallel(
             s_gen=hidden_gen.shape[1],
@@ -1510,28 +1629,55 @@ class Cosmos3VFMTransformer(nn.Module):
             has_sound=has_sound,
             ulysses_size=ulysses_size,
         )
-        freqs_cos, freqs_sin = self.cached_freqs_gen
+        freqs_cos, freqs_sin = active_cached_freqs_gen
         hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
         freqs_gen = (freqs_cos, freqs_sin)
+        if active_attn_key_mask is None and active_und_key_mask is not None:
+            if active_und_key_mask.shape[0] != hidden_gen.shape[0]:
+                raise ValueError(
+                    "Cosmos3 UND key mask batch dimension must match GEN hidden states: "
+                    f"mask={tuple(active_und_key_mask.shape)}, hidden={tuple(hidden_gen.shape)}."
+                )
+            gen_mask = torch.ones(
+                (hidden_gen.shape[0], hidden_gen.shape[1]),
+                dtype=torch.bool,
+                device=hidden_gen.device,
+            )
+            active_attn_key_mask = torch.cat(
+                [active_und_key_mask.to(dtype=torch.bool, device=hidden_gen.device), gen_mask],
+                dim=1,
+            )
+        elif active_attn_key_mask is not None:
+            expected_shape = (hidden_gen.shape[0], active_cached_kv[0][0].shape[1] + hidden_gen.shape[1])
+            if active_attn_key_mask.shape != expected_shape:
+                raise ValueError(
+                    "Cosmos3 attention key mask must match combined UND+GEN key dimensions: "
+                    f"mask={tuple(active_attn_key_mask.shape)}, expected={expected_shape}."
+                )
+            if active_attn_key_mask.dtype != torch.bool or active_attn_key_mask.device != hidden_gen.device:
+                active_attn_key_mask = active_attn_key_mask.to(dtype=torch.bool, device=hidden_gen.device)
 
-        if len(self.gen_layers) == len(self.cached_kv):
-            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+        if len(self.gen_layers) == len(active_cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, active_cached_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
                     k_und=k_und,
                     v_und=v_und,
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
+                    attn_key_mask=active_attn_key_mask,
                 )
                 # Cache-dit's block wrapper may return a tuple; unwrap it.
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
         else:
             # Cache-dit patches gen_layers to a grouped wrapper.
+            if active_und_key_mask is not None or active_attn_key_mask is not None:
+                raise ValueError("Cosmos3 masked UND K/V batching is not supported with cache-dit grouped layers.")
             for layer in self.gen_layers:
                 hidden_gen = layer(
                     hidden_gen,
-                    cached_kv=self.cached_kv,
+                    cached_kv=active_cached_kv,
                     freqs_gen=freqs_gen,
                 )
                 if isinstance(hidden_gen, tuple):

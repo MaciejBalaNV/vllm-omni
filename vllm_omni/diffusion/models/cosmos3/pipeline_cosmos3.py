@@ -22,7 +22,7 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import fields
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -105,6 +105,10 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
 COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
     max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
 )
@@ -135,6 +139,20 @@ COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL: tuple[float, float] = (400.0, 1000.0)
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+
+_STEP_COND_IDS = "cosmos3_cond_ids"
+_STEP_COND_MASK = "cosmos3_cond_mask"
+_STEP_UNCOND_IDS = "cosmos3_uncond_ids"
+_STEP_UNCOND_MASK = "cosmos3_uncond_mask"
+_STEP_COND_KV = "cosmos3_cond_kv"
+_STEP_UNCOND_KV = "cosmos3_uncond_kv"
+_STEP_COND_FREQS_GEN = "cosmos3_cond_freqs_gen"
+_STEP_UNCOND_FREQS_GEN = "cosmos3_uncond_freqs_gen"
+_STEP_SHARED_KWARGS = "cosmos3_shared_kwargs"
+_STEP_GUIDANCE_SCALE = "cosmos3_guidance_scale"
+_STEP_GUIDANCE_INTERVAL = "cosmos3_guidance_interval"
+_STEP_GENERATOR = "cosmos3_generator"
+_STEP_DECODE_IS_T2I = "cosmos3_decode_is_t2i"
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +409,97 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
+def get_cosmos3_pre_admission_hook(od_config: OmniDiffusionConfig):
+    """Validate and canonicalize Cosmos3 step-execution requests before scheduling."""
+
+    def _prompt_param(prompt_data, key: str, default=None):
+        if not isinstance(prompt_data, dict):
+            return default
+        if prompt_data.get(key) is not None:
+            return prompt_data[key]
+        additional = prompt_data.get("additional_information")
+        if isinstance(additional, dict) and additional.get(key) is not None:
+            return additional[key]
+        return default
+
+    def _sp_param(sp, key: str, default=None):
+        extra = getattr(sp, "extra_args", None) or {}
+        if isinstance(extra, dict) and extra.get(key) is not None:
+            return extra[key]
+        value = getattr(sp, key, None)
+        return default if value is None else value
+
+    def _truthy(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def pre_admission_hook(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        if not bool(getattr(od_config, "step_execution", False)):
+            return request
+
+        if len(request.prompts) != 1:
+            raise ValueError("Cosmos3 step execution currently requires exactly one prompt per request.")
+
+        prompt_data = request.prompts[0]
+        if not Cosmos3OmniDiffusersPipeline._is_t2i_request(request):
+            raise ValueError(
+                "Cosmos3 step_execution=True currently supports text-to-image requests only. "
+                "Use a separate step_execution=False engine for video, sound, or action requests."
+            )
+
+        sp = request.sampling_params
+        action_mode = normalize_action_mode(_sp_param(sp, "action_mode", _prompt_param(prompt_data, "action_mode")))
+        sound_requested = any(
+            _truthy(value)
+            for value in (
+                _sp_param(sp, "generate_sound"),
+                _sp_param(sp, "sound_gen"),
+                _prompt_param(prompt_data, "generate_sound"),
+                _prompt_param(prompt_data, "sound_gen"),
+            )
+        )
+        modalities = prompt_data.get("modalities", []) if isinstance(prompt_data, dict) else []
+        if isinstance(modalities, str):
+            modalities = [modalities]
+        if action_mode is not None or sound_requested or "audio" in (modalities or []):
+            raise ValueError(
+                "Cosmos3 step_execution=True accepts only T2I image generation; "
+                "sound and action requests require a separate step_execution=False engine."
+            )
+
+        if isinstance(prompt_data, dict):
+            multi_modal_data = prompt_data.get("multi_modal_data", {}) or {}
+            additional_info = prompt_data.get("additional_information", {}) or {}
+            if (
+                multi_modal_data.get("image") is not None
+                or multi_modal_data.get("video") is not None
+                or additional_info.get("preprocessed_image") is not None
+                or additional_info.get("preprocessed_video") is not None
+            ):
+                raise ValueError(
+                    "Cosmos3 step_execution=True supports text-to-image only; "
+                    "image/video conditioning requires a separate step_execution=False engine."
+                )
+
+        if sp.height is None:
+            sp.height = COSMOS3_T2I_DEFAULT_HEIGHT
+        if sp.width is None:
+            sp.width = COSMOS3_T2I_DEFAULT_WIDTH
+        sp.num_frames = 1
+        if sp.num_inference_steps is None:
+            sp.num_inference_steps = COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS
+        if not getattr(sp, "guidance_scale_provided", False):
+            sp.guidance_scale = COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE
+        sp.guidance_scale_provided = True
+        sp.guidance_scale_2 = sp.guidance_scale
+        sp.do_classifier_free_guidance = bool(sp.guidance_scale and sp.guidance_scale > 1.0)
+        sp.guidance_rescale = getattr(sp, "guidance_rescale", 0.0) or 0.0
+        return request
+
+    return pre_admission_hook
+
+
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     from .guardrails import check_video_safety, is_guardrails_enabled
 
@@ -548,6 +657,7 @@ class Cosmos3OmniDiffusersPipeline(
     """
 
     support_image_input: ClassVar[bool] = True
+    supports_step_execution: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
 
     @classmethod
@@ -592,6 +702,16 @@ class Cosmos3OmniDiffusersPipeline(
                 "(transformer↔encoder swapping) is not supported. "
                 "Use --enable-layerwise-offload instead."
             )
+        parallel_config = getattr(od_config, "parallel_config", None)
+        if bool(getattr(od_config, "step_execution", False)) and parallel_config is not None:
+            ulysses_degree = int(getattr(parallel_config, "ulysses_degree", 1) or 1)
+            ring_degree = int(getattr(parallel_config, "ring_degree", 1) or 1)
+            if ulysses_degree > 1 or ring_degree > 1:
+                raise ValueError(
+                    "Cosmos3 step_execution=True does not support Ulysses or Ring sequence parallelism yet "
+                    f"(ulysses_degree={ulysses_degree}, ring_degree={ring_degree}). "
+                    "Use tensor parallelism without sequence parallelism, or run Cosmos3 with step_execution=False."
+                )
         self.od_config = od_config
         self.device = get_local_device()
         self.dtype = od_config.dtype
@@ -1274,12 +1394,24 @@ class Cosmos3OmniDiffusersPipeline(
         self._cpu_scheduler_state()
         self._current_flow_shift = target
 
+    @staticmethod
+    def _cpu_scheduler_state_for(scheduler) -> None:
+        for name, value in vars(scheduler).items():
+            if isinstance(value, torch.Tensor) and value.device.type != "cpu":
+                setattr(scheduler, name, value.cpu())
+
     def _cpu_scheduler_state(self) -> None:
         # We need to move scheduler tensors to CPU, as unipc from diffusers assumes they are on CPU.
         # However, after the creation they are on GPU due to "with target_device:" in diffusers_loader.py
-        for name, value in vars(self.scheduler).items():
-            if isinstance(value, torch.Tensor) and value.device.type != "cpu":
-                setattr(self.scheduler, name, value.cpu())
+        self._cpu_scheduler_state_for(self.scheduler)
+
+    def _build_request_scheduler(self, flow_shift: float, num_inference_steps: int):
+        scheduler = UniPCMultistepScheduler.from_config(self._base_scheduler_config, flow_shift=float(flow_shift))
+        self._cpu_scheduler_state_for(scheduler)
+        scheduler.set_timesteps(int(num_inference_steps), device=self.device)
+        if hasattr(scheduler, "set_begin_index"):
+            scheduler.set_begin_index(0)
+        return scheduler
 
     @property
     def guidance_scale(self):
@@ -1438,11 +1570,12 @@ class Cosmos3OmniDiffusersPipeline(
         width: int,
         num_frames: int,
         generator: torch.Generator,
+        batch_size: int = 1,
     ) -> torch.Tensor:
         num_channels_latents = self.transformer.latent_channel_size
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         shape = (
-            1,
+            int(batch_size),
             num_channels_latents,
             num_latent_frames,
             height // self.vae_scale_factor_spatial,
@@ -2175,6 +2308,417 @@ class Cosmos3OmniDiffusersPipeline(
         if sound_latents is not None:
             outputs.append(sound_latents)
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    # -- Step execution (T2I only) ------------------------------------------
+
+    @staticmethod
+    def _normalize_guidance_interval(value: Any) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().flatten().tolist()
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"Cosmos3 guidance_interval must be a pair, got {value!r}.")
+        lo, hi = float(value[0]), float(value[1])
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    @staticmethod
+    def _step_prompt_modalities(prompt_data: Any) -> list[str]:
+        modalities = prompt_data.get("modalities", []) if isinstance(prompt_data, dict) else []
+        if modalities is None:
+            return []
+        if isinstance(modalities, str):
+            return [modalities]
+        return list(modalities)
+
+    def _validate_step_request(self, state: DiffusionRequestState) -> None:
+        prompts = state.prompts or []
+        if len(prompts) != 1:
+            raise ValueError("Cosmos3 step execution currently requires exactly one prompt per request.")
+        sampling = state.sampling
+        if sampling.timesteps is not None or sampling.sigmas is not None:
+            raise ValueError("Cosmos3 step execution does not support custom timesteps or sigmas yet.")
+        if int(sampling.num_outputs_per_prompt or 1) < 1:
+            raise ValueError("Cosmos3 num_outputs_per_prompt must be positive.")
+        prompt_data = prompts[0]
+        modalities = self._step_prompt_modalities(prompt_data)
+        if "image" not in modalities:
+            raise ValueError("Cosmos3 step execution currently supports only T2I prompts with modalities=['image'].")
+        if "video" in modalities or "audio" in modalities:
+            raise ValueError(
+                "Cosmos3 step execution accepts only image output; video/audio require step_execution=False."
+            )
+        if self._get_action_mode(prompt_data, sampling) is not None or self._is_sound_request(prompt_data, sampling):
+            raise ValueError("Cosmos3 step execution accepts only T2I; sound/action require step_execution=False.")
+        if isinstance(prompt_data, dict):
+            multi_modal_data = prompt_data.get("multi_modal_data", {}) or {}
+            additional_info = prompt_data.get("additional_information", {}) or {}
+            if (
+                multi_modal_data.get("image") is not None
+                or multi_modal_data.get("video") is not None
+                or additional_info.get("preprocessed_image") is not None
+                or additional_info.get("preprocessed_video") is not None
+            ):
+                raise ValueError("Cosmos3 step execution does not support image/video conditioning.")
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        if parallel_config is not None:
+            ulysses_degree = int(getattr(parallel_config, "ulysses_degree", 1) or 1)
+            ring_degree = int(getattr(parallel_config, "ring_degree", 1) or 1)
+            if ulysses_degree > 1 or ring_degree > 1:
+                raise ValueError("Cosmos3 step execution does not support Ulysses/Ring sequence parallelism yet.")
+
+    def prepare_encode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionRequestState:
+        del kwargs
+        self._validate_step_request(state)
+        sampling = state.sampling
+        prompt_data = state.prompts[0]
+        if isinstance(prompt_data, str):
+            prompt = prompt_data
+            negative_prompt = ""
+        else:
+            prompt = prompt_data.get("prompt", "")
+            negative_prompt = prompt_data.get("negative_prompt") or ""
+
+        height = int(sampling.height or COSMOS3_T2I_DEFAULT_HEIGHT)
+        width = int(sampling.width or COSMOS3_T2I_DEFAULT_WIDTH)
+        num_frames = 1
+        num_inference_steps = int(sampling.num_inference_steps or COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS)
+        guidance_scale = float(
+            sampling.guidance_scale
+            if getattr(sampling, "guidance_scale_provided", False)
+            else COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE
+        )
+        flow_shift_target = float(self._get_sp_param(sampling, "flow_shift", COSMOS3_T2I_DEFAULT_FLOW_SHIFT))
+        guidance_interval = self._normalize_guidance_interval(
+            self._get_sp_param(sampling, "guidance_interval", COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL)
+        )
+        frame_rate = float(
+            self._get_sp_param(sampling, "resolved_frame_rate") or self._get_sp_param(sampling, "frame_rate") or 24.0
+        )
+        max_sequence_length = int(
+            self._get_sp_param(sampling, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sampling, "use_system_prompt", False))
+        batch_size = int(sampling.num_outputs_per_prompt or 1)
+
+        sampling.height = height
+        sampling.width = width
+        sampling.num_frames = 1
+        sampling.num_inference_steps = num_inference_steps
+        sampling.guidance_scale = guidance_scale
+        sampling.guidance_scale_provided = True
+        sampling.guidance_scale_2 = guidance_scale
+        sampling.do_classifier_free_guidance = guidance_scale > 1.0
+
+        generator = sampling.generator
+        if generator is None:
+            seed = sampling.seed if sampling.seed is not None else 42
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            sampling.generator = generator
+
+        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+            prompt,
+            negative_prompt,
+            num_frames,
+            frame_rate,
+            height,
+            width,
+            max_sequence_length,
+            sampling,
+            use_system_prompt,
+            is_t2i=True,
+        )
+
+        latents = self._prepare_latents(height, width, num_frames, generator, batch_size=batch_size)
+        video_shape = (int(latents.shape[2]), int(latents.shape[3]), int(latents.shape[4]))
+        scheduler = self._build_request_scheduler(flow_shift_target, num_inference_steps)
+        shared_kwargs = {"video_shape": video_shape, "fps": frame_rate}
+
+        cond_kv, cond_freqs_gen, cond_key_mask = self.transformer.build_text_conditioning_cache(
+            cond_ids,
+            cond_mask,
+            video_shape=video_shape,
+            fps=frame_rate,
+            device=self.device,
+            dtype=latents.dtype,
+            return_key_mask=True,
+        )
+        uncond_kv, uncond_freqs_gen, uncond_key_mask = self.transformer.build_text_conditioning_cache(
+            uncond_ids,
+            uncond_mask,
+            video_shape=video_shape,
+            fps=frame_rate,
+            device=self.device,
+            dtype=latents.dtype,
+            return_key_mask=True,
+        )
+
+        state.latents = latents
+        state.timesteps = scheduler.timesteps
+        state.step_index = 0
+        state.scheduler = scheduler
+        state.do_true_cfg = guidance_scale > 1.0
+        state.extra = {
+            _STEP_COND_IDS: cond_ids,
+            _STEP_COND_MASK: cond_key_mask,
+            _STEP_UNCOND_IDS: uncond_ids,
+            _STEP_UNCOND_MASK: uncond_key_mask,
+            _STEP_COND_KV: cond_kv,
+            _STEP_UNCOND_KV: uncond_kv,
+            _STEP_COND_FREQS_GEN: cond_freqs_gen,
+            _STEP_UNCOND_FREQS_GEN: uncond_freqs_gen,
+            _STEP_SHARED_KWARGS: shared_kwargs,
+            _STEP_GUIDANCE_SCALE: guidance_scale,
+            _STEP_GUIDANCE_INTERVAL: guidance_interval,
+            _STEP_GENERATOR: generator,
+            _STEP_DECODE_IS_T2I: True,
+        }
+        return state
+
+    @staticmethod
+    def _expand_rows(value: torch.Tensor, row_count: int) -> torch.Tensor:
+        if value.shape[0] == row_count:
+            return value
+        if value.shape[0] != 1:
+            raise ValueError(f"Cannot expand Cosmos3 cached tensor with batch {value.shape[0]} to {row_count}.")
+        return value.expand(row_count, *value.shape[1:])
+
+    @classmethod
+    def _pad_cached_rows(cls, rows: list[torch.Tensor], target_seq_len: int) -> torch.Tensor:
+        padded = []
+        for row in rows:
+            if row.shape[1] == target_seq_len:
+                padded.append(row)
+                continue
+            out = row.new_zeros((row.shape[0], target_seq_len, *row.shape[2:]))
+            out[:, : row.shape[1]] = row
+            padded.append(out)
+        return torch.cat(padded, dim=0)
+
+    @classmethod
+    def _pad_mask_rows(cls, rows: list[torch.Tensor], target_seq_len: int) -> torch.Tensor:
+        padded = []
+        for row in rows:
+            row = row.to(dtype=torch.bool)
+            if row.shape[1] == target_seq_len:
+                padded.append(row)
+                continue
+            out = torch.zeros((row.shape[0], target_seq_len), dtype=torch.bool, device=row.device)
+            out[:, : row.shape[1]] = row
+            padded.append(out)
+        return torch.cat(padded, dim=0)
+
+    def _merge_branch_static_cache(
+        self,
+        states: list[DiffusionRequestState],
+        *,
+        kv_key: str,
+        mask_key: str,
+        freqs_key: str,
+    ) -> dict[str, Any]:
+        first_kv = states[0].extra[kv_key]
+        num_layers = len(first_kv)
+        masks: list[torch.Tensor] = []
+        freqs_cos: list[torch.Tensor] = []
+        freqs_sin: list[torch.Tensor] = []
+        kv_rows: list[list[tuple[torch.Tensor, torch.Tensor]]] = [[] for _ in range(num_layers)]
+
+        for state in states:
+            if state.latents is None:
+                raise ValueError(f"Cosmos3 request {state.request_id} has no latents.")
+            row_count = int(state.latents.shape[0])
+            mask = state.extra[mask_key]
+            masks.append(self._expand_rows(mask, row_count))
+            cos, sin = state.extra[freqs_key]
+            freqs_cos.append(self._expand_rows(cos, row_count))
+            freqs_sin.append(self._expand_rows(sin, row_count))
+            cached_kv = state.extra[kv_key]
+            if len(cached_kv) != num_layers:
+                raise ValueError("Cosmos3 step batch mixed transformer cache layer counts.")
+            for layer_idx, (key, value) in enumerate(cached_kv):
+                kv_rows[layer_idx].append((self._expand_rows(key, row_count), self._expand_rows(value, row_count)))
+
+        target_seq_len = max(int(mask.shape[1]) for mask in masks)
+        merged_kv = []
+        for layer_rows in kv_rows:
+            merged_kv.append(
+                (
+                    self._pad_cached_rows([key for key, _ in layer_rows], target_seq_len),
+                    self._pad_cached_rows([value for _, value in layer_rows], target_seq_len),
+                )
+            )
+        return {
+            "cached_kv": merged_kv,
+            "mask": self._pad_mask_rows(masks, target_seq_len),
+            "freqs_gen": (torch.cat(freqs_cos, dim=0), torch.cat(freqs_sin, dim=0)),
+        }
+
+    def _get_step_static_cache(
+        self,
+        states: list[DiffusionRequestState],
+        *,
+        include_uncond: bool = True,
+    ) -> dict[str, Any]:
+        signature = tuple((state.request_id, int(state.latents.shape[0])) for state in states)
+        cached = getattr(self, "_step_static_batch_cache", None)
+        if isinstance(cached, dict) and cached.get("signature") == signature:
+            if include_uncond and "uncond" not in cached:
+                cached["uncond"] = self._merge_branch_static_cache(
+                    states,
+                    kv_key=_STEP_UNCOND_KV,
+                    mask_key=_STEP_UNCOND_MASK,
+                    freqs_key=_STEP_UNCOND_FREQS_GEN,
+                )
+            return cached
+
+        rebuilt = {
+            "signature": signature,
+            "cond": self._merge_branch_static_cache(
+                states,
+                kv_key=_STEP_COND_KV,
+                mask_key=_STEP_COND_MASK,
+                freqs_key=_STEP_COND_FREQS_GEN,
+            ),
+        }
+        if include_uncond:
+            rebuilt["uncond"] = self._merge_branch_static_cache(
+                states,
+                kv_key=_STEP_UNCOND_KV,
+                mask_key=_STEP_UNCOND_MASK,
+                freqs_key=_STEP_UNCOND_FREQS_GEN,
+            )
+        self._step_static_batch_cache = rebuilt
+        return rebuilt
+
+    @staticmethod
+    def _ensure_shared_step_kwargs(states: list[DiffusionRequestState]) -> dict[str, Any]:
+        first = dict(states[0].extra[_STEP_SHARED_KWARGS])
+        for state in states[1:]:
+            current = state.extra[_STEP_SHARED_KWARGS]
+            if current != first:
+                raise ValueError("Cosmos3 step batch mixed incompatible latent/video shape metadata.")
+        return first
+
+    def _ensure_branch_attn_key_mask(
+        self,
+        branch: dict[str, Any],
+        shared_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        video_shape = shared_kwargs["video_shape"]
+        t, h, w = (int(video_shape[0]), int(video_shape[1]), int(video_shape[2]))
+        hp, wp, _, _ = self.transformer._pad_to_patch_size(h, w)
+        s_gen = t * hp * wp
+        mask = branch["mask"]
+        signature = (int(mask.shape[0]), int(mask.shape[1]), int(s_gen), mask.device)
+        if branch.get("attn_key_mask_signature") != signature:
+            gen_mask = torch.ones((mask.shape[0], s_gen), dtype=torch.bool, device=mask.device)
+            branch["attn_key_mask"] = torch.cat([mask.to(dtype=torch.bool), gen_mask], dim=1)
+            branch["attn_key_mask_signature"] = signature
+        return branch["attn_key_mask"]
+
+    @staticmethod
+    def _guidance_scales_for_rows(
+        states: list[DiffusionRequestState],
+        *,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        scales: list[torch.Tensor] = []
+        for state in states:
+            if state.latents is None:
+                raise ValueError(f"Cosmos3 request {state.request_id} has no latents.")
+            timestep = state.current_timestep
+            if timestep is None:
+                raise ValueError(f"Cosmos3 request {state.request_id} has no current timestep.")
+            t_scalar = float(timestep.item()) if torch.is_tensor(timestep) else float(timestep)
+            interval = state.extra.get(_STEP_GUIDANCE_INTERVAL)
+            active = interval is None or (float(interval[0]) <= t_scalar <= float(interval[1]))
+            guidance_scale = float(state.extra.get(_STEP_GUIDANCE_SCALE, 1.0))
+            scale = guidance_scale if state.do_true_cfg and guidance_scale > 1.0 and active else 1.0
+            scales.append(torch.full((int(state.latents.shape[0]),), scale, dtype=latents.dtype, device=latents.device))
+        shape = (-1,) + (1,) * (latents.ndim - 1)
+        return torch.cat(scales, dim=0).reshape(shape)
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        del kwargs
+        if getattr(self, "interrupt", False):
+            return None
+        states = list(input_batch.states)
+        if not states:
+            raise ValueError("Cosmos3 denoise_step received an empty batch.")
+        shared_kwargs = self._ensure_shared_step_kwargs(states)
+        scales = self._guidance_scales_for_rows(states, latents=input_batch.latents)
+        needs_cfg = bool(torch.any(scales != 1.0).item())
+        static_cache = self._get_step_static_cache(states, include_uncond=needs_cfg)
+
+        cond = static_cache["cond"]
+        cond_attn_key_mask = self._ensure_branch_attn_key_mask(cond, shared_kwargs)
+        noise_cond = self.transformer(
+            hidden_states=input_batch.latents,
+            timestep=input_batch.timesteps,
+            text_ids=None,
+            text_mask=cond["mask"],
+            cached_kv=cond["cached_kv"],
+            cached_freqs_gen=cond["freqs_gen"],
+            und_key_mask=cond["mask"],
+            attn_key_mask=cond_attn_key_mask,
+            **shared_kwargs,
+        )
+        if not needs_cfg:
+            return noise_cond
+
+        uncond = static_cache["uncond"]
+        uncond_attn_key_mask = self._ensure_branch_attn_key_mask(uncond, shared_kwargs)
+        noise_uncond = self.transformer(
+            hidden_states=input_batch.latents,
+            timestep=input_batch.timesteps,
+            text_ids=None,
+            text_mask=uncond["mask"],
+            cached_kv=uncond["cached_kv"],
+            cached_freqs_gen=uncond["freqs_gen"],
+            und_key_mask=uncond["mask"],
+            attn_key_mask=uncond_attn_key_mask,
+            **shared_kwargs,
+        )
+        return noise_uncond + scales * (noise_cond - noise_uncond)
+
+    def step_scheduler(
+        self,
+        state: DiffusionRequestState,
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        if getattr(self, "interrupt", False):
+            return
+        latent_dtype = state.latents.dtype
+        state.latents = state.scheduler.step(
+            noise_pred,
+            state.current_timestep,
+            state.latents,
+            return_dict=False,
+        )[0].to(dtype=latent_dtype)
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: DiffusionRequestState,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        output_type = kwargs.get("output_type", "pil")
+        latents = state.latents
+        if output_type == "latent":
+            return DiffusionOutput(output={"image": latents})
+        video = self._decode_latents(latents)
+        return DiffusionOutput(output={"image": video})
 
     # -- Forward (main generation entry point) -------------------------------
 

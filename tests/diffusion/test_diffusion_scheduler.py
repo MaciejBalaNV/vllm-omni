@@ -403,6 +403,51 @@ class TestDiffusionEngine:
         assert output is runner_output.result
         engine.execute_fn.assert_called_once()
 
+    def test_sync_path_runs_pre_admission_hook_before_scheduler(self, mocker: MockerFixture) -> None:
+        request = _make_request("sync_hook")
+        runner_output = _make_request_output("sync_hook")
+        scheduler = _StubScheduler(request, runner_output)
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = scheduler
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._closed = False
+        engine.abort_queue = queue.Queue()
+        engine.execute_fn = mocker.Mock(return_value=runner_output)
+
+        def hook(req: OmniDiffusionRequest) -> OmniDiffusionRequest:
+            req.sampling_params.height = 1024
+            return req
+
+        engine.pre_admission_hook = hook
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert output is runner_output.result
+        assert scheduler._request.sampling_params.height == 1024
+
+    def test_async_path_runs_pre_admission_hook_before_scheduler(self) -> None:
+        request = _make_request("async_hook")
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = RequestScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine._cv = threading.Condition(threading.RLock())
+        engine._closed = False
+        engine._out_queue = {}
+        engine.main_loop = SimpleNamespace(create_future=lambda: object())
+
+        def hook(req: OmniDiffusionRequest) -> OmniDiffusionRequest:
+            req.sampling_params.width = 1024
+            return req
+
+        engine.pre_admission_hook = hook
+
+        request_id = engine.add_request(request)
+
+        assert engine.scheduler.get_request_state(request_id).req.sampling_params.width == 1024
+
     def test_initializes_injected_scheduler(
         self,
         monkeypatch: pytest.MonkeyPatch,

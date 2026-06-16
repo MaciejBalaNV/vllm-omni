@@ -42,6 +42,7 @@ from vllm_omni.diffusion.output_formatter import (
 from vllm_omni.diffusion.registry import (
     get_diffusion_action_post_process_func,
     get_diffusion_post_process_func,
+    get_diffusion_pre_admission_hook,
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
@@ -120,6 +121,7 @@ class DiffusionEngine:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.action_post_process_func = get_diffusion_action_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        self.pre_admission_hook = get_diffusion_pre_admission_hook(od_config)
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
@@ -165,6 +167,12 @@ class DiffusionEngine:
             logger.error(f"Dummy run failed: {e}")
             self.close()
             raise e
+
+    def _run_pre_admission_hook(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        hook = getattr(self, "pre_admission_hook", None)
+        if hook is None:
+            return request
+        return hook(request)
 
     async def _check_and_start_background_loop(self):
         if self._closed:
@@ -434,6 +442,7 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
+            request = self._run_pre_admission_hook(request)
             fut = self.main_loop.create_future()
             request_id = self.scheduler.add_request(request)
             self._out_queue[request_id] = fut
@@ -462,6 +471,7 @@ class DiffusionEngine:
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
+            request = self._run_pre_admission_hook(request)
             target_request_id = self.scheduler.add_request(request)
 
             # keep scheduling and executing until the target request is finished

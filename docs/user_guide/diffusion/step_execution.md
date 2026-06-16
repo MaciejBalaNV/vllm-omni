@@ -44,6 +44,7 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 | Pipeline | Example models | Step execution |
 |----------|----------------|----------------|
 | `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
+| `Cosmos3OmniDiffusersPipeline` | `nvidia/Cosmos3-Nano` | Yes, T2I only |
 | All other diffusion pipelines | `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, `QwenImageLayeredPipeline`, GLM-Image, Wan, Flux, etc. | No |
 
 !!! warning "Experimental continuous batching"
@@ -57,6 +58,9 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 
 - Continuous batching under `step_execution` is experimental and only batches
   compatible requests.
+- `step_execution` is engine-wide. For Cosmos3, a step-mode engine accepts only
+  text-to-image requests (`modalities=["image"]`). Use a separate
+  `step_execution=False` engine for T2V, I2V, V2V, sound, or action requests.
 - `cache_backend` is not supported together with step execution.
 - Unsupported pipelines fail early during model loading.
 - Request-mode extras such as KV transfer are not wired into step mode yet.
@@ -70,7 +74,7 @@ Use step execution only when you specifically need the pipeline to run through
 its stepwise request state machine. For normal diffusion inference, leave it
 disabled unless your workflow depends on this mode.
 
-For Qwen-Image online serving, the usual progression is:
+For Qwen-Image and Cosmos3 T2I online serving, the usual progression is:
 
 - start with `--step-execution --max-num-seqs 1` if you only need the step-wise path
 - increase `--max-num-seqs` after that if you want the experimental compatible-request batching behavior
