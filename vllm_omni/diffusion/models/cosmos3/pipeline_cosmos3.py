@@ -3127,14 +3127,19 @@ class Cosmos3OmniDiffusersPipeline(
         video = self._decode_latents(latents)
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
-            logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
+            if not sound_enabled:
+                logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
 
         if sound_enabled:
             if sound_latents is None or target_audio_samples is None or sound_sample_rate is None:
                 raise ValueError("Cosmos3 sound generation finished without sound latents.")
             if _is_rank_zero():
                 logger.info("Decoding sound...")
+            sound_decode_start = time.time()
             audio = self._decode_sound_latents(sound_latents, target_audio_samples)
+            if _is_rank_zero():
+                logger.info("Sound tokenizer decoded in %.2fs", time.time() - sound_decode_start)
+                logger.info("Total pipeline time: %.2fs", time.time() - pipeline_start)
             return DiffusionOutput(output={"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate})
 
         if action_enabled:
