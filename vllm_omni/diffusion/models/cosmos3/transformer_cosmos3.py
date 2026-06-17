@@ -680,26 +680,13 @@ class Cosmos3CrossAttention(nn.Module):
                 )
             if attn_key_mask.dtype != torch.bool or attn_key_mask.device != q.device:
                 attn_key_mask = attn_key_mask.to(dtype=torch.bool, device=q.device)
-            q_sdpa = q.transpose(1, 2)
-            k_sdpa = k_all.transpose(1, 2)
-            v_sdpa = v_all.transpose(1, 2)
-            if k_sdpa.shape[1] != q_sdpa.shape[1]:
-                if q_sdpa.shape[1] % k_sdpa.shape[1] != 0:
-                    raise ValueError(
-                        "Cosmos3 local masked attention requires query heads to be a multiple of KV heads: "
-                        f"q_heads={q_sdpa.shape[1]}, kv_heads={k_sdpa.shape[1]}."
-                    )
-                repeats = q_sdpa.shape[1] // k_sdpa.shape[1]
-                k_sdpa = k_sdpa.repeat_interleave(repeats, dim=1)
-                v_sdpa = v_sdpa.repeat_interleave(repeats, dim=1)
-            out = F.scaled_dot_product_attention(
-                q_sdpa,
-                k_sdpa,
-                v_sdpa,
-                attn_mask=attn_key_mask[:, None, None, :],
-                dropout_p=0.0,
-            )
-            out = out.transpose(1, 2)
+            if self.attn.attn_backend.supports_attention_mask():
+                out = self.attn(q, k_all, v_all, AttentionMetadata(attn_mask=attn_key_mask))
+            else:
+                raise ValueError(
+                    f"Cannot use {self.attn.attn_backend.get_name()} attention backend with mask,"
+                    f"which is necessary for step execution."
+                )
         return out.reshape(B, S_gen, -1)
 
     # -- SP path: framework Attention with joint_key/value -------------------

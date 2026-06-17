@@ -153,6 +153,9 @@ _STEP_GUIDANCE_SCALE = "cosmos3_guidance_scale"
 _STEP_GUIDANCE_INTERVAL = "cosmos3_guidance_interval"
 _STEP_GENERATOR = "cosmos3_generator"
 _STEP_DECODE_IS_T2I = "cosmos3_decode_is_t2i"
+# CPU copy of the per-request timestep schedule. Used to decide guidance-interval
+# activation on the host so denoise_step needs no per-step device sync.
+_STEP_TIMESTEPS_CPU = "cosmos3_timesteps_cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -2479,6 +2482,12 @@ class Cosmos3OmniDiffusersPipeline(
             return_key_mask=True,
         )
 
+        sched_timesteps = scheduler.timesteps
+        if torch.is_tensor(sched_timesteps):
+            timesteps_cpu = tuple(float(t) for t in sched_timesteps.detach().cpu().tolist())
+        else:
+            timesteps_cpu = tuple(float(t) for t in sched_timesteps)
+
         state.latents = latents
         state.timesteps = scheduler.timesteps
         state.step_index = 0
@@ -2498,6 +2507,7 @@ class Cosmos3OmniDiffusersPipeline(
             _STEP_GUIDANCE_INTERVAL: guidance_interval,
             _STEP_GENERATOR: generator,
             _STEP_DECODE_IS_T2I: True,
+            _STEP_TIMESTEPS_CPU: timesteps_cpu,
         }
         return state
 
@@ -2564,7 +2574,9 @@ class Cosmos3OmniDiffusersPipeline(
             for layer_idx, (key, value) in enumerate(cached_kv):
                 kv_rows[layer_idx].append((self._expand_rows(key, row_count), self._expand_rows(value, row_count)))
 
-        target_seq_len = max(int(mask.shape[1]) for mask in masks)
+        lengths = [int(mask.shape[1]) for mask in masks]
+        target_seq_len = max(lengths)
+        needs_mask = min(lengths) != target_seq_len
         merged_kv = []
         for layer_rows in kv_rows:
             merged_kv.append(
@@ -2575,7 +2587,7 @@ class Cosmos3OmniDiffusersPipeline(
             )
         return {
             "cached_kv": merged_kv,
-            "mask": self._pad_mask_rows(masks, target_seq_len),
+            "mask": self._pad_mask_rows(masks, target_seq_len) if needs_mask else None,
             "freqs_gen": (torch.cat(freqs_cos, dim=0), torch.cat(freqs_sin, dim=0)),
         }
 
@@ -2629,12 +2641,14 @@ class Cosmos3OmniDiffusersPipeline(
         self,
         branch: dict[str, Any],
         shared_kwargs: dict[str, Any],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
+        mask = branch.get("mask")
+        if mask is None:
+            return None
         video_shape = shared_kwargs["video_shape"]
         t, h, w = (int(video_shape[0]), int(video_shape[1]), int(video_shape[2]))
         hp, wp, _, _ = self.transformer._pad_to_patch_size(h, w)
         s_gen = t * hp * wp
-        mask = branch["mask"]
         signature = (int(mask.shape[0]), int(mask.shape[1]), int(s_gen), mask.device)
         if branch.get("attn_key_mask_signature") != signature:
             gen_mask = torch.ones((mask.shape[0], s_gen), dtype=torch.bool, device=mask.device)
@@ -2647,22 +2661,28 @@ class Cosmos3OmniDiffusersPipeline(
         states: list[DiffusionRequestState],
         *,
         latents: torch.Tensor,
-    ) -> torch.Tensor:
-        scales: list[torch.Tensor] = []
+    ) -> tuple[torch.Tensor, bool]:
+        # Computed entirely on the host (timesteps/interval/guidance are CPU
+        # values cached at prepare_encode) so a denoise step needs no GPU sync;
+        # the per-row scales are shipped to device in a single async copy.
+        row_scales: list[float] = []
         for state in states:
             if state.latents is None:
                 raise ValueError(f"Cosmos3 request {state.request_id} has no latents.")
-            timestep = state.current_timestep
-            if timestep is None:
+            timesteps_cpu = state.extra.get(_STEP_TIMESTEPS_CPU)
+            step_index = int(state.step_index)
+            if not timesteps_cpu or step_index >= len(timesteps_cpu):
                 raise ValueError(f"Cosmos3 request {state.request_id} has no current timestep.")
-            t_scalar = float(timestep.item()) if torch.is_tensor(timestep) else float(timestep)
+            t_scalar = float(timesteps_cpu[step_index])
             interval = state.extra.get(_STEP_GUIDANCE_INTERVAL)
             active = interval is None or (float(interval[0]) <= t_scalar <= float(interval[1]))
             guidance_scale = float(state.extra.get(_STEP_GUIDANCE_SCALE, 1.0))
             scale = guidance_scale if state.do_true_cfg and guidance_scale > 1.0 and active else 1.0
-            scales.append(torch.full((int(state.latents.shape[0]),), scale, dtype=latents.dtype, device=latents.device))
+            row_scales.extend([scale] * int(state.latents.shape[0]))
+        needs_cfg = any(scale != 1.0 for scale in row_scales)
         shape = (-1,) + (1,) * (latents.ndim - 1)
-        return torch.cat(scales, dim=0).reshape(shape)
+        scales = torch.tensor(row_scales, dtype=latents.dtype, device=latents.device).reshape(shape)
+        return scales, needs_cfg
 
     def denoise_step(
         self,
@@ -2676,8 +2696,7 @@ class Cosmos3OmniDiffusersPipeline(
         if not states:
             raise ValueError("Cosmos3 denoise_step received an empty batch.")
         shared_kwargs = self._ensure_shared_step_kwargs(states)
-        scales = self._guidance_scales_for_rows(states, latents=input_batch.latents)
-        needs_cfg = bool(torch.any(scales != 1.0).item())
+        scales, needs_cfg = self._guidance_scales_for_rows(states, latents=input_batch.latents)
         static_cache = self._get_step_static_cache(states, include_uncond=needs_cfg)
 
         cond = static_cache["cond"]

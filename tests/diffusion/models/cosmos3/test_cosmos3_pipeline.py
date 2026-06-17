@@ -159,7 +159,7 @@ class StubCosmos3Transformer(nn.Module):
             {
                 "token": token,
                 "timestep": timestep.clone(),
-                "text_mask": text_mask.clone(),
+                "text_mask": text_mask.clone() if text_mask is not None else None,
                 "cache_before": self.cached_kv,
                 "kwargs": dict(kwargs),
             }
@@ -888,6 +888,58 @@ def test_step_t2i_batches_prompt_lengths_rows_and_guidance_interval(make_cosmos3
     assert rebuilt is not first_cache
 
 
+def test_step_t2i_equal_length_batch_uses_fast_unmasked_attention(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline._build_request_scheduler = lambda flow_shift, num_steps: StubScheduler([900], flow_shift=flow_shift)
+
+    def fake_format(prompt, negative_prompt, *args, **kwargs):
+        del prompt, negative_prompt, args, kwargs
+        cond_ids = torch.full((1, 2), 2, dtype=torch.long)
+        cond_mask = torch.ones(1, 2, dtype=torch.long)
+        uncond_ids = torch.full((1, 1), 1, dtype=torch.long)
+        uncond_mask = torch.ones(1, 1, dtype=torch.long)
+        return cond_ids, cond_mask, uncond_ids, uncond_mask
+
+    pipeline._format_and_tokenize_prompts = fake_format
+    pipeline._prepare_latents = lambda height, width, num_frames, generator, batch_size=1: torch.zeros(
+        batch_size, 2, 1, 1, 1
+    )
+
+    def _make(req_id):
+        return DiffusionRequestState(
+            request_id=req_id,
+            sampling=make_sampling_params(
+                num_inference_steps=1,
+                guidance_scale=3.0,
+                guidance_scale_provided=True,
+                extra_args={"guidance_interval": (500.0, 1000.0)},
+            ),
+            prompts=[{"prompt": f"{req_id} prompt", "modalities": ["image"]}],
+        )
+
+    a = _make("a")
+    b = _make("b")
+    pipeline.prepare_encode(a)
+    pipeline.prepare_encode(b)
+
+    pred = pipeline.denoise_step(InputBatch.make_batch([a, b]))
+
+    # Both rows: uncond=1, cond=2, scale=3 at t=900 (inside interval) -> 4.
+    assert tuple(pred.shape) == (2, 2, 1, 1, 1)
+    torch.testing.assert_close(pred, torch.full((2, 2, 1, 1, 1), 4.0))
+
+    # Equal real lengths across the batch -> no padding -> no key mask, so both
+    # the conditional and unconditional passes take the fast attention path.
+    cond_call, uncond_call = pipeline.transformer.calls[-2:]
+    for call in (cond_call, uncond_call):
+        assert call["kwargs"]["und_key_mask"] is None
+        assert call["kwargs"]["attn_key_mask"] is None
+    assert pipeline._get_step_static_cache([a, b])["cond"]["mask"] is None
+
+
 def test_step_t2i_skips_uncond_when_cfg_is_neutral(make_cosmos3_pipeline) -> None:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
@@ -925,8 +977,10 @@ def test_step_t2i_skips_uncond_when_cfg_is_neutral(make_cosmos3_pipeline) -> Non
     assert len(pipeline.transformer.calls) == 1
     assert "uncond" not in pipeline._step_static_batch_cache
     cond_call = pipeline.transformer.calls[0]
-    assert cond_call["kwargs"]["und_key_mask"].tolist() == [[True, True]]
-    assert cond_call["kwargs"]["attn_key_mask"].tolist() == [[True, True, True]]
+    # batch=1 has no padding, so no key mask is passed and the GEN
+    # cross-attention uses the fast (unmasked) FrameworkAttention path.
+    assert cond_call["kwargs"]["und_key_mask"] is None
+    assert cond_call["kwargs"]["attn_key_mask"] is None
 
 
 class TestForwardRouting:
