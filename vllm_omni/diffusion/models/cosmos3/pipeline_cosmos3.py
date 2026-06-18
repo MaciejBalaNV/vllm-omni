@@ -50,6 +50,7 @@ from vllm_omni.diffusion.models.interface import (
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.entrypoints.openai.video_api_utils import positive_float
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from .action import (
@@ -112,7 +113,6 @@ from .utils import (
     normalize_condition_video_keep,
     normalize_robolab_action_space,
     pose_abs_to_rel,
-    positive_float,
     postprocess_robolab_action,
     resize_rgb_uint8,
 )
