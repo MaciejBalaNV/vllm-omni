@@ -942,9 +942,10 @@ class Cosmos3OmniDiffusersPipeline(
         if branch_caches is None:
             return self.transformer(**kwargs)
 
+        cache_key = str(cache_key)
         self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(cache_key, (None, None))
         prediction = self.transformer(**kwargs)
-        branch_caches[str(cache_key)] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+        branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
         return prediction
 
     def combine_multi_branch_cfg_noise(

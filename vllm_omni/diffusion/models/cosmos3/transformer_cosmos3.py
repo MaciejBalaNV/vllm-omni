@@ -1405,7 +1405,8 @@ class Cosmos3VFMTransformer(nn.Module):
             [B, C, t, h, w] velocity prediction, or
             tuple outputs in video, action, sound order when extra modalities are provided.
         """
-        del kwargs
+        if kwargs:
+            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)

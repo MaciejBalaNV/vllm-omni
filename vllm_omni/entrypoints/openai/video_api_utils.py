@@ -37,7 +37,7 @@ class VideoFrames(list[Image.Image]):
         self.frame_rate = fps
 
 
-def _positive_float(value: Any) -> float | None:
+def positive_float(value: Any) -> float | None:
     if value is None:
         return None
     if hasattr(value, "item") and not isinstance(value, (bytes, str)):
@@ -85,9 +85,9 @@ def _decode_video_bytes(
             video_stream = container.streams.video[0] if container.streams.video else None
             if video_stream is not None:
                 fps = (
-                    _positive_float(getattr(video_stream, "average_rate", None))
-                    or _positive_float(getattr(video_stream, "base_rate", None))
-                    or _positive_float(getattr(video_stream, "guessed_rate", None))
+                    positive_float(getattr(video_stream, "average_rate", None))
+                    or positive_float(getattr(video_stream, "base_rate", None))
+                    or positive_float(getattr(video_stream, "guessed_rate", None))
                 )
             for frame in container.decode(video=0):
                 image = frame.to_image().convert("RGB")

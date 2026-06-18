@@ -369,17 +369,3 @@ def postprocess_robolab_action(action: torch.Tensor, inputs: RoboLabActionPostpr
 
     log_robolab_action_summary("postprocessed_robolab_action", action_np)
     return np.asarray(action_np, dtype=np.float32)
-
-
-def positive_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if hasattr(value, "item") and not isinstance(value, (bytes, str)):
-        value = value.item()
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    if result <= 0:
-        return None
-    return result
