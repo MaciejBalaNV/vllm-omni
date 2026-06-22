@@ -1304,7 +1304,6 @@ class TestForwardRouting:
                 {
                     "key": "image",
                     "is_t2i": True,
-                    "use_system_prompt": True,
                     "flow": [3.0],
                     "steps": [50, 50],
                     "frames": 1,
@@ -1316,7 +1315,6 @@ class TestForwardRouting:
                 {
                     "key": "video",
                     "is_t2i": False,
-                    "use_system_prompt": True,
                     "flow": [1.0],
                     "steps": [35],
                     "frames": 189,
@@ -1338,7 +1336,6 @@ class TestForwardRouting:
 
         assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
-        assert captured["format"]["use_system_prompt"] is expected["use_system_prompt"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]
         assert captured["scheduler_use_karras_sigmas"] == [None]
@@ -1368,7 +1365,6 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is velocity_mask
-        assert captured["format"]["use_system_prompt"] is True
 
         video_tensor = torch.zeros(1, 3, 5, 16, 16)
         v2v_condition = torch.full((1, 2, 2, 1, 1), 4.0)
@@ -1396,7 +1392,6 @@ class TestForwardRouting:
         assert captured["flow_shifts"][-1] == 10.0
         assert captured["scheduler_use_karras_sigmas"][-1] is False
         assert captured["format"]["negative_prompt"] == ""
-        assert captured["format"]["use_system_prompt"] is True
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["noisy_frame_mask"] is v2v_mask
         assert captured["diffuse_calls"][-1]["condition_latents"] is v2v_condition
 
@@ -1412,7 +1407,6 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["sound_latents"] is sound_latents
-        assert captured["format"]["use_system_prompt"] is True
         assert output.output["audio_sample_rate"] == 10
 
         pipeline.transformer = pipeline.transformer.__class__(latent_channel_size=2, action_gen=True, action_dim=4)
@@ -1438,7 +1432,6 @@ class TestForwardRouting:
             )
         )
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
-        assert captured["format"]["use_system_prompt"] is False
         assert output.custom_output["action"].shape == (1, 2, 2)
         assert "action_only_output" not in output.custom_output
 
