@@ -2929,7 +2929,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", not action_enabled))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
