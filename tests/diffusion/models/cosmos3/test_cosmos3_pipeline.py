@@ -999,6 +999,8 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True}))
     assert cfg is not None
     assert list(cfg.hints) == ["edge"]
+    assert cfg.hints["edge"].control_weight == 1.0
+    assert cfg.normalized_control_weights == [1.0]
     assert cfg.guidance_scale == 3.0
     assert cfg.control_guidance == 1.5
     assert cfg.flow_shift == 10.0
@@ -1076,6 +1078,40 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
+
+
+def test_transfer_control_weight_validation_and_normalization() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    single = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": {"control_weight": 0.4}}))
+    assert single is not None
+    assert single.hints["edge"].control_weight == 0.4
+    assert single.normalized_control_weights == [1.0]
+
+    multiple = transfer.resolve_transfer_config(
+        make_sampling_params(
+            extra_args={
+                "edge": {"control_weight": 1.0},
+                "depth": {"control_weight": 3.0, "control": torch.zeros(3, 1, 8, 8, dtype=torch.uint8)},
+            }
+        )
+    )
+    assert multiple is not None
+    assert multiple.normalized_control_weights == [0.25, 0.75]
+
+    with pytest.raises(ValueError, match="Unsupported.*weight"):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": {"weight": 0.5}}))
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": {"control_weight": -0.5}}))
+    with pytest.raises(ValueError, match="positive sum"):
+        transfer.resolve_transfer_config(
+            make_sampling_params(
+                extra_args={
+                    "edge": {"control_weight": 0.0},
+                    "depth": {"control_weight": 0.0, "control": torch.zeros(3, 1, 8, 8, dtype=torch.uint8)},
+                }
+            )
+        )
 
 
 def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
@@ -1757,6 +1793,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
         control_guidance=1.5,
         control_guidance_interval=None,
         control_latents=[torch.zeros_like(latents)],
+        control_weights=[1.0],
         shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
         velocity_mask=velocity_mask,
         condition_latents=torch.zeros_like(latents),
@@ -1767,6 +1804,9 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
         (2, False),
         (1, True),
     ]
+    assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
+    assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
+    assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
 
 

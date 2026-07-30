@@ -333,7 +333,11 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
 - **Transfer controls:** `extra_params` may include `edge`, `blur`, `depth`,
   `seg`, or `wsm`. Each hint accepts `true`, a path string, or an object such as
   `{"control_path": "/path/to/control.mp4"}`; `edge` also accepts
-  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`.
+  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`. Every hint
+  accepts a non-negative `control_weight`; weights are normalized across active
+  controls and therefore only set their relative influence. A single positive
+  weight always normalizes to `1.0`; use `control_guidance` to change the
+  absolute strength of a single control.
   Transfer always uses Cosmos3's transfer-specific system prompt. By default it
   also appends a directive naming every active hint and asking the model to
   follow its shape, position, and motion precisely; set the request-level

@@ -162,7 +162,8 @@ are not implemented yet. Models may expose additional V2V controls through
 `condition_frame_indexes_vision` and `condition_video_keep` to select which
 decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
 also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints. Each hint
-may specify its own `control_path`. Request-level transfer options include
+may specify its own `control_path` and `control_weight`. Request-level transfer
+options include
 `control_guidance`, `control_guidance_interval`,
 `emphasize_control_in_prompt`, `num_video_frames_per_chunk`,
 `num_conditional_frames`, `show_control_condition`, and `show_input`. Transfer
