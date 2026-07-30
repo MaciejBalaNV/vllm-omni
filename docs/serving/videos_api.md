@@ -166,10 +166,15 @@ may specify its own `control_path`. Request-level transfer options include
 `control_guidance`, `control_guidance_interval`,
 `emphasize_control_in_prompt`, `num_video_frames_per_chunk`,
 `num_conditional_frames`, `show_control_condition`, and `show_input`. Transfer
-uses Cosmos3's transfer-specific system prompt and, by default, appends a
-control-adherence directive to the positive prompt; set
-`emphasize_control_in_prompt` to `false` to disable that directive. See the
-Cosmos3 recipe for complete examples.
+uses its transfer-specific system prompt and, by default, appends a
+control-adherence directive to the positive prompt. It adds duration/FPS and
+resolution metadata to both CFG branches but does not add a negative prompt
+automatically. The Cosmos3 recipe includes an optional reference negative
+prompt and shows how to pass it. Set `emphasize_control_in_prompt`,
+`use_duration_template`, or `use_resolution_template` to `false` to disable the
+corresponding addition. `negative_metadata_mode` accepts `same`, `inverse`, or
+`none` and defaults to `same` for transfer. See the Cosmos3 recipe for complete
+examples.
 
 ### Speech-to-Video
 
