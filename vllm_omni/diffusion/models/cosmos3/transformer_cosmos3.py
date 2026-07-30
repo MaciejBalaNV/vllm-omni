@@ -1764,6 +1764,13 @@ class Cosmos3VFMTransformer(nn.Module):
 
         # Query Ulysses state at runtime
         ulysses_size, _, _ = _get_ulysses_state()
+        if use_multi_control_attention and ulysses_size > 1:
+            logger.warning_once(
+                "Cosmos3 multi-control attention requires full [control_i | target] "
+                "sequences, so the GEN pathway runs replicated on every Ulysses rank. "
+                "Sequence parallelism will not reduce per-rank memory or latency for "
+                "multi-control transfer requests."
+            )
 
         # Pack action/sound tokens (no learned weights) up front so the UND
         # cache sizing knows their token lengths.  The modality projections are

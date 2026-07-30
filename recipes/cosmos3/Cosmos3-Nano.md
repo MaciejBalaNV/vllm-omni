@@ -337,7 +337,10 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   accepts a non-negative `control_weight`; weights are normalized across active
   controls and therefore only set their relative influence. A single positive
   weight always normalizes to `1.0`; use `control_guidance` to change the
-  absolute strength of a single control.
+  absolute strength of a single control. With two or more active controls, the
+  per-control attention passes run replicated on every sequence-parallel
+  (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
+  multi-control transfer requests.
   Transfer always uses Cosmos3's transfer-specific system prompt. By default it
   also appends a directive naming every active hint and asking the model to
   follow its shape, position, and motion precisely; set the request-level
