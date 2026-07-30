@@ -1004,6 +1004,12 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert cfg.flow_shift == 10.0
     assert cfg.num_video_frames_per_chunk == 93
     assert cfg.share_vision_temporal_positions is True
+    assert cfg.emphasize_control_in_prompt is True
+    prompt_ablation_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": True, "emphasize_control_in_prompt": False})
+    )
+    assert prompt_ablation_cfg is not None
+    assert prompt_ablation_cfg.emphasize_control_in_prompt is False
     # fps omitted (no fps/frame_rate on the sampling params) -> wsm preset default (10) applies.
     defaulted_fps_cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"wsm": True}))
     assert defaulted_fps_cfg is not None
@@ -1330,6 +1336,42 @@ def test_format_and_tokenize_prompts_applies_video_templates_and_system_override
             "system_prompt": "API system prompt",
         },
     ]
+
+
+def test_format_and_tokenize_prompts_applies_transfer_prompt_contract(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
+        COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    )
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+    directive = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names="edge")
+
+    pipeline._format_and_tokenize_prompts(
+        "A robot",
+        "bad",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(
+            extra_args={
+                "use_resolution_template": True,
+                "system_prompt": "request-level system prompt",
+            }
+        ),
+        use_system_prompt=True,
+        is_t2i=False,
+        system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+        prompt_suffix=directive,
+    )
+
+    assert calls[0]["text"] == f"A robot. This video is of 720x1280 resolution. {directive}"
+    assert calls[1]["text"] == "bad. This video is not of 720x1280 resolution."
+    assert all(call["use_system_prompt"] is True for call in calls)
+    assert all(call["system_prompt"] == COSMOS3_TRANSFER_SYSTEM_PROMPT for call in calls)
 
 
 def test_format_and_tokenize_prompts_uses_image_templates_for_t2i(make_cosmos3_pipeline) -> None:
@@ -1789,14 +1831,28 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
     torch.testing.assert_close(result, torch.full_like(latents, 508.0))
 
 
-@pytest.mark.parametrize(("hint_key", "expected_fps"), [("edge", 8.0), ("wsm", 10.0)])
-def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint_key: str, expected_fps: float) -> None:
+@pytest.mark.parametrize(
+    ("hint_key", "emphasize_control", "expected_fps"),
+    [("edge", None, 8.0), ("wsm", None, 10.0), ("edge", False, 8.0)],
+)
+def test_forward_transfer_uses_reference_prompts_and_source_fps_except_wsm(
+    make_cosmos3_pipeline,
+    hint_key: str,
+    emphasize_control: bool | None,
+    expected_fps: float,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
+        COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    )
+
     pipeline = make_cosmos3_pipeline()
     captured: dict[str, Any] = {}
 
     def fake_format(prompt, negative_prompt, num_frames, frame_rate, height, width, *args, **kwargs):
-        del prompt, negative_prompt, num_frames, height, width, args, kwargs
+        del prompt, negative_prompt, num_frames, height, width, args
         captured["format_frame_rate"] = frame_rate
+        captured["format_kwargs"] = kwargs
         return _ids(2), _mask(), _ids(1), _mask()
 
     def fake_encode(video: torch.Tensor) -> torch.Tensor:
@@ -1833,6 +1889,14 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16, device="meta")
 
     control = torch.zeros(3, 5, 16, 16, dtype=torch.uint8)
+    extra_args = {
+        hint_key: {"control": control},
+        "max_frames": 5,
+        "num_video_frames_per_chunk": 5,
+        "show_control_condition": True,
+    }
+    if emphasize_control is not None:
+        extra_args["emphasize_control_in_prompt"] = emphasize_control
     request = SimpleNamespace(
         prompts=[
             {
@@ -1848,18 +1912,19 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
             height=16,
             width=16,
             # fps omitted (no frame_rate) -> non-wsm uses the source video fps (8), wsm uses its preset (10).
-            extra_args={
-                hint_key: {"control": control},
-                "max_frames": 5,
-                "num_video_frames_per_chunk": 5,
-                "show_control_condition": True,
-            },
+            extra_args=extra_args,
         ),
     )
 
     output = pipeline.forward(request)
 
     assert captured["format_frame_rate"] == expected_fps
+    assert captured["format_kwargs"]["use_system_prompt"] is True
+    assert captured["format_kwargs"]["system_prompt"] == COSMOS3_TRANSFER_SYSTEM_PROMPT
+    expected_suffix = (
+        None if emphasize_control is False else COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint_key)
+    )
+    assert captured["format_kwargs"]["prompt_suffix"] == expected_suffix
     assert captured["shared_kwargs"]["fps"] == expected_fps
     assert captured["flow_shifts"] == [10.0]
     # Transfer applies the V2V flow shift when building its timestep schedule.

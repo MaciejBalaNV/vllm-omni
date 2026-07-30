@@ -155,6 +155,14 @@ COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{widt
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
 COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
+COSMOS3_TRANSFER_SYSTEM_PROMPT = (
+    "You are a helpful assistant that generates images or videos following the user's instructions"
+    " and control signals (edge maps, blur, depth, or segmentation)."
+)
+COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
+    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
+    "visible structure must align with the {hint_names} signal at every frame."
+)
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
 COSMOS3_T2V_DEFAULT_WIDTH = 1280
@@ -2040,6 +2048,8 @@ class Cosmos3OmniDiffusersPipeline(
         sp: OmniDiffusionSamplingParams,
         use_system_prompt: bool = False,
         is_t2i: bool = False,
+        system_prompt: str | None = None,
+        prompt_suffix: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Format prompts with metadata templates and tokenize.
 
@@ -2047,7 +2057,8 @@ class Cosmos3OmniDiffusersPipeline(
 
         For T2I (``is_t2i=True``) the duration template is suppressed (no FPS
         or duration concept for a single image) and the image-flavored
-        resolution template is used.
+        resolution template is used. ``prompt_suffix`` is appended only to the
+        positive prompt, after metadata formatting.
         """
         # Route cosmos3-specific controls through ``_get_sp_param`` so they
         # are picked up from ``extra_args`` (OpenAI endpoint path) as well
@@ -2078,6 +2089,8 @@ class Cosmos3OmniDiffusersPipeline(
                 duration_template=dur_tmpl,
                 resolution_template=res_tmpl,
             )
+        if prompt_suffix:
+            prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
         if _is_rank_zero():
             logger.info("Final prompt: '%s'", prompt)
 
@@ -2102,13 +2115,14 @@ class Cosmos3OmniDiffusersPipeline(
             force_duration_template=True,
         )
 
-        default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
-        sys_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
+        if system_prompt is None:
+            default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
+            system_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
         cond_ids, cond_mask = self._tokenize_prompt(
-            prompt, max_sequence_length, use_system_prompt, system_prompt=sys_prompt
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
         uncond_ids, uncond_mask = self._tokenize_prompt(
-            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=sys_prompt
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
         return cond_ids, cond_mask, uncond_ids, uncond_mask
 
@@ -3005,7 +3019,10 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
+        transfer_prompt_suffix = None
+        if transfer_config.emphasize_control_in_prompt:
+            hint_names = ", ".join(hint.key for hint in transfer_config.ordered_hints)
+            transfer_prompt_suffix = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint_names)
 
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
@@ -3025,8 +3042,10 @@ class Cosmos3OmniDiffusersPipeline(
             width,
             max_sequence_length,
             sp,
-            use_system_prompt,
+            use_system_prompt=True,
             is_t2i=False,
+            system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+            prompt_suffix=transfer_prompt_suffix,
         )
 
         output_chunks: list[torch.Tensor] = []

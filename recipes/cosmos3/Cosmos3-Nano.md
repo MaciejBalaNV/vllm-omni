@@ -331,6 +331,10 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   `seg`, or `wsm`. Each hint accepts `true`, a path string, or an object such as
   `{"control_path": "/path/to/control.mp4"}`; `edge` also accepts
   `preset_edge_threshold` and `blur` accepts `preset_blur_strength`.
+  Transfer always uses Cosmos3's transfer-specific system prompt. By default it
+  also appends a directive naming every active hint and asking the model to
+  follow its shape, position, and motion precisely; set the request-level
+  `emphasize_control_in_prompt` option to `false` for prompt ablations.
   Transfer-level options include `control_guidance`,
   `control_guidance_interval`, `num_video_frames_per_chunk` (default `93`,
   `101` for WSM), `num_conditional_frames` (default `1`),

@@ -33,6 +33,7 @@ TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "show_input": False,
     "num_first_chunk_conditional_frames": 0,
     "share_vision_temporal_positions": True,
+    "emphasize_control_in_prompt": True,
 }
 TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
@@ -103,6 +104,7 @@ class Cosmos3TransferConfig:
     show_input: bool = False
     num_first_chunk_conditional_frames: int = 0
     share_vision_temporal_positions: bool = True
+    emphasize_control_in_prompt: bool = True
     num_frames: int | None = None
     fps: float | None = None
 
@@ -184,7 +186,7 @@ def _as_interval(value: Any) -> tuple[float, float] | None:
         return None
     if isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
+    if not isinstance(value, list | tuple) or len(value) != 2:
         raise ValueError("Cosmos3 transfer control_guidance_interval must contain exactly two values.")
     lo, hi = float(value[0]), float(value[1])
     if lo > hi:
@@ -239,6 +241,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             "show_input",
             "num_first_chunk_conditional_frames",
             "share_vision_temporal_positions",
+            "emphasize_control_in_prompt",
         )
         if any(_is_user_field(extra, sp, prompt_data, key) for key in transfer_only):
             raise ValueError("Cosmos3 transfer options were provided, but no transfer hint was selected.")
@@ -292,6 +295,10 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
         share_vision_temporal_positions=_as_bool(
             _param(extra, sp, prompt_data, "share_vision_temporal_positions", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"]),
+        ),
+        emphasize_control_in_prompt=_as_bool(
+            _param(extra, sp, prompt_data, "emphasize_control_in_prompt", None),
+            bool(TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"]),
         ),
         num_frames=(
             int(_param(extra, sp, prompt_data, "num_frames"))
