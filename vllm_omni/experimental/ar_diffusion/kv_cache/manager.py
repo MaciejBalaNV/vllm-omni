@@ -250,14 +250,41 @@ class ARDiffusionKVCache:
             sink_chunks=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
         )
+        # Scratch blocks are outside KVCacheManager ownership. A non-committing
+        # fused forward needs one block per current frame plus space for any
+        # model-declared auxiliary tokens. Gathered-dense models do not use the
+        # region, but the immutable capability still reserves the frame floor.
+        declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
+        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
+        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
+        override_blocks = int(override) if override is not None else 0
+        if override_blocks < 0:
+            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+        self.scratch_blocks_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
+        self.scratch_num_blocks = self.num_local_kv_branches * self.scratch_blocks_per_kv_branch
+
+        page_bytes = self.spec.page_size_bytes * num_layers
+        scratch_total_bytes = self.scratch_num_blocks * page_bytes
+        resident_blocks = config.sink_chunks + config.window_chunks
+        min_blocks = self.num_local_kv_branches * (resident_blocks + self.frames_per_block) + 2
+        minimum_total_bytes = cross_total_bytes + (min_blocks + self.scratch_num_blocks) * page_bytes
+        if minimum_total_bytes > available_bytes:
+            raise MemoryError(
+                "AR-Diffusion KV startup allocation exceeds available memory: "
+                f"requires at least {minimum_total_bytes} bytes "
+                f"(managed={min_blocks * page_bytes}, scratch={scratch_total_bytes}, "
+                f"cross_attention={cross_total_bytes}), available={available_bytes}. "
+                "Reduce window_frames/sink_frames, prompt cache length, or KV branches."
+            )
+
         # Each pool block spans all layers' K/V, so size against the per-layer
         # page size times the layer count.
         # Size the self-attn pool against memory reserved for the maximum number
-        # of lazily allocated cross-attention sessions.
+        # of lazily allocated cross-attention sessions and mandatory scratch.
         num_blocks = compute_num_blocks(
-            max(0, available_bytes - cross_total_bytes),
+            max(0, available_bytes - cross_total_bytes - scratch_total_bytes),
             config.gpu_memory_fraction,
-            self.spec.page_size_bytes * num_layers,
+            page_bytes,
         )
         # Floor: one forward needs the resident window plus the in-flight chunk
         # (frames_per_block frame-blocks) for every KV branch THIS rank runs,
@@ -266,8 +293,6 @@ class ARDiffusionKVCache:
         # paging at the true frame_seqlen makes each block larger and the pool
         # fewer-blocks — so guarantee the minimum the rollout cannot run without,
         # otherwise allocate_chunk hits an exhausted pool mid-forward.
-        resident_blocks = config.sink_chunks + config.window_chunks
-        min_blocks = self.num_local_kv_branches * (resident_blocks + self.frames_per_block) + 2
         if num_blocks < min_blocks:
             _log.warning(
                 "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
@@ -285,18 +310,6 @@ class ARDiffusionKVCache:
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
         self.managed_num_blocks = num_blocks
         self.num_blocks = num_blocks
-        # Scratch blocks are outside KVCacheManager ownership. A non-committing
-        # forward needs one block per current frame plus space for any
-        # model-declared action/state tokens that coexist with video KV.
-        declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
-        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
-        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
-        override_blocks = int(override) if override is not None else 0
-        if override_blocks < 0:
-            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
-        scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
-        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
-        self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
         self.num_blocks_total = self.managed_num_blocks + self.scratch_num_blocks
         self.null_block_id = self.manager.block_pool.null_block.block_id
 
@@ -546,6 +559,31 @@ class ARDiffusionKVCache:
 
     def value_cache(self, layer_idx: int) -> torch.Tensor:
         return self._kv_pools[layer_idx][1]
+
+    def write_token_kv(
+        self,
+        layer_idx: int,
+        slot_mapping: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        """Copy dense token K/V into explicit flat pool slots for one layer."""
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise IndexError(f"AR-Diffusion layer index {layer_idx} is outside [0, {self.num_layers})")
+        slots = slot_mapping.to(device=self._k_pools[layer_idx].device, dtype=torch.long)
+        if slots.numel() != key.shape[0] or slots.numel() != value.shape[0]:
+            raise ValueError(
+                "AR-Diffusion slot/K/V length mismatch: "
+                f"slots={slots.numel()}, key={key.shape[0]}, value={value.shape[0]}"
+            )
+        self._k_pools[layer_idx][slots] = key.to(
+            device=self._k_pools[layer_idx].device,
+            dtype=self._k_pools[layer_idx].dtype,
+        )
+        self._v_pools[layer_idx][slots] = value.to(
+            device=self._v_pools[layer_idx].device,
+            dtype=self._v_pools[layer_idx].dtype,
+        )
 
     def window_block_ids(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         """Resident (non-null) managed blocks visible to paged attention."""

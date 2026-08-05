@@ -480,6 +480,7 @@ class Cosmos3CausalAttention(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         rms_norm_eps: float,
+        use_und_k_norm_for_gen: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -532,6 +533,9 @@ class Cosmos3CausalAttention(nn.Module):
 
         self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm_und_for_gen = (
+            RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
+        )
 
         # skip_sequence_parallel=True because the UND pathway is
         # computed once and replicated across SP ranks.
@@ -563,6 +567,13 @@ class Cosmos3CausalAttention(nn.Module):
 
         # Qwen3-style RoPE
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        if self.k_norm_und_for_gen is not None:
+            k = F.rms_norm(
+                k,
+                (self.head_dim,),
+                self.k_norm_und_for_gen.weight,
+                eps=self.k_norm_und_for_gen.variance_epsilon,
+            )
 
         out = self.attn(q, k, v).reshape(B, S, -1)
         return self.to_out(out), k, v
@@ -756,6 +767,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         num_key_value_heads: int,
         head_dim: int,
         rms_norm_eps: float,
+        use_und_k_norm_for_gen: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -766,6 +778,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
+            use_und_k_norm_for_gen=use_und_k_norm_for_gen,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -898,6 +911,7 @@ class Cosmos3LanguageModel(nn.Module):
         rms_norm_eps: float,
         rope_theta: float,
         mrope_section: list[int],
+        use_und_k_norm_for_gen: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -917,6 +931,7 @@ class Cosmos3LanguageModel(nn.Module):
                     num_key_value_heads=num_key_value_heads,
                     head_dim=head_dim,
                     rms_norm_eps=rms_norm_eps,
+                    use_und_k_norm_for_gen=use_und_k_norm_for_gen,
                     quant_config=quant_config,
                     prefix=f"{prefix}.layers.{i}",
                 )
@@ -1006,6 +1021,7 @@ class Cosmos3VFMTransformer(nn.Module):
     packed_modules_mapping = {}
 
     _language_model_cls = Cosmos3LanguageModel
+    _gen_layer_cls = Cosmos3GenDecoderLayer
     _gen_mlp_cls = Cosmos3GatedMLP
 
     @staticmethod
@@ -1172,7 +1188,7 @@ class Cosmos3VFMTransformer(nn.Module):
 
         self.gen_layers = nn.ModuleList(
             [
-                Cosmos3GenDecoderLayer(
+                self._gen_layer_cls(
                     layer_idx=i,
                     hidden_size=self.hidden_size,
                     intermediate_size=self.intermediate_size,

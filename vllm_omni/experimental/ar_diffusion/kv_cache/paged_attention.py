@@ -16,11 +16,26 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapp
 # TP ranks are separate processes), mirroring vLLM's forward-context pattern for
 # keeping multi-GiB cache tensors out of the compiled graph's inputs.
 _CURRENT_PAGED_KV_CACHE: Any = None
+_CURRENT_PAGED_FORWARD_CONTEXT: ARDiffusionPagedForwardContext | None = None
 
 
 def set_current_paged_kv_cache(kv_cache: Any) -> None:
     global _CURRENT_PAGED_KV_CACHE
     _CURRENT_PAGED_KV_CACHE = kv_cache
+
+
+def _set_current_paged_forward_context(context: ARDiffusionPagedForwardContext) -> None:
+    """Publish the active context for fused-op write accounting.
+
+    The fused write-and-attend op intentionally keeps the multi-GiB KV pools out
+    of its graph inputs.  For the same reason, commit bookkeeping stays on the
+    host-side forward context and is reached through this process-local binding.
+    AR-Diffusion executes one request per worker at a time, so this mirrors the
+    existing process-local KV-pool binding above.
+    """
+
+    global _CURRENT_PAGED_FORWARD_CONTEXT
+    _CURRENT_PAGED_FORWARD_CONTEXT = context
 
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
@@ -87,6 +102,7 @@ class ARDiffusionPagedForwardContext:
     max_query_len: int = 0
     max_seq_len: int = 0
     _prepared: bool = False
+    _written_layers: set[int] = field(default_factory=set)
 
     @property
     def block_size(self) -> int:
@@ -124,6 +140,131 @@ class ARDiffusionPagedForwardContext:
                 self.block_size,
             ).to(device=device)
         self._allocated_video = True
+
+    @property
+    def num_layers(self) -> int:
+        return int(self.kv_cache.num_layers)
+
+    def _validate_layer_idx(self, layer_idx: int) -> int:
+        layer_idx = int(layer_idx)
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise IndexError(
+                f"AR-Diffusion layer index {layer_idx} is outside [0, {self.num_layers})"
+            )
+        return layer_idx
+
+    def gather_history(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather one layer's immutable history snapshot into dense K/V.
+
+        ``history_block_ids`` is captured before any current-page allocation.
+        Reading only that snapshot is load-bearing: the manager's live block
+        table also contains in-flight allocations after the first layer writes.
+        """
+
+        layer_idx = self._validate_layer_idx(layer_idx)
+        key_cache = self.kv_cache.key_cache(layer_idx)
+        value_cache = self.kv_cache.value_cache(layer_idx)
+        if not self.history_block_ids:
+            shape = (1, 0, int(self.kv_cache.num_kv_heads), int(self.kv_cache.head_size))
+            return key_cache.new_empty(shape), value_cache.new_empty(shape)
+
+        block_ids = torch.as_tensor(
+            self.history_block_ids,
+            dtype=torch.long,
+            device=key_cache.device,
+        )
+        keys = key_cache.index_select(0, block_ids).reshape(
+            1,
+            -1,
+            int(self.kv_cache.num_kv_heads),
+            int(self.kv_cache.head_size),
+        )
+        values = value_cache.index_select(0, block_ids).reshape_as(keys)
+        return keys, values
+
+    def _validate_layer_write(self, layer_idx: int) -> int:
+        if not self.commit_current:
+            raise RuntimeError(
+                "AR-Diffusion write-only KV updates require commit_current=True; "
+                "non-committing denoise contexts are read-only"
+            )
+        layer_idx = self._validate_layer_idx(layer_idx)
+        if layer_idx in self._written_layers:
+            raise RuntimeError(
+                f"AR-Diffusion current-page K/V for layer {layer_idx} was written more than once"
+            )
+        return layer_idx
+
+    def mark_layer_written(self, layer_idx: int) -> None:
+        """Record exactly one successful current-page write for ``layer_idx``."""
+
+        layer_idx = self._validate_layer_write(layer_idx)
+        self._written_layers.add(layer_idx)
+
+    def write_only(
+        self,
+        layer_idx: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        """Write one layer's current frame K/V without running attention.
+
+        This is the gathered-dense counterpart of the fused paged op.  It is
+        intentionally unavailable on scratch/non-committing contexts so noisy
+        denoise steps cannot accidentally enter the persistent pool.
+        """
+
+        if not self.commit_current:
+            raise RuntimeError(
+                "AR-Diffusion write_only() requires commit_current=True; "
+                "non-committing denoise contexts are read-only"
+            )
+        layer_idx = self._validate_layer_write(layer_idx)
+        if key.device != value.device:
+            raise ValueError(
+                f"AR-Diffusion write_only() K/V devices differ: {key.device} != {value.device}"
+            )
+        expected = (
+            self.seq_len,
+            int(self.kv_cache.num_kv_heads),
+            int(self.kv_cache.head_size),
+        )
+        if key.ndim == 4 and key.shape[0] == 1:
+            key = key[0]
+        if value.ndim == 4 and value.shape[0] == 1:
+            value = value[0]
+        if tuple(key.shape) != expected or tuple(value.shape) != expected:
+            raise ValueError(
+                "AR-Diffusion write_only() expected K/V shape "
+                f"{expected} (or batch-prefixed (1, ...)), got "
+                f"{tuple(key.shape)} and {tuple(value.shape)}"
+            )
+
+        self.ensure_video_slots(key.device)
+        assert self.current_video_slot_mapping is not None
+        self.kv_cache.write_token_kv(
+            layer_idx,
+            self.current_video_slot_mapping,
+            key,
+            value,
+        )
+        self._written_layers.add(layer_idx)
+
+    def validate_commit_complete(self) -> None:
+        """Fail closed unless every configured layer wrote the current page."""
+
+        if not self.commit_current:
+            return
+        expected = set(range(self.num_layers))
+        if self._written_layers != expected:
+            missing = sorted(expected - self._written_layers)
+            extra = sorted(self._written_layers - expected)
+            detail = f"missing layers {missing}"
+            if extra:
+                detail += f", unexpected layers {extra}"
+            raise RuntimeError(
+                "AR-Diffusion cannot commit an incomplete current page: " + detail
+            )
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
         """Reserve scratch slots for action/state K/V, if present."""
@@ -229,6 +370,7 @@ class ARDiffusionPagedForwardContext:
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
         set_current_paged_kv_cache(self.kv_cache)
+        _set_current_paged_forward_context(self)
         self._prepared = True
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
@@ -309,6 +451,16 @@ class ARDiffusionPagedLayerContext:
     def to_layer_inputs(self) -> ARDiffusionPagedLayerInputs:
         """Compiled-region payload; requires ``forward_ctx.prepare()`` first."""
         return self.forward_ctx.layer_inputs(self.layer_idx)
+
+    def gather_history(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather this layer's dense history from the captured block snapshot."""
+
+        return self.forward_ctx.gather_history(self.layer_idx)
+
+    def write_only(self, key: torch.Tensor, value: torch.Tensor) -> None:
+        """Persist this layer's current-frame K/V without running attention."""
+
+        self.forward_ctx.write_only(self.layer_idx, key, value)
 
 
 def is_ar_diffusion_paged_context(value: object) -> bool:
@@ -456,6 +608,13 @@ def _paged_write_attn_impl(
     if kv is None:
         raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() set the KV pool registry")
     layer_idx = int(layer_idx)
+    forward_ctx = _CURRENT_PAGED_FORWARD_CONTEXT
+    if forward_ctx is None:
+        raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() bound its forward context")
+    if forward_ctx.kv_cache is not kv:
+        raise RuntimeError("ar_diffusion_paged_write_attn active KV pool/context mismatch")
+    if forward_ctx.commit_current:
+        forward_ctx._validate_layer_write(layer_idx)
     k_pool = kv._k_pools[layer_idx]
     v_pool = kv._v_pools[layer_idx]
     k_pool[video_slots] = k_curr.to(k_pool.dtype)
@@ -463,6 +622,8 @@ def _paged_write_attn_impl(
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
         k_pool[action_slots] = k_act.to(k_pool.dtype)
         v_pool[action_slots] = v_act.to(v_pool.dtype)
+    if forward_ctx.commit_current:
+        forward_ctx._written_layers.add(layer_idx)
     return ar_diffusion_paged_attention(
         query,
         kv.key_cache(layer_idx),

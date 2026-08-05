@@ -204,7 +204,8 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
         device=torch.device("cpu"),
     )
     cross_bytes = 2 * 2 * L * 4 * 64 * torch.float16.itemsize * 2  # K+V, pos+neg, layers
-    expected = compute_num_blocks(avail - cross_bytes, 0.5, kv.spec.page_size_bytes * 2)
+    scratch_bytes = kv.scratch_num_blocks * kv.spec.page_size_bytes * 2
+    expected = compute_num_blocks(avail - cross_bytes - scratch_bytes, 0.5, kv.spec.page_size_bytes * 2)
     assert kv.num_blocks == expected
     assert expected > 1 * (2 + 1) + 2  # above the local-slot floor, so the cross deduction is what's tested
 
@@ -229,7 +230,7 @@ def _make_kv(
         dtype=torch.float32,
         block_size=BLOCK,
         max_model_len=4096,
-        available_bytes=1 << 16,  # tiny -> the floor binds
+        available_bytes=1 << 20,  # fraction is tiny enough that the floor binds
         device=torch.device("cpu"),
         kv_branches=kv_branches,
         session_capacity=1,
@@ -287,6 +288,24 @@ def test_scratch_exhaustion_still_raises():
     cap = one.scratch_blocks_per_kv_branch
     with pytest.raises(RuntimeError, match="scratch blocks exhausted"):
         one.scratch_block_ids("positive", 0, cap + 1)
+
+
+def test_startup_allocation_fails_before_pool_build_when_geometry_exceeds_budget():
+    with pytest.raises(MemoryError, match="startup allocation exceeds available memory"):
+        ARDiffusionKVCache(
+            ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=9),
+            num_layers=2,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.float32,
+            block_size=BLOCK,
+            max_model_len=4096,
+            available_bytes=1 << 16,
+            device=torch.device("cpu"),
+            kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+            session_capacity=1,
+            frames_per_block=2,
+        )
 
 
 def test_non_contiguous_branch_indices_rejected():

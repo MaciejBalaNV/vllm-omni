@@ -31,6 +31,10 @@ from vllm_omni.model_extras.cosmos3 import (
 from vllm_omni.model_extras.cosmos3 import (
     build_text_to_image_prompt as build_cosmos3_text_to_image_prompt,
 )
+from vllm_omni.model_extras.cosmos_dreams import (
+    COSMOS_DREAMS_EXTRA_BODY_PARAMS,
+    COSMOS_DREAMS_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -208,6 +212,17 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
         "text_to_image_prompt_builder": build_cosmos3_text_to_image_prompt,
+    },
+    **{
+        model_class_name: {
+            "extra_body_params": COSMOS_DREAMS_EXTRA_BODY_PARAMS,
+            "extra_output_params": COSMOS_DREAMS_EXTRA_OUTPUT_PARAMS,
+        }
+        for model_class_name in (
+            "CosmosDreamsPipeline",
+            "CosmosDreamsOmniPipeline",
+            "Cosmos3InteractivePipeline",
+        )
     },
     "MagiHumanPipeline": {
         "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
