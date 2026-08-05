@@ -127,6 +127,8 @@ class ARDiffusionKVState:
         ctx = self._paged_pending.get(kv_branch)
         if ctx is None:
             return
+        if ctx.commit_current:
+            ctx.validate_commit_complete()
         if ctx.commit_current and ctx._allocated_video:
             n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
             for _ in range(n_chunks):

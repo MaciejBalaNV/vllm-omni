@@ -94,12 +94,10 @@ def _commit_video_span(
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0].forward_ctx
-    ctx.ensure_video_slots(device)
+    layer_ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0]
     k = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     v = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
-    kv._k_pools[0][ctx.current_video_slot_mapping] = k[0]
-    kv._v_pools[0][ctx.current_video_slot_mapping] = v[0]
+    layer_ctx.write_only(k, v)
     st.commit_paged_context(kv_branch)
     return k, v
 
@@ -113,7 +111,8 @@ def test_paged_context_allocates_lazily_and_commits_after_forward():
     assert st.adapter(POS).completed_chunks == 0
     assert ctx.current_video_slot_mapping is None
 
-    ctx.ensure_video_slots(torch.device("cpu"))
+    zeros = torch.zeros(1, BLOCK, N_HEADS, HEAD_DIM)
+    contexts[0].write_only(zeros, zeros)
     assert st.adapter(POS).completed_chunks == 0
     assert len(ctx.current_video_block_ids) == 1
 
@@ -134,6 +133,58 @@ def test_scratch_video_and_action_blocks_do_not_commit():
     st.commit_paged_context(POS)
     assert st.adapter(POS).completed_chunks == 0
     assert st._committed[POS] == 0
+
+
+def test_dense_gather_uses_immutable_history_snapshot_and_write_only_is_strict():
+    _, st = make_state(num_layers=2)
+    first = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
+    old_k = []
+    old_v = []
+    for layer_idx, layer_ctx in enumerate(first):
+        k = torch.full((1, BLOCK, N_HEADS, HEAD_DIM), float(layer_idx + 1))
+        v = torch.full((1, BLOCK, N_HEADS, HEAD_DIM), float(-(layer_idx + 1)))
+        layer_ctx.write_only(k, v)
+        old_k.append(k)
+        old_v.append(v)
+    st.commit_paged_context(POS)
+
+    current = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
+    gathered_k0, gathered_v0 = current[0].gather_history()
+    torch.testing.assert_close(gathered_k0, old_k[0])
+    torch.testing.assert_close(gathered_v0, old_v[0])
+
+    current_k = torch.full_like(old_k[0], 99)
+    current_v = torch.full_like(old_v[0], -99)
+    current[0].write_only(current_k, current_v)
+
+    # Layer 0's write allocated an in-flight block in the live manager table.
+    # Layer 1 must still gather only the snapshot captured before that write.
+    gathered_k1, gathered_v1 = current[1].gather_history()
+    torch.testing.assert_close(gathered_k1, old_k[1])
+    torch.testing.assert_close(gathered_v1, old_v[1])
+
+    with pytest.raises(RuntimeError, match=r"incomplete current page.*missing layers \[1\]"):
+        st.commit_paged_context(POS)
+    with pytest.raises(RuntimeError, match="more than once"):
+        current[0].write_only(current_k, current_v)
+
+    current[1].write_only(current_k + 1, current_v - 1)
+    st.commit_paged_context(POS)
+
+
+def test_dense_write_only_rejects_non_committing_context():
+    _, st = make_state()
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
+    kv = torch.zeros(1, BLOCK, N_HEADS, HEAD_DIM)
+    with pytest.raises(RuntimeError, match="commit_current=True"):
+        layer_ctx.write_only(kv, kv)
+
+
+def test_commit_refuses_context_without_all_layer_writes():
+    _, st = make_state(num_layers=2)
+    st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
+    with pytest.raises(RuntimeError, match=r"missing layers \[0, 1\]"):
+        st.commit_paged_context(POS)
 
 
 def test_pipeline_kv_get_paged_path_has_no_gather_backend():
@@ -173,12 +224,16 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         history_k_parts.append(k)
         history_v_parts.append(v)
 
-    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0]
+    ctx = layer_ctx.forward_ctx
     ctx.ensure_video_slots(device)
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
-    kv._k_pools[0][ctx.current_video_slot_mapping] = current_k[0]
-    kv._v_pools[0][ctx.current_video_slot_mapping] = current_v[0]
+    if commit_current:
+        layer_ctx.write_only(current_k, current_v)
+    else:
+        kv._k_pools[0][ctx.current_video_slot_mapping] = current_k[0]
+        kv._v_pools[0][ctx.current_video_slot_mapping] = current_v[0]
 
     action_k = action_v = None
     if action_len:
@@ -306,10 +361,12 @@ def test_block_table_padded_to_fixed_width():
 
     ctx1 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx1.prepare(device=device, action_len=0, query_len=BLOCK)
+    ctx1.mark_layer_written(0)
     st.commit_paged_context(POS)
 
     ctx2 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx2.prepare(device=device, action_len=0, query_len=BLOCK)
+    ctx2.mark_layer_written(0)
     st.commit_paged_context(POS)
 
     # 1-block vs 2-block visible history: same table width, same max_seq_len.

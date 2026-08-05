@@ -128,6 +128,8 @@ def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch:
     state = runner._get_or_create_session(session_id)
     ctx = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx.ensure_video_slots(torch.device("cpu"))
+    for layer_idx in range(state.num_layers):
+        ctx.mark_layer_written(layer_idx)
     state.commit_paged_context(kv_branch)
     return state
 

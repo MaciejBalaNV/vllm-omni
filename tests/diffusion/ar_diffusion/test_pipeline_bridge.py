@@ -49,6 +49,8 @@ def make_state(num_layers=1, window_chunks=4, cross_attn_length=0, shared_local_
 def _prepare_and_commit(st: ARDiffusionKVState, kv_branch: str, n_chunks: int) -> None:
     ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0].forward_ctx
     ctx.ensure_video_slots(torch.device("cpu"))
+    for layer_idx in range(st.num_layers):
+        ctx.mark_layer_written(layer_idx)
     st.commit_paged_context(kv_branch)
 
 
@@ -71,6 +73,7 @@ def test_managed_paged_context_commits_only_after_forward():
     ctx.ensure_video_slots(torch.device("cpu"))
     assert st.adapter(POS).completed_chunks == 0
     assert len(ctx.current_video_block_ids) == 2
+    ctx.mark_layer_written(0)
 
     st.commit_paged_context(POS)
 
