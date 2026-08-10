@@ -10,10 +10,6 @@ envelope rather than as a video frame stream.
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -27,69 +23,6 @@ ACTION_MODES = {
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
 }
-
-
-@dataclass(frozen=True)
-class ActionNormalizer:
-    """Per-dimension affine normalizer used by interactive action inputs.
-
-    The checkpoint manifest supplies the provenance identifier while the
-    deploy config supplies the numeric statistics.  Keeping those concerns
-    separate makes a session fingerprint detect accidental statistic changes
-    without embedding a large vector in every request.
-    """
-
-    mean: tuple[float, ...] = ()
-    std: tuple[float, ...] = ()
-    identity: str = "none"
-
-    def __post_init__(self) -> None:
-        if bool(self.mean) != bool(self.std):
-            raise ValueError("Cosmos3 action normalizer mean/std must both be present or both be empty.")
-        if len(self.mean) != len(self.std):
-            raise ValueError(
-                "Cosmos3 action normalizer mean/std lengths differ: "
-                f"{len(self.mean)} != {len(self.std)}."
-            )
-        if any(not math.isfinite(value) for value in (*self.mean, *self.std)):
-            raise ValueError("Cosmos3 action normalizer mean/std must contain only finite values.")
-        if any(value <= 0.0 for value in self.std):
-            raise ValueError("Cosmos3 action normalizer standard deviations must all be positive.")
-        if not self.identity:
-            raise ValueError("Cosmos3 action normalizer identity must be non-empty.")
-
-    @classmethod
-    def from_config(
-        cls,
-        config: Any,
-        *,
-        identity: str | None = None,
-    ) -> ActionNormalizer:
-        if config is None:
-            return cls(identity=str(identity or "none"))
-        if not isinstance(config, dict):
-            raise TypeError("Cosmos3 action_normalizer must be a mapping with mean and std arrays.")
-        mean = tuple(float(value) for value in config.get("mean", ()))
-        std = tuple(float(value) for value in config.get("std", ()))
-        normalizer_id = config.get("id", config.get("identity", identity))
-        if normalizer_id is None:
-            payload = json.dumps({"mean": mean, "std": std}, separators=(",", ":"))
-            normalizer_id = hashlib.sha256(payload.encode()).hexdigest()
-        return cls(mean=mean, std=std, identity=str(normalizer_id))
-
-    def normalize(self, action: torch.Tensor) -> torch.Tensor:
-        if not torch.isfinite(action).all():
-            raise ValueError("Cosmos3 raw actions must contain only finite values.")
-        if not self.mean:
-            return action
-        if action.shape[-1] != len(self.mean):
-            raise ValueError(
-                "Cosmos3 raw action dimension does not match the configured normalizer: "
-                f"{action.shape[-1]} != {len(self.mean)}."
-            )
-        mean = action.new_tensor(self.mean)
-        std = action.new_tensor(self.std)
-        return (action - mean) / std
 
 
 EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {

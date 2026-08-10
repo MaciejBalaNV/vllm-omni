@@ -16,7 +16,8 @@ class CosmosDreamsSessionFingerprint:
     width: int
     fps: float
     domain_id: int
-    normalizer_id: str
+    embodiment: str
+    action_contract_sha256: str
     checkpoint_id: str
     manifest_id: str
     sampler_id: str
@@ -26,25 +27,24 @@ class CosmosDreamsSessionFingerprint:
             raise ValueError("Cosmos-Dreams session fingerprint requires prompt_hash")
         if self.height <= 0 or self.width <= 0 or self.fps <= 0:
             raise ValueError(
-                "Cosmos-Dreams fingerprint resolution/FPS must be positive, "
-                f"got {self.height}x{self.width}@{self.fps}"
+                f"Cosmos-Dreams fingerprint resolution/FPS must be positive, got {self.height}x{self.width}@{self.fps}"
             )
         if self.domain_id < 0:
             raise ValueError(f"Cosmos-Dreams domain_id must be non-negative, got {self.domain_id}")
+        if not self.embodiment:
+            raise ValueError("Cosmos-Dreams session fingerprint requires an embodiment")
+        if not self.action_contract_sha256:
+            raise ValueError("Cosmos-Dreams session fingerprint requires action_contract_sha256")
         if not self.real_text_kv_lengths:
             raise ValueError("Cosmos-Dreams fingerprint requires at least one text KV branch")
         if any(length <= 0 for _, length in self.real_text_kv_lengths):
-            raise ValueError(
-                f"Cosmos-Dreams real text KV lengths must be positive, got {self.real_text_kv_lengths}"
-            )
+            raise ValueError(f"Cosmos-Dreams real text KV lengths must be positive, got {self.real_text_kv_lengths}")
 
     def text_length(self, branch: str) -> int:
         try:
             return dict(self.real_text_kv_lengths)[branch]
         except KeyError as exc:
-            raise KeyError(
-                f"Cosmos-Dreams fingerprint has no text length for branch {branch!r}"
-            ) from exc
+            raise KeyError(f"Cosmos-Dreams fingerprint has no text length for branch {branch!r}") from exc
 
 
 @dataclass
@@ -82,13 +82,10 @@ class CosmosDreamsSessionState:
         frame_idx: int,
     ) -> None:
         if self.fingerprint is None:
-            raise RuntimeError(
-                f"Cosmos-Dreams session {self.session_id!r} is not initialized; session reset required"
-            )
+            raise RuntimeError(f"Cosmos-Dreams session {self.session_id!r} is not initialized; session reset required")
         if self.terminal:
             raise ValueError(
-                f"Cosmos-Dreams session {self.session_id!r} already completed a full rollout; "
-                "session reset required"
+                f"Cosmos-Dreams session {self.session_id!r} already completed a full rollout; session reset required"
             )
         if fingerprint != self.fingerprint:
             changed = [
@@ -97,8 +94,7 @@ class CosmosDreamsSessionState:
                 if getattr(self.fingerprint, field_name) != getattr(fingerprint, field_name)
             ]
             raise ValueError(
-                "Cosmos-Dreams session conditioning changed "
-                f"({', '.join(changed)}); session reset required"
+                f"Cosmos-Dreams session conditioning changed ({', '.join(changed)}); session reset required"
             )
         if frame_idx != self.next_frame_idx:
             raise ValueError(
@@ -108,10 +104,7 @@ class CosmosDreamsSessionState:
 
     def append_chunk(self, chunk: torch.Tensor, *, frame_start: int) -> None:
         if chunk.ndim != 5 or chunk.shape[0] != 1:
-            raise ValueError(
-                "Cosmos-Dreams session chunks must have shape [1,C,T,H,W], "
-                f"got {tuple(chunk.shape)}"
-            )
+            raise ValueError(f"Cosmos-Dreams session chunks must have shape [1,C,T,H,W], got {tuple(chunk.shape)}")
         if frame_start != self.next_frame_idx:
             raise ValueError(
                 "Cosmos-Dreams cannot append an out-of-order chunk: "

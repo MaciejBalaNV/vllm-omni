@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.cosmos3.action import ActionNormalizer
+from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
+    CosmosDreamsActionSchema,
+    canonical_sha256,
+    float32_value,
+)
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos_dreams.normalizer import QuantileRotAffineNormalizer
 from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistilledSampler
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
@@ -27,6 +33,167 @@ from vllm_omni.diffusion.models.cosmos_dreams.utils import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+def _action_layout() -> dict[str, Any]:
+    return {
+        "id": "agibot_backward_framewise_rot6d_v1",
+        "pose_convention": "backward_framewise",
+        "delta_equation": "T_i^-1 @ T_{i+1}",
+        "rotation_representation": "rot6d_columns",
+        "fields": [
+            {"name": "head_translation", "offset": 0, "size": 3, "unit": "meter"},
+            {
+                "name": "head_rotation",
+                "offset": 3,
+                "size": 6,
+                "unit": "dimensionless",
+                "representation": "rot6d_columns",
+            },
+            {"name": "right_translation", "offset": 9, "size": 3, "unit": "meter"},
+            {
+                "name": "right_rotation",
+                "offset": 12,
+                "size": 6,
+                "unit": "dimensionless",
+                "representation": "rot6d_columns",
+            },
+            {
+                "name": "right_gripper",
+                "offset": 18,
+                "size": 1,
+                "unit": "open_fraction",
+                "closed_value": 0.0,
+                "open_value": 1.0,
+            },
+            {"name": "left_translation", "offset": 19, "size": 3, "unit": "meter"},
+            {
+                "name": "left_rotation",
+                "offset": 22,
+                "size": 6,
+                "unit": "dimensionless",
+                "representation": "rot6d_columns",
+            },
+            {
+                "name": "left_gripper",
+                "offset": 28,
+                "size": 1,
+                "unit": "open_fraction",
+                "closed_value": 0.0,
+                "open_value": 1.0,
+            },
+        ],
+    }
+
+
+def _action_schema_payload() -> dict[str, Any]:
+    offset = [float32_value((index - 14) / 100.0) for index in range(29)]
+    training_config_excerpt = {
+        "datasets": [
+            {
+                "dataset_class": "AgiBotWorldBetaDataset",
+                "embodiment": "agibotworld",
+                "method": "quantile_rot",
+                "apply_forward_clamp": False,
+                "pose_convention": "backward_framewise",
+                "rotation_format": "rot6d",
+                "stats_filename": "agibot_backward_framewise_rot6d.json",
+            }
+        ],
+        "experiment": "interact_8b_tfdcm_chunk4_agibot",
+    }
+    normalizer: dict[str, Any] = {
+        "schema_version": 1,
+        "method": "quantile_rot",
+        "transform": {
+            "type": "affine",
+            "offset": offset,
+            "scale": [1.0] * 29,
+            "forward_clamp": False,
+        },
+        "derivation": {
+            "statistics_block": "global_raw",
+            "low_key": "q01",
+            "high_key": "q99",
+            "range_floor": float32_value(1e-8),
+        },
+        "source": {
+            "path": ("projects/cosmos3/cosmos3/datasets/action/normalizers/agibot_backward_framewise_rot6d.json"),
+            "artifact_path": f"cosmos_dreams_action_sources/{'a' * 64}.json",
+            "sha256": "a" * 64,
+            "repository_revision": "d" * 40,
+        },
+        "training_config": {
+            "experiment": "interact_8b_tfdcm_chunk4_agibot",
+            "resolved_sha256": canonical_sha256(training_config_excerpt),
+            "repository_revision": "d" * 40,
+        },
+    }
+    normalizer["transform_sha256"] = canonical_sha256(
+        {
+            "schema_version": normalizer["schema_version"],
+            "method": normalizer["method"],
+            "transform": normalizer["transform"],
+            "derivation": normalizer["derivation"],
+        }
+    )
+    schema: dict[str, Any] = {
+        "schema_version": 2,
+        "action_tokens_per_frame": 4,
+        "raw_action_dim": 29,
+        "model_action_dim": 64,
+        "num_embodiment_domains": 32,
+        "default_embodiment": "agibotworld",
+        "embodiment_to_domain": {"agibotworld": 15},
+        "layout": _action_layout(),
+        "padding": {"stage": "after_normalization", "value": 0.0},
+        "training_config_excerpt": training_config_excerpt,
+        "normalizers": {"agibotworld": normalizer},
+    }
+    schema["contract_sha256"] = canonical_sha256(
+        {
+            "schema_version": 2,
+            "action_tokens_per_frame": 4,
+            "raw_action_dim": 29,
+            "model_action_dim": 64,
+            "num_embodiment_domains": 32,
+            "default_embodiment": "agibotworld",
+            "embodiment_to_domain": {"agibotworld": 15},
+            "layout": schema["layout"],
+            "padding": schema["padding"],
+            "normalizer_sha256_by_embodiment": {"agibotworld": normalizer["transform_sha256"]},
+        }
+    )
+    return schema
+
+
+def _artifact() -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "checkpoint_hash": "a" * 64,
+        "checkpoint_id": "checkpoint",
+        "checkpoint_iteration": 1600,
+        "chunk_size": 4,
+        "window_frames": 64,
+        "sink_frames": 0,
+        "text_cache_max_len": 512,
+        "deploy_resolution": [720, 1280],
+        "attention_mode": "three_way",
+        "video_temporal_causal": True,
+        "latent_patch_size": 2,
+        "vae_spatial_compression_factor": 16,
+        "temporal_compression_factor": 4,
+        "fixed_step_sampler_config": {
+            "sample_type": "sde",
+            "t_list": [1.0, 15 / 16, 5 / 6, 5 / 8],
+            "num_train_timesteps": 1000,
+        },
+        "action_schema": _action_schema_payload(),
+        "temporal_modality_margin": 15000,
+        "unified_3d_mrope_reset_spatial_ids": True,
+        "base_fps": 24.0,
+        "enable_fps_modulation": True,
+    }
+
+
 def _fingerprint(**overrides) -> CosmosDreamsSessionFingerprint:
     values = {
         "prompt_hash": "prompt",
@@ -35,7 +202,8 @@ def _fingerprint(**overrides) -> CosmosDreamsSessionFingerprint:
         "width": 1280,
         "fps": 15.0,
         "domain_id": 15,
-        "normalizer_id": "normalizer",
+        "embodiment": "agibotworld",
+        "action_contract_sha256": "contract",
         "checkpoint_id": "checkpoint",
         "manifest_id": "manifest",
         "sampler_id": "sampler",
@@ -45,33 +213,17 @@ def _fingerprint(**overrides) -> CosmosDreamsSessionFingerprint:
 
 
 def test_manifest_reads_exported_nested_causal_fields() -> None:
-    artifact = {
-        "chunk_size": 4,
-        "checkpoint_hash": "a" * 64,
-        "checkpoint_id": "checkpoint",
-        "checkpoint_iteration": 1600,
-        "normalizer_id": "normalizer",
-        "normalizer_source": "config/normalizer.json",
-        "action_normalizer": {
-            "mean": [0.0],
-            "std": [1.0],
-            "source": "config/normalizer.json",
-        },
-        "embodiment_to_domain": {"agibotworld": 15, "camera": 2},
-        "window_frames": 64,
-        "deploy_resolution": [720, 1280],
-        "fixed_step_sampler_config": {
-            "sample_type": "sde",
-            "t_list": [1.0, 15 / 16, 5 / 6, 5 / 8],
-        },
-    }
+    artifact = _artifact()
     config = SimpleNamespace(
         model_config={
+            # Alternate deployment aliases cannot override artifact geometry.
+            "height": 1,
+            "width": 1,
             "cosmos_dreams": {
                 "chunk_size": 4,
                 "window_frames": 64,
                 "deploy_resolution": [720, 1280],
-            }
+            },
         },
         tf_model_config=SimpleNamespace(to_dict=lambda: {"cosmos_dreams": artifact}),
         custom_pipeline_args={},
@@ -85,10 +237,22 @@ def test_manifest_reads_exported_nested_causal_fields() -> None:
     assert manifest.tokens_per_frame == 924
     assert manifest.checkpoint_hash == "a" * 64
     manifest.require_exported_artifact()
-    assert manifest.resolve_domain_name(" CAMERA ") == 2
+    assert manifest.resolve_domain_name(" AGIBOTWORLD ") == 15
+    assert manifest.resolve_embodiment(None, 15) == "agibotworld"
 
     config.model_config["cosmos_dreams"]["chunk_size"] = 8
     with pytest.raises(ValueError, match="contradicts the exported artifact"):
+        CosmosDreamsManifest.from_od_config(config, require_explicit=True)
+
+
+def test_transformer_artifact_uses_only_the_canonical_cosmos_dreams_key() -> None:
+    config = SimpleNamespace(
+        model_config={},
+        tf_model_config={"causal_manifest": _artifact()},
+        custom_pipeline_args={},
+    )
+
+    with pytest.raises(ValueError, match="requires a causal manifest embedded"):
         CosmosDreamsManifest.from_od_config(config, require_explicit=True)
 
 
@@ -99,13 +263,7 @@ def test_deploy_manifest_cannot_replace_missing_transformer_artifact() -> None:
                 "checkpoint_id": "deploy-only",
                 "checkpoint_iteration": 1600,
                 "checkpoint_hash": "a" * 64,
-                "normalizer_id": "deploy-only",
-                "normalizer_source": "deploy-only",
-                "action_normalizer": {
-                    "mean": [0.0],
-                    "std": [1.0],
-                    "source": "deploy-only",
-                },
+                "action_schema": _action_schema_payload(),
             }
         },
         tf_model_config={},
@@ -127,11 +285,103 @@ def test_manifest_rejects_deployment_defaults_and_placeholder_hash() -> None:
         checkpoint_id="checkpoint",
         checkpoint_iteration=1600,
         checkpoint_hash="a" * 64,
-        normalizer_id="normalizer",
-        normalizer_source="config/normalizer.json",
+        action_schema=CosmosDreamsActionSchema.model_validate(_action_schema_payload()),
     )
     with pytest.raises(ValueError, match="Unknown Cosmos-Dreams domain_name"):
         manifest.resolve_domain_name("unknown")
+
+
+def test_action_contract_rejects_legacy_unsupported_and_tampered_payloads() -> None:
+    payload = _action_schema_payload()
+    payload["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema_version"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _action_schema_payload()
+    payload["normalizers"]["agibotworld"]["method"] = "meanstd"
+    with pytest.raises(ValueError, match="quantile_rot"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _action_schema_payload()
+    payload["normalizers"]["agibotworld"]["transform"]["forward_clamp"] = True
+    with pytest.raises(ValueError, match="False"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _action_schema_payload()
+    payload["normalizers"]["agibotworld"]["transform"]["offset"][0] += 1.0
+    with pytest.raises(ValueError, match="transform_sha256"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _action_schema_payload()
+    payload["normalizers"]["agibotworld"]["transform"]["mask"] = [True] * 29
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _action_schema_payload()
+    payload["normalizers"]["agibotworld"]["transform"]["offset"][0] = "0.0"
+    with pytest.raises(ValueError, match="valid number"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+    payload = _action_schema_payload()
+    payload["normalizers"]["agibotworld"]["source"]["artifact_path"] = "../../outside.json"
+    with pytest.raises(ValueError, match="content-addressed"):
+        CosmosDreamsActionSchema.model_validate(payload)
+
+
+def test_action_contract_canonical_hash_has_cross_repository_golden_value() -> None:
+    assert (
+        canonical_sha256(
+            {
+                "z": -0.0,
+                "offset": [0.1, -0.2],
+                "range_floor": 1e-8,
+                "nested": {"b": 2, "a": 1},
+            }
+        )
+        == "4dbce8b9f13f18b829cefb38c2ea5e3efb0bcbb529d9120b9d78a3c731be2ab7"
+    )
+
+
+def test_action_contract_resolves_embodiment_and_rejects_domain_mismatch() -> None:
+    schema = CosmosDreamsActionSchema.model_validate(_action_schema_payload())
+
+    assert schema.resolve_embodiment(None, 15) == "agibotworld"
+    assert schema.resolve_embodiment(" AGIBOTWORLD ", 15) == "agibotworld"
+    with pytest.raises(ValueError, match="embodiment/domain mismatch"):
+        schema.resolve_embodiment(None, 2)
+    with pytest.raises(ValueError, match="Unknown Cosmos-Dreams embodiment"):
+        schema.resolve_embodiment("unknown", 15)
+
+
+def test_deployment_cannot_override_artifact_action_schema() -> None:
+    artifact = _artifact()
+    config = SimpleNamespace(
+        model_config={"cosmos_dreams": {"action_schema": artifact["action_schema"]}},
+        tf_model_config={"cosmos_dreams": artifact},
+        custom_pipeline_args={},
+    )
+    with pytest.raises(ValueError, match="may only come from transformer/config.json"):
+        CosmosDreamsManifest.from_od_config(config, require_explicit=True)
+
+
+def test_runtime_rejects_flattened_legacy_artifact_fields() -> None:
+    artifact = _artifact()
+    artifact["normalizer_id"] = "legacy"
+    config = SimpleNamespace(
+        model_config={},
+        tf_model_config={"cosmos_dreams": artifact},
+        custom_pipeline_args={},
+    )
+    with pytest.raises(ValueError, match="unknown fields.*normalizer_id"):
+        CosmosDreamsManifest.from_od_config(config, require_explicit=True)
+
+    config = SimpleNamespace(
+        model_config={"action_normalizer": {"mean": [0.0], "std": [1.0]}},
+        tf_model_config={"cosmos_dreams": _artifact()},
+        custom_pipeline_args={},
+    )
+    with pytest.raises(ValueError, match="legacy normalizer fields"):
+        CosmosDreamsManifest.from_od_config(config, require_explicit=True)
 
 
 def test_chunk_partition_is_singleton_then_four_frame_chunks() -> None:
@@ -140,15 +390,14 @@ def test_chunk_partition_is_singleton_then_four_frame_chunks() -> None:
 
 
 def test_clean_commit_order_is_per_frame_and_skips_only_global_terminal_frame() -> None:
-    assert list(
-        iter_clean_commit_frames(1, 5, target_frame=5, terminal_request=False)
-    ) == [(0, 1), (1, 2), (2, 3), (3, 4)]
-    assert list(
-        iter_clean_commit_frames(1, 5, target_frame=5, terminal_request=True)
-    ) == [(0, 1), (1, 2), (2, 3)]
-    assert list(
-        iter_clean_commit_frames(5, 7, target_frame=7, terminal_request=True)
-    ) == [(0, 5)]
+    assert list(iter_clean_commit_frames(1, 5, target_frame=5, terminal_request=False)) == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+    ]
+    assert list(iter_clean_commit_frames(1, 5, target_frame=5, terminal_request=True)) == [(0, 1), (1, 2), (2, 3)]
+    assert list(iter_clean_commit_frames(5, 7, target_frame=7, terminal_request=True)) == [(0, 5)]
 
 
 def test_action_and_vision_tokens_round_trip_in_per_frame_order() -> None:
@@ -265,7 +514,8 @@ def test_kv_estimator_counts_managed_scratch_and_text_pools() -> None:
         ("width", 1216),
         ("fps", 24.0),
         ("domain_id", 2),
-        ("normalizer_id", "other-normalizer"),
+        ("embodiment", "agibot_gear_gripper"),
+        ("action_contract_sha256", "other-contract"),
         ("checkpoint_id", "other-checkpoint"),
         ("manifest_id", "other-manifest"),
         ("sampler_id", "other-sampler"),
@@ -299,15 +549,47 @@ def test_session_fingerprint_rejects_order_terminal_reuse_and_resets() -> None:
     assert not state.terminal
 
 
-def test_action_normalizer_affine_transform_and_identity() -> None:
-    normalizer = ActionNormalizer.from_config(
-        {"mean": [1.0, -1.0], "std": [2.0, 4.0], "id": "stats"}
+def test_action_normalizer_affine_inverse_outliers_and_dimension() -> None:
+    contract = CosmosDreamsActionSchema.model_validate(_action_schema_payload())
+    normalizer = QuantileRotAffineNormalizer.from_contract(contract.normalizers["agibotworld"])
+    offset = torch.tensor(normalizer.offset)
+    raw = torch.stack([offset, offset + 1.0, offset + 100.0])
+
+    normalized = normalizer.normalize(raw)
+
+    torch.testing.assert_close(normalized[0], torch.zeros(29))
+    assert torch.all(normalized[2] > 99.0)
+    torch.testing.assert_close(normalizer.denormalize(normalized), raw)
+    with pytest.raises(ValueError, match="raw action dimension"):
+        normalizer.normalize(torch.zeros(1, 28))
+
+
+def test_pipeline_normalizes_float32_before_zero_padding_to_model_width() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
     )
 
-    normalized = normalizer.normalize(torch.tensor([[3.0, 3.0]]))
+    action_schema = CosmosDreamsActionSchema.model_validate(_action_schema_payload())
+    normalizer = QuantileRotAffineNormalizer.from_contract(action_schema.normalizers["agibotworld"])
+    raw = torch.tensor([normalizer.offset], dtype=torch.float64)
+    stub = SimpleNamespace(
+        action_normalizers={"agibotworld": normalizer},
+        manifest=CosmosDreamsManifest(action_schema=action_schema),
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        _get_sp_param=lambda _sp, key, default: raw if key == "action" else default,
+    )
 
-    torch.testing.assert_close(normalized, torch.tensor([[1.0, 1.0]]))
-    assert normalizer.identity == "stats"
+    result = CosmosDreamsPipeline._prepare_raw_action(
+        stub,
+        SimpleNamespace(),
+        embodiment="agibotworld",
+    )
+
+    assert result is not None
+    assert result.shape == (1, 64)
+    assert result.dtype == torch.float16
+    torch.testing.assert_close(result, torch.zeros_like(result))
 
 
 def test_distilled_sampler_uses_sigma_times_training_timesteps_and_is_seeded() -> None:
@@ -378,9 +660,7 @@ def test_actions_for_frames_local_layout_is_stable_across_chunks() -> None:
 
     assert first_null == () and second_null == ()
     torch.testing.assert_close(first_chunk[0, :, 0], torch.arange(16, dtype=torch.float32))
-    torch.testing.assert_close(
-        second_chunk[0, :, 0], torch.arange(16, 32, dtype=torch.float32)
-    )
+    torch.testing.assert_close(second_chunk[0, :, 0], torch.arange(16, 32, dtype=torch.float32))
 
 
 def test_actions_for_frames_global_layout_and_frame_zero_null() -> None:
@@ -388,14 +668,10 @@ def test_actions_for_frames_global_layout_and_frame_zero_null() -> None:
     slice_actions = pipeline_cls._actions_for_frames
     raw = _numbered_action_rows(32)  # global rows for frames 1..8
 
-    chunk, nulls = slice_actions(
-        stub, raw, layout="global", request_start_frame=0, frame_start=5, frame_end=9
-    )
+    chunk, nulls = slice_actions(stub, raw, layout="global", request_start_frame=0, frame_start=5, frame_end=9)
     torch.testing.assert_close(chunk[0, :, 0], torch.arange(16, 32, dtype=torch.float32))
     assert nulls == ()
 
-    prefix, prefix_nulls = slice_actions(
-        stub, raw, layout="global", request_start_frame=0, frame_start=0, frame_end=1
-    )
+    prefix, prefix_nulls = slice_actions(stub, raw, layout="global", request_start_frame=0, frame_start=0, frame_end=1)
     assert prefix_nulls == (0,)
     torch.testing.assert_close(prefix, torch.zeros_like(prefix))
