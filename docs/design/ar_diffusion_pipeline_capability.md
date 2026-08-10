@@ -87,6 +87,10 @@ state.commit_paged_context("main")
 `gather_history()` reads the immutable block snapshot captured when
 `get_kv_caches()` created the context. It never re-reads the live block table,
 which may already contain an in-flight current page after another layer writes.
+The snapshot is trimmed to the declared sink + sliding-window span before the
+gather: pool eviction is lazy (it runs inside the next allocation), so between
+a commit and the following forward the raw snapshot can transiently hold one
+chunk beyond the window, which attention must never see.
 Gather one layer at a time to avoid duplicating the full pool transiently.
 
 `write_only()` is legal only on a committing context, allocates the current
@@ -95,6 +99,19 @@ fails unless every configured layer wrote successfully. Non-committing denoise
 contexts are read-only, so noisy K/V cannot accidentally become persistent.
 Models that commit multiple frames must open and commit one clean context per
 frame in causal order when later frames depend on earlier refreshed K/V.
+
+## Admission rejection vs. forward failure
+
+A pipeline that rejects a request during validation — before touching session
+state or the KV pool — should raise `ARDiffusionRequestRejectedError`. The runner
+surfaces the error without releasing the session, so the client keeps its
+accumulated KV history and can retry a corrected request (or reset
+explicitly). Any other exception from a forward is treated as a failure of
+unknown extent: the runner releases the session's KV and notifies the pipeline
+to drop its model-owned state, because partially committed pages cannot be
+trusted. Pipelines must therefore complete every fail-closed check (session
+fingerprint, chunk-index ordering, prompt-length, resolution, action coverage)
+before their first side effect.
 
 ## DreamZero adapter
 

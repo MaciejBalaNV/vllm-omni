@@ -153,23 +153,47 @@ class ARDiffusionPagedForwardContext:
             )
         return layer_idx
 
+    def visible_history_block_ids(self) -> list[int]:
+        """History snapshot trimmed to the sink + sliding-window capacity.
+
+        The manager evicts lazily — out-of-window blocks are only released by
+        the *next* allocation — so between a commit and the following forward
+        the snapshot can hold up to one chunk beyond the window. Attention must
+        never see that overhang: trim to the sink prefix plus the window tail,
+        the shape the dense oracle maintains eagerly and the pool converges to.
+        """
+
+        history = self.history_block_ids
+        max_history_blocks = self.max_video_tokens // self.block_size
+        if len(history) <= max_history_blocks:
+            return list(history)
+        sink_blocks = int(self.kv_cache.spec.sink_chunks)
+        tail_blocks = max_history_blocks - sink_blocks
+        visible = list(history[:sink_blocks])
+        if tail_blocks > 0:
+            visible += history[-tail_blocks:]
+        return visible
+
     def gather_history(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather one layer's immutable history snapshot into dense K/V.
 
         ``history_block_ids`` is captured before any current-page allocation.
         Reading only that snapshot is load-bearing: the manager's live block
         table also contains in-flight allocations after the first layer writes.
+        The snapshot is additionally trimmed to the visible sink + window span
+        (see :meth:`visible_history_block_ids`).
         """
 
         layer_idx = self._validate_layer_idx(layer_idx)
         key_cache = self.kv_cache.key_cache(layer_idx)
         value_cache = self.kv_cache.value_cache(layer_idx)
-        if not self.history_block_ids:
+        visible_block_ids = self.visible_history_block_ids()
+        if not visible_block_ids:
             shape = (1, 0, int(self.kv_cache.num_kv_heads), int(self.kv_cache.head_size))
             return key_cache.new_empty(shape), value_cache.new_empty(shape)
 
         block_ids = torch.as_tensor(
-            self.history_block_ids,
+            visible_block_ids,
             dtype=torch.long,
             device=key_cache.device,
         )

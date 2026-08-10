@@ -13,6 +13,18 @@ if TYPE_CHECKING:
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 
+class ARDiffusionRequestRejectedError(ValueError):
+    """A request failed admission validation before any state was touched.
+
+    Pipelines raise this for fail-closed rejections (session-fingerprint
+    mismatch, out-of-order chunk index, over-long prompt, wrong resolution,
+    malformed inputs). The contract: no session state, KV pool content, or
+    accounting was modified, so the runner must surface the error WITHOUT
+    releasing the session — the client keeps its paid-for KV history and can
+    retry a corrected request or explicitly reset.
+    """
+
+
 @dataclass(frozen=True)
 class ARDiffusionKVBranchSpec:
     """One logical model KV branch and its worker-local storage slot.

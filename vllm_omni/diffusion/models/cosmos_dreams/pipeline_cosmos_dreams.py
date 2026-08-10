@@ -45,6 +45,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestRejectedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -443,16 +444,53 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         action = pad_action_to_dim(action, self.manifest.max_action_dim)
         return action.to(device=self.device, dtype=self.dtype)
 
+    def _resolve_action_layout(
+        self,
+        raw_action: torch.Tensor | None,
+        *,
+        start_frame: int,
+        target_frame: int,
+    ) -> str | None:
+        """Decide once per request how raw action rows are indexed.
+
+        ``global``: row block ``[(f-1)*A, f*A)`` conditions latent frame ``f``
+        ``local``:
+        rows cover exactly this request's non-prefix frames in order (the
+        chunk-per-request tick layout). Resolving once keeps the
+        interpretation stable across every chunk of the request and turns
+        insufficient coverage into an admission rejection instead of a
+        mid-rollout failure after frames were already committed.
+        """
+        if raw_action is None:
+            return None
+        action_count = self.manifest.action_tokens_per_frame
+        global_rows = max((target_frame - 1) * action_count, 0)
+        local_rows = sum(
+            action_count for frame in range(start_frame, target_frame) if frame > 0
+        )
+        rows = raw_action.shape[0]
+        if rows >= global_rows:
+            return "global"
+        if rows == local_rows:
+            return "local"
+        raise ARDiffusionRequestRejectedError(
+            "Cosmos-Dreams action length cannot cover the requested latent frames: "
+            f"rows={rows}, frame_range=[{start_frame}, {target_frame}), "
+            f"expected local rows={local_rows} or at least global rows={global_rows}."
+        )
+
     def _actions_for_frames(
         self,
         raw_action: torch.Tensor | None,
         *,
+        layout: str | None,
+        request_start_frame: int,
         frame_start: int,
         frame_end: int,
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
         action_count = self.manifest.action_tokens_per_frame
         frame_count = frame_end - frame_start
-        if raw_action is None:
+        if raw_action is None or layout is None:
             zeros = torch.zeros(
                 1,
                 frame_count * action_count,
@@ -462,30 +500,19 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
             return zeros, tuple(range(frame_count))
 
-        non_prefix_frames = [frame for frame in range(frame_start, frame_end) if frame > 0]
-        local_rows = len(non_prefix_frames) * action_count
-        global_end = max((frame_end - 1) * action_count, 0)
-        use_global = raw_action.shape[0] >= global_end
-        if not use_global and raw_action.shape[0] != local_rows:
-            raise ValueError(
-                "Cosmos-Dreams action length cannot cover the requested latent frames: "
-                f"rows={raw_action.shape[0]}, frame_range=[{frame_start}, {frame_end}), "
-                f"expected local rows={local_rows} or at least global rows={global_end}."
-            )
-
+        # First raw row conditions the first non-prefix frame of the request.
+        local_base_frame = max(request_start_frame, 1)
         rows: list[torch.Tensor] = []
         null_indexes: list[int] = []
-        local_cursor = 0
         for local_idx, frame_idx in enumerate(range(frame_start, frame_end)):
             if frame_idx == 0:
                 rows.append(raw_action.new_zeros(action_count, self.manifest.max_action_dim))
                 null_indexes.append(local_idx)
                 continue
-            if use_global:
+            if layout == "global":
                 start = (frame_idx - 1) * action_count
             else:
-                start = local_cursor
-                local_cursor += action_count
+                start = (frame_idx - local_base_frame) * action_count
             rows.append(raw_action[start : start + action_count])
         return torch.cat(rows, dim=0).unsqueeze(0), tuple(null_indexes)
 
@@ -560,6 +587,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         try:
             return self._forward_impl(req)
+        except ARDiffusionRequestRejectedError:
+            # Admission rejection: guaranteed to be raised before any session
+            # or KV side effect, so the session (and its paid-for history)
+            # survives for a corrected retry or an explicit reset.
+            raise
         except Exception:
             extra = req.sampling_params.extra_args or {}
             session_id = str(extra.get("session_id") or self._bound_session_id or "default")
@@ -567,15 +599,22 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise
 
     def _forward_impl(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        # ---- Admission (pure) ------------------------------------------------
+        # Everything in this section only reads request and session state and
+        # raises ARDiffusionRequestRejectedError on invalid input. No session may be
+        # created, initialized, evicted, or written before it completes: the
+        # rejection contract promises the client an unchanged session.
         if len(req.prompts) != 1:
-            raise ValueError("CosmosDreamsPipeline supports exactly one prompt per request.")
+            raise ARDiffusionRequestRejectedError(
+                "CosmosDreamsPipeline supports exactly one prompt per request."
+            )
         prompt_data = req.prompts[0]
         prompt = prompt_data if isinstance(prompt_data, str) else str(prompt_data.get("prompt", ""))
         sp = req.sampling_params
         extra = sp.extra_args or {}
         session_id = str(extra.get("session_id") or self._bound_session_id or "default")
         if self._bound_session_id is not None and session_id != self._bound_session_id:
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams request session {session_id!r} does not match bound "
                 f"session {self._bound_session_id!r}."
             )
@@ -583,12 +622,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         reset = bool(extra.get("reset", False))
         close_session = bool(extra.get("close_session", False))
         tick = bool(extra.get("ar_diffusion_tick", False) or extra.get("chunk_only", False))
-        if reset:
-            self._drop_session(session_id)
-        state = self._get_or_create_state(session_id)
-        state_was_new = state.fingerprint is None
+        existing_state = self._states.get(session_id)
+        if reset or existing_state is None or existing_state.fingerprint is None:
+            existing_state = None
+        state_was_new = existing_state is None
         if not tick and state_was_new and session_id == "default" and not reset and not close_session:
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams full rollouts on the default session require reset=True at start "
                 "or close_session=True at end."
             )
@@ -596,7 +635,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         height = int(sp.height or self.manifest.height)
         width = int(sp.width or self.manifest.width)
         if (height, width) != (self.manifest.height, self.manifest.width):
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams resolution is fixed per deployment: "
                 f"requested {height}x{width}, configured {self.manifest.height}x{self.manifest.width}."
             )
@@ -607,7 +646,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             or self.default_fps
         )
         if not math.isfinite(fps) or fps <= 0:
-            raise ValueError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
+            raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
         domain_name = self._get_sp_param(sp, "domain_name", None)
         domain_value = self._get_sp_param(sp, "domain_id", None)
         if domain_value is None and domain_name is None:
@@ -615,23 +654,27 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if domain_value is not None:
             domain_id = int(domain_value)
             if domain_id < 0:
-                raise ValueError(f"Cosmos-Dreams domain_id must be non-negative, got {domain_id}.")
+                raise ARDiffusionRequestRejectedError(
+                    f"Cosmos-Dreams domain_id must be non-negative, got {domain_id}."
+                )
         else:
-            domain_id = self.manifest.resolve_domain_name(str(domain_name))
+            try:
+                domain_id = self.manifest.resolve_domain_name(str(domain_name))
+            except ValueError as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if domain_id >= self.manifest.num_embodiment_domains:
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams domain_id is outside the exported embodiment table: "
                 f"{domain_id} not in [0, {self.manifest.num_embodiment_domains})."
             )
-        domain_ids = torch.tensor([domain_id], device=self.device, dtype=torch.long)
 
         guidance_scale = float(self._get_sp_param(sp, "guidance_scale", 1.0) or 1.0)
         if guidance_scale != 1.0:
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams distilled inference requires guidance_scale=1.0, got {guidance_scale}."
             )
         if sp.num_inference_steps not in (None, len(self.manifest.t_list)):
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams distilled inference uses the checkpoint-defined four-step schedule; "
                 f"got num_inference_steps={sp.num_inference_steps}."
             )
@@ -643,7 +686,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         real_text_kv_len = int(text_mask[0].sum().item())
         if real_text_kv_len > self.manifest.text_cache_max_len:
-            raise ValueError(
+            raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams prompt exceeds text_cache_max_len: "
                 f"{real_text_kv_len} > {self.manifest.text_cache_max_len}."
             )
@@ -655,30 +698,39 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             fps=fps,
             domain_id=domain_id,
         )
-        requested_frame_idx = int(extra.get("frame_idx", state.next_frame_idx))
+        start_frame = 0 if state_was_new else existing_state.next_frame_idx
+        requested_frame_idx = int(extra.get("frame_idx", start_frame))
         if state_was_new:
             if requested_frame_idx != 0:
-                raise ValueError(
+                raise ARDiffusionRequestRejectedError(
                     "Cosmos-Dreams new sessions must start at latent frame 0; "
                     f"got {requested_frame_idx}."
                 )
-            state.initialize(fingerprint)
         else:
-            state.validate_request(fingerprint, frame_idx=requested_frame_idx)
-        text_kv = self._ensure_text_kv(state, text_ids, text_mask)
+            try:
+                existing_state.validate_request(fingerprint, frame_idx=requested_frame_idx)
+            except (ValueError, RuntimeError) as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
-        raw_action = self._prepare_raw_action(sp)
-        initial_latent = self._initial_condition_latent(prompt_data, sp)
-        if state.next_frame_idx > 0 and initial_latent is not None:
-            raise ValueError(
+        try:
+            raw_action = self._prepare_raw_action(sp)
+        except (TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        try:
+            initial_latent = self._initial_condition_latent(prompt_data, sp)
+        except (TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if start_frame > 0 and initial_latent is not None:
+            raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams initial media may only be supplied at frame 0; session reset required."
             )
 
-        start_frame = state.next_frame_idx
         if tick:
             tick_frames = int(extra.get("num_latent_frames", self.manifest.chunk_size))
             if tick_frames <= 0:
-                raise ValueError(f"Cosmos-Dreams num_latent_frames must be positive, got {tick_frames}.")
+                raise ARDiffusionRequestRejectedError(
+                    f"Cosmos-Dreams num_latent_frames must be positive, got {tick_frames}."
+                )
             target_frame = start_frame + tick_frames
             # Frame zero is the singleton causal prefix. A normal first tick
             # therefore advances through [0, 1) and then one [1, 5) chunk,
@@ -686,21 +738,35 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             if start_frame == 0:
                 target_frame += 1
             if not close_session and (target_frame - 1) % self.manifest.chunk_size != 0:
-                raise ValueError(
+                raise ARDiffusionRequestRejectedError(
                     "Cosmos-Dreams non-terminal ticks must end on a canonical [1,4,4,...] "
                     f"chunk boundary, got target latent frame {target_frame}."
                 )
         else:
             requested_pixel_frames = int(sp.num_frames or 1)
             if requested_pixel_frames <= 0:
-                raise ValueError(
+                raise ARDiffusionRequestRejectedError(
                     f"Cosmos-Dreams num_frames must be positive, got {requested_pixel_frames}."
                 )
             target_frame = (requested_pixel_frames - 1) // self.manifest.temporal_compression_factor + 1
             if target_frame < start_frame:
-                raise ValueError(
+                raise ARDiffusionRequestRejectedError(
                     "Cosmos-Dreams full rollout target precedes existing session state; session reset required."
                 )
+        action_layout = self._resolve_action_layout(
+            raw_action,
+            start_frame=start_frame,
+            target_frame=target_frame,
+        )
+
+        # ---- Side effects begin ---------------------------------------------
+        if reset:
+            self._drop_session(session_id)
+        state = self._get_or_create_state(session_id)
+        if state.fingerprint is None:
+            state.initialize(fingerprint)
+        domain_ids = torch.tensor([domain_id], device=self.device, dtype=torch.long)
+        text_kv = self._ensure_text_kv(state, text_ids, text_mask)
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)
@@ -708,6 +774,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if initial_latent is not None and state.next_frame_idx == 0:
             initial_action, initial_null = self._actions_for_frames(
                 raw_action,
+                layout=action_layout,
+                request_start_frame=start_frame,
                 frame_start=0,
                 frame_end=1,
             )
@@ -734,6 +802,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             chunk_frames = chunk_end - chunk_start
             action_chunk, null_action_indexes = self._actions_for_frames(
                 raw_action,
+                layout=action_layout,
+                request_start_frame=start_frame,
                 frame_start=chunk_start,
                 frame_end=chunk_end,
             )
