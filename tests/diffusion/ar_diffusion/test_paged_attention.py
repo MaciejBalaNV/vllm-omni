@@ -32,8 +32,20 @@ POS = "positive"
 NEG = "negative"
 
 
-def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu")):
-    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
+def make_state(
+    *,
+    num_layers=1,
+    window_chunks=2,
+    sink_chunks=0,
+    dtype=torch.float32,
+    device=torch.device("cpu"),
+):
+    cfg = ARDiffusionKVConfig(
+        enable=True,
+        chunk_size=BLOCK,
+        window_chunks=window_chunks,
+        sink_chunks=sink_chunks,
+    )
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -170,6 +182,59 @@ def test_dense_gather_uses_immutable_history_snapshot_and_write_only_is_strict()
 
     current[1].write_only(current_k + 1, current_v - 1)
     st.commit_paged_context(POS)
+
+
+def test_gather_history_trims_to_window_after_rollover():
+    """Eviction is lazy, so post-rollover snapshots can transiently hold one
+    out-of-window chunk. gather_history must never expose it: the visible
+    history must exactly match the dense oracle's eager sink+window trim."""
+    torch.manual_seed(0)
+    kv, st = make_state(window_chunks=2)
+    committed = [
+        _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        for _ in range(3)
+    ]
+
+    # No allocation has happened since the third commit, so the raw snapshot
+    # may still contain the rolled-out first chunk; the gather must not.
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
+    gathered_k, gathered_v = layer_ctx.gather_history()
+    assert gathered_k.shape[1] == kv.spec.sliding_window
+    expected_k = torch.cat([committed[1][0], committed[2][0]], dim=1)
+    expected_v = torch.cat([committed[1][1], committed[2][1]], dim=1)
+    torch.testing.assert_close(gathered_k, expected_k)
+    torch.testing.assert_close(gathered_v, expected_v)
+
+
+def test_gather_history_preserves_sink_blocks_across_rollover():
+    torch.manual_seed(0)
+    kv, st = make_state(window_chunks=2, sink_chunks=1)
+    committed = [
+        _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        for _ in range(4)
+    ]
+
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
+    gathered_k, gathered_v = layer_ctx.gather_history()
+    assert gathered_k.shape[1] == (kv.spec.sink_chunks + kv.spec.window_chunks) * BLOCK
+    expected_k = torch.cat([committed[0][0], committed[2][0], committed[3][0]], dim=1)
+    expected_v = torch.cat([committed[0][1], committed[2][1], committed[3][1]], dim=1)
+    torch.testing.assert_close(gathered_k, expected_k)
+    torch.testing.assert_close(gathered_v, expected_v)
 
 
 def test_dense_write_only_rejects_non_committing_context():

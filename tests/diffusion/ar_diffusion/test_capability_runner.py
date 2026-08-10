@@ -15,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
@@ -244,6 +245,34 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert not runner._sessions
     assert not kv._adapters
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_request_rejection_preserves_session_state(monkeypatch):
+    """Admission rejections must NOT tear down the session: the client keeps
+    its paid-for KV history and can retry a corrected request or reset."""
+    pipeline = CapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    kv = runner.kv_cache
+    assert kv is not None
+    state_before = commit_one_frame(runner, "keep", "main")
+    blocks_before = kv.window_block_ids(state_before.adapter("main"))
+    assert blocks_before
+
+    def reject(self, req, kv_prefetch_job=None):
+        raise ARDiffusionRequestRejectedError("out-of-order tick")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", reject)
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "keep"}))
+
+    with pytest.raises(ARDiffusionRequestRejectedError, match="out-of-order tick"):
+        runner.execute_model(request)
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == []
+    assert pipeline.resets == []
+    assert tuple(runner._sessions) == ("keep",)
+    assert runner._sessions["keep"] is state_before
+    assert kv.window_block_ids(state_before.adapter("main")) == blocks_before
 
 
 def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):

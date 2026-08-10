@@ -326,3 +326,76 @@ def test_distilled_sampler_uses_sigma_times_training_timesteps_and_is_seeded() -
     assert timesteps == [1000.0, 500.0]
     torch.testing.assert_close(first, second)
     assert first.dtype == torch.float32
+
+
+def _action_layout_pipeline_stub():
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    stub = SimpleNamespace(
+        manifest=CosmosDreamsManifest(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    return CosmosDreamsPipeline, stub
+
+
+def _numbered_action_rows(rows: int, dim: int = 64) -> torch.Tensor:
+    return torch.arange(rows, dtype=torch.float32).unsqueeze(1).repeat(1, dim)
+
+
+def test_action_layout_resolution_is_per_request_and_rejects_short_actions() -> None:
+    from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
+
+    pipeline_cls, stub = _action_layout_pipeline_stub()
+    resolve = pipeline_cls._resolve_action_layout
+
+    assert resolve(stub, None, start_frame=0, target_frame=5) is None
+    # Whole-rollout jsonl layout: rows cover frames 1..target-1 globally.
+    assert resolve(stub, _numbered_action_rows(16), start_frame=0, target_frame=5) == "global"
+    # Tick continuation with exactly this request's rows is local, and must
+    # stay local for EVERY chunk of the request (rows < global requirement).
+    assert resolve(stub, _numbered_action_rows(16), start_frame=5, target_frame=9) == "local"
+    with pytest.raises(ARDiffusionRequestRejectedError, match="cannot cover"):
+        resolve(stub, _numbered_action_rows(20), start_frame=5, target_frame=9)
+
+
+def test_actions_for_frames_local_layout_is_stable_across_chunks() -> None:
+    """Regression: a two-chunk local-layout tick must consume rows in request
+    order; per-chunk global/local re-detection previously flipped the first
+    chunk to global indexing and misconditioned every frame."""
+    pipeline_cls, stub = _action_layout_pipeline_stub()
+    slice_actions = pipeline_cls._actions_for_frames
+    raw = _numbered_action_rows(32)  # request [5, 13): 8 frames x 4 rows
+
+    first_chunk, first_null = slice_actions(
+        stub, raw, layout="local", request_start_frame=5, frame_start=5, frame_end=9
+    )
+    second_chunk, second_null = slice_actions(
+        stub, raw, layout="local", request_start_frame=5, frame_start=9, frame_end=13
+    )
+
+    assert first_null == () and second_null == ()
+    torch.testing.assert_close(first_chunk[0, :, 0], torch.arange(16, dtype=torch.float32))
+    torch.testing.assert_close(
+        second_chunk[0, :, 0], torch.arange(16, 32, dtype=torch.float32)
+    )
+
+
+def test_actions_for_frames_global_layout_and_frame_zero_null() -> None:
+    pipeline_cls, stub = _action_layout_pipeline_stub()
+    slice_actions = pipeline_cls._actions_for_frames
+    raw = _numbered_action_rows(32)  # global rows for frames 1..8
+
+    chunk, nulls = slice_actions(
+        stub, raw, layout="global", request_start_frame=0, frame_start=5, frame_end=9
+    )
+    torch.testing.assert_close(chunk[0, :, 0], torch.arange(16, 32, dtype=torch.float32))
+    assert nulls == ()
+
+    prefix, prefix_nulls = slice_actions(
+        stub, raw, layout="global", request_start_frame=0, frame_start=0, frame_end=1
+    )
+    assert prefix_nulls == (0,)
+    torch.testing.assert_close(prefix, torch.zeros_like(prefix))

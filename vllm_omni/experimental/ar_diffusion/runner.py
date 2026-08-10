@@ -15,6 +15,7 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestRejectedError,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
 )
@@ -255,6 +256,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
             if self.device is not None and torch.device(self.device).type == "cuda":
                 torch.accelerator.synchronize(self.device)
+        except ARDiffusionRequestRejectedError:
+            # Admission rejection: the pipeline guarantees no session state or
+            # KV content changed. Keep the session so the client can retry a
+            # corrected request (or reset explicitly) without losing history.
+            logger.info(
+                "AR-Diffusion request rejected at admission for session=%s; session state retained",
+                session_id,
+            )
+            raise
         except Exception:
             self._release_session(
                 session_id,
