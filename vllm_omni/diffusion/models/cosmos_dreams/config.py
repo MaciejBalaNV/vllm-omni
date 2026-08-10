@@ -6,8 +6,40 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from typing import Any
+
+from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
+    ACTION_TOKENS_PER_FRAME,
+    MODEL_ACTION_DIM,
+    NUM_EMBODIMENT_DOMAINS,
+    RAW_ACTION_DIM,
+    CosmosDreamsActionSchema,
+)
+
+_EXPORTED_ARTIFACT_FIELDS = {
+    "schema_version",
+    "checkpoint_id",
+    "checkpoint_iteration",
+    "checkpoint_hash",
+    "chunk_size",
+    "window_frames",
+    "sink_frames",
+    "text_cache_max_len",
+    "deploy_resolution",
+    "attention_mode",
+    "video_temporal_causal",
+    "latent_patch_size",
+    "vae_spatial_compression_factor",
+    "temporal_compression_factor",
+    "fixed_step_sampler_config",
+    "action_schema",
+    "temporal_modality_margin",
+    "unified_3d_mrope_reset_spatial_ids",
+    "base_fps",
+    "enable_fps_modulation",
+}
+_LEGACY_NORMALIZER_FIELDS = {"action_normalizer", "normalizer_id", "normalizer_source"}
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -55,11 +87,7 @@ def _exported_artifact_source(config: Any) -> dict[str, Any]:
     """Return the causal payload embedded in ``transformer/config.json``."""
 
     transformer_config = _mapping(getattr(config, "tf_model_config", None))
-    for key in ("cosmos_dreams", "causal_manifest", "interactive_config"):
-        nested = _mapping(transformer_config.get(key))
-        if nested:
-            return nested
-    return {}
+    return _mapping(transformer_config.get("cosmos_dreams"))
 
 
 def _validate_deploy_overrides(config: Any, artifact: dict[str, Any]) -> None:
@@ -67,8 +95,28 @@ def _validate_deploy_overrides(config: Any, artifact: dict[str, Any]) -> None:
 
     for attr in ("custom_pipeline_args", "model_config"):
         root = _mapping(getattr(config, attr, None))
+        legacy_root_fields = sorted(_LEGACY_NORMALIZER_FIELDS & set(root))
+        if legacy_root_fields:
+            raise ValueError(
+                f"Cosmos-Dreams deployment contains legacy normalizer fields in {attr}: {legacy_root_fields}."
+            )
+        if "action_schema" in root:
+            raise ValueError(
+                f"Cosmos-Dreams action_schema may only come from transformer/config.json, not {attr}.action_schema."
+            )
         for key in ("cosmos_dreams", "causal_manifest", "interactive_config"):
             override = _mapping(root.get(key))
+            legacy_override_fields = sorted(_LEGACY_NORMALIZER_FIELDS & set(override))
+            if legacy_override_fields:
+                raise ValueError(
+                    "Cosmos-Dreams deployment contains legacy normalizer fields in "
+                    f"{attr}.{key}: {legacy_override_fields}."
+                )
+            if "action_schema" in override:
+                raise ValueError(
+                    "Cosmos-Dreams action_schema may only come from transformer/config.json, "
+                    f"not {attr}.{key}.action_schema."
+                )
             for field in artifact.keys() & override.keys():
                 if artifact[field] != override[field]:
                     raise ValueError(
@@ -86,7 +134,7 @@ class CosmosDreamsManifest:
     latent patch grid uses ceiling division, matching Cosmos3 patchification.
     """
 
-    schema_version: int = 1
+    schema_version: int = 2
     chunk_size: int = 4
     window_frames: int = 96
     sink_frames: int = 0
@@ -96,9 +144,6 @@ class CosmosDreamsManifest:
     latent_patch_size: int = 2
     vae_spatial_compression_factor: int = 16
     temporal_compression_factor: int = 4
-    action_tokens_per_frame: int = 4
-    max_action_dim: int = 64
-    num_embodiment_domains: int = 32
     temporal_modality_margin: int = 15_000
     base_fps: float = 24.0
     enable_fps_modulation: bool = True
@@ -110,15 +155,11 @@ class CosmosDreamsManifest:
     checkpoint_id: str = "unknown"
     checkpoint_iteration: int = 0
     checkpoint_hash: str = "unknown"
-    normalizer_id: str = "none"
-    normalizer_source: str = "unknown"
-    embodiment_to_domain: tuple[tuple[str, int], ...] = (("agibotworld", 15),)
+    action_schema: CosmosDreamsActionSchema | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError(
-                f"Cosmos-Dreams manifest schema_version must be 1, got {self.schema_version}"
-            )
+        if self.schema_version != 2:
+            raise ValueError(f"Cosmos-Dreams manifest schema_version must be 2, got {self.schema_version}")
         positive = {
             "schema_version": self.schema_version,
             "chunk_size": self.chunk_size,
@@ -130,7 +171,8 @@ class CosmosDreamsManifest:
             "vae_spatial_compression_factor": self.vae_spatial_compression_factor,
             "temporal_compression_factor": self.temporal_compression_factor,
             "action_tokens_per_frame": self.action_tokens_per_frame,
-            "max_action_dim": self.max_action_dim,
+            "model_action_dim": self.max_action_dim,
+            "raw_action_dim": self.raw_action_dim,
             "num_embodiment_domains": self.num_embodiment_domains,
             "num_train_timesteps": self.num_train_timesteps,
         }
@@ -141,14 +183,10 @@ class CosmosDreamsManifest:
             raise ValueError(f"Cosmos-Dreams manifest sink_frames must be non-negative, got {self.sink_frames}")
         if self.checkpoint_iteration < 0:
             raise ValueError(
-                "Cosmos-Dreams checkpoint_iteration must be non-negative, "
-                f"got {self.checkpoint_iteration}"
+                f"Cosmos-Dreams checkpoint_iteration must be non-negative, got {self.checkpoint_iteration}"
             )
         if self.attention_mode != "three_way":
-            raise ValueError(
-                "Cosmos-Dreams requires attention_mode='three_way', "
-                f"got {self.attention_mode!r}"
-            )
+            raise ValueError(f"Cosmos-Dreams requires attention_mode='three_way', got {self.attention_mode!r}")
         if not self.video_temporal_causal:
             raise ValueError("Cosmos-Dreams requires video_temporal_causal=True")
         if not self.enable_fps_modulation:
@@ -175,29 +213,46 @@ class CosmosDreamsManifest:
             or any(character not in "0123456789abcdefABCDEF" for character in self.checkpoint_hash)
         ):
             raise ValueError(
-                "Cosmos-Dreams checkpoint_hash must be a 64-character SHA-256 digest, "
-                f"got {self.checkpoint_hash!r}"
+                f"Cosmos-Dreams checkpoint_hash must be a 64-character SHA-256 digest, got {self.checkpoint_hash!r}"
             )
         if self.checkpoint_hash != "unknown" and set(self.checkpoint_hash) == {"0"}:
             raise ValueError("Cosmos-Dreams checkpoint_hash cannot be the all-zero template value")
-        domain_names = [name for name, _ in self.embodiment_to_domain]
-        if not domain_names or any(not name for name in domain_names):
-            raise ValueError("Cosmos-Dreams embodiment_to_domain must contain non-empty names")
-        if len(domain_names) != len(set(domain_names)):
-            raise ValueError(
-                "Cosmos-Dreams embodiment_to_domain names must be unique, "
-                f"got {domain_names}"
-            )
-        invalid_domains = {
-            name: domain_id
-            for name, domain_id in self.embodiment_to_domain
-            if domain_id < 0 or domain_id >= self.num_embodiment_domains
-        }
-        if invalid_domains:
-            raise ValueError(
-                "Cosmos-Dreams embodiment domain IDs must be inside the exported table, "
-                f"got {invalid_domains}"
-            )
+
+    @property
+    def action_tokens_per_frame(self) -> int:
+        if self.action_schema is None:
+            return ACTION_TOKENS_PER_FRAME
+        return self.action_schema.action_tokens_per_frame
+
+    @property
+    def raw_action_dim(self) -> int:
+        if self.action_schema is None:
+            return RAW_ACTION_DIM
+        return self.action_schema.raw_action_dim
+
+    @property
+    def max_action_dim(self) -> int:
+        if self.action_schema is None:
+            return MODEL_ACTION_DIM
+        return self.action_schema.model_action_dim
+
+    @property
+    def num_embodiment_domains(self) -> int:
+        if self.action_schema is None:
+            return NUM_EMBODIMENT_DOMAINS
+        return self.action_schema.num_embodiment_domains
+
+    @property
+    def embodiment_to_domain(self) -> tuple[tuple[str, int], ...]:
+        if self.action_schema is None:
+            return (("agibotworld", 15),)
+        return tuple(sorted(self.action_schema.embodiment_to_domain.items()))
+
+    @property
+    def action_contract_sha256(self) -> str:
+        if self.action_schema is None:
+            return "none"
+        return self.action_schema.contract_sha256
 
     @classmethod
     def from_od_config(
@@ -213,25 +268,22 @@ class CosmosDreamsManifest:
                     "Cosmos-Dreams requires a causal manifest embedded in transformer/config.json; "
                     "deployment defaults are not a validated artifact."
                 )
-            missing_artifact_fields = [
-                field
-                for field in (
-                    "checkpoint_id",
-                    "checkpoint_iteration",
-                    "checkpoint_hash",
-                    "normalizer_id",
-                    "normalizer_source",
-                    "action_normalizer",
-                )
-                if artifact.get(field) in (None, "", "unknown", "none", 0)
-            ]
+            missing_artifact_fields = sorted(_EXPORTED_ARTIFACT_FIELDS - set(artifact))
+            unknown_artifact_fields = sorted(set(artifact) - _EXPORTED_ARTIFACT_FIELDS)
             if missing_artifact_fields:
                 raise ValueError(
-                    "Cosmos-Dreams transformer artifact is incomplete; missing "
-                    f"{', '.join(missing_artifact_fields)}."
+                    f"Cosmos-Dreams transformer artifact is incomplete; missing {', '.join(missing_artifact_fields)}."
+                )
+            if unknown_artifact_fields:
+                raise ValueError(
+                    f"Cosmos-Dreams transformer artifact contains unknown fields: {unknown_artifact_fields}."
                 )
             _validate_deploy_overrides(od_config, artifact)
-        sources = _manifest_sources(od_config)
+        else:
+            artifact = _exported_artifact_source(od_config)
+            if artifact:
+                _validate_deploy_overrides(od_config, artifact)
+        sources = [artifact] if artifact else _manifest_sources(od_config)
         fixed_step = _mapping(_first(sources, "fixed_step_sampler_config", default={}))
         resolution = _first(sources, "deploy_resolution", default=None)
         resolution_map = _mapping(resolution)
@@ -247,40 +299,23 @@ class CosmosDreamsManifest:
             width = resolution_list[1] if width is None else width
 
         raw_t_list = fixed_step.get("t_list", _first(sources, "t_list", default=cls.t_list))
-        raw_domains = _first(
-            sources,
-            "embodiment_to_domain",
-            default=dict(cls.embodiment_to_domain),
+        raw_action_schema = _first(sources, "action_schema", default=None)
+        action_schema = (
+            CosmosDreamsActionSchema.model_validate(raw_action_schema) if raw_action_schema is not None else None
         )
-        if not isinstance(raw_domains, dict):
-            raise ValueError(
-                "Cosmos-Dreams embodiment_to_domain must be a mapping, "
-                f"got {type(raw_domains).__name__}"
-            )
         return cls(
-            schema_version=int(_first(sources, "schema_version", default=1)),
-            chunk_size=int(
-                _first(sources, "chunk_size", "teacher_forcing_frames_per_chunk", default=4)
-            ),
+            schema_version=int(_first(sources, "schema_version", default=2)),
+            chunk_size=int(_first(sources, "chunk_size", "teacher_forcing_frames_per_chunk", default=4)),
             window_frames=int(_first(sources, "window_frames", "kv_cache_inference_size", default=96)),
             sink_frames=int(_first(sources, "sink_frames", "attention_sink_size", default=0)),
-            text_cache_max_len=int(
-                _first(sources, "text_cache_max_len", "ar_static_und_cache_max_len", default=512)
-            ),
+            text_cache_max_len=int(_first(sources, "text_cache_max_len", "ar_static_und_cache_max_len", default=512)),
             height=int(height if height is not None else 720),
             width=int(width if width is not None else 1280),
             latent_patch_size=int(_first(sources, "latent_patch_size", "patch_spatial", default=2)),
             vae_spatial_compression_factor=int(
                 _first(sources, "vae_spatial_compression_factor", "latent_downsample_factor", default=16)
             ),
-            temporal_compression_factor=int(
-                _first(sources, "temporal_compression_factor", default=4)
-            ),
-            action_tokens_per_frame=int(
-                _first(sources, "action_tokens_per_frame", "temporal_compression_factor", default=4)
-            ),
-            max_action_dim=int(_first(sources, "max_action_dim", "action_dim", default=64)),
-            num_embodiment_domains=int(_first(sources, "num_embodiment_domains", default=32)),
+            temporal_compression_factor=int(_first(sources, "temporal_compression_factor", default=4)),
             temporal_modality_margin=int(
                 _first(
                     sources,
@@ -291,9 +326,7 @@ class CosmosDreamsManifest:
             ),
             base_fps=float(_first(sources, "base_fps", default=24.0)),
             enable_fps_modulation=bool(_first(sources, "enable_fps_modulation", default=True)),
-            attention_mode=str(
-                _first(sources, "attention_mode", "joint_attn_implementation", default="three_way")
-            ),
+            attention_mode=str(_first(sources, "attention_mode", "joint_attn_implementation", default="three_way")),
             video_temporal_causal=bool(_first(sources, "video_temporal_causal", default=True)),
             sample_type=str(fixed_step.get("sample_type", _first(sources, "sample_type", default="sde"))),
             t_list=tuple(float(value) for value in raw_t_list),
@@ -306,13 +339,7 @@ class CosmosDreamsManifest:
             checkpoint_id=str(_first(sources, "checkpoint_id", default="unknown")),
             checkpoint_iteration=int(_first(sources, "checkpoint_iteration", default=0)),
             checkpoint_hash=str(_first(sources, "checkpoint_hash", default="unknown")),
-            normalizer_id=str(
-                _first(sources, "normalizer_id", "action_normalizer_id", default="none")
-            ),
-            normalizer_source=str(_first(sources, "normalizer_source", default="unknown")),
-            embodiment_to_domain=tuple(
-                sorted((str(name).strip().lower(), int(domain_id)) for name, domain_id in raw_domains.items())
-            ),
+            action_schema=action_schema,
         )
 
     def require_exported_artifact(self) -> None:
@@ -325,10 +352,8 @@ class CosmosDreamsManifest:
             missing.append("checkpoint_iteration")
         if not self.checkpoint_hash or self.checkpoint_hash == "unknown":
             missing.append("checkpoint_hash")
-        if not self.normalizer_id or self.normalizer_id == "none":
-            missing.append("normalizer_id")
-        if not self.normalizer_source or self.normalizer_source == "unknown":
-            missing.append("normalizer_source")
+        if self.action_schema is None:
+            missing.append("action_schema")
         if missing:
             raise ValueError(
                 "Cosmos-Dreams requires a validated exported artifact; missing "
@@ -344,6 +369,11 @@ class CosmosDreamsManifest:
                 f"Unknown Cosmos-Dreams domain_name={name!r}; expected one of "
                 f"{sorted(dict(self.embodiment_to_domain))}."
             ) from exc
+
+    def resolve_embodiment(self, name: str | None, domain_id: int | None) -> str:
+        if self.action_schema is None:
+            raise ValueError("Cosmos-Dreams action_schema is unavailable.")
+        return self.action_schema.resolve_embodiment(name, domain_id)
 
     @property
     def latent_height(self) -> int:
@@ -376,5 +406,9 @@ class CosmosDreamsManifest:
 
     @property
     def digest(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        values = {field.name: getattr(self, field.name) for field in fields(self) if field.name != "action_schema"}
+        values["action_schema"] = (
+            self.action_schema.model_dump(mode="json", exclude_none=True) if self.action_schema is not None else None
+        )
+        payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()

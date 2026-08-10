@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos-Dreams (Cosmos3-Interactive) diffusion model family."""
 
+from vllm_omni.diffusion.models.cosmos_dreams.action_contract import CosmosDreamsActionSchema
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 
 __all__ = [
     "Cosmos3InteractivePipeline",
+    "CosmosDreamsActionSchema",
     "CosmosDreamsManifest",
     "CosmosDreamsOmniPipeline",
     "CosmosDreamsPipeline",

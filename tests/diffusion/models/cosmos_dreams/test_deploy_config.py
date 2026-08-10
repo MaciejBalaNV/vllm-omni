@@ -30,9 +30,7 @@ def test_cosmos_dreams_topology_and_deploy_route_to_ar_diffusion() -> None:
     assert stage["max_num_seqs"] == 1
     assert stage["enforce_eager"] is True
     assert stage["model_class_name"] == "CosmosDreamsPipeline"
-    engine = DiffusionEngine.resolve_engine_class(
-        SimpleNamespace(engine_backend=stage["engine_backend"])
-    )
+    engine = DiffusionEngine.resolve_engine_class(SimpleNamespace(engine_backend=stage["engine_backend"]))
     assert issubclass(engine, ARDiffusionEngine)
 
 
@@ -48,3 +46,5 @@ def test_cosmos_dreams_deploy_keeps_artifact_fields_out_of_templates() -> None:
     assert "normalizer_id" not in manifest
     assert "normalizer_source" not in manifest
     assert "action_normalizer" not in manifest
+    assert "action_schema" not in manifest
+    assert manifest["schema_version"] == 2

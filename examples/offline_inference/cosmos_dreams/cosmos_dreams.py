@@ -151,6 +151,9 @@ def main() -> None:
         "close_session": True,
         "domain_id": int(record.get("domain_id", 15)),
     }
+    domain_name = record.get("domain_name", record.get("embodiment"))
+    if domain_name is not None:
+        extra_args["domain_name"] = str(domain_name)
     if action is not None:
         extra_args["action"] = action
 

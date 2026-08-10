@@ -2,9 +2,12 @@
 
 This runner accepts the reference interactive jsonl plus its optional pickle
 payload. A record may contain `prompt`/`ai_caption`, `input_video`/`video`/`image`,
-`action`, `fps`/`conditioning_fps`, and `domain_id`, or point to a pickle with `pickle_path`, `pkl_path`, or
-`data_path`. The first source frame is used as the causal prefix; action rows
-are normalized from the exported deployment stats and padded to 64 dimensions.
+`action`, `fps`/`conditioning_fps`, `domain_id`, and
+`domain_name`/`embodiment`, or point to a pickle with `pickle_path`,
+`pkl_path`, or `data_path`. The first source frame is used as the causal prefix;
+action rows are normalized using the selected embodiment's exported contract
+and padded to 64 dimensions. When no embodiment is supplied, the artifact's
+declared default (currently `agibotworld`) is used.
 
 ```bash
 python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
