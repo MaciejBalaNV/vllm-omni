@@ -1146,6 +1146,14 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
     video = torch.zeros(1, 3, 1, 4, 4)
 
     assert func(video, output_type="latent") is video
+    latent_payload = {"video": video}
+    assert (
+        func(
+            latent_payload,
+            sampling_params=SimpleNamespace(output_type="latent"),
+        )
+        is latent_payload
+    )
     assert func({"image": video})[0].size == (4, 4)
     # Video-only postprocess returns the bare processed video (not a dict),
     # matching the image/latent branches and peer audio-capable pipelines.
