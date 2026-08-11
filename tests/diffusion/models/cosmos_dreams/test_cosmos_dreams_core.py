@@ -308,7 +308,8 @@ def test_action_contract_rejects_legacy_unsupported_and_tampered_payloads() -> N
         CosmosDreamsActionSchema.model_validate(payload)
 
     payload = _action_schema_payload()
-    payload["normalizers"]["agibotworld"]["transform"]["offset"][0] += 1.0
+    transform = payload["normalizers"]["agibotworld"]["transform"]
+    transform["offset"][0] = float32_value(transform["offset"][0] + 1.0)
     with pytest.raises(ValueError, match="transform_sha256"):
         CosmosDreamsActionSchema.model_validate(payload)
 
