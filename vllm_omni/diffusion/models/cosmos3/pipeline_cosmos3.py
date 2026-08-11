@@ -605,6 +605,9 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         output_type: str = "np",
         sampling_params=None,
     ):
+        request_output_type = getattr(sampling_params, "output_type", None)
+        if request_output_type is not None:
+            output_type = request_output_type
         if output_type == "latent":
             return output
 
@@ -900,9 +903,7 @@ class Cosmos3OmniDiffusersPipeline(
             sound_latent_fps = self._sound_tokenizer.latent_fps
 
         # --- Transformer (weights loaded later via weights_sources) ---
-        transformer_cls = self._transformer_cls_override or resolve_cosmos3_transformer_cls(
-            od_config.tf_model_config
-        )
+        transformer_cls = self._transformer_cls_override or resolve_cosmos3_transformer_cls(od_config.tf_model_config)
         self.transformer = transformer_cls(
             od_config=od_config,
             temporal_compression_factor=self.vae_scale_factor_temporal,
