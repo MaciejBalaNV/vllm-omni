@@ -178,7 +178,7 @@ class ARDiffusionKVCache:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
         if config.window_chunks is None:
-            raise ValueError("Phase 1 requires a bounded window (window_chunks)")
+            raise ValueError("AR-Diffusion paged KV requires a bounded window (window_chunks)")
         if config.chunk_size <= 0:
             raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
         if not kv_branches:

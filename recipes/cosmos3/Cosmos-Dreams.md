@@ -61,9 +61,14 @@ rejects a deploy override that contradicts those embedded artifact fields.
 The KV startup allocation is a hard floor. At TP=1/BF16, one 720p frame across
 36 layers is about 133 MiB; the configured window, the mandatory one-page
 scratch reservation, and the 512-token text pool are all counted before model
-execution. Reduce `window_frames` if the manager reports an insufficient
-memory budget. A sliding window changes long-horizon semantics relative to the
-unbounded reference and needs a separate quality evaluation.
+execution. If the manager reports an insufficient memory budget, use a
+checkpoint artifact exported with a smaller `window_frames`; runtime overrides
+are rejected. The physical window does not cap the logical session at that
+length: evicted positions remain logical placeholders while generation rolls
+forward. A sliding window changes long-horizon semantics relative to the
+unbounded reference and needs a separate quality evaluation. Engine-level
+window/sink/reset overrides would make the paged path diverge from the
+manifest-driven dense oracle.
 
 ## Request modes
 

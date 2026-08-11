@@ -252,6 +252,16 @@ def test_commit_refuses_context_without_all_layer_writes():
         st.commit_paged_context(POS)
 
 
+def test_unallocated_committing_context_cannot_be_replaced():
+    """A commit context is a transaction even before its first lazy write."""
+
+    _, st = make_state()
+    st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
+
+    with pytest.raises(RuntimeError, match="replaced before.*committed"):
+        st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)
+
+
 def test_pipeline_kv_get_paged_path_has_no_gather_backend():
     kv, st = make_state()
     assert not hasattr(kv, "gather_window_all_layers")

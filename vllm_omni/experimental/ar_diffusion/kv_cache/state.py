@@ -95,7 +95,7 @@ class ARDiffusionKVState:
             )
 
         pending = self._paged_pending.get(kv_branch)
-        if pending is not None and pending.commit_current and pending._allocated_video and not pending._committed:
+        if pending is not None and pending.commit_current and not pending._committed:
             raise RuntimeError("AR-Diffusion paged context replaced before its managed current chunk was committed")
 
         adapter = self.adapter(kv_branch)
