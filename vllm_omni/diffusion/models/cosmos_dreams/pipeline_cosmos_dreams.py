@@ -121,6 +121,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     paged storage and gathers one layer of immutable history at a time.
     """
 
+    # The engine's generic warmup request is 512x512 with a one-step sampler,
+    # while Cosmos-Dreams has artifact-fixed geometry and a four-step sampler.
+    # Skip that incompatible request; AR-Diffusion owns any model-valid rollout
+    # warmup when CUDA graphs are enabled.
+    dummy_run_num_frames: ClassVar[int] = 0
     _transformer_cls_override: ClassVar[type[CosmosDreamsTransformer]] = CosmosDreamsTransformer
     _MAIN_BRANCH = "main"
     _SESSION_CAPACITY = 1

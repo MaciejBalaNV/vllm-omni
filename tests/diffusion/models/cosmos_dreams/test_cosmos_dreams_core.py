@@ -592,6 +592,14 @@ def test_pipeline_normalizes_float32_before_zero_padding_to_model_width() -> Non
     torch.testing.assert_close(result, torch.zeros_like(result))
 
 
+def test_pipeline_disables_incompatible_generic_warmup() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    assert CosmosDreamsPipeline.dummy_run_num_frames == 0
+
+
 def test_distilled_sampler_uses_sigma_times_training_timesteps_and_is_seeded() -> None:
     sampler = CosmosDreamsDistilledSampler([1.0, 0.5], sample_type="sde", num_train_timesteps=1000)
     timesteps: list[float] = []
