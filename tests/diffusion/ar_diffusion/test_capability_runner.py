@@ -275,6 +275,16 @@ def test_request_rejection_preserves_session_state(monkeypatch):
     assert kv.window_block_ids(state_before.adapter("main")) == blocks_before
 
 
+def test_malformed_extra_args_is_rejected_before_session_creation():
+    runner = make_runner(CapablePipeline(lingbot_like_spec()))
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args=[]))
+
+    with pytest.raises(ARDiffusionRequestRejectedError, match="extra_args must be a mapping"):
+        runner.execute_model(request)
+
+    assert not runner._sessions
+
+
 def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     pipeline = CapablePipeline(lingbot_like_spec())
     runner = make_runner(pipeline)

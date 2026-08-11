@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 
 import torch
 from vllm.logger import init_logger
@@ -231,8 +232,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return state
 
     @staticmethod
-    def _request_session(req: OmniDiffusionRequest) -> tuple[str, dict]:
-        extra_args = req.sampling_params.extra_args or {}
+    def _request_session(req: OmniDiffusionRequest) -> tuple[str, Mapping]:
+        extra_args = req.sampling_params.extra_args
+        if extra_args is None:
+            extra_args = {}
+        if not isinstance(extra_args, Mapping):
+            raise ARDiffusionRequestRejectedError(
+                f"AR-Diffusion extra_args must be a mapping, got {type(extra_args).__name__}."
+            )
         return str(extra_args.get("session_id") or "default"), extra_args
 
     def execute_model(

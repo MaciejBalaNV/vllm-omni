@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -78,6 +78,26 @@ def _nested_config_value(config: Any, key: str, default: Any = None) -> Any:
         if root.get(key) is not None:
             return root[key]
     return default
+
+
+def _first_not_none(*values: Any) -> Any:
+    """Return the first explicitly supplied value, preserving falsey inputs."""
+
+    return next((value for value in values if value is not None), None)
+
+
+def _admission_int(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams {name} must be an integer, got {value!r}.") from exc
+
+
+def _admission_float(value: Any, name: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams {name} must be numeric, got {value!r}.") from exc
 
 
 def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
@@ -224,7 +244,39 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- AR-Diffusion pipeline capability ---------------------------------
 
+    def _validate_ar_diffusion_deploy_overrides(self) -> None:
+        od_config = getattr(self, "od_config", None)
+        raw = getattr(od_config, "ar_diffusion_kv_config", None)
+        if raw is None:
+            model_config = getattr(od_config, "model_config", None)
+            if isinstance(model_config, dict):
+                raw = model_config.get("ar_diffusion_kv_config")
+        if raw is None:
+            return
+
+        def configured(name: str, default: Any) -> Any:
+            if isinstance(raw, dict):
+                return raw.get(name, default)
+            return getattr(raw, name, default)
+
+        actual_window = configured("window_chunks", None) or self.manifest.window_frames
+        actual_sink = configured("sink_chunks", 0) or self.manifest.sink_frames
+        actual_reset = bool(configured("reset_at_boundary", False))
+        mismatches = []
+        if int(actual_window) != self.manifest.window_frames:
+            mismatches.append(f"window_chunks={actual_window} (manifest={self.manifest.window_frames})")
+        if int(actual_sink) != self.manifest.sink_frames:
+            mismatches.append(f"sink_chunks={actual_sink} (manifest={self.manifest.sink_frames})")
+        if actual_reset:
+            mismatches.append("reset_at_boundary=True (manifest=False)")
+        if mismatches:
+            raise ValueError(
+                "Cosmos-Dreams AR-Diffusion window geometry is fixed by the model manifest; "
+                "deployment overrides would diverge from the dense oracle: " + ", ".join(mismatches)
+            )
+
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
+        self._validate_ar_diffusion_deploy_overrides()
         return ARDiffusionKVCacheSpec(
             num_layers=self.transformer.num_hidden_layers,
             num_kv_heads=self.transformer.num_kv_heads_local,
@@ -236,10 +288,49 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             kv_branches=(ARDiffusionKVBranchSpec(self._MAIN_BRANCH, 0),),
             session_capacity=self._SESSION_CAPACITY,
             cross_attention=(ARDiffusionCrossAttentionKVSpec("text", self.manifest.text_cache_max_len),),
-            max_model_len=(self.manifest.sink_frames + self.manifest.window_frames + 1)
-            * self.manifest.tokens_per_frame,
             max_scratch_tokens_per_branch=0,
         )
+
+    def _validate_bound_kv_geometry(self, state) -> None:
+        """Reject engine overrides that would diverge from the dense oracle.
+
+        ``window_frames`` and ``sink_frames`` are checkpoint-manifest semantics
+        for Cosmos-Dreams, not performance-only engine knobs. The generic AR
+        runner permits deployment overrides for other models, so validate the
+        resolved cache here before it can be bound to a model session.
+        """
+
+        cache = state.kv_cache
+        actual = {
+            "num_layers": int(cache.num_layers),
+            "num_kv_heads": int(cache.num_kv_heads),
+            "head_size": int(cache.head_size),
+            "tokens_per_frame": int(cache.block_size),
+            "window_frames": int(cache.spec.window_chunks),
+            "sink_frames": int(cache.spec.sink_chunks),
+            "reset_at_boundary": bool(cache.spec.reset_at_boundary),
+            "text_cache_max_len": int(cache.cross_attention_lengths.get("text", -1)),
+        }
+        expected = {
+            "num_layers": int(self.transformer.num_hidden_layers),
+            "num_kv_heads": int(self.transformer.num_kv_heads_local),
+            "head_size": int(self.transformer.head_dim),
+            "tokens_per_frame": int(self.manifest.tokens_per_frame),
+            "window_frames": int(self.manifest.window_frames),
+            "sink_frames": int(self.manifest.sink_frames),
+            "reset_at_boundary": False,
+            "text_cache_max_len": int(self.manifest.text_cache_max_len),
+        }
+        mismatches = {name: (expected[name], actual[name]) for name in expected if expected[name] != actual[name]}
+        if mismatches:
+            details = ", ".join(
+                f"{name}=expected {expected_value}, got {actual_value}"
+                for name, (expected_value, actual_value) in mismatches.items()
+            )
+            raise RuntimeError(
+                "Cosmos-Dreams AR-Diffusion KV geometry differs from the immutable "
+                f"model manifest ({details}). Fix the deployment configuration and restart."
+            )
 
     @contextmanager
     def bind_ar_diffusion_state(self, session_id, state):
@@ -247,6 +338,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise RuntimeError("Cosmos-Dreams AR-Diffusion state is already bound.")
         if state.session_id != session_id:
             raise ValueError(f"Cosmos-Dreams bound session mismatch: {state.session_id!r} != {session_id!r}.")
+        self._validate_bound_kv_geometry(state)
         self._ar_diffusion_kv_state = state
         self._bound_session_id = str(session_id)
         try:
@@ -265,6 +357,23 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         state = self._states.pop(str(session_id or "default"), None)
         if state is not None:
             state.reset()
+
+    @staticmethod
+    def _validate_session_mode(
+        *,
+        tick: bool,
+        state_was_new: bool,
+        session_id: str,
+        reset: bool,
+        close_session: bool,
+    ) -> None:
+        """Prevent accidental history reuse by ordinary offline requests."""
+
+        if not tick and state_was_new and not reset and not close_session:
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos-Dreams full rollout session {session_id!r} requires reset=True at start "
+                "or close_session=True at end."
+            )
 
     # -- Session and conditioning -----------------------------------------
 
@@ -581,9 +690,20 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if len(req.prompts) != 1:
             raise ARDiffusionRequestRejectedError("CosmosDreamsPipeline supports exactly one prompt per request.")
         prompt_data = req.prompts[0]
-        prompt = prompt_data if isinstance(prompt_data, str) else str(prompt_data.get("prompt", ""))
+        if isinstance(prompt_data, str):
+            prompt = prompt_data
+        elif isinstance(prompt_data, Mapping):
+            prompt = str(prompt_data.get("prompt", ""))
+        else:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos-Dreams prompt input must be a string or a mapping with a 'prompt' field."
+            )
         sp = req.sampling_params
-        extra = sp.extra_args or {}
+        extra = {} if sp.extra_args is None else sp.extra_args
+        if not isinstance(extra, Mapping):
+            raise ARDiffusionRequestRejectedError(
+                f"Cosmos-Dreams extra_args must be a mapping, got {type(extra).__name__}."
+            )
         session_id = str(extra.get("session_id") or self._bound_session_id or "default")
         if self._bound_session_id is not None and session_id != self._bound_session_id:
             raise ARDiffusionRequestRejectedError(
@@ -597,24 +717,29 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if reset or existing_state is None or existing_state.fingerprint is None:
             existing_state = None
         state_was_new = existing_state is None
-        if not tick and state_was_new and session_id == "default" and not reset and not close_session:
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams full rollouts on the default session require reset=True at start "
-                "or close_session=True at end."
-            )
+        self._validate_session_mode(
+            tick=tick,
+            state_was_new=state_was_new,
+            session_id=session_id,
+            reset=reset,
+            close_session=close_session,
+        )
 
-        height = int(sp.height or self.manifest.height)
-        width = int(sp.width or self.manifest.width)
+        height = _admission_int(_first_not_none(sp.height, self.manifest.height), "height")
+        width = _admission_int(_first_not_none(sp.width, self.manifest.width), "width")
         if (height, width) != (self.manifest.height, self.manifest.width):
             raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams resolution is fixed per deployment: "
                 f"requested {height}x{width}, configured {self.manifest.height}x{self.manifest.width}."
             )
-        fps = float(
-            self._get_sp_param(sp, "resolved_frame_rate", None)
-            or self._get_sp_param(sp, "frame_rate", None)
-            or self._get_sp_param(sp, "fps", None)
-            or self.default_fps
+        fps = _admission_float(
+            _first_not_none(
+                self._get_sp_param(sp, "resolved_frame_rate", None),
+                self._get_sp_param(sp, "frame_rate", None),
+                self._get_sp_param(sp, "fps", None),
+                self.default_fps,
+            ),
+            "FPS",
         )
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
@@ -623,7 +748,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if domain_value is None and domain_name is None:
             domain_value = self.default_domain_id
         if domain_value is not None:
-            domain_id = int(domain_value)
+            domain_id = _admission_int(domain_value, "domain_id")
             if domain_id < 0:
                 raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams domain_id must be non-negative, got {domain_id}.")
         else:
@@ -641,7 +766,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
 
-        guidance_scale = float(self._get_sp_param(sp, "guidance_scale", 1.0) or 1.0)
+        guidance_scale = _admission_float(
+            _first_not_none(self._get_sp_param(sp, "guidance_scale", None), 1.0),
+            "guidance_scale",
+        )
         if guidance_scale != 1.0:
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams distilled inference requires guidance_scale=1.0, got {guidance_scale}."
@@ -673,7 +801,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             embodiment=embodiment,
         )
         start_frame = 0 if state_was_new else existing_state.next_frame_idx
-        requested_frame_idx = int(extra.get("frame_idx", start_frame))
+        requested_frame_idx = _admission_int(extra.get("frame_idx", start_frame), "frame_idx")
         if state_was_new:
             if requested_frame_idx != 0:
                 raise ARDiffusionRequestRejectedError(
@@ -687,7 +815,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
         try:
             raw_action = self._prepare_raw_action(sp, embodiment=embodiment)
-        except (TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         try:
             initial_latent = self._initial_condition_latent(prompt_data, sp)
@@ -699,7 +827,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
 
         if tick:
-            tick_frames = int(extra.get("num_latent_frames", self.manifest.chunk_size))
+            tick_frames = _admission_int(
+                extra.get("num_latent_frames", self.manifest.chunk_size),
+                "num_latent_frames",
+            )
             if tick_frames <= 0:
                 raise ARDiffusionRequestRejectedError(
                     f"Cosmos-Dreams num_latent_frames must be positive, got {tick_frames}."
@@ -716,7 +847,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     f"chunk boundary, got target latent frame {target_frame}."
                 )
         else:
-            requested_pixel_frames = int(sp.num_frames or 1)
+            requested_pixel_frames = _admission_int(_first_not_none(sp.num_frames, 1), "num_frames")
             if requested_pixel_frames <= 0:
                 raise ARDiffusionRequestRejectedError(
                     f"Cosmos-Dreams num_frames must be positive, got {requested_pixel_frames}."

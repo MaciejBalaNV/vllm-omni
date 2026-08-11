@@ -600,6 +600,151 @@ def test_pipeline_disables_incompatible_generic_warmup() -> None:
     assert CosmosDreamsPipeline.dummy_run_num_frames == 0
 
 
+def test_ar_cache_spec_uses_frame_pages_and_does_not_cap_at_resident_window() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    manifest = CosmosDreamsManifest(
+        height=32,
+        width=32,
+        window_frames=2,
+        sink_frames=1,
+        text_cache_max_len=3,
+    )
+    stub = SimpleNamespace(
+        transformer=SimpleNamespace(num_hidden_layers=2, num_kv_heads_local=1, head_dim=4),
+        manifest=manifest,
+        _MAIN_BRANCH="main",
+        _SESSION_CAPACITY=1,
+        _validate_ar_diffusion_deploy_overrides=lambda: None,
+    )
+
+    spec = CosmosDreamsPipeline.ar_diffusion_kv_cache_spec(stub)
+
+    assert spec.num_kv_heads == 1  # already TP-local
+    assert spec.tokens_per_frame == manifest.tokens_per_frame
+    assert spec.frames_per_block == 1
+    assert spec.window_frames == 2
+    assert spec.sink_frames == 1
+    assert spec.max_scratch_tokens_per_branch == 0
+    assert spec.max_model_len == 1 << 20
+    assert spec.max_model_len > (spec.sink_frames + spec.window_frames + 1) * spec.tokens_per_frame
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"window_chunks": 3},
+        {"sink_chunks": 2},
+        {"reset_at_boundary": True},
+    ],
+)
+def test_ar_cache_spec_rejects_semantic_window_overrides(override: dict[str, Any]) -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    stub = SimpleNamespace(
+        manifest=CosmosDreamsManifest(window_frames=2, sink_frames=1),
+        od_config=SimpleNamespace(ar_diffusion_kv_config=override),
+    )
+
+    with pytest.raises(ValueError, match="fixed by the model manifest"):
+        CosmosDreamsPipeline._validate_ar_diffusion_deploy_overrides(stub)
+
+
+def test_bound_ar_cache_geometry_must_match_the_manifest() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+
+    manifest = CosmosDreamsManifest(
+        height=32,
+        width=32,
+        window_frames=2,
+        sink_frames=1,
+        text_cache_max_len=3,
+    )
+    transformer = SimpleNamespace(num_hidden_layers=2, num_kv_heads_local=1, head_dim=4)
+    cache = SimpleNamespace(
+        num_layers=2,
+        num_kv_heads=1,
+        head_size=4,
+        block_size=manifest.tokens_per_frame,
+        spec=SimpleNamespace(window_chunks=2, sink_chunks=1, reset_at_boundary=False),
+        cross_attention_lengths={"text": 3},
+    )
+    stub = SimpleNamespace(manifest=manifest, transformer=transformer)
+
+    CosmosDreamsPipeline._validate_bound_kv_geometry(stub, SimpleNamespace(kv_cache=cache))
+
+    cache.spec.window_chunks = 3
+    with pytest.raises(RuntimeError, match="window_frames=expected 2, got 3"):
+        CosmosDreamsPipeline._validate_bound_kv_geometry(stub, SimpleNamespace(kv_cache=cache))
+
+
+def test_falsey_sampling_values_are_not_replaced_by_defaults() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        _admission_float,
+        _admission_int,
+        _first_not_none,
+    )
+    from vllm_omni.experimental.ar_diffusion.capability import (
+        ARDiffusionRequestRejectedError,
+    )
+
+    assert _first_not_none(None, 0.0, 15.0) == 0.0
+    assert _first_not_none(None, False, True) is False
+    with pytest.raises(ARDiffusionRequestRejectedError, match="FPS must be numeric"):
+        _admission_float("invalid", "FPS")
+    with pytest.raises(ARDiffusionRequestRejectedError, match="frame_idx must be an integer"):
+        _admission_int(None, "frame_idx")
+
+
+def test_offline_session_requires_explicit_lifecycle() -> None:
+    from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
+        CosmosDreamsPipeline,
+    )
+    from vllm_omni.experimental.ar_diffusion.capability import (
+        ARDiffusionRequestRejectedError,
+    )
+
+    validate = CosmosDreamsPipeline._validate_session_mode
+    with pytest.raises(ARDiffusionRequestRejectedError, match="requires reset=True.*or close_session=True"):
+        validate(
+            tick=False,
+            state_was_new=True,
+            session_id="default",
+            reset=False,
+            close_session=False,
+        )
+    with pytest.raises(ARDiffusionRequestRejectedError, match="explicit-session.*requires reset=True"):
+        validate(
+            tick=False,
+            state_was_new=True,
+            session_id="explicit-session",
+            reset=False,
+            close_session=False,
+        )
+
+    for overrides in (
+        {"reset": True},
+        {"close_session": True},
+        {"tick": True},
+        {"state_was_new": False},
+    ):
+        values = {
+            "tick": False,
+            "state_was_new": True,
+            "session_id": "default",
+            "reset": False,
+            "close_session": False,
+            **overrides,
+        }
+        validate(**values)
+
+
 def test_distilled_sampler_uses_sigma_times_training_timesteps_and_is_seeded() -> None:
     sampler = CosmosDreamsDistilledSampler([1.0, 0.5], sample_type="sde", num_train_timesteps=1000)
     timesteps: list[float] = []
