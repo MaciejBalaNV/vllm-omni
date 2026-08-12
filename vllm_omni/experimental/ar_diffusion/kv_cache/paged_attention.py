@@ -148,9 +148,7 @@ class ARDiffusionPagedForwardContext:
     def _validate_layer_idx(self, layer_idx: int) -> int:
         layer_idx = int(layer_idx)
         if layer_idx < 0 or layer_idx >= self.num_layers:
-            raise IndexError(
-                f"AR-Diffusion layer index {layer_idx} is outside [0, {self.num_layers})"
-            )
+            raise IndexError(f"AR-Diffusion layer index {layer_idx} is outside [0, {self.num_layers})")
         return layer_idx
 
     def visible_history_block_ids(self) -> list[int]:
@@ -214,16 +212,8 @@ class ARDiffusionPagedForwardContext:
             )
         layer_idx = self._validate_layer_idx(layer_idx)
         if layer_idx in self._written_layers:
-            raise RuntimeError(
-                f"AR-Diffusion current-page K/V for layer {layer_idx} was written more than once"
-            )
+            raise RuntimeError(f"AR-Diffusion current-page K/V for layer {layer_idx} was written more than once")
         return layer_idx
-
-    def mark_layer_written(self, layer_idx: int) -> None:
-        """Record exactly one successful current-page write for ``layer_idx``."""
-
-        layer_idx = self._validate_layer_write(layer_idx)
-        self._written_layers.add(layer_idx)
 
     def write_only(
         self,
@@ -240,14 +230,11 @@ class ARDiffusionPagedForwardContext:
 
         if not self.commit_current:
             raise RuntimeError(
-                "AR-Diffusion write_only() requires commit_current=True; "
-                "non-committing denoise contexts are read-only"
+                "AR-Diffusion write_only() requires commit_current=True; non-committing denoise contexts are read-only"
             )
         layer_idx = self._validate_layer_write(layer_idx)
         if key.device != value.device:
-            raise ValueError(
-                f"AR-Diffusion write_only() K/V devices differ: {key.device} != {value.device}"
-            )
+            raise ValueError(f"AR-Diffusion write_only() K/V devices differ: {key.device} != {value.device}")
         expected = (
             self.seq_len,
             int(self.kv_cache.num_kv_heads),
@@ -286,9 +273,7 @@ class ARDiffusionPagedForwardContext:
             detail = f"missing layers {missing}"
             if extra:
                 detail += f", unexpected layers {extra}"
-            raise RuntimeError(
-                "AR-Diffusion cannot commit an incomplete current page: " + detail
-            )
+            raise RuntimeError("AR-Diffusion cannot commit an incomplete current page: " + detail)
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
         """Reserve scratch slots for action/state K/V, if present."""

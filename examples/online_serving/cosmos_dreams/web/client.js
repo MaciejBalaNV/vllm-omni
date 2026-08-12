@@ -57,7 +57,11 @@ async function connect() {
       metricsNode.textContent = JSON.stringify(payload.timing, null, 2);
     }
     if (payload.type === "chunk_streaming") {
-      const acknowledge = () => send({type: "presented", chunk_index: payload.chunk_index});
+      const acknowledge = () => send({
+        type: "presented",
+        generation_id: payload.generation_id,
+        chunk_index: payload.chunk_index,
+      });
       if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(acknowledge);
       else requestAnimationFrame(acknowledge);
     }

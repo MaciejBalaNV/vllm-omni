@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import importlib.util
+import json
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -461,10 +464,126 @@ async def test_bounded_rgb_queue_applies_backpressure_and_never_exceeds_depth() 
     assert handed_off
     assert not producer.done()
     assert queue.qsize() == 2
-    await queue.get()
+    first_frame = await queue.get()
+    assert first_frame.generation_id == 0
     assert await producer == 3
     assert queue.max_observed_depth == 2
     await queue.close()
+
+
+class _FakeDataChannel:
+    readyState = "open"  # noqa: N815 - mirrors aiortc's browser-compatible API
+
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    def send(self, message: str) -> None:
+        self.messages.append(json.loads(message))
+
+
+def _load_webrtc_demo(monkeypatch):
+    demo_path = Path(__file__).parents[4] / "examples/online_serving/cosmos_dreams/webrtc_demo.py"
+    monkeypatch.syspath_prepend(str(demo_path.parent))
+    monkeypatch.setitem(
+        sys.modules,
+        "demo_support",
+        SimpleNamespace(
+            load_replay_actions=lambda path: None,
+            load_scene_bundle=lambda path: None,
+        ),
+    )
+    spec = importlib.util.spec_from_file_location(f"cosmos_dreams_webrtc_test_{id(monkeypatch)}", demo_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "_make_video_track", lambda *args, **kwargs: object())
+    return module
+
+
+async def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("Timed out waiting for Cosmos-Dreams WebRTC test state.")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_webrtc_reset_restarts_chunk_zero_and_rejects_late_old_generation_ack(monkeypatch) -> None:
+    demo = _load_webrtc_demo(monkeypatch)
+    channel = _FakeDataChannel()
+    session = demo.CosmosDreamsWebRTCSession(
+        backend=_FakeTickBackend(),
+        scene=_scene(fps=1),
+        seed=7,
+        queue_frames=32,
+        replay_actions=None,
+    )
+    session._channel = channel
+
+    await session._handle_message(json.dumps({"type": "action", "action": {"event": "keydown", "key": "w"}}))
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "chunk_done" and message.get("generation_id") == 0 for message in channel.messages
+        )
+    )
+    first_recorder = session.recorder
+
+    await session._handle_message(json.dumps({"type": "reset"}))
+    assert session._generation_id == 1
+    assert session.recorder is not first_recorder
+    assert any(
+        message.get("type") == "reset_done" and message.get("generation_id") == 1 for message in channel.messages
+    )
+    await session._handle_message(json.dumps({"type": "action", "action": {"event": "keydown", "key": "w"}}))
+    await _wait_until(
+        lambda: any(
+            message.get("type") == "chunk_done"
+            and message.get("generation_id") == 1
+            and message.get("chunk_index") == 0
+            for message in channel.messages
+        )
+    )
+    assert not session._worker.done()
+
+    await session._handle_message(json.dumps({"type": "presented", "generation_id": 0, "chunk_index": 0}))
+    assert session.recorder.record(0)["key_arrival_to_first_presented_s"] is None
+    await session._handle_message(json.dumps({"type": "presented", "generation_id": 1, "chunk_index": 0}))
+    assert session.recorder.record(0)["key_arrival_to_first_presented_s"] is not None
+    await session._handle_message(json.dumps({"type": "reset"}))
+    assert session._generation_id == 2
+    assert not session._worker.done()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_webrtc_worker_reports_recorder_failure_without_retaining_a_task_exception(monkeypatch) -> None:
+    demo = _load_webrtc_demo(monkeypatch)
+    channel = _FakeDataChannel()
+    session = demo.CosmosDreamsWebRTCSession(
+        backend=_FakeTickBackend(),
+        scene=_scene(fps=1),
+        seed=7,
+        queue_frames=32,
+        replay_actions=None,
+    )
+    session._channel = channel
+
+    def fail_begin(**kwargs) -> None:
+        raise ValueError("synthetic recorder collision")
+
+    monkeypatch.setattr(session.recorder, "begin", fail_begin)
+    await session._handle_message(json.dumps({"type": "action", "action": {"event": "keydown", "key": "w"}}))
+    await _wait_until(lambda: session._worker.done())
+
+    assert session._worker.exception() is None
+    assert any(
+        message.get("type") == "error"
+        and "synthetic recorder collision" in str(message.get("message"))
+        and message.get("session_reset_required") is True
+        for message in channel.messages
+    )
+    await session.close()
 
 
 def test_latency_recorder_reports_cold_separately_and_uses_16_frame_budget() -> None:

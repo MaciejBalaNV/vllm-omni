@@ -32,6 +32,7 @@ def video_tensor_to_rgb_frames(video: torch.Tensor) -> list[np.ndarray]:
 @dataclass(frozen=True, slots=True)
 class QueuedRGBFrame:
     frame: np.ndarray
+    generation_id: int
     chunk_index: int
     frame_in_chunk: int
 
@@ -58,10 +59,13 @@ class BoundedRGBFrameQueue:
         self,
         result: CosmosDreamsTickResult,
         *,
+        generation_id: int = 0,
         on_encoder_handoff: Callable[[], None] | None = None,
     ) -> int:
         if self._closed:
             return 0
+        if isinstance(generation_id, bool) or not isinstance(generation_id, int) or generation_id < 0:
+            raise ValueError("generation_id must be a non-negative integer.")
         frames = await asyncio.to_thread(video_tensor_to_rgb_frames, result.frames)
         if on_encoder_handoff is not None:
             on_encoder_handoff()
@@ -71,6 +75,7 @@ class BoundedRGBFrameQueue:
             await self._queue.put(
                 QueuedRGBFrame(
                     frame=frame,
+                    generation_id=generation_id,
                     chunk_index=result.chunk_index,
                     frame_in_chunk=frame_idx,
                 )

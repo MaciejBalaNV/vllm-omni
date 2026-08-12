@@ -128,10 +128,18 @@ def make_runner(
 
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
     state = runner._get_or_create_session(session_id)
-    ctx = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)[0].forward_ctx
-    ctx.ensure_video_slots(torch.device("cpu"))
-    for layer_idx in range(state.num_layers):
-        ctx.mark_layer_written(layer_idx)
+    contexts = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)
+    assert runner.kv_cache is not None
+    key = torch.zeros(
+        1,
+        BLOCK,
+        runner.kv_cache.num_kv_heads,
+        runner.kv_cache.head_size,
+        dtype=runner.kv_cache.dtype,
+    )
+    value = torch.zeros_like(key)
+    for layer_ctx in contexts:
+        layer_ctx.write_only(key, value)
     state.commit_paged_context(kv_branch)
     return state
 

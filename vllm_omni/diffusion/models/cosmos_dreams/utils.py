@@ -46,8 +46,7 @@ def iter_clean_commit_frames(
     """
     if chunk_start < 0 or chunk_end <= chunk_start or target_frame < chunk_end:
         raise ValueError(
-            "Invalid Cosmos-Dreams clean-commit range: "
-            f"chunk=[{chunk_start}, {chunk_end}), target={target_frame}"
+            f"Invalid Cosmos-Dreams clean-commit range: chunk=[{chunk_start}, {chunk_end}), target={target_frame}"
         )
     for local_idx, frame_idx in enumerate(range(chunk_start, chunk_end)):
         if terminal_request and frame_idx == target_frame - 1:
@@ -124,9 +123,7 @@ def build_interleaved_mrope_position_ids(
     if fps <= 0 or base_fps <= 0:
         raise ValueError(f"Cosmos-Dreams FPS values must be positive, got fps={fps}, base_fps={base_fps}")
     if action_tokens_per_frame <= 0:
-        raise ValueError(
-            f"Cosmos-Dreams action_tokens_per_frame must be positive, got {action_tokens_per_frame}"
-        )
+        raise ValueError(f"Cosmos-Dreams action_tokens_per_frame must be positive, got {action_tokens_per_frame}")
 
     null_frames = {int(frame) for frame in null_action_frames}
     patch_count = grid_h * grid_w
@@ -143,10 +140,15 @@ def build_interleaved_mrope_position_ids(
             action_t = torch.full((action_tokens_per_frame,), vision_t, dtype=torch.float32)
         else:
             substep = frame_stride / action_tokens_per_frame
-            action_t = vision_t - frame_stride + substep * torch.arange(
-                1,
-                action_tokens_per_frame + 1,
-                dtype=torch.float32,
+            action_t = (
+                vision_t
+                - frame_stride
+                + substep
+                * torch.arange(
+                    1,
+                    action_tokens_per_frame + 1,
+                    dtype=torch.float32,
+                )
             )
         zeros = torch.zeros(action_tokens_per_frame, dtype=torch.float32)
         action_ids = torch.stack([action_t, zeros, zeros], dim=0)
@@ -237,20 +239,9 @@ def estimate_kv_memory_bytes(
             raise ValueError(f"Cosmos-Dreams KV estimate {name} must be positive, got {value}")
     if max_scratch_tokens_per_branch < 0:
         raise ValueError("Cosmos-Dreams max_scratch_tokens_per_branch must be non-negative")
-    page_bytes = int(
-        2
-        * manifest.tokens_per_frame
-        * num_kv_heads
-        * head_size
-        * dtype.itemsize
-        * num_layers
-    )
-    managed_blocks = num_local_kv_branches * (
-        manifest.sink_frames + manifest.window_frames + frames_per_block
-    ) + 2
-    scratch_per_branch = frames_per_block + math.ceil(
-        max_scratch_tokens_per_branch / manifest.tokens_per_frame
-    )
+    page_bytes = int(2 * manifest.tokens_per_frame * num_kv_heads * head_size * dtype.itemsize * num_layers)
+    managed_blocks = num_local_kv_branches * (manifest.sink_frames + manifest.window_frames + frames_per_block) + 2
+    scratch_per_branch = frames_per_block + math.ceil(max_scratch_tokens_per_branch / manifest.tokens_per_frame)
     scratch_blocks = num_local_kv_branches * scratch_per_branch
     self_attention_bytes = managed_blocks * page_bytes
     scratch_bytes = scratch_blocks * page_bytes

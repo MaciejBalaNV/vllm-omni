@@ -613,9 +613,7 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         output_type: str = "np",
         sampling_params=None,
     ):
-        request_output_type = getattr(sampling_params, "output_type", None)
-        if request_output_type is not None:
-            output_type = request_output_type
+        output_type = getattr(sampling_params, "output_type", None) or output_type
         if output_type == "latent":
             return output
 
