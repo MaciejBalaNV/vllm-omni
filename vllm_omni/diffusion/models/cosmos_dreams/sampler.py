@@ -24,18 +24,11 @@ class CosmosDreamsDistilledSampler:
         if not self.t_list:
             raise ValueError("Cosmos-Dreams distilled t_list must not be empty")
         if abs(self.t_list[0] - 1.0) > 1e-6:
-            raise ValueError(
-                f"Cosmos-Dreams distilled t_list must start at 1.0, got {self.t_list[0]}"
-            )
+            raise ValueError(f"Cosmos-Dreams distilled t_list must start at 1.0, got {self.t_list[0]}")
         if any(sigma <= 0.0 or sigma > 1.0 for sigma in self.t_list):
-            raise ValueError(
-                "Cosmos-Dreams distilled t_list entries must be in (0, 1], "
-                f"got {self.t_list}"
-            )
+            raise ValueError(f"Cosmos-Dreams distilled t_list entries must be in (0, 1], got {self.t_list}")
         if self.sample_type not in {"ode", "sde"}:
-            raise ValueError(
-                f"Cosmos-Dreams distilled sample_type must be 'ode' or 'sde', got {sample_type!r}"
-            )
+            raise ValueError(f"Cosmos-Dreams distilled sample_type must be 'ode' or 'sde', got {sample_type!r}")
         if self.num_train_timesteps <= 0:
             raise ValueError("Cosmos-Dreams num_train_timesteps must be positive")
         if any(left <= right for left, right in zip(self.t_list, self.t_list[1:])):

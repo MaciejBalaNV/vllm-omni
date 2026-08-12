@@ -19,6 +19,7 @@ from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistill
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
     CosmosDreamsSessionState,
+    append_dense_kv_history,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.utils import (
     build_interleaved_mrope_position_ids,
@@ -775,6 +776,86 @@ def _action_layout_pipeline_stub():
         dtype=torch.float32,
     )
     return CosmosDreamsPipeline, stub
+
+
+def test_dense_kv_replaces_each_layer_immediately(monkeypatch) -> None:
+    old_0_k = torch.tensor([[[[1.0]], [[2.0]]]])
+    old_0_v = old_0_k + 10
+    old_1_k = old_0_k + 20
+    old_1_v = old_0_k + 30
+    old_layer_ids = (id(old_0_k), id(old_0_v))
+    history = [
+        (old_0_k, old_0_v),
+        (old_1_k, old_1_v),
+    ]
+    del old_0_k, old_0_v, old_1_k, old_1_v
+
+    current = [
+        (torch.tensor([[[[3.0]]]]), torch.tensor([[[[13.0]]]])),
+        (torch.tensor([[[[23.0]]]]), torch.tensor([[[[33.0]]]])),
+    ]
+    real_cat = torch.cat
+    cat_calls = 0
+
+    def tracked_cat(tensors, *args, **kwargs):
+        nonlocal cat_calls
+        cat_calls += 1
+        if cat_calls == 3:
+            assert tuple(id(tensor) for tensor in history[0]) != old_layer_ids
+            assert history[0][0].shape[1] == 3
+        return real_cat(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", tracked_cat)
+    updated = append_dense_kv_history(
+        history,
+        current,
+        tokens_per_frame=1,
+        sink_frames=0,
+        window_frames=8,
+    )
+
+    assert cat_calls == 4
+    torch.testing.assert_close(
+        updated[0][0].flatten(),
+        torch.tensor([1.0, 2.0, 3.0]),
+    )
+
+
+def test_dense_kv_first_block_reuses_transformer_output_storage() -> None:
+    key = torch.tensor([[[[1.0]]]])
+    value = torch.tensor([[[[2.0]]]])
+
+    history = append_dense_kv_history(
+        None,
+        [(key, value)],
+        tokens_per_frame=1,
+        sink_frames=0,
+        window_frames=8,
+    )
+
+    assert history[0][0].data_ptr() == key.data_ptr()
+    assert history[0][1].data_ptr() == value.data_ptr()
+
+
+def test_dense_kv_builds_the_final_sink_and_tail_without_append_then_trim() -> None:
+    history = [
+        (
+            torch.tensor([[[[0.0]], [[1.0]], [[2.0]]]]),
+            torch.tensor([[[[10.0]], [[11.0]], [[12.0]]]]),
+        )
+    ]
+
+    updated = append_dense_kv_history(
+        history,
+        [(torch.tensor([[[[3.0]]]]), torch.tensor([[[[13.0]]]]))],
+        tokens_per_frame=1,
+        sink_frames=1,
+        window_frames=2,
+    )
+
+    key, value = updated[0]
+    torch.testing.assert_close(key.flatten(), torch.tensor([0.0, 2.0, 3.0]))
+    torch.testing.assert_close(value.flatten(), torch.tensor([10.0, 12.0, 13.0]))
 
 
 def _numbered_action_rows(rows: int, dim: int = 64) -> torch.Tensor:

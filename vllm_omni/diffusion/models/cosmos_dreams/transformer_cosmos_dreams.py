@@ -55,19 +55,14 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
         null_action_frame_indexes: tuple[int, ...] = (),
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] != 1:
-            raise ValueError(
-                "Cosmos-Dreams causal attention supports batch_size=1, "
-                f"got {hidden_states.shape[0]}"
-            )
+            raise ValueError(f"Cosmos-Dreams causal attention supports batch_size=1, got {hidden_states.shape[0]}")
         if real_text_kv_len <= 0 or real_text_kv_len > text_k.shape[1]:
             raise ValueError(
                 "Cosmos-Dreams real text KV length must be in the stored range, "
                 f"got real={real_text_kv_len}, stored={text_k.shape[1]}"
             )
         if text_k.shape != text_v.shape:
-            raise ValueError(
-                f"Cosmos-Dreams text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}"
-            )
+            raise ValueError(f"Cosmos-Dreams text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}")
         if dense_history is not None and paged_context is not None:
             raise ValueError("Cosmos-Dreams attention accepts either dense_history or paged_context, not both")
 
@@ -182,10 +177,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         if missing:
             preview = ", ".join(missing[:12])
             suffix = "" if len(missing) <= 12 else f" (and {len(missing) - 12} more)"
-            raise ValueError(
-                "Cosmos-Dreams checkpoint is missing required transformer weights: "
-                f"{preview}{suffix}"
-            )
+            raise ValueError(f"Cosmos-Dreams checkpoint is missing required transformer weights: {preview}{suffix}")
 
     @staticmethod
     def _validate_supported_config(model_config: Any) -> None:
@@ -284,9 +276,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
                     f"Cosmos-Dreams text K/V must be matching batch-one tensors, got {key.shape} and {value.shape}"
                 )
             if key.shape[1] > max_len:
-                raise ValueError(
-                    f"Cosmos-Dreams prompt has {key.shape[1]} KV tokens but text_cache_max_len={max_len}"
-                )
+                raise ValueError(f"Cosmos-Dreams prompt has {key.shape[1]} KV tokens but text_cache_max_len={max_len}")
             pad_len = max_len - key.shape[1]
             if pad_len:
                 key = torch.cat([key, key.new_zeros(1, pad_len, *key.shape[2:])], dim=1)
@@ -307,18 +297,22 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         null_action_frame_indexes: tuple[int, ...],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         absolute_null_frames = tuple(frame_start + frame for frame in null_action_frame_indexes)
-        position_ids = build_interleaved_mrope_position_ids(
-            frame_start=frame_start,
-            num_frames=num_frames,
-            grid_h=grid_h,
-            grid_w=grid_w,
-            text_temporal_offset=real_text_kv_len,
-            temporal_modality_margin=self.temporal_modality_margin,
-            fps=fps,
-            base_fps=self.base_fps,
-            action_tokens_per_frame=self.manifest.action_tokens_per_frame,
-            null_action_frames=absolute_null_frames,
-        ).unsqueeze(1).to(hidden.device)
+        position_ids = (
+            build_interleaved_mrope_position_ids(
+                frame_start=frame_start,
+                num_frames=num_frames,
+                grid_h=grid_h,
+                grid_w=grid_w,
+                text_temporal_offset=real_text_kv_len,
+                temporal_modality_margin=self.temporal_modality_margin,
+                fps=fps,
+                base_fps=self.base_fps,
+                action_tokens_per_frame=self.manifest.action_tokens_per_frame,
+                null_action_frames=absolute_null_frames,
+            )
+            .unsqueeze(1)
+            .to(hidden.device)
+        )
         cos, sin = self.language_model.rotary_emb(hidden, position_ids=position_ids)
         return cos.unsqueeze(2), sin.unsqueeze(2)
 
@@ -345,21 +339,16 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         """
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
             raise ValueError(
-                "Cosmos-Dreams hidden_states must have shape [1,C,T,H,W], "
-                f"got {tuple(hidden_states.shape)}"
+                f"Cosmos-Dreams hidden_states must have shape [1,C,T,H,W], got {tuple(hidden_states.shape)}"
             )
         if timestep.shape not in {(1,), (1, 1)}:
             raise ValueError(f"Cosmos-Dreams timestep must have shape [1] or [1,1], got {tuple(timestep.shape)}")
         if len(text_kv) != self.num_hidden_layers:
-            raise ValueError(
-                f"Cosmos-Dreams expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}"
-            )
+            raise ValueError(f"Cosmos-Dreams expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}")
         if paged_kv is not None and dense_history is not None:
             raise ValueError("Cosmos-Dreams forward accepts either paged_kv or dense_history, not both")
         if paged_kv is not None and len(paged_kv) != self.num_hidden_layers:
-            raise ValueError(
-                f"Cosmos-Dreams expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}"
-            )
+            raise ValueError(f"Cosmos-Dreams expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}")
         if dense_history is not None and len(dense_history) != self.num_hidden_layers:
             raise ValueError(
                 f"Cosmos-Dreams expected {self.num_hidden_layers} dense history layers, got {len(dense_history)}"

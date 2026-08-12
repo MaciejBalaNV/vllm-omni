@@ -83,7 +83,7 @@ def _make_video_track(
                     self._next_deadline = now
             first_new_frame = 1 if queued.chunk_index == 0 else 0
             if queued.frame_in_chunk == first_new_frame:
-                on_chunk_start(queued.chunk_index)
+                on_chunk_start(queued.generation_id, queued.chunk_index)
             frame = VideoFrame.from_ndarray(queued.frame, format="rgb24")
             frame.pts = self._pts
             frame.time_base = self._time_base
@@ -117,9 +117,11 @@ class CosmosDreamsWebRTCSession:
         self.replay_actions = replay_actions
         self._replay_index = 0
         self._channel = None
+        self._generation_id = 0
         self._first_action = asyncio.Event()
         self._pending_arrivals: deque[float] = deque()
-        self._worker = asyncio.create_task(self._generation_worker())
+        self._worker = asyncio.create_task(self._generation_worker(self._generation_id))
+        self._lifecycle_lock = asyncio.Lock()
         self._closed = False
 
     def bind_channel(self, channel) -> None:
@@ -133,10 +135,31 @@ class CosmosDreamsWebRTCSession:
         if self._channel is not None and getattr(self._channel, "readyState", "") == "open":
             self._channel.send(json.dumps(payload, separators=(",", ":")))
 
-    def _notify_chunk_streaming(self, chunk_index: int) -> None:
-        self._send({"type": "chunk_streaming", "chunk_index": chunk_index})
+    def _notify_chunk_streaming(self, generation_id: int, chunk_index: int) -> None:
+        self._send(
+            {
+                "type": "chunk_streaming",
+                "generation_id": generation_id,
+                "chunk_index": chunk_index,
+            }
+        )
 
     async def _handle_message(self, message: Any) -> None:
+        try:
+            await self._handle_message_impl(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Cosmos-Dreams control message failed")
+            self._send(
+                {
+                    "type": "error",
+                    "message": str(exc),
+                    "session_reset_required": True,
+                }
+            )
+
+    async def _handle_message_impl(self, message: Any) -> None:
         try:
             payload = json.loads(message) if isinstance(message, str) else {}
         except json.JSONDecodeError:
@@ -148,12 +171,28 @@ class CosmosDreamsWebRTCSession:
             return
         if message_type == "reset":
             await self.reset()
-            self._send({"type": "reset_done", "session_id": self.runtime.session_id})
+            self._send(
+                {
+                    "type": "reset_done",
+                    "session_id": self.runtime.session_id,
+                    "generation_id": self._generation_id,
+                }
+            )
             return
         if message_type == "disconnect":
             await self.close()
             return
         if message_type == "presented":
+            generation_id = payload.get("generation_id")
+            if (
+                isinstance(generation_id, bool)
+                or not isinstance(generation_id, int)
+                or generation_id != self._generation_id
+            ):
+                # A frame may already be inside the browser or encoder when a
+                # reset clears the queue. Never let its late acknowledgement
+                # mark the new generation's identically numbered chunk.
+                return
             chunk_index = int(payload.get("chunk_index", -1))
             if chunk_index >= 0:
                 try:
@@ -162,7 +201,13 @@ class CosmosDreamsWebRTCSession:
                 except KeyError:
                     pass
                 else:
-                    self._send({"type": "presentation_timing", "timing": timing})
+                    self._send(
+                        {
+                            "type": "presentation_timing",
+                            "generation_id": generation_id,
+                            "timing": timing,
+                        }
+                    )
             return
         if message_type != "action":
             self._send({"type": "error", "message": "Expected action, reset, heartbeat, or disconnect."})
@@ -186,106 +231,141 @@ class CosmosDreamsWebRTCSession:
         self._replay_index += 1
         return action
 
-    async def _generation_worker(self) -> None:
+    def _report_worker_failure(self, generation_id: int, exc: Exception) -> None:
+        logger.error(
+            "Cosmos-Dreams generation worker failed in generation %d",
+            generation_id,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        self._send(
+            {
+                "type": "error",
+                "generation_id": generation_id,
+                "message": str(exc),
+                "session_reset_required": True,
+            }
+        )
+
+    async def _generation_worker(self, generation_id: int) -> None:
         try:
             await self._first_action.wait()
             self.resampler.next_chunk_start = time.perf_counter()
             while not self._closed:
-                chunk_duration = ACTION_STEPS_PER_TICK * self.resampler.dt
-                trigger = self.resampler.next_chunk_start
-                delay = trigger - time.perf_counter()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                if self._closed:
-                    return
-                now = time.perf_counter()
-                if now - trigger > chunk_duration:
-                    self.resampler.next_chunk_start = now
-                segments, frame_times = self.resampler.sample_chunk(ACTION_STEPS_PER_TICK)
-                chunk_end = self.resampler.next_chunk_start
-                arrivals: list[float] = []
-                while self._pending_arrivals and self._pending_arrivals[0] <= chunk_end:
-                    arrivals.append(self._pending_arrivals.popleft())
-                key_arrival = min(arrivals) if arrivals else frame_times[0] - self.resampler.dt
-                chunk_index = 0 if not self.runtime.started else (self.runtime.next_frame_idx - 1) // 4
-                dispatch = time.perf_counter()
-                self.recorder.begin(
-                    chunk_index=chunk_index,
-                    key_arrival_time=key_arrival,
-                    request_dispatch_time=dispatch,
-                )
-                snapshot = self.controller.snapshot()
+                snapshot = None
+                timing_started = False
+                tick_committed = False
+                chunk_index = -1
                 try:
+                    chunk_duration = ACTION_STEPS_PER_TICK * self.resampler.dt
+                    trigger = self.resampler.next_chunk_start
+                    delay = trigger - time.perf_counter()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    if self._closed:
+                        return
+                    now = time.perf_counter()
+                    if now - trigger > chunk_duration:
+                        self.resampler.next_chunk_start = now
+                    segments, frame_times = self.resampler.sample_chunk(ACTION_STEPS_PER_TICK)
+                    chunk_end = self.resampler.next_chunk_start
+                    arrivals: list[float] = []
+                    while self._pending_arrivals and self._pending_arrivals[0] <= chunk_end:
+                        arrivals.append(self._pending_arrivals.popleft())
+                    key_arrival = min(arrivals) if arrivals else frame_times[0] - self.resampler.dt
+                    chunk_index = 0 if not self.runtime.started else (self.runtime.next_frame_idx - 1) // 4
+                    snapshot = self.controller.snapshot()
+                    self.recorder.begin(
+                        chunk_index=chunk_index,
+                        key_arrival_time=key_arrival,
+                        request_dispatch_time=time.perf_counter(),
+                    )
+                    timing_started = True
                     if self.replay_actions is None:
                         action = self.controller.build_action_chunk(segments, frame_times)
                     else:
                         action = self._next_replay_action()
                     result = await self.runtime.tick_async(action, key_arrival_time=key_arrival)
+                    tick_committed = True
+                    self.recorder.attach_tick(result)
+                    enqueued = await self.queue.enqueue_chunk(
+                        result,
+                        generation_id=generation_id,
+                        on_encoder_handoff=partial(self.recorder.mark_encoder_handoff, result.chunk_index),
+                    )
+                    self.recorder.mark_enqueue_done(result.chunk_index)
+                    timing = self.recorder.record(result.chunk_index)
+                    self._send(
+                        {
+                            "type": "chunk_done",
+                            "generation_id": generation_id,
+                            "chunk_index": result.chunk_index,
+                            "frame_idx": result.frame_idx,
+                            "next_frame_idx": result.next_frame_idx,
+                            "frames": enqueued,
+                            "queue_depth": self.queue.qsize(),
+                            "timing": timing,
+                        }
+                    )
                 except EOFError:
                     self._send({"type": "replay_done"})
                     return
                 except Exception as exc:
-                    self.controller.restore(snapshot)
-                    self.recorder.discard(chunk_index)
-                    logger.exception("Cosmos-Dreams tick failed")
-                    self._send(
-                        {
-                            "type": "error",
-                            "message": str(exc),
-                            "session_reset_required": "reset required" in str(exc).lower(),
-                        }
-                    )
-                    self._first_action.clear()
-                    await self._first_action.wait()
-                    self.resampler.next_chunk_start = time.perf_counter()
-                    continue
-
-                self.recorder.attach_tick(result)
-                enqueued = await self.queue.enqueue_chunk(
-                    result,
-                    on_encoder_handoff=partial(self.recorder.mark_encoder_handoff, result.chunk_index),
-                )
-                self.recorder.mark_enqueue_done(result.chunk_index)
-                timing = self.recorder.record(result.chunk_index)
-                self._send(
-                    {
-                        "type": "chunk_done",
-                        "chunk_index": result.chunk_index,
-                        "frame_idx": result.frame_idx,
-                        "next_frame_idx": result.next_frame_idx,
-                        "frames": enqueued,
-                        "queue_depth": self.queue.qsize(),
-                        "timing": timing,
-                    }
-                )
+                    if snapshot is not None and not tick_committed:
+                        self.controller.restore(snapshot)
+                    if timing_started:
+                        self.recorder.discard(chunk_index)
+                    self._report_worker_failure(generation_id, exc)
+                    return
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            self._report_worker_failure(generation_id, exc)
 
     async def reset(self) -> None:
-        self._worker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._worker
-        await self.runtime.reset_async()
-        self.controller.reset()
-        self.resampler.reset(start_time=time.perf_counter())
-        self.queue.clear()
-        self._pending_arrivals.clear()
-        self._replay_index = 0
-        self._first_action = asyncio.Event()
-        self._worker = asyncio.create_task(self._generation_worker())
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Cannot reset a closed Cosmos-Dreams WebRTC session.")
+            previous_generation = self._generation_id
+            # Advance before the first await so late browser acknowledgements
+            # are rejected throughout reset, including frames already handed
+            # to the encoder before the queue is cleared.
+            self._generation_id += 1
+            self._worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker
+            summary = self.recorder.warm_summary(playback_fps=self.scene.fps)
+            logger.info(
+                "Cosmos-Dreams generation %d latency summary before reset: %s",
+                previous_generation,
+                summary,
+            )
+            self.recorder = CosmosDreamsLatencyRecorder()
+            await self.runtime.reset_async()
+            self.controller.reset()
+            self.resampler.reset(start_time=time.perf_counter())
+            self.queue.clear()
+            self._pending_arrivals.clear()
+            self._replay_index = 0
+            self._first_action = asyncio.Event()
+            self._worker = asyncio.create_task(self._generation_worker(self._generation_id))
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._worker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._worker
-        with contextlib.suppress(Exception):
-            await self.runtime.close_async()
-        await self.queue.close()
-        summary = self.recorder.warm_summary(playback_fps=self.scene.fps)
-        logger.info("Cosmos-Dreams warm latency summary: %s", summary)
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker
+            with contextlib.suppress(Exception):
+                await self.runtime.close_async()
+            await self.queue.close()
+            summary = self.recorder.warm_summary(playback_fps=self.scene.fps)
+            logger.info(
+                "Cosmos-Dreams generation %d final latency summary: %s",
+                self._generation_id,
+                summary,
+            )
 
 
 class SingleUserWebRTCManager:

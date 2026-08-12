@@ -533,9 +533,7 @@ class Cosmos3CausalAttention(nn.Module):
 
         self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm_und_for_gen = (
-            RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
-        )
+        self.k_norm_und_for_gen = RMSNorm(self.head_dim, eps=rms_norm_eps) if use_und_k_norm_for_gen else None
 
         # skip_sequence_parallel=True because the UND pathway is
         # computed once and replicated across SP ranks.

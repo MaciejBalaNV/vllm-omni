@@ -434,14 +434,17 @@ def test_block_table_padded_to_fixed_width():
     device = torch.device("cpu")
     kv, st = make_state(window_chunks=2)
 
-    ctx1 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    layer1 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0]
+    ctx1 = layer1.forward_ctx
     ctx1.prepare(device=device, action_len=0, query_len=BLOCK)
-    ctx1.mark_layer_written(0)
+    key = torch.zeros(1, BLOCK, N_HEADS, HEAD_DIM)
+    layer1.write_only(key, torch.zeros_like(key))
     st.commit_paged_context(POS)
 
-    ctx2 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    layer2 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0]
+    ctx2 = layer2.forward_ctx
     ctx2.prepare(device=device, action_len=0, query_len=BLOCK)
-    ctx2.mark_layer_written(0)
+    layer2.write_only(key, torch.zeros_like(key))
     st.commit_paged_context(POS)
 
     # 1-block vs 2-block visible history: same table width, same max_seq_len.

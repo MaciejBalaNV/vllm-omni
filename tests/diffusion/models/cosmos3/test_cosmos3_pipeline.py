@@ -1197,6 +1197,25 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
         func({"image": video, "video": video})
 
 
+def test_postprocess_output_type_request_precedence_and_empty_fallback(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    class RecordingVideoProcessor:
+        def __init__(self, *, vae_scale_factor: int) -> None:
+            assert vae_scale_factor == 16
+
+        def postprocess_video(self, _video, *, output_type: str) -> str:
+            return output_type
+
+    monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", RecordingVideoProcessor)
+    func = pipeline_cosmos3.get_cosmos3_post_process_func(SimpleNamespace())
+    output = object()
+
+    assert func(output, output_type="pt", sampling_params=SimpleNamespace(output_type=None)) == "pt"
+    assert func(output, output_type="pt", sampling_params=SimpleNamespace(output_type="")) == "pt"
+    assert func(output, output_type="np", sampling_params=SimpleNamespace(output_type="pt")) == "pt"
+
+
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         RoboLabPolicyInputs,

@@ -30,6 +30,7 @@ from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistill
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
     CosmosDreamsSessionState,
+    append_dense_kv_history,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.streaming_vae import decode_wan_causal_chunk
 from vllm_omni.diffusion.models.cosmos_dreams.tick_adapter import parse_cosmos_dreams_tick
@@ -452,8 +453,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
                 cached = [(entry["k"], entry["v"]) for entry in pooled]
         state.text_kv_by_branch[self._MAIN_BRANCH] = cached
-        state.prompt_ids_by_branch[self._MAIN_BRANCH] = text_ids.detach().cpu()
-        state.prompt_masks_by_branch[self._MAIN_BRANCH] = text_mask.detach().cpu()
         return cached
 
     def _fingerprint(
@@ -489,22 +488,13 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         current_kv: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
         history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
-        if history is None:
-            history = [(key[:, :0], value[:, :0]) for key, value in current_kv]
-        next_history: list[tuple[torch.Tensor, torch.Tensor]] = []
-        tokens_per_frame = self.manifest.tokens_per_frame
-        for (old_k, old_v), (new_k, new_v) in zip(history, current_kv, strict=True):
-            key = torch.cat([old_k, new_k], dim=1)
-            value = torch.cat([old_v, new_v], dim=1)
-            resident_frames = key.shape[1] // tokens_per_frame
-            max_frames = self.manifest.sink_frames + self.manifest.window_frames
-            if resident_frames > max_frames:
-                sink_tokens = self.manifest.sink_frames * tokens_per_frame
-                tail_tokens = self.manifest.window_frames * tokens_per_frame
-                key = torch.cat([key[:, :sink_tokens], key[:, -tail_tokens:]], dim=1)
-                value = torch.cat([value[:, :sink_tokens], value[:, -tail_tokens:]], dim=1)
-            next_history.append((key, value))
-        state.dense_kv_by_branch[self._MAIN_BRANCH] = next_history
+        state.dense_kv_by_branch[self._MAIN_BRANCH] = append_dense_kv_history(
+            history,
+            current_kv,
+            tokens_per_frame=self.manifest.tokens_per_frame,
+            sink_frames=self.manifest.sink_frames,
+            window_frames=self.manifest.window_frames,
+        )
 
     def _transformer_forward(
         self,
