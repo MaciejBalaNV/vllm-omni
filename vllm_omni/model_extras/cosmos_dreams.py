@@ -11,6 +11,7 @@ COSMOS_DREAMS_EXTRA_BODY_PARAMS = frozenset(
         "domain_name",
         "frame_idx",
         "initial_latent",
+        "measure_tick_latency",
         "num_latent_frames",
         "reset",
         "session_id",

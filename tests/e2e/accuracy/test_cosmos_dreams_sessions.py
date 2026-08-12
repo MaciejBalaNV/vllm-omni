@@ -10,7 +10,9 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.models.cosmos_dreams.tick_adapter import build_cosmos_dreams_action_control
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -42,6 +44,8 @@ def _unwrap_latent(output: Any) -> torch.Tensor:
             return _unwrap_latent(output.request_output)
         return _unwrap_latent(output.images)
     if isinstance(output, dict):
+        if isinstance(output.get("payload"), dict):
+            return _unwrap_latent(output["payload"])
         return _unwrap_latent(output.get("video", output))
     if not isinstance(output, torch.Tensor):
         raise TypeError(f"Expected a latent tensor, got {type(output).__name__}")
@@ -93,38 +97,52 @@ def test_full_rollout_matches_two_persistent_tick_requests() -> None:
             ),
         )
     )
+    first_tick_request = ARDiffusionTickRequest(
+        session_id="cosmos-dreams-e2e-ticks",
+        request_id="cosmos-dreams-e2e-tick-0",
+        chunk_index=0,
+        prompt=PROMPT,
+        controls=(
+            build_cosmos_dreams_action_control(
+                full_actions[:16],
+                frame_idx=0,
+                measure_tick_latency=False,
+            ),
+        ),
+        reset=True,
+    )
     first_tick = _unwrap_latent(
         omni.generate(
             PROMPT,
             _sampling_params(
                 num_frames=17,
                 extra_args={
-                    "session_id": "cosmos-dreams-e2e-ticks",
-                    "reset": True,
-                    "ar_diffusion_tick": True,
-                    "num_latent_frames": 4,
-                    "frame_idx": 0,
-                    "domain_id": 15,
-                    "action": full_actions[:16],
+                    **first_tick_request.to_extra_args(),
                     "initial_latent": initial_latent,
                 },
             ),
         )
+    )
+    second_tick_request = ARDiffusionTickRequest(
+        session_id="cosmos-dreams-e2e-ticks",
+        request_id="cosmos-dreams-e2e-tick-1",
+        chunk_index=1,
+        prompt=PROMPT,
+        controls=(
+            build_cosmos_dreams_action_control(
+                full_actions[16:],
+                frame_idx=5,
+                measure_tick_latency=False,
+            ),
+        ),
+        close_session=True,
     )
     second_tick = _unwrap_latent(
         omni.generate(
             PROMPT,
             _sampling_params(
                 num_frames=16,
-                extra_args={
-                    "session_id": "cosmos-dreams-e2e-ticks",
-                    "close_session": True,
-                    "ar_diffusion_tick": True,
-                    "num_latent_frames": 4,
-                    "frame_idx": 5,
-                    "domain_id": 15,
-                    "action": full_actions[16:],
-                },
+                extra_args=second_tick_request.to_extra_args(),
             ),
         )
     )

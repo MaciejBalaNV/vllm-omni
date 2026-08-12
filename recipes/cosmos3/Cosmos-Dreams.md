@@ -75,11 +75,14 @@ manifest-driven dense oracle.
 - Full rollout: provide all actions, `reset=true`, and preferably
   `close_session=true`. The globally last latent frame is not committed because
   it has no downstream reader.
-- Tick session: set `ar_diffusion_tick=true` and a stable `session_id`. The first
-  tick covers the singleton prefix and one four-frame chunk; later ticks commit
-  one four-frame chunk. Prompt, resolution, FPS, domain, normalizer, checkpoint,
-  and sampler are fingerprinted. Any mutation or out-of-order `frame_idx` fails
-  with `session reset required`.
+- Tick session: use `ARDiffusionSession` with an `ARDiffusionOmniTickConsumer`
+  and carry AgiBot actions as a `robot_action.v1` control inside the typed
+  `ARDiffusionTickRequest`. The first tick covers the singleton prefix and one
+  four-frame chunk; later ticks commit one four-frame chunk. Request, event,
+  session, and chunk identities are validated against the returned
+  `metadata.ar_diffusion` envelope. Reset, close, and disconnect release the
+  owning worker through `ARDiffusionWorkerLifecycle`; no inference request is
+  submitted solely for cleanup.
 - Dense oracle: select the default `DiffusionEngine` with the same checkpoint.
   It maintains dense per-layer history and is the numerical reference for the
   gathered-paged path.
@@ -92,3 +95,9 @@ multi-session serving remain follow-up work.
 
 See the [offline parity runner](../../examples/offline_inference/cosmos_dreams/README.md)
 for jsonl/pickle input and latent-output examples.
+
+The required Phase-3 serving artifact is the
+[single-user keyboard/WebRTC demo](../../examples/online_serving/cosmos_dreams/README.md).
+It sends one four-latent tick per request, builds only raw AgiBot `[16,29]`
+actions client-side, incrementally decodes the new 5/4 latent frames with
+session-owned Wan features, and applies bounded presentation backpressure.

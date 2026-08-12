@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, ClassVar
 
 import torch
@@ -30,6 +31,8 @@ from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
     CosmosDreamsSessionState,
 )
+from vllm_omni.diffusion.models.cosmos_dreams.streaming_vae import decode_wan_causal_chunk
+from vllm_omni.diffusion.models.cosmos_dreams.tick_adapter import parse_cosmos_dreams_tick
 from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams import (
     CosmosDreamsTransformer,
     CosmosDreamsTransformerOutput,
@@ -46,6 +49,10 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
     ARDiffusionRequestRejectedError,
+)
+from vllm_omni.experimental.ar_diffusion.tick_protocol import (
+    ARDiffusionChunkMetadata,
+    ARDiffusionTickRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -356,7 +363,33 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     def _drop_session(self, session_id: str) -> None:
         state = self._states.pop(str(session_id or "default"), None)
         if state is not None:
+            if state.vae_decoder_initialized:
+                self.vae.clear_cache()
             state.reset()
+
+    def _sync_for_tick_timing(self, enabled: bool) -> None:
+        if not enabled or self.device.type != "cuda":
+            return
+        torch.accelerator.synchronize(self.device)
+
+    @contextmanager
+    def _timed_tick_stage(
+        self,
+        durations: dict[str, float],
+        name: str,
+        *,
+        enabled: bool,
+    ):
+        if not enabled:
+            yield
+            return
+        self._sync_for_tick_timing(True)
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync_for_tick_timing(True)
+            durations[name] = durations.get(name, 0.0) + (time.perf_counter() - started)
 
     @staticmethod
     def _validate_session_mode(
@@ -524,8 +557,15 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- Action and latent preparation ------------------------------------
 
-    def _prepare_raw_action(self, sp, *, embodiment: str) -> torch.Tensor | None:
-        action_value = self._get_sp_param(sp, "action", None)
+    def _prepare_raw_action(
+        self,
+        sp,
+        *,
+        embodiment: str,
+        action_value: Any = None,
+    ) -> torch.Tensor | None:
+        if action_value is None:
+            action_value = self._get_sp_param(sp, "action", None)
         if action_value is None:
             return None
         action = self.action_normalizers[embodiment].normalize(load_action_tensor(action_value))
@@ -664,6 +704,34 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             commit_current=True,
         )
 
+    def _denormalize_vae_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        latents = latents.to(device=self.device, dtype=self.vae.dtype)
+        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
+            latents_mean, latents_std = self._get_latents_mean_std(latents.device, latents.dtype)
+            return (latents * latents_std) + latents_mean
+        return latents / float(getattr(self.vae.config, "scaling_factor", 1.0))
+
+    def _decode_live_latents(
+        self,
+        state: CosmosDreamsSessionState,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode only the new tick block with session-owned Wan features."""
+
+        execution_context = getattr(self.vae, "_execution_context", None)
+        with execution_context() if callable(execution_context) else nullcontext():
+            result = decode_wan_causal_chunk(
+                self.vae,
+                self._denormalize_vae_latents(latents),
+                feature_cache=state.vae_decoder_feat_cache,
+                initialized=state.vae_decoder_initialized,
+            )
+        state.record_incremental_decode(
+            input_frames=int(latents.shape[2]),
+            feature_cache=result.feature_cache,
+        )
+        return result.video
+
     # -- Generation --------------------------------------------------------
 
     @torch.no_grad()
@@ -704,15 +772,39 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams extra_args must be a mapping, got {type(extra).__name__}."
             )
-        session_id = str(extra.get("session_id") or self._bound_session_id or "default")
+        try:
+            typed_tick = ARDiffusionTickRequest.from_extra_args(extra)
+            typed_inputs = parse_cosmos_dreams_tick(typed_tick) if typed_tick is not None else None
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if typed_tick is not None:
+            if self._ar_diffusion_kv_state is None:
+                raise ARDiffusionRequestRejectedError(
+                    "Cosmos-Dreams typed ticks require ARDiffusionEngine session binding."
+                )
+            if typed_tick.prompt is not None and typed_tick.prompt != prompt:
+                raise ARDiffusionRequestRejectedError(
+                    "Cosmos-Dreams ar_diffusion_tick.prompt must match the standard request prompt."
+                )
+        session_id = str(
+            typed_tick.session_id
+            if typed_tick is not None
+            else extra.get("session_id") or self._bound_session_id or "default"
+        )
         if self._bound_session_id is not None and session_id != self._bound_session_id:
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams request session {session_id!r} does not match bound session {self._bound_session_id!r}."
             )
 
-        reset = bool(extra.get("reset", False))
-        close_session = bool(extra.get("close_session", False))
-        tick = bool(extra.get("ar_diffusion_tick", False) or extra.get("chunk_only", False))
+        reset = typed_tick.reset if typed_tick is not None else bool(extra.get("reset", False))
+        close_session = typed_tick.close_session if typed_tick is not None else bool(extra.get("close_session", False))
+        tick = typed_tick is not None or bool(extra.get("chunk_only", False))
+        measure_tick_latency = tick and (
+            typed_inputs.measure_tick_latency
+            if typed_inputs is not None
+            else bool(extra.get("measure_tick_latency", False))
+        )
+        tick_output_type = "latent" if sp.output_type == "latent" else "video"
         existing_state = self._states.get(session_id)
         if reset or existing_state is None or existing_state.fingerprint is None:
             existing_state = None
@@ -743,8 +835,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
-        domain_name = self._get_sp_param(sp, "domain_name", None)
-        domain_value = self._get_sp_param(sp, "domain_id", None)
+        domain_name = (
+            typed_inputs.domain_name if typed_inputs is not None else self._get_sp_param(sp, "domain_name", None)
+        )
+        domain_value = typed_inputs.domain_id if typed_inputs is not None else self._get_sp_param(sp, "domain_id", None)
         if domain_value is None and domain_name is None:
             domain_value = self.default_domain_id
         if domain_value is not None:
@@ -801,7 +895,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             embodiment=embodiment,
         )
         start_frame = 0 if state_was_new else existing_state.next_frame_idx
-        requested_frame_idx = _admission_int(extra.get("frame_idx", start_frame), "frame_idx")
+        requested_frame_idx = _admission_int(
+            typed_inputs.frame_idx if typed_inputs is not None else extra.get("frame_idx", start_frame),
+            "frame_idx",
+        )
         if state_was_new:
             if requested_frame_idx != 0:
                 raise ARDiffusionRequestRejectedError(
@@ -812,9 +909,17 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 existing_state.validate_request(fingerprint, frame_idx=requested_frame_idx)
             except (ValueError, RuntimeError) as exc:
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
+            if tick and existing_state.tick_output_type not in (None, tick_output_type):
+                raise ARDiffusionRequestRejectedError(
+                    "Cosmos-Dreams tick output_type cannot change within a session; session reset required."
+                )
 
         try:
-            raw_action = self._prepare_raw_action(sp, embodiment=embodiment)
+            raw_action = self._prepare_raw_action(
+                sp,
+                embodiment=embodiment,
+                action_value=typed_inputs.action if typed_inputs is not None else None,
+            )
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         try:
@@ -828,7 +933,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
         if tick:
             tick_frames = _admission_int(
-                extra.get("num_latent_frames", self.manifest.chunk_size),
+                (
+                    typed_inputs.num_latent_frames
+                    if typed_inputs is not None
+                    else extra.get("num_latent_frames", self.manifest.chunk_size)
+                ),
                 "num_latent_frames",
             )
             if tick_frames <= 0:
@@ -864,16 +973,22 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
 
         # ---- Side effects begin ---------------------------------------------
+        tick_durations: dict[str, float] = {}
+        self._sync_for_tick_timing(measure_tick_latency)
+        tick_total_started = time.perf_counter() if measure_tick_latency else 0.0
         if reset:
             self._drop_session(session_id)
         state = self._get_or_create_state(session_id)
         if state.fingerprint is None:
             state.initialize(fingerprint)
+        if tick and state.tick_output_type is None:
+            state.tick_output_type = tick_output_type
         domain_ids = torch.tensor([domain_id], device=self.device, dtype=torch.long)
         text_kv = self._ensure_text_kv(state, text_ids, text_mask)
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)
+        request_latent_chunks: list[torch.Tensor] = []
 
         if initial_latent is not None and state.next_frame_idx == 0:
             initial_action, initial_null = self._actions_for_frames(
@@ -884,18 +999,24 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 frame_end=1,
             )
             if target_frame > 1 or not terminal_request:
-                self._commit_clean_frame(
-                    state,
-                    initial_latent,
-                    frame_idx=0,
-                    text_kv=text_kv,
-                    real_text_kv_len=real_text_kv_len,
-                    fps=fps,
-                    action=initial_action,
-                    domain_ids=domain_ids,
-                    null_action=bool(initial_null),
-                )
-            state.append_chunk(initial_latent, frame_start=0)
+                with self._timed_tick_stage(
+                    tick_durations,
+                    "clean_cache_commit_s",
+                    enabled=measure_tick_latency,
+                ):
+                    self._commit_clean_frame(
+                        state,
+                        initial_latent,
+                        frame_idx=0,
+                        text_kv=text_kv,
+                        real_text_kv_len=real_text_kv_len,
+                        fps=fps,
+                        action=initial_action,
+                        domain_ids=domain_ids,
+                        null_action=bool(initial_null),
+                    )
+            state.append_chunk(initial_latent, frame_start=0, retain_latent=not tick)
+            request_latent_chunks.append(initial_latent)
 
         generation_start = state.next_frame_idx
         for chunk_start, chunk_end in iter_ar_chunk_ranges(
@@ -942,56 +1063,81 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 )
                 return output.video.float()
 
-            clean_chunk = self.distilled_sampler.sample(
-                velocity_fn,
-                initial_noise,
-                seed=seed,
-                frame_idx=chunk_start,
-            ).to(self.dtype)
+            with self._timed_tick_stage(
+                tick_durations,
+                "denoise_s",
+                enabled=measure_tick_latency,
+            ):
+                clean_chunk = self.distilled_sampler.sample(
+                    velocity_fn,
+                    initial_noise,
+                    seed=seed,
+                    frame_idx=chunk_start,
+                ).to(self.dtype)
 
             action_count = self.manifest.action_tokens_per_frame
-            for local_idx, frame_idx in iter_clean_commit_frames(
-                chunk_start,
-                chunk_end,
-                target_frame=target_frame,
-                terminal_request=terminal_request,
+            with self._timed_tick_stage(
+                tick_durations,
+                "clean_cache_commit_s",
+                enabled=measure_tick_latency,
             ):
-                action_start = local_idx * action_count
-                action_frame = action_chunk[:, action_start : action_start + action_count]
-                self._commit_clean_frame(
-                    state,
-                    clean_chunk[:, :, local_idx : local_idx + 1],
-                    frame_idx=frame_idx,
-                    text_kv=text_kv,
-                    real_text_kv_len=real_text_kv_len,
-                    fps=fps,
-                    action=action_frame,
-                    domain_ids=domain_ids,
-                    null_action=local_idx in null_action_indexes,
-                )
-            state.append_chunk(clean_chunk, frame_start=chunk_start)
+                for local_idx, frame_idx in iter_clean_commit_frames(
+                    chunk_start,
+                    chunk_end,
+                    target_frame=target_frame,
+                    terminal_request=terminal_request,
+                ):
+                    action_start = local_idx * action_count
+                    action_frame = action_chunk[:, action_start : action_start + action_count]
+                    self._commit_clean_frame(
+                        state,
+                        clean_chunk[:, :, local_idx : local_idx + 1],
+                        frame_idx=frame_idx,
+                        text_kv=text_kv,
+                        real_text_kv_len=real_text_kv_len,
+                        fps=fps,
+                        action=action_frame,
+                        domain_ids=domain_ids,
+                        null_action=local_idx in null_action_indexes,
+                    )
+            state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick)
+            request_latent_chunks.append(clean_chunk)
 
+        if not request_latent_chunks:
+            raise RuntimeError("Cosmos-Dreams request produced no new latent frames.")
+        request_latents = torch.cat(request_latent_chunks, dim=2)
         accumulated = state.accumulated_latents
-        if accumulated is None:
-            raise RuntimeError("Cosmos-Dreams rollout produced no latent frames.")
-        if tick:
-            previous_pixel_frames = (
-                0 if start_frame == 0 else (start_frame - 1) * self.manifest.temporal_compression_factor + 1
-            )
-        else:
-            previous_pixel_frames = 0
+        if not tick and accumulated is None:
+            raise RuntimeError("Cosmos-Dreams full rollout produced no accumulated latent frames.")
         if sp.output_type == "latent":
-            output_value = accumulated[:, :, start_frame:] if tick else accumulated
+            output_value = request_latents if tick else accumulated
         else:
-            output_value = self._decode_latents(accumulated).clamp(-1, 1)
-            if tick and previous_pixel_frames:
-                output_value = output_value[:, :, previous_pixel_frames:]
-            elif not tick:
+            with self._timed_tick_stage(
+                tick_durations,
+                "vae_decode_s",
+                enabled=measure_tick_latency,
+            ):
+                if tick:
+                    output_value = self._decode_live_latents(state, request_latents).clamp(-1, 1)
+                else:
+                    output_value = self._decode_latents(accumulated).clamp(-1, 1)
+            if not tick:
                 output_value = output_value[:, :, : int(sp.num_frames or 1)]
 
         if not tick:
             state.terminal = True
-        result = DiffusionOutput(output={"video": output_value})
+        if measure_tick_latency:
+            self._sync_for_tick_timing(True)
+            tick_durations["tick_model_total_s"] = time.perf_counter() - tick_total_started
+        output: dict[str, Any] = {"video": output_value}
+        if typed_tick is not None:
+            output = {
+                "payload": output,
+                "metadata": {
+                    "ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict(),
+                },
+            }
+        result = DiffusionOutput(output=output, stage_durations=tick_durations)
         if close_session and self._ar_diffusion_kv_state is None:
             self._drop_session(session_id)
         return result
