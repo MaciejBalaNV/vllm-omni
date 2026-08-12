@@ -8,12 +8,16 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from vllm_omni.errors import OmniClientError
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
+AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE = "ARDiffusionRequestRejectedError"
 
-class ARDiffusionRequestRejectedError(ValueError):
+
+class ARDiffusionRequestRejectedError(OmniClientError):
     """A request failed admission validation before any state was touched.
 
     Pipelines raise this for fail-closed rejections (session-fingerprint
@@ -23,6 +27,9 @@ class ARDiffusionRequestRejectedError(ValueError):
     releasing the session — the client keeps its paid-for KV history and can
     retry a corrected request or explicitly reset.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, error_type=AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE)
 
 
 @dataclass(frozen=True)

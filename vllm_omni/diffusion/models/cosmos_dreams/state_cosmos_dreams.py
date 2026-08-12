@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -53,12 +54,16 @@ class CosmosDreamsSessionState:
     fingerprint: CosmosDreamsSessionFingerprint | None = None
     next_frame_idx: int = 0
     terminal: bool = False
+    tick_output_type: str | None = None
     prompt_ids_by_branch: dict[str, torch.Tensor] = field(default_factory=dict)
     prompt_masks_by_branch: dict[str, torch.Tensor] = field(default_factory=dict)
     text_kv_by_branch: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
     dense_kv_by_branch: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
     latents: list[torch.Tensor] = field(default_factory=list)
-    vae_decoder_feat_cache: list[torch.Tensor | None] | None = None
+    vae_decoder_feat_cache: list[Any] | None = None
+    vae_decoder_initialized: bool = False
+    last_vae_decode_input_frames: int = 0
+    max_vae_decode_input_frames: int = 0
 
     def initialize(
         self,
@@ -102,7 +107,13 @@ class CosmosDreamsSessionState:
                 f"expected latent frame {self.next_frame_idx}, got {frame_idx}; session reset required"
             )
 
-    def append_chunk(self, chunk: torch.Tensor, *, frame_start: int) -> None:
+    def append_chunk(
+        self,
+        chunk: torch.Tensor,
+        *,
+        frame_start: int,
+        retain_latent: bool = True,
+    ) -> None:
         if chunk.ndim != 5 or chunk.shape[0] != 1:
             raise ValueError(f"Cosmos-Dreams session chunks must have shape [1,C,T,H,W], got {tuple(chunk.shape)}")
         if frame_start != self.next_frame_idx:
@@ -110,19 +121,37 @@ class CosmosDreamsSessionState:
                 "Cosmos-Dreams cannot append an out-of-order chunk: "
                 f"expected {self.next_frame_idx}, got {frame_start}; session reset required"
             )
-        self.latents.append(chunk.detach())
+        if retain_latent:
+            self.latents.append(chunk.detach())
         self.next_frame_idx += int(chunk.shape[2])
+
+    def record_incremental_decode(
+        self,
+        *,
+        input_frames: int,
+        feature_cache: list[Any],
+    ) -> None:
+        if input_frames <= 0:
+            raise ValueError(f"Cosmos-Dreams decode input_frames must be positive, got {input_frames}")
+        self.vae_decoder_feat_cache = feature_cache
+        self.vae_decoder_initialized = True
+        self.last_vae_decode_input_frames = int(input_frames)
+        self.max_vae_decode_input_frames = max(self.max_vae_decode_input_frames, int(input_frames))
 
     def reset(self) -> None:
         self.fingerprint = None
         self.next_frame_idx = 0
         self.terminal = False
+        self.tick_output_type = None
         self.prompt_ids_by_branch.clear()
         self.prompt_masks_by_branch.clear()
         self.text_kv_by_branch.clear()
         self.dense_kv_by_branch.clear()
         self.latents.clear()
         self.vae_decoder_feat_cache = None
+        self.vae_decoder_initialized = False
+        self.last_vae_decode_input_frames = 0
+        self.max_vae_decode_input_frames = 0
 
     @property
     def accumulated_latents(self) -> torch.Tensor | None:

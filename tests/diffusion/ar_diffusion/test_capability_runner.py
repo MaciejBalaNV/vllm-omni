@@ -19,6 +19,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
 BLOCK = 16
 POS = "positive"
@@ -283,6 +284,22 @@ def test_malformed_extra_args_is_rejected_before_session_creation():
         runner.execute_model(request)
 
     assert not runner._sessions
+
+
+def test_typed_tick_supplies_the_runner_session_and_lifecycle_flags():
+    tick = ARDiffusionTickRequest(
+        session_id="typed-world",
+        request_id="typed-request",
+        chunk_index=3,
+        reset=True,
+        close_session=True,
+    )
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()))
+
+    session_id, _, parsed = ARDiffusionModelRunner._request_session(request)
+
+    assert session_id == "typed-world"
+    assert parsed == tick
 
 
 def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):

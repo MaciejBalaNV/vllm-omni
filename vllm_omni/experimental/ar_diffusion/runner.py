@@ -23,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
 logger = init_logger(__name__)
 
@@ -232,7 +233,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return state
 
     @staticmethod
-    def _request_session(req: OmniDiffusionRequest) -> tuple[str, Mapping]:
+    def _request_session(
+        req: OmniDiffusionRequest,
+    ) -> tuple[str, Mapping, ARDiffusionTickRequest | None]:
         extra_args = req.sampling_params.extra_args
         if extra_args is None:
             extra_args = {}
@@ -240,7 +243,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise ARDiffusionRequestRejectedError(
                 f"AR-Diffusion extra_args must be a mapping, got {type(extra_args).__name__}."
             )
-        return str(extra_args.get("session_id") or "default"), extra_args
+        try:
+            tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if tick is not None:
+            return tick.session_id, extra_args, tick
+        return str(extra_args.get("session_id") or "default"), extra_args, None
 
     def execute_model(
         self,
@@ -253,8 +262,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
-        session_id, extra_args = self._request_session(req)
-        if extra_args.get("reset", False):
+        session_id, extra_args, tick = self._request_session(req)
+        reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
+        close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
+        if reset:
             self.reset_session(session_id)
         state = self._get_or_create_session(session_id)
         started = time.perf_counter()
@@ -285,7 +296,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
             raise
         self._perf_e2e_times.append(time.perf_counter() - started)
-        if extra_args.get("close_session", False):
+        if close_session:
             self.close_session(session_id)
         return output
 
