@@ -2939,9 +2939,7 @@ class Cosmos3OmniDiffusersPipeline(
         source_h, source_w = source_hw or (COSMOS3_T2V_DEFAULT_HEIGHT, COSMOS3_T2V_DEFAULT_WIDTH)
         target_w, target_h = find_closest_target_size(int(source_h), int(source_w), resolution)
         aspect_ratio = next(
-            ratio
-            for ratio, size in VIDEO_RES_SIZE_INFO[str(resolution)].items()
-            if size == (target_w, target_h)
+            ratio for ratio, size in VIDEO_RES_SIZE_INFO[str(resolution)].items() if size == (target_w, target_h)
         )
         return int(target_h), int(target_w), aspect_ratio
 
