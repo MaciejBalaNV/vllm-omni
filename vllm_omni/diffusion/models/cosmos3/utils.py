@@ -47,6 +47,12 @@ ROBOLAB_CONCAT_VIEW_DESCRIPTION = (
     "sides, with the robot visible."
 )
 
+_LEGACY_EMBODIMENT_ALIASES = {
+    "galbot": "embodiment_b",
+    "agibot_gear_gripper": "embodiment_c_gripper",
+    "agibot_gear_gripper_ext": "embodiment_c_gripper_ext",
+}
+
 
 @dataclass(frozen=True)
 class RoboLabPolicyInputs:
@@ -229,19 +235,61 @@ def lazy_import(module_name: str, symbol_name: str, error_message: str):
     return getattr(module, symbol_name)
 
 
-def lazy_action_transform_pipeline(max_action_dim: int):
+def preflight_robolab_framework_imports() -> None:
+    """Fail early when the mounted Cosmos Framework cannot serve action policy."""
+    required_symbols = (
+        (
+            "cosmos_framework.data.generator.action.utils.transforms",
+            "ActionTransformPipeline",
+        ),
+        (
+            "cosmos_framework.data.generator.action.utils.pose_utils",
+            "convert_rotation",
+        ),
+        (
+            "cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc",
+            "FlowUniPCMultistepScheduler",
+        ),
+        (
+            "cosmos_framework.data.generator.action.utils.domain_utils",
+            "get_domain_id",
+        ),
+    )
+    for module_name, symbol_name in required_symbols:
+        lazy_import(
+            module_name,
+            symbol_name,
+            "Cosmos3 RoboLab policy serving requires the current cosmos_framework source on PYTHONPATH.",
+        )
+
+
+def lazy_action_transform_pipeline(max_action_dim: int, *, format_prompt_as_json: bool = False):
     ActionTransformPipeline = lazy_import(
-        "cosmos_framework.data.vfm.action.transforms",
+        "cosmos_framework.data.generator.action.utils.transforms",
         "ActionTransformPipeline",
         "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
         "golden ActionTransformPipeline can be reused.",
     )
-    return ActionTransformPipeline(max_action_dim=max_action_dim, cfg_dropout_rate=0.0)
+    return ActionTransformPipeline(
+        max_action_dim=max_action_dim,
+        cfg_dropout_rate=0.0,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+
+
+def get_robolab_domain_id(domain_name: str) -> int:
+    get_domain_id = lazy_import(
+        "cosmos_framework.data.generator.action.utils.domain_utils",
+        "get_domain_id",
+        "Cosmos3 RoboLab policy serving requires cosmos_framework domain_utils on PYTHONPATH.",
+    )
+    canonical_name = _LEGACY_EMBODIMENT_ALIASES.get(domain_name.lower().strip(), domain_name)
+    return int(get_domain_id(canonical_name))
 
 
 def build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.device):
     FlowUniPCMultistepScheduler = lazy_import(
-        "cosmos_framework.model.vfm.diffusion.samplers.fm_solvers_unipc",
+        "cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc",
         "FlowUniPCMultistepScheduler",
         (
             "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
@@ -260,7 +308,7 @@ def build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.de
 
 def convert_midtrain_rotation(value: Any, src: str, dst: str) -> np.ndarray:
     convert_rotation = lazy_import(
-        "cosmos_framework.data.vfm.action.pose_utils",
+        "cosmos_framework.data.generator.action.utils.pose_utils",
         "convert_rotation",
         "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
     )
@@ -269,7 +317,7 @@ def convert_midtrain_rotation(value: Any, src: str, dst: str) -> np.ndarray:
 
 def pose_abs_to_rel(*args, **kwargs) -> np.ndarray:
     pose_abs_to_rel_func = lazy_import(
-        "cosmos_framework.data.vfm.action.pose_utils",
+        "cosmos_framework.data.generator.action.utils.pose_utils",
         "pose_abs_to_rel",
         "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
     )
@@ -278,7 +326,7 @@ def pose_abs_to_rel(*args, **kwargs) -> np.ndarray:
 
 def pose_rel_to_abs(*args, **kwargs) -> np.ndarray:
     pose_rel_to_abs_func = lazy_import(
-        "cosmos_framework.data.vfm.action.pose_utils",
+        "cosmos_framework.data.generator.action.utils.pose_utils",
         "pose_rel_to_abs",
         "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
     )
@@ -287,7 +335,7 @@ def pose_rel_to_abs(*args, **kwargs) -> np.ndarray:
 
 def build_abs_pose_from_components(*args, **kwargs) -> np.ndarray:
     build_abs_pose_from_components_func = lazy_import(
-        "cosmos_framework.data.vfm.action.pose_utils",
+        "cosmos_framework.data.generator.action.utils.pose_utils",
         "build_abs_pose_from_components",
         "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
     )

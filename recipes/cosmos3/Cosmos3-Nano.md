@@ -50,9 +50,10 @@ mode is selected per request:
   **`nvidia/Cosmos3-Nano-Policy-DROID`** is served the same way
   (`domain_name=droid_lerobot`).
 
-- **DROID OpenPI policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and
-  connect an OpenPI-compatible websocket client to `/v1/realtime/robot/openpi`.
-  This path returns action chunks directly instead of an mp4.
+- **DROID policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and connect
+  either the unchanged RoboLab Cosmos3 client to the root websocket route `/`,
+  or a generic OpenPI-compatible client to `/v1/realtime/robot/openpi`. This path
+  returns action chunks directly instead of an mp4.
 
   Action requests can use `input_reference` or `video_reference` for video input.
   `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
@@ -268,13 +269,30 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
 
-# DROID OpenPI policy server (websocket action serving).
-# Requires cosmos_framework on PYTHONPATH because the pipeline reuses the
-# reference RoboLab action transforms. If your checkpoint config already
-# includes policy_server_config, omit the stage_overrides file and flag.
+# DROID websocket policy server. Use the current cosmos-framework source; a
+# package install is unnecessary and can introduce dependency conflicts.
+export COSMOS_FRAMEWORK_ROOT=/path/to/cosmos-framework
+export PYTHONPATH="$COSMOS_FRAMEWORK_ROOT"
+
+# Verify the four source-only integration modules in the vLLM environment.
+python - <<'PY'
+from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
+from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
+from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
+from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
+print("cosmos-framework RoboLab imports OK; DROID domain:", get_domain_id("droid_lerobot"))
+PY
+
+# JSON prompt formatting is a property of this DROID checkpoint's training
+# recipe, not a generic server default. Configure it as a request default.
 cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
 {
   "0": {
+    "default_sampling_params": {
+      "extra_args": {
+        "format_prompt_as_json": true
+      }
+    },
     "model_config": {
       "policy_server_config": {
         "image_resolution": [540, 640],
@@ -296,11 +314,25 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   --no-guardrails \
   --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
 
-# Point an OpenPI websocket client at:
+# The unchanged RoboLab Cosmos3 client connects to:
+#   ws://localhost:8000/
+# It receives one binary msgpack {} handshake, sends a msgpack-numpy
+# observation, and receives {"action": <float32 ndarray>}.
+#
+# A generic OpenPI websocket client can instead connect to:
 #   ws://localhost:8000/v1/realtime/robot/openpi
-# The first server message is policy_server_config. Each infer request sends a
-# msgpack-numpy observation dict and receives a writable float32 action array.
+# That legacy route receives policy_server_config as its first server message
+# and returns the action array directly. policy_server_config is required only
+# for the legacy route; the RoboLab root route works without it.
 ```
+
+The root compatibility route has no receive-idle timeout and treats every
+request as a fresh session, because RoboLab sends neither session IDs nor reset
+messages. It closes the websocket on malformed requests or inference failures
+instead of sending an error payload that the RoboLab client cannot decode.
+When `--api-key` or `VLLM_API_KEY` is configured, `/` requires the same bearer
+token as `/v1`; the unchanged RoboLab Cosmos3 client does not currently attach
+that header.
 
 #### Notes
 

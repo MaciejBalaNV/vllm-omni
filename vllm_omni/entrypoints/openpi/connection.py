@@ -17,6 +17,9 @@ Inbound payloads accept both the openpi-client markers above and the legacy
 vLLM-native markers:
     ndarray -> {nd: true, type, kind, shape, data}
     scalar  -> {nd: false, type, kind, data}
+
+The root RoboLab profile sends an empty binary handshake and wraps successful
+actions as ``{"action": ndarray}``; the legacy route retains the protocol above.
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ _MISSING = object()
 
 
 def _pack_numpy(obj: Any) -> Any:
-    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+    if isinstance(obj, np.ndarray | np.generic) and obj.dtype.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {obj.dtype}")
     if isinstance(obj, np.ndarray):
         if not obj.flags.c_contiguous:
@@ -153,11 +156,20 @@ class RobotRealtimeConnection:
         self,
         websocket: WebSocket,
         serving: ServingRealtimeRobotOpenPI,
-        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
+        idle_timeout: float | None = _DEFAULT_IDLE_TIMEOUT,
+        *,
+        handshake_metadata: dict[str, Any] | None = None,
+        wrap_action_response: bool = False,
+        stateless_requests: bool = False,
+        close_on_error: bool = False,
     ) -> None:
         self.websocket = websocket
         self.serving = serving
         self._idle_timeout = idle_timeout
+        self._handshake_metadata = handshake_metadata
+        self._wrap_action_response = wrap_action_response
+        self._stateless_requests = stateless_requests
+        self._close_on_error = close_on_error
         self._current_session_id: str | None = None
         self._call_count = 0
 
@@ -167,6 +179,12 @@ class RobotRealtimeConnection:
 
     async def _send_error(self, message: str) -> None:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
+
+    async def _close_with_error(self, *, code: int, reason: str) -> None:
+        try:
+            await self.websocket.close(code=code, reason=reason)
+        except Exception:
+            logger.debug("Failed to close robot policy websocket", exc_info=True)
 
     def _unpack_request(self, data: bytes) -> dict[str, Any]:
         if len(data) > MAX_OPENPI_PAYLOAD_BYTES:
@@ -183,16 +201,24 @@ class RobotRealtimeConnection:
         try:
             # Send model-specific PolicyServerConfig resolved by serving from
             # diffusion od_config.model_config.
-            metadata = self.serving.policy_server_config.to_dict()
+            metadata = (
+                self.serving.policy_server_config.to_dict()
+                if self._handshake_metadata is None
+                else self._handshake_metadata
+            )
             await self.websocket.send_bytes(_pack(metadata))
 
             while True:
                 try:
-                    msg = await asyncio.wait_for(
-                        self.websocket.receive(),
-                        timeout=self._idle_timeout,
-                    )
+                    if self._idle_timeout is None:
+                        msg = await self.websocket.receive()
+                    else:
+                        msg = await asyncio.wait_for(
+                            self.websocket.receive(),
+                            timeout=self._idle_timeout,
+                        )
                 except asyncio.TimeoutError:
+                    assert self._idle_timeout is not None
                     logger.info("Robot OpenPI connection idle timeout after %.1f seconds", self._idle_timeout)
                     try:
                         await self.websocket.close()
@@ -204,12 +230,18 @@ class RobotRealtimeConnection:
                     break
 
                 if "bytes" not in msg or not msg["bytes"]:
+                    if self._close_on_error:
+                        await self._close_with_error(code=1003, reason="Binary msgpack requests required")
+                        return
                     continue
 
                 try:
                     obs = self._unpack_request(msg["bytes"])
                 except Exception:
                     logger.exception("Invalid robot OpenPI request payload")
+                    if self._close_on_error:
+                        await self._close_with_error(code=1003, reason="Invalid msgpack request")
+                        return
                     try:
                         await self._send_error("Invalid request payload")
                     except Exception:
@@ -217,33 +249,43 @@ class RobotRealtimeConnection:
                     continue
 
                 try:
-                    endpoint = obs.pop("endpoint", "infer")
+                    endpoint = "infer" if self._stateless_requests else obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
                         self.reset()
                         self.serving.reset(obs)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
                     else:
-                        session_id = str(obs.get("session_id") or self._current_session_id or "default")
-                        if session_id != self._current_session_id:
-                            if self._current_session_id is not None:
-                                logger.info(
-                                    "Robot OpenPI session changed %s -> %s",
-                                    self._current_session_id,
-                                    session_id,
-                                )
-                            self._current_session_id = session_id
-                            self._call_count = 0
+                        if self._stateless_requests:
+                            self._call_count += 1
+                            session_id = f"robolab-{self._call_count}"
+                            reset = True
+                        else:
+                            session_id = str(obs.get("session_id") or self._current_session_id or "default")
+                            if session_id != self._current_session_id:
+                                if self._current_session_id is not None:
+                                    logger.info(
+                                        "Robot OpenPI session changed %s -> %s",
+                                        self._current_session_id,
+                                        session_id,
+                                    )
+                                self._current_session_id = session_id
+                                self._call_count = 0
 
-                        self._call_count += 1
+                            self._call_count += 1
+                            reset = self._call_count <= 1
                         actions = await self.serving.infer(
                             obs,
                             session_id=session_id,
-                            reset=self._call_count <= 1,
+                            reset=reset,
                         )
-                        await self.websocket.send_bytes(_pack(actions))
+                        response = {"action": actions} if self._wrap_action_response else actions
+                        await self.websocket.send_bytes(_pack(response))
                 except Exception:
                     logger.exception("Error handling request")
+                    if self._close_on_error:
+                        await self._close_with_error(code=1011, reason="Policy inference failed")
+                        return
                     try:
                         await self._send_error("Internal inference error")
                     except Exception:
@@ -253,3 +295,23 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+
+
+class RoboLabRealtimeConnection(RobotRealtimeConnection):
+    """RoboLab's root-route OpenPI profile.
+
+    RoboLab doesn't send session or reset messages, so every request is treated
+    as an independent policy call. The compatibility route deliberately has no
+    receive idle timeout because the client replans only every 32 simulator steps.
+    """
+
+    def __init__(self, websocket: WebSocket, serving: ServingRealtimeRobotOpenPI) -> None:
+        super().__init__(
+            websocket,
+            serving,
+            idle_timeout=None,
+            handshake_metadata={},
+            wrap_action_response=True,
+            stateless_requests=True,
+            close_on_error=True,
+        )

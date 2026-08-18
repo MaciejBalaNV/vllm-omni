@@ -12,6 +12,10 @@
 transformers >= 5.10.1, < 5.15
 av>=14.0.0
 omegaconf>=2.3.0
+attrs>=25.4.0
+iopath>=0.1.10
+loguru==0.7.3
+scipy==1.18.0
 diffusers==0.38.0
 safetensors>=0.8.0
 accelerate==1.12.0

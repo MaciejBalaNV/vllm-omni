@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -174,6 +175,189 @@ def test_create_policy_server_returns_none_without_policy_config():
     assert serving is None
 
 
+def test_legacy_policy_request_defaults_key_no_longer_controls_serving():
+    od_config = SimpleNamespace(
+        model_config={
+            "policy_server_config": {},
+            "policy_request_defaults": "malformed legacy value",
+        }
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_policy_server(
+        engine_client=SimpleNamespace(get_diffusion_od_config=lambda: od_config),
+        model_name="generic-policy",
+    )
+
+    assert serving is not None
+
+
+def test_robolab_policy_server_does_not_require_policy_server_config(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
+
+    monkeypatch.setattr(cosmos3_utils, "preflight_robolab_framework_imports", lambda: None)
+    default_params = OmniDiffusionSamplingParams(extra_args={"format_prompt_as_json": True})
+    engine_client = SimpleNamespace(
+        model="nvidia/Cosmos3-Nano-Policy-DROID",
+        default_sampling_params_list=[default_params],
+        get_diffusion_od_config=lambda: SimpleNamespace(
+            model_class_name="Cosmos3OmniDiffusersPipeline",
+        ),
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="diffusion",
+                engine_args=SimpleNamespace(
+                    tf_model_config={"action_gen": True},
+                    model_config={},
+                ),
+            )
+        ],
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="nvidia/Cosmos3-Nano-Policy-DROID",
+    )
+
+    assert serving is not None
+    assert serving.policy_server_config.to_dict() == {}
+    request = serving._build_request({"prompt": "pick"}, session_id="robolab-1", reset=True)
+    assert request.sampling_params.extra_args["format_prompt_as_json"] is True
+
+
+def test_robolab_policy_server_missing_framework_disables_only_route(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
+
+    def missing_framework():
+        raise ModuleNotFoundError("cosmos_framework is not on PYTHONPATH")
+
+    monkeypatch.setattr(cosmos3_utils, "preflight_robolab_framework_imports", missing_framework)
+    engine_client = SimpleNamespace(
+        get_diffusion_od_config=lambda: SimpleNamespace(
+            model_class_name="Cosmos3OmniDiffusersPipeline",
+            action_gen=True,
+        )
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="nvidia/Cosmos3-Nano-Policy-DROID",
+    )
+
+    assert serving is None
+
+
+def test_robolab_policy_server_accepts_registered_cosmos3_alias(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
+
+    monkeypatch.setattr(cosmos3_utils, "preflight_robolab_framework_imports", lambda: None)
+    engine_client = SimpleNamespace(
+        get_diffusion_od_config=lambda: SimpleNamespace(
+            model_class_name="Cosmos3OmniPipeline",
+            action_gen=True,
+        )
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="custom-policy-alias",
+    )
+
+    assert serving is not None
+
+
+def test_robolab_policy_server_resolves_action_capability_from_canonical_model(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
+    from vllm_omni.model_extras import cosmos3 as cosmos3_extras
+
+    monkeypatch.setattr(cosmos3_utils, "preflight_robolab_framework_imports", lambda: None)
+    inspected_models = []
+
+    def resolve_action_gen(model, *, revision=None):
+        inspected_models.append((model, revision))
+        return True
+
+    monkeypatch.setattr(cosmos3_extras, "resolve_cosmos3_action_gen", resolve_action_gen)
+    engine_client = SimpleNamespace(
+        model="nvidia/Cosmos3-Edge-Policy-DROID",
+        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="Cosmos3OmniPipeline"),
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="diffusion",
+                engine_args=SimpleNamespace(revision="policy-revision"),
+            )
+        ],
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="served-policy-alias",
+    )
+
+    assert serving is not None
+    assert inspected_models == [("nvidia/Cosmos3-Edge-Policy-DROID", "policy-revision")]
+
+
+def test_robolab_policy_server_edge_fallback_ignores_served_model_alias(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
+    from vllm_omni.model_extras import cosmos3 as cosmos3_extras
+
+    monkeypatch.setattr(cosmos3_utils, "preflight_robolab_framework_imports", lambda: None)
+    monkeypatch.setattr(cosmos3_extras, "resolve_cosmos3_action_gen", lambda *args, **kwargs: None)
+    engine_client = SimpleNamespace(
+        model="nvidia/Cosmos3-Edge-Policy-DROID",
+        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="Cosmos3OmniPipeline"),
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="served-policy-alias",
+    )
+
+    assert serving is not None
+
+
+def test_robolab_policy_server_rejects_non_action_cosmos3_model():
+    engine_client = SimpleNamespace(
+        get_diffusion_od_config=lambda: SimpleNamespace(
+            model_class_name="Cosmos3OmniDiffusersPipeline",
+            tf_model_config={"action_gen": False},
+        )
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="nvidia/Cosmos3-Nano",
+    )
+
+    assert serving is None
+
+
+def test_robolab_policy_server_honors_explicit_stage_pipeline_override(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import utils as cosmos3_utils
+
+    monkeypatch.setattr(cosmos3_utils, "preflight_robolab_framework_imports", lambda: None)
+    engine_client = SimpleNamespace(
+        get_diffusion_od_config=lambda: SimpleNamespace(model_class_name="AutoResolvedPipeline"),
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="diffusion",
+                engine_args=SimpleNamespace(
+                    model_class_name="Cosmos3OmniDiffusersPipeline",
+                    tf_model_config={"action_gen": True},
+                    model_config={},
+                ),
+            )
+        ],
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_robolab_policy_server(
+        engine_client=engine_client,
+        model_name="custom/droid-policy",
+    )
+
+    assert serving is not None
+
+
 def test_policy_server_config_allows_explicit_empty_config():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(
         engine_client=_engine_with_policy_config(policy_config={}),
@@ -218,6 +402,70 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id != request_b.request_id
 
 
+def test_build_request_clones_stage_defaults_before_protocol_fields():
+    default_params = OmniDiffusionSamplingParams(
+        extra_args={
+            "format_prompt_as_json": True,
+            "session_id": "configured-session-must-not-win",
+            "reset": False,
+            "nested": {"values": []},
+        }
+    )
+    od_config = SimpleNamespace(model_config={"policy_server_config": {}})
+    engine_client = SimpleNamespace(
+        get_diffusion_od_config=lambda: od_config,
+        default_sampling_params_list=[default_params],
+    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=engine_client,
+        model_name="custom-policy",
+    )
+
+    request_a = serving._build_request(
+        {"prompt": "pick up the object"},
+        session_id="wire-session",
+        reset=True,
+    )
+    request_b = serving._build_request(
+        {"prompt": "pick up the object"},
+        session_id="wire-session",
+        reset=False,
+    )
+
+    assert request_a.sampling_params.extra_args["format_prompt_as_json"] is True
+    assert request_a.sampling_params.extra_args["session_id"] == "wire-session"
+    assert request_a.sampling_params.extra_args["reset"] is True
+    request_a.sampling_params.extra_args["nested"]["values"].append("request-a")
+    assert request_b.sampling_params.extra_args["nested"] == {"values": []}
+    assert default_params.extra_args["nested"] == {"values": []}
+
+
+def test_released_droid_policy_defaults_to_json_prompt_format():
+    engine_client = _engine_with_policy_config()
+    engine_client.model = "nvidia/Cosmos3-Nano-Policy-DROID"
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=engine_client,
+        model_name="served-policy-alias",
+    )
+
+    request = serving._build_request({"prompt": "pick"}, session_id="robolab-1", reset=True)
+
+    assert request.sampling_params.extra_args["format_prompt_as_json"] is True
+
+
+def test_explicit_stage_default_can_disable_droid_json_prompt_format():
+    engine_client = _engine_with_policy_config()
+    engine_client.model = "nvidia/Cosmos3-Nano-Policy-DROID"
+    engine_client.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(extra_args={"format_prompt_as_json": False})
+    ]
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
+
+    request = serving._build_request({"prompt": "pick"}, session_id="robolab-1", reset=True)
+
+    assert request.sampling_params.extra_args["format_prompt_as_json"] is False
+
+
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
     engine = RecordingEngine()
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
@@ -240,6 +488,29 @@ def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
     assert sampling_params_b.extra_args["session_id"] == "session-a"
     assert sampling_params_a.extra_args["reset"] is True
     assert sampling_params_b.extra_args["reset"] is False
+
+
+def test_infer_yields_event_loop_while_engine_is_running():
+    class DelayedEngine(RecordingEngine):
+        def generate(self, *, prompt, request_id, sampling_params_list):
+            async def _generate():
+                await asyncio.sleep(0.03)
+                yield SimpleNamespace(multimodal_output={"actions": [0.0]})
+
+            return _generate()
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=DelayedEngine())
+
+    async def run_test():
+        infer_task = asyncio.create_task(serving.infer({"prompt": "pick"}, session_id="session-a", reset=True))
+        ticks = 0
+        while not infer_task.done():
+            await asyncio.sleep(0.005)
+            ticks += 1
+        await infer_task
+        return ticks
+
+    assert asyncio.run(run_test()) >= 2
 
 
 def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):

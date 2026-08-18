@@ -17,6 +17,8 @@ class FakeWebSocket:
         self.sent_texts = []
         self.accepted = False
         self.closed = False
+        self.close_code = None
+        self.close_reason = None
 
     async def accept(self):
         self.accepted = True
@@ -30,8 +32,10 @@ class FakeWebSocket:
     async def receive(self):
         return self._messages.pop(0)
 
-    async def close(self):
+    async def close(self, code=1000, reason=None):
         self.closed = True
+        self.close_code = code
+        self.close_reason = reason
 
 
 def _serving_mock():
@@ -256,6 +260,115 @@ def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
     assert websocket.closed is True
     assert websocket.sent_texts == []
     serving.infer.assert_not_called()
+
+
+def test_robolab_connection_uses_empty_handshake_wrapped_actions_and_stateless_requests(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"first": {"prompt": "first"},
+        b"second": {"prompt": "second"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    serving.infer = AsyncMock(return_value=np.zeros((32, 8), dtype=np.float32))
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"first"},
+            {"type": "websocket.receive", "bytes": b"second"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
+
+    assert websocket.sent_bytes[0] == {}
+    assert len(websocket.sent_bytes) == 3
+    assert set(websocket.sent_bytes[1]) == {"action"}
+    assert websocket.sent_bytes[1]["action"].shape == (32, 8)
+    assert websocket.sent_bytes[2]["action"].shape == (32, 8)
+    assert [call.kwargs for call in serving.infer.await_args_list] == [
+        {"session_id": "robolab-1", "reset": True},
+        {"session_id": "robolab-2", "reset": True},
+    ]
+    assert websocket.sent_texts == []
+
+
+def test_robolab_handshake_and_action_reply_are_binary_msgpack():
+    request = openpi_connection._pack({"prompt": "pick"})
+    serving = _serving_mock()
+    serving.infer = AsyncMock(return_value=np.zeros((32, 8), dtype=np.float32))
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": request},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
+
+    assert openpi_connection._unpack(websocket.sent_bytes[0]) == {}
+    response = openpi_connection._unpack(websocket.sent_bytes[1])
+    assert set(response) == {"action"}
+    assert response["action"].shape == (32, 8)
+    assert response["action"].dtype == np.float32
+    assert websocket.sent_texts == []
+
+
+def test_robolab_connection_closes_instead_of_sending_error_reply(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"prompt": "fail"})
+    serving = _serving_mock()
+    serving.infer = AsyncMock(side_effect=RuntimeError("private failure"))
+    websocket = FakeWebSocket([{"type": "websocket.receive", "bytes": b"request"}])
+
+    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
+
+    assert websocket.sent_bytes == [{}]
+    assert websocket.sent_texts == []
+    assert websocket.closed is True
+    assert websocket.close_code == 1011
+    assert websocket.close_reason == "Policy inference failed"
+
+
+def test_robolab_connection_rejects_text_frames_without_text_reply(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    serving = _serving_mock()
+    websocket = FakeWebSocket([{"type": "websocket.receive", "text": "{}"}])
+
+    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
+
+    assert websocket.sent_bytes == [{}]
+    assert websocket.sent_texts == []
+    assert websocket.closed is True
+    assert websocket.close_code == 1003
+    assert websocket.close_reason == "Binary msgpack requests required"
+    serving.infer.assert_not_called()
+
+
+def test_robolab_connection_does_not_apply_legacy_idle_timeout(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"prompt": "delayed"})
+    serving = _serving_mock()
+    websocket = FakeWebSocket([])
+    messages = [
+        {"type": "websocket.receive", "bytes": b"request"},
+        {"type": "websocket.disconnect"},
+    ]
+
+    async def delayed_receive():
+        await asyncio.sleep(0.02)
+        return messages.pop(0)
+
+    websocket.receive = delayed_receive
+
+    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
+
+    assert websocket.closed is False
+    serving.infer.assert_awaited_once_with(
+        {"prompt": "delayed"},
+        session_id="robolab-1",
+        reset=True,
+    )
 
 
 def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):

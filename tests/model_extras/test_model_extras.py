@@ -176,6 +176,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
             "resolution",
             "image_size",
             "use_state",
+            "format_prompt_as_json",
             "observation",
             "robot_obs",
             "deterministic_seed",
@@ -191,6 +192,36 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
         }
     )
     assert should_init_extra_args_for_non_diffusion_stages(pipeline_name) is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_cosmos3_action_capability_resolves_from_transformer_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_extras.cosmos3 import resolve_cosmos3_action_gen
+
+    calls = []
+
+    def get_config(path, model, *, revision=None):
+        calls.append((path, model, revision))
+        return {"action_gen": True} if path == "transformer/config.json" else None
+
+    monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", get_config)
+
+    assert resolve_cosmos3_action_gen("nvidia/Cosmos3-Edge-Policy-DROID", revision="rev-a") is True
+    assert calls == [("transformer/config.json", "nvidia/Cosmos3-Edge-Policy-DROID", "rev-a")]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_cosmos3_action_capability_preserves_explicit_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_extras.cosmos3 import resolve_cosmos3_action_gen
+
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_hf_file_to_dict",
+        lambda *args, **kwargs: {"transformer": {"action_gen": False}},
+    )
+
+    assert resolve_cosmos3_action_gen("nvidia/Cosmos3-Nano") is False
 
 
 @pytest.mark.core_model
