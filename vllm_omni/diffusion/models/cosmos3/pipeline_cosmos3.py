@@ -192,6 +192,7 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # are tokenized to their natural length (no padding); this only bounds the
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
+COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -261,6 +262,16 @@ def _normalize_aspect_ratio(value: Any) -> str | None:
     if width <= 0 or height <= 0:
         return None
     return f"{width},{height}"
+
+
+def _aspect_ratio_for_dimensions(width: int, height: int) -> str:
+    """Return Cosmos's canonical label for a known bucket, else the exact ratio."""
+    for sizes in VIDEO_RES_SIZE_INFO.values():
+        for aspect_ratio, size in sizes.items():
+            if size == (width, height):
+                return aspect_ratio
+    divisor = math.gcd(width, height)
+    return f"{width // divisor},{height // divisor}"
 
 
 def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransformer]:
@@ -520,6 +531,17 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
         # Resolve missing H/W.
         if transfer_requested:
+            requested_width = request.sampling_params.width
+            requested_height = request.sampling_params.height
+            if (
+                requested_width is not None
+                and requested_height is not None
+                and COSMOS3_TRANSFER_REQUESTED_SIZE_KEY not in extra
+            ):
+                extra[COSMOS3_TRANSFER_REQUESTED_SIZE_KEY] = {
+                    "width": int(requested_width),
+                    "height": int(requested_height),
+                }
             _set_transfer_size_from_image(request, image)
         elif request.sampling_params.height is None or request.sampling_params.width is None:
             if action_mode is not None:
@@ -2115,17 +2137,39 @@ class Cosmos3OmniDiffusersPipeline(
             res_tmpl = COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_RESOLUTION_TEMPLATE
         else:
             res_tmpl = None
+        requested_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
+        prompt_aspect_ratio = _json_object_aspect_ratio(prompt)
+        metadata_aspect_ratio = requested_aspect_ratio if requested_aspect_ratio is not None else prompt_aspect_ratio
+        canvas_aspect_ratio = aspect_ratio_override or _aspect_ratio_for_dimensions(width, height)
+        normalized_metadata_ratio = _normalize_aspect_ratio(metadata_aspect_ratio)
+        if (
+            aspect_ratio_override is None
+            and metadata_aspect_ratio is not None
+            and normalized_metadata_ratio != canvas_aspect_ratio
+            and _is_rank_zero()
+        ):
+            aspect_ratio_source = (
+                "requested aspect_ratio" if requested_aspect_ratio is not None else "JSON prompt aspect_ratio"
+            )
+            logger.warning(
+                "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
+                aspect_ratio_source,
+                metadata_aspect_ratio,
+                width,
+                height,
+                canvas_aspect_ratio,
+            )
+            metadata_aspect_ratio = canvas_aspect_ratio
+        elif aspect_ratio_override is not None:
+            metadata_aspect_ratio = aspect_ratio_override
+
         json_prompt = _format_json_object_prompt(
             prompt,
             num_frames=num_frames,
             frame_rate=frame_rate,
             height=height,
             width=width,
-            aspect_ratio=(
-                aspect_ratio_override
-                if aspect_ratio_override is not None
-                else self._get_sp_param(sp, "aspect_ratio", None)
-            ),
+            aspect_ratio=metadata_aspect_ratio,
         )
         if json_prompt is not None:
             prompt = json_prompt
@@ -2915,8 +2959,13 @@ class Cosmos3OmniDiffusersPipeline(
         if not _is_rank_zero():
             return
 
-        requested_width = getattr(sp, "width", None)
-        requested_height = getattr(sp, "height", None)
+        requested_size_data = self._get_sp_param(sp, COSMOS3_TRANSFER_REQUESTED_SIZE_KEY, None)
+        if isinstance(requested_size_data, Mapping):
+            requested_width = requested_size_data.get("width")
+            requested_height = requested_size_data.get("height")
+        else:
+            requested_width = getattr(sp, "width", None)
+            requested_height = getattr(sp, "height", None)
         if requested_width is not None and requested_height is not None:
             try:
                 requested_size = (int(requested_width), int(requested_height))

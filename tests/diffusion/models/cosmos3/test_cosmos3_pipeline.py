@@ -1087,6 +1087,7 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     )
     additional = preprocess(request).prompt["additional_information"]
     assert (request.sampling_params.height, request.sampling_params.width) == (192, 320)
+    assert request.sampling_params.extra_args["_cosmos3_transfer_requested_size"] == {"width": 32, "height": 16}
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
@@ -1443,15 +1444,45 @@ def test_format_and_tokenize_prompts_transfer_aspect_ratio_override(make_cosmos3
     assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
 
 
+def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata(
+    make_cosmos3_pipeline,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import json
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    with caplog.at_level("WARNING"):
+        pipeline._format_and_tokenize_prompts(
+            '{"caption": "A robot", "aspect_ratio": "4,3"}',
+            "",
+            num_frames=48,
+            frame_rate=24,
+            height=720,
+            width=1280,
+            max_sequence_length=32,
+            sp=SimpleNamespace(extra_args={}),
+            is_t2i=False,
+        )
+
+    assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
+    assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in caplog.text
+
+
 def test_transfer_bucket_selection_warns_on_size_and_aspect_ratio_conflicts(
     make_cosmos3_pipeline,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     pipeline = make_cosmos3_pipeline()
     sp = make_sampling_params(
-        width=1280,
-        height=720,
-        extra_args={"resolution": "480", "aspect_ratio": "4:3"},
+        width=832,
+        height=480,
+        extra_args={
+            "resolution": "480",
+            "aspect_ratio": "4:3",
+            "_cosmos3_transfer_requested_size": {"width": 1280, "height": 720},
+        },
     )
 
     height, width, aspect_ratio = pipeline._transfer_bucket_size(sp, (480, 832))
