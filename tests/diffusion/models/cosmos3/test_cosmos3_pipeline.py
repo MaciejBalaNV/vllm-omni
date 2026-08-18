@@ -1444,9 +1444,12 @@ def test_format_and_tokenize_prompts_transfer_aspect_ratio_override(make_cosmos3
     assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
 
 
-def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata(
+@pytest.mark.parametrize("rank_zero", [True, False])
+def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata_on_every_rank(
     make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
     mocker,
+    rank_zero: bool,
 ) -> None:
     import json
 
@@ -1454,6 +1457,7 @@ def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata(
 
     pipeline = make_cosmos3_pipeline()
     calls = _capture_tokenize_calls(pipeline)
+    monkeypatch.setattr(pipeline_cosmos3, "_is_rank_zero", lambda: rank_zero)
     warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
 
     pipeline._format_and_tokenize_prompts(
@@ -1469,8 +1473,49 @@ def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata(
     )
 
     assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
-    rendered_warning = warning.call_args.args[0] % warning.call_args.args[1:]
-    assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in rendered_warning
+    if rank_zero:
+        rendered_warning = warning.call_args.args[0] % warning.call_args.args[1:]
+        assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in rendered_warning
+    else:
+        warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "aspect_ratio"),
+    [
+        (1104, 816, "4,3"),
+        (832, 468, "16,9"),
+    ],
+)
+def test_format_and_tokenize_prompts_keeps_nearest_canonical_aspect_ratio(
+    make_cosmos3_pipeline,
+    mocker,
+    width: int,
+    height: int,
+    aspect_ratio: str,
+) -> None:
+    import json
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
+
+    pipeline._format_and_tokenize_prompts(
+        json.dumps({"caption": "A robot", "aspect_ratio": aspect_ratio}),
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=height,
+        width=width,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={}),
+        is_t2i=False,
+    )
+
+    assert json.loads(calls[0]["text"])["aspect_ratio"] == aspect_ratio
+    warning.assert_not_called()
 
 
 def test_transfer_bucket_selection_warns_on_size_and_aspect_ratio_conflicts(

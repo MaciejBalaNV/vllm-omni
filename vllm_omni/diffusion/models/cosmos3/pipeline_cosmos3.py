@@ -193,6 +193,13 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
+COSMOS3_CANONICAL_ASPECT_RATIOS: dict[str, float] = {
+    "16,9": 16 / 9,
+    "4,3": 4 / 3,
+    "1,1": 1.0,
+    "3,4": 3 / 4,
+    "9,16": 9 / 16,
+}
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -261,17 +268,19 @@ def _normalize_aspect_ratio(value: Any) -> str | None:
         return None
     if width <= 0 or height <= 0:
         return None
-    return f"{width},{height}"
+    divisor = math.gcd(width, height)
+    return f"{width // divisor},{height // divisor}"
 
 
 def _aspect_ratio_for_dimensions(width: int, height: int) -> str:
-    """Return Cosmos's canonical label for a known bucket, else the exact ratio."""
-    for sizes in VIDEO_RES_SIZE_INFO.values():
-        for aspect_ratio, size in sizes.items():
-            if size == (width, height):
-                return aspect_ratio
-    divisor = math.gcd(width, height)
-    return f"{width // divisor},{height // divisor}"
+    """Return the nearest supported Cosmos aspect-ratio label."""
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Cosmos3 canvas dimensions must be positive, got {width}x{height}.")
+    canvas_ratio = width / height
+    return min(
+        COSMOS3_CANONICAL_ASPECT_RATIOS,
+        key=lambda label: abs(canvas_ratio - COSMOS3_CANONICAL_ASPECT_RATIOS[label]),
+    )
 
 
 def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransformer]:
@@ -2142,23 +2151,24 @@ class Cosmos3OmniDiffusersPipeline(
         metadata_aspect_ratio = requested_aspect_ratio if requested_aspect_ratio is not None else prompt_aspect_ratio
         canvas_aspect_ratio = aspect_ratio_override or _aspect_ratio_for_dimensions(width, height)
         normalized_metadata_ratio = _normalize_aspect_ratio(metadata_aspect_ratio)
-        if (
+        has_aspect_ratio_conflict = (
             aspect_ratio_override is None
             and metadata_aspect_ratio is not None
             and normalized_metadata_ratio != canvas_aspect_ratio
-            and _is_rank_zero()
-        ):
+        )
+        if has_aspect_ratio_conflict:
             aspect_ratio_source = (
                 "requested aspect_ratio" if requested_aspect_ratio is not None else "JSON prompt aspect_ratio"
             )
-            logger.warning(
-                "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
-                aspect_ratio_source,
-                metadata_aspect_ratio,
-                width,
-                height,
-                canvas_aspect_ratio,
-            )
+            if _is_rank_zero():
+                logger.warning(
+                    "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
+                    aspect_ratio_source,
+                    metadata_aspect_ratio,
+                    width,
+                    height,
+                    canvas_aspect_ratio,
+                )
             metadata_aspect_ratio = canvas_aspect_ratio
         elif aspect_ratio_override is not None:
             metadata_aspect_ratio = aspect_ratio_override
