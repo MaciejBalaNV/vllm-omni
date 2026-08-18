@@ -1421,6 +1421,56 @@ def test_format_and_tokenize_prompts_rewrites_json_object_metadata(make_cosmos3_
     )
 
 
+def test_format_and_tokenize_prompts_transfer_aspect_ratio_override(make_cosmos3_pipeline) -> None:
+    import json
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    pipeline._format_and_tokenize_prompts(
+        '{"caption": "A robot", "aspect_ratio": "4,3"}',
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=480,
+        width=832,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={"aspect_ratio": "4:3"}),
+        is_t2i=False,
+        aspect_ratio_override="16,9",
+    )
+
+    assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
+
+
+def test_transfer_bucket_selection_warns_on_size_and_aspect_ratio_conflicts(
+    make_cosmos3_pipeline,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    sp = make_sampling_params(
+        width=1280,
+        height=720,
+        extra_args={"resolution": "480", "aspect_ratio": "4:3"},
+    )
+
+    height, width, aspect_ratio = pipeline._transfer_bucket_size(sp, (480, 832))
+    assert (height, width, aspect_ratio) == (480, 832, "16,9")
+
+    with caplog.at_level("WARNING"):
+        pipeline._warn_transfer_bucket_conflicts(
+            sp,
+            "A transfer prompt",
+            source_hw=(480, 832),
+            height=height,
+            width=width,
+            aspect_ratio=aspect_ratio,
+        )
+
+    assert "ignores requested size=1280x720 (WxH)" in caplog.text
+    assert "requested aspect_ratio='4:3' conflicts with the control-selected 16,9 bucket" in caplog.text
+
+
 def test_format_and_tokenize_prompts_removes_video_metadata_from_t2i_json(make_cosmos3_pipeline) -> None:
     import json
 
@@ -1863,8 +1913,9 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     captured: dict[str, Any] = {}
 
     def fake_format(prompt, negative_prompt, num_frames, frame_rate, height, width, *args, **kwargs):
-        del prompt, negative_prompt, num_frames, height, width, args, kwargs
+        del prompt, negative_prompt, num_frames, height, width, args
         captured["format_frame_rate"] = frame_rate
+        captured["format_aspect_ratio"] = kwargs["aspect_ratio_override"]
         return _ids(2), _mask(), _ids(1), _mask()
 
     def fake_encode(video: torch.Tensor) -> torch.Tensor:
@@ -1887,7 +1938,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
         captured["shared_kwargs"] = kwargs["shared_kwargs"]
         return kwargs["latents"]
 
-    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16, "1,1")
     pipeline._format_and_tokenize_prompts = fake_format
     pipeline._encode_video_tensor = fake_encode
     pipeline._prepare_transfer_latents = fake_prepare
@@ -1928,6 +1979,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     output = pipeline.forward(request)
 
     assert captured["format_frame_rate"] == expected_fps
+    assert captured["format_aspect_ratio"] == "1,1"
     assert captured["shared_kwargs"]["fps"] == expected_fps
     assert captured["flow_shifts"] == [10.0]
     # Transfer applies the V2V flow shift when building its timestep schedule.
@@ -1943,7 +1995,7 @@ def test_forward_transfer_runs_multichunk_overlap_path(
     pipeline = make_cosmos3_pipeline()
     captured: dict[str, Any] = {"targets": [], "conditional_frames": []}
 
-    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16, "1,1")
     pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
     pipeline._set_flow_shift = lambda target, **_kwargs: captured.setdefault("flow_shifts", []).append(target)
 
