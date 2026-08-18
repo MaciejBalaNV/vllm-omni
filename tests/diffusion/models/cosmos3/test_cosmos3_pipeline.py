@@ -1446,35 +1446,41 @@ def test_format_and_tokenize_prompts_transfer_aspect_ratio_override(make_cosmos3
 
 def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata(
     make_cosmos3_pipeline,
-    caplog: pytest.LogCaptureFixture,
+    mocker,
 ) -> None:
     import json
 
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
     pipeline = make_cosmos3_pipeline()
     calls = _capture_tokenize_calls(pipeline)
+    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
 
-    with caplog.at_level("WARNING"):
-        pipeline._format_and_tokenize_prompts(
-            '{"caption": "A robot", "aspect_ratio": "4,3"}',
-            "",
-            num_frames=48,
-            frame_rate=24,
-            height=720,
-            width=1280,
-            max_sequence_length=32,
-            sp=SimpleNamespace(extra_args={}),
-            is_t2i=False,
-        )
+    pipeline._format_and_tokenize_prompts(
+        '{"caption": "A robot", "aspect_ratio": "4,3"}',
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={}),
+        is_t2i=False,
+    )
 
     assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
-    assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in caplog.text
+    rendered_warning = warning.call_args.args[0] % warning.call_args.args[1:]
+    assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in rendered_warning
 
 
 def test_transfer_bucket_selection_warns_on_size_and_aspect_ratio_conflicts(
     make_cosmos3_pipeline,
-    caplog: pytest.LogCaptureFixture,
+    mocker,
 ) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
     pipeline = make_cosmos3_pipeline()
+    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
     sp = make_sampling_params(
         width=832,
         height=480,
@@ -1488,18 +1494,21 @@ def test_transfer_bucket_selection_warns_on_size_and_aspect_ratio_conflicts(
     height, width, aspect_ratio = pipeline._transfer_bucket_size(sp, (480, 832))
     assert (height, width, aspect_ratio) == (480, 832, "16,9")
 
-    with caplog.at_level("WARNING"):
-        pipeline._warn_transfer_bucket_conflicts(
-            sp,
-            "A transfer prompt",
-            source_hw=(480, 832),
-            height=height,
-            width=width,
-            aspect_ratio=aspect_ratio,
-        )
+    pipeline._warn_transfer_bucket_conflicts(
+        sp,
+        "A transfer prompt",
+        source_hw=(480, 832),
+        height=height,
+        width=width,
+        aspect_ratio=aspect_ratio,
+    )
 
-    assert "ignores requested size=1280x720 (WxH)" in caplog.text
-    assert "requested aspect_ratio='4:3' conflicts with the control-selected 16,9 bucket" in caplog.text
+    rendered_warnings = [call.args[0] % call.args[1:] for call in warning.call_args_list]
+    assert any("ignores requested size=1280x720 (WxH)" in message for message in rendered_warnings)
+    assert any(
+        "requested aspect_ratio='4:3' conflicts with the control-selected 16,9 bucket" in message
+        for message in rendered_warnings
+    )
 
 
 def test_format_and_tokenize_prompts_removes_video_metadata_from_t2i_json(make_cosmos3_pipeline) -> None:
