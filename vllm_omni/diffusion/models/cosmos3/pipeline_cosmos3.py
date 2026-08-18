@@ -85,7 +85,6 @@ from .action import (
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODE_POLICY,
-    VIDEO_RES_SIZE_INFO,
     action_start_frame_offset,
     build_action_condition_mask,
     build_vision_condition_mask,
@@ -127,6 +126,7 @@ from .utils import (
     ROBOLAB_DEFAULT_RAW_ACTION_DIM,
     ROBOLAB_DEFAULT_RESOLUTION,
     ROBOLAB_MIDTRAIN_RAW_ACTION_DIM,
+    VIDEO_RES_SIZE_INFO,
     RoboLabActionPostprocessInputs,
     RoboLabPolicyInputs,
     build_abs_pose_from_components,
@@ -193,13 +193,6 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
-COSMOS3_CANONICAL_ASPECT_RATIOS: dict[str, float] = {
-    "16,9": 16 / 9,
-    "4,3": 4 / 3,
-    "1,1": 1.0,
-    "3,4": 3 / 4,
-    "9,16": 9 / 16,
-}
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -277,9 +270,14 @@ def _aspect_ratio_for_dimensions(width: int, height: int) -> str:
     if width <= 0 or height <= 0:
         raise ValueError(f"Cosmos3 canvas dimensions must be positive, got {width}x{height}.")
     canvas_ratio = width / height
+
+    def ratio_value(label: str) -> float:
+        ratio_width, ratio_height = (int(part) for part in label.split(","))
+        return ratio_width / ratio_height
+
     return min(
-        COSMOS3_CANONICAL_ASPECT_RATIOS,
-        key=lambda label: abs(canvas_ratio - COSMOS3_CANONICAL_ASPECT_RATIOS[label]),
+        (label for sizes in VIDEO_RES_SIZE_INFO.values() for label in sizes),
+        key=lambda label: abs(canvas_ratio - ratio_value(label)),
     )
 
 
