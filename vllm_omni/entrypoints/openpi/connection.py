@@ -209,22 +209,22 @@ class RobotRealtimeConnection:
             await self.websocket.send_bytes(_pack(metadata))
 
             while True:
-                try:
-                    if self._idle_timeout is None:
-                        msg = await self.websocket.receive()
-                    else:
+                idle_timeout = self._idle_timeout
+                if idle_timeout is None:
+                    msg = await self.websocket.receive()
+                else:
+                    try:
                         msg = await asyncio.wait_for(
                             self.websocket.receive(),
-                            timeout=self._idle_timeout,
+                            timeout=idle_timeout,
                         )
-                except asyncio.TimeoutError:
-                    assert self._idle_timeout is not None
-                    logger.info("Robot OpenPI connection idle timeout after %.1f seconds", self._idle_timeout)
-                    try:
-                        await self.websocket.close()
-                    except Exception:
-                        logger.debug("Failed to close idle robot OpenPI websocket", exc_info=True)
-                    return
+                    except asyncio.TimeoutError:
+                        logger.info("Robot OpenPI connection idle timeout after %.1f seconds", idle_timeout)
+                        try:
+                            await self.websocket.close()
+                        except Exception:
+                            logger.debug("Failed to close idle robot OpenPI websocket", exc_info=True)
+                        return
 
                 if msg.get("type") == "websocket.disconnect":
                     break
@@ -249,7 +249,14 @@ class RobotRealtimeConnection:
                     continue
 
                 try:
-                    endpoint = "infer" if self._stateless_requests else obs.pop("endpoint", "infer")
+                    endpoint = obs.pop("endpoint", "infer")
+
+                    if self._stateless_requests and endpoint != "infer":
+                        await self._close_with_error(
+                            code=1003,
+                            reason="RoboLab route supports only inference requests",
+                        )
+                        return
 
                     if endpoint == "reset":
                         self.reset()

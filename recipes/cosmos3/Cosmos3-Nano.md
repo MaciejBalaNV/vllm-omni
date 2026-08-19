@@ -269,9 +269,10 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
 
-# DROID websocket policy server. Use the current cosmos-framework source; a
+# DROID websocket policy server. Use the tested cosmos-framework revision; a
 # package install is unnecessary and can introduce dependency conflicts.
 export COSMOS_FRAMEWORK_ROOT=/path/to/cosmos-framework
+git -C "$COSMOS_FRAMEWORK_ROOT" checkout c14617c2bc93dacbf69674fb964eec93182933d9
 export PYTHONPATH="$COSMOS_FRAMEWORK_ROOT"
 
 # Verify the four source-only integration modules in the vLLM environment.

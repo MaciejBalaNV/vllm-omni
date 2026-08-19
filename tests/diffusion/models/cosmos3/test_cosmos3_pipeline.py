@@ -22,25 +22,18 @@ from vllm_omni.experimental.world_models.session_state import SessionStateManage
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def test_action_domain_table_tracks_current_framework_and_legacy_aliases() -> None:
+@pytest.mark.parametrize(
+    ("alias", "canonical_name"),
+    [
+        ("galbot", "embodiment_b"),
+        ("agibot_gear_gripper", "embodiment_c_gripper"),
+        ("agibot_gear_gripper_ext", "embodiment_c_gripper_ext"),
+    ],
+)
+def test_action_domain_table_preserves_legacy_aliases(alias: str, canonical_name: str) -> None:
     from vllm_omni.diffusion.models.cosmos3.action import resolve_domain_id
 
-    expected = {
-        "droid_lerobot": 8,
-        "embodiment_b": 9,
-        "galbot": 9,
-        "embodiment_c_gripper": 15,
-        "agibot_gear_gripper": 15,
-        "embodiment_c_gripper_ext": 15,
-        "agibot_gear_gripper_ext": 15,
-        "xdof_yam": 16,
-        "molmoact2_yam": 16,
-        "abc_yam": 16,
-        "drawanything": 21,
-        "behavior1k_lerobot": 22,
-        "maniparena": 23,
-    }
-    assert {name: resolve_domain_id(domain_name=name) for name in expected} == expected
+    assert resolve_domain_id(domain_name=alias) == resolve_domain_id(domain_name=canonical_name)
 
 
 def test_pipeline_declares_layerwise_offload_components() -> None:

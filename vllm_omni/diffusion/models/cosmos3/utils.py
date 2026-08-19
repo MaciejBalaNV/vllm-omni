@@ -227,49 +227,68 @@ def extract_robolab_prompt_image(prompt_data: Any | None) -> np.ndarray | None:
     return ensure_rgb_uint8_image(image, "multi_modal_data.image")
 
 
+_ROBOLAB_FRAMEWORK_IMPORT_ERROR = (
+    "Cosmos3 RoboLab policy serving requires a compatible cosmos_framework source on PYTHONPATH."
+)
+_ROBOLAB_FRAMEWORK_IMPORTS: dict[str, tuple[str, str]] = {
+    "ActionTransformPipeline": (
+        "cosmos_framework.data.generator.action.utils.transforms",
+        "ActionTransformPipeline",
+    ),
+    "convert_rotation": (
+        "cosmos_framework.data.generator.action.utils.pose_utils",
+        "convert_rotation",
+    ),
+    "pose_abs_to_rel": (
+        "cosmos_framework.data.generator.action.utils.pose_utils",
+        "pose_abs_to_rel",
+    ),
+    "pose_rel_to_abs": (
+        "cosmos_framework.data.generator.action.utils.pose_utils",
+        "pose_rel_to_abs",
+    ),
+    "build_abs_pose_from_components": (
+        "cosmos_framework.data.generator.action.utils.pose_utils",
+        "build_abs_pose_from_components",
+    ),
+    "FlowUniPCMultistepScheduler": (
+        "cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc",
+        "FlowUniPCMultistepScheduler",
+    ),
+    "get_domain_id": (
+        "cosmos_framework.data.generator.action.utils.domain_utils",
+        "get_domain_id",
+    ),
+}
+
+
 def lazy_import(module_name: str, symbol_name: str, error_message: str):
     try:
         module = import_module(module_name)
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(error_message) from exc
-    return getattr(module, symbol_name)
+        return getattr(module, symbol_name)
+    except (ImportError, AttributeError) as exc:
+        raise ImportError(
+            f"{error_message} Could not import required symbol {symbol_name!r} from {module_name!r}."
+        ) from exc
+
+
+def _load_robolab_framework_symbol(symbol_name: str):
+    module_name, exported_name = _ROBOLAB_FRAMEWORK_IMPORTS[symbol_name]
+    return lazy_import(
+        module_name,
+        exported_name,
+        _ROBOLAB_FRAMEWORK_IMPORT_ERROR,
+    )
 
 
 def preflight_robolab_framework_imports() -> None:
-    """Fail early when the mounted Cosmos Framework cannot serve action policy."""
-    required_symbols = (
-        (
-            "cosmos_framework.data.generator.action.utils.transforms",
-            "ActionTransformPipeline",
-        ),
-        (
-            "cosmos_framework.data.generator.action.utils.pose_utils",
-            "convert_rotation",
-        ),
-        (
-            "cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc",
-            "FlowUniPCMultistepScheduler",
-        ),
-        (
-            "cosmos_framework.data.generator.action.utils.domain_utils",
-            "get_domain_id",
-        ),
-    )
-    for module_name, symbol_name in required_symbols:
-        lazy_import(
-            module_name,
-            symbol_name,
-            "Cosmos3 RoboLab policy serving requires the current cosmos_framework source on PYTHONPATH.",
-        )
+    """Validate every Cosmos Framework symbol used by action policy serving."""
+    for symbol_name in _ROBOLAB_FRAMEWORK_IMPORTS:
+        _load_robolab_framework_symbol(symbol_name)
 
 
 def lazy_action_transform_pipeline(max_action_dim: int, *, format_prompt_as_json: bool = False):
-    ActionTransformPipeline = lazy_import(
-        "cosmos_framework.data.generator.action.utils.transforms",
-        "ActionTransformPipeline",
-        "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
-        "golden ActionTransformPipeline can be reused.",
-    )
+    ActionTransformPipeline = _load_robolab_framework_symbol("ActionTransformPipeline")
     return ActionTransformPipeline(
         max_action_dim=max_action_dim,
         cfg_dropout_rate=0.0,
@@ -278,24 +297,13 @@ def lazy_action_transform_pipeline(max_action_dim: int, *, format_prompt_as_json
 
 
 def get_robolab_domain_id(domain_name: str) -> int:
-    get_domain_id = lazy_import(
-        "cosmos_framework.data.generator.action.utils.domain_utils",
-        "get_domain_id",
-        "Cosmos3 RoboLab policy serving requires cosmos_framework domain_utils on PYTHONPATH.",
-    )
+    get_domain_id = _load_robolab_framework_symbol("get_domain_id")
     canonical_name = _LEGACY_EMBODIMENT_ALIASES.get(domain_name.lower().strip(), domain_name)
     return int(get_domain_id(canonical_name))
 
 
 def build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.device):
-    FlowUniPCMultistepScheduler = lazy_import(
-        "cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc",
-        "FlowUniPCMultistepScheduler",
-        (
-            "Cosmos3 RoboLab policy serving requires cosmos_framework on PYTHONPATH so the "
-            "golden FlowUniPCMultistepScheduler can be reused."
-        ),
-    )
+    FlowUniPCMultistepScheduler = _load_robolab_framework_symbol("FlowUniPCMultistepScheduler")
 
     scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=1000,
@@ -307,38 +315,22 @@ def build_robolab_unipc_scheduler(num_steps: int, shift: float, device: torch.de
 
 
 def convert_midtrain_rotation(value: Any, src: str, dst: str) -> np.ndarray:
-    convert_rotation = lazy_import(
-        "cosmos_framework.data.generator.action.utils.pose_utils",
-        "convert_rotation",
-        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
-    )
+    convert_rotation = _load_robolab_framework_symbol("convert_rotation")
     return convert_rotation(value, src, dst)
 
 
 def pose_abs_to_rel(*args, **kwargs) -> np.ndarray:
-    pose_abs_to_rel_func = lazy_import(
-        "cosmos_framework.data.generator.action.utils.pose_utils",
-        "pose_abs_to_rel",
-        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
-    )
+    pose_abs_to_rel_func = _load_robolab_framework_symbol("pose_abs_to_rel")
     return pose_abs_to_rel_func(*args, **kwargs)
 
 
 def pose_rel_to_abs(*args, **kwargs) -> np.ndarray:
-    pose_rel_to_abs_func = lazy_import(
-        "cosmos_framework.data.generator.action.utils.pose_utils",
-        "pose_rel_to_abs",
-        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
-    )
+    pose_rel_to_abs_func = _load_robolab_framework_symbol("pose_rel_to_abs")
     return pose_rel_to_abs_func(*args, **kwargs)
 
 
 def build_abs_pose_from_components(*args, **kwargs) -> np.ndarray:
-    build_abs_pose_from_components_func = lazy_import(
-        "cosmos_framework.data.generator.action.utils.pose_utils",
-        "build_abs_pose_from_components",
-        "Cosmos3 RoboLab midtrain action serving requires cosmos_framework pose_utils on PYTHONPATH.",
-    )
+    build_abs_pose_from_components_func = _load_robolab_framework_symbol("build_abs_pose_from_components")
     return build_abs_pose_from_components_func(*args, **kwargs)
 
 
