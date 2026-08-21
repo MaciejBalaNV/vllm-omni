@@ -146,7 +146,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
     # checkpoints (which stay on the single-stage diffusion fallback), so this
     # entry is only reachable through a deploy yaml's ``pipeline:`` key
-    # (see deploy/cosmos3_policy_droid.yaml), mirroring the π0 serving flow.
+    # (see deploy/cosmos3_policy_droid.yaml).
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,

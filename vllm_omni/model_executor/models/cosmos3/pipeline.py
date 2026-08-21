@@ -3,12 +3,12 @@
 """Cosmos3 policy single-stage topology for online OpenPI serving.
 
 Cosmos3 policy checkpoints (e.g. ``nvidia/Cosmos3-Nano-Policy-DROID``) are one
-diffusion stage: robot observation -> action chunk. Like π0, they are
+diffusion stage: robot observation -> action chunk. They are
 registered in ``OMNI_PIPELINES`` because online OpenPI serving
 (``/v1/realtime/robot/openpi``) requires a registered pipeline so the deploy
 yaml's ``model_config.policy_server_config`` reaches the websocket handshake.
 
-Unlike π0 and GR00T, this pipeline declares neither ``hf_architectures`` nor
+This pipeline declares neither ``hf_architectures`` nor
 ``diffusers_class_name``: policy checkpoints share their HF metadata
 (``model_type=cosmos3_omni``, ``model_index.json`` ``_class_name=
 Cosmos3OmniDiffusersPipeline``) with the T2I/video Cosmos3 checkpoints, which

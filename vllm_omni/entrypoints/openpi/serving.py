@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Serving layer for the OpenPI robot-policy websocket route.
+"""Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
 Flow: raw obs → engine request → actions.
 The loaded policy model owns dataset transforms inside its pipeline.
@@ -9,7 +9,6 @@ The loaded policy model owns dataset transforms inside its pipeline.
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -29,7 +28,7 @@ def _to_builtin_container(value: Any) -> Any:
         return OmegaConf.to_container(value, resolve=True)
     if isinstance(value, Mapping):
         return {key: _to_builtin_container(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return [_to_builtin_container(item) for item in value]
     return value
 
@@ -93,7 +92,7 @@ class ServingRealtimeRobotOpenPI:
             return None
 
     @staticmethod
-    def _get_model_config(engine_client: Any) -> Any:
+    def _get_policy_server_config(engine_client: Any) -> PolicyServerConfig:
         model_config = None
         get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
         if callable(get_od_config):
@@ -115,14 +114,10 @@ class ServingRealtimeRobotOpenPI:
 
         if model_config is None:
             model_config = getattr(engine_client, "model_config", None)
-        return model_config
-
-    @classmethod
-    def _get_policy_server_config(cls, engine_client: Any) -> PolicyServerConfig:
-        return PolicyServerConfig.from_model_config(cls._get_model_config(engine_client))
+        return PolicyServerConfig.from_model_config(model_config)
 
     def reset(self, obs: dict) -> None:
-        """Reset hook; per-connection state lives in RobotRealtimeConnection."""
+        """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
@@ -158,23 +153,19 @@ class ServingRealtimeRobotOpenPI:
             get_default_sampling_params_list,
         )
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-        from vllm_omni.model_extras.cosmos3 import is_cosmos3_droid_policy_checkpoint
 
+        # The engine applies stage default_sampling_params only to requests
+        # that carry no explicit params; this endpoint always passes explicit
+        # params, so start from a clone of the diffusion stage's defaults
+        # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
+        # protocol fields on top.
         sampling_params = OmniDiffusionSamplingParams()
         for default_params in get_default_sampling_params_list(self.engine_client):
             if isinstance(default_params, OmniDiffusionSamplingParams):
                 sampling_params = clone_sampling_params(default_params)
                 break
 
-        # ``sampling_params`` is cloned, and copy the nested request namespace as
-        # an additional guard against a custom clone implementation sharing it.
-        extra_args = copy.deepcopy(sampling_params.extra_args or {})
-        canonical_model_name = str(getattr(self.engine_client, "model", "") or "")
-        droid_model_name = canonical_model_name or self.model_name
-        if is_cosmos3_droid_policy_checkpoint(droid_model_name):
-            # This is a property of the released DROID checkpoints, not a global
-            # Cosmos3 default. An explicit stage default still takes precedence.
-            extra_args.setdefault("format_prompt_as_json", True)
+        extra_args = sampling_params.extra_args or {}
         extra_args.update(
             {
                 "reset": reset,

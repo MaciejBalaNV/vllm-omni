@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import asyncio
 import json
 import threading
@@ -271,32 +274,6 @@ def test_build_request_clones_stage_defaults_before_protocol_fields():
     request_a.sampling_params.extra_args["nested"]["values"].append("request-a")
     assert request_b.sampling_params.extra_args["nested"] == {"values": []}
     assert default_params.extra_args["nested"] == {"values": []}
-
-
-def test_released_droid_policy_defaults_to_json_prompt_format():
-    engine_client = _engine_with_policy_config()
-    engine_client.model = "nvidia/Cosmos3-Nano-Policy-DROID"
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(
-        engine_client=engine_client,
-        model_name="served-policy-alias",
-    )
-
-    request = serving._build_request({"prompt": "pick"}, session_id="robolab-1", reset=True)
-
-    assert request.sampling_params.extra_args["format_prompt_as_json"] is True
-
-
-def test_explicit_stage_default_can_disable_droid_json_prompt_format():
-    engine_client = _engine_with_policy_config()
-    engine_client.model = "nvidia/Cosmos3-Nano-Policy-DROID"
-    engine_client.default_sampling_params_list = [
-        OmniDiffusionSamplingParams(extra_args={"format_prompt_as_json": False})
-    ]
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
-
-    request = serving._build_request({"prompt": "pick"}, session_id="robolab-1", reset=True)
-
-    assert request.sampling_params.extra_args["format_prompt_as_json"] is False
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():

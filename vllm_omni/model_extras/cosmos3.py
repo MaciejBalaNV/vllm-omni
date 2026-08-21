@@ -3,22 +3,6 @@
 
 from __future__ import annotations
 
-COSMOS3_DROID_POLICY_CHECKPOINT_NAMES = frozenset(
-    {
-        "cosmos3-nano-policy-droid",
-        "cosmos3-edge-policy-droid",
-    }
-)
-
-
-def is_cosmos3_droid_policy_checkpoint(model: str | None) -> bool:
-    """Return whether *model* names one of the released DROID policies."""
-    if not model:
-        return False
-    checkpoint_name = str(model).rstrip("/").rsplit("/", 1)[-1].lower()
-    return checkpoint_name in COSMOS3_DROID_POLICY_CHECKPOINT_NAMES
-
-
 COSMOS3_EXTRA_BODY_PARAMS = frozenset(
     {
         "flow_shift",
