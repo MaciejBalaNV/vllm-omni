@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Serving layer for the legacy OpenPI and root RoboLab websocket routes.
+"""Serving layer for the OpenPI robot-policy websocket route.
 
 Flow: raw obs → engine request → actions.
 The loaded policy model owns dataset transforms inside its pipeline.
@@ -32,18 +32,6 @@ def _to_builtin_container(value: Any) -> Any:
     if isinstance(value, list | tuple):
         return [_to_builtin_container(item) for item in value]
     return value
-
-
-def _config_value(config: Any, key: str, default: Any = None) -> Any:
-    if isinstance(config, Mapping):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
 
 
 @dataclass(frozen=True)
@@ -84,13 +72,10 @@ class ServingRealtimeRobotOpenPI:
         self,
         engine_client: Any,
         model_name: str | None = None,
-        *,
-        policy_server_config: PolicyServerConfig | None = None,
     ) -> None:
         self.engine_client = engine_client
         self.model_name = model_name
-        model_config = self._get_model_config(engine_client)
-        self.policy_server_config = policy_server_config or PolicyServerConfig.from_model_config(model_config)
+        self.policy_server_config = self._get_policy_server_config(engine_client)
         self._request_counter = count()
 
     @classmethod
@@ -106,37 +91,6 @@ class ServingRealtimeRobotOpenPI:
                 raise
             logger.info("Robot OpenPI serving disabled for model %s", model_name)
             return None
-
-    @classmethod
-    def create_robolab_policy_server(
-        cls,
-        engine_client: Any,
-        model_name: str | None = None,
-    ) -> ServingRealtimeRobotOpenPI | None:
-        """Create the root-route adapter without requiring handshake metadata."""
-        if not cls._supports_cosmos3_action_policy(engine_client, model_name):
-            logger.info("RoboLab compatibility serving disabled for model %s", model_name)
-            return None
-
-        # Validate source-only dependencies before accepting clients, but keep
-        # the standard vLLM endpoints available when the optional integration is
-        # not installed or is version-skewed.
-        try:
-            from vllm_omni.diffusion.models.cosmos3.utils import preflight_robolab_framework_imports
-
-            preflight_robolab_framework_imports()
-        except (ImportError, AttributeError) as exc:
-            logger.warning(
-                "RoboLab compatibility serving disabled for model %s: %s",
-                model_name,
-                exc,
-            )
-            return None
-        return cls(
-            engine_client=engine_client,
-            model_name=model_name,
-            policy_server_config=PolicyServerConfig({}),
-        )
 
     @staticmethod
     def _get_model_config(engine_client: Any) -> Any:
@@ -164,68 +118,11 @@ class ServingRealtimeRobotOpenPI:
         return model_config
 
     @classmethod
-    def _supports_cosmos3_action_policy(cls, engine_client: Any, model_name: str | None) -> bool:
-        from vllm_omni.model_extras.cosmos3 import (
-            COSMOS3_PIPELINE_NAMES,
-            resolve_cosmos3_action_gen,
-        )
-
-        od_config = None
-        get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
-        if callable(get_od_config):
-            od_config = get_od_config()
-        pipeline_names = {_config_value(od_config, "model_class_name")}
-        for stage_config in getattr(engine_client, "stage_configs", []) or []:
-            if getattr(stage_config, "stage_type", None) != "diffusion":
-                continue
-            engine_args = getattr(stage_config, "engine_args", None)
-            pipeline_names.add(_config_value(engine_args, "model_class_name"))
-        if pipeline_names.isdisjoint(COSMOS3_PIPELINE_NAMES):
-            return False
-
-        config_candidates = [
-            od_config,
-            _config_value(od_config, "tf_model_config"),
-            _config_value(getattr(engine_client, "od_config", None), "tf_model_config"),
-        ]
-        for stage_config in getattr(engine_client, "stage_configs", []) or []:
-            if getattr(stage_config, "stage_type", None) == "diffusion":
-                config_candidates.append(_config_value(getattr(stage_config, "engine_args", None), "tf_model_config"))
-
-        for config in config_candidates:
-            action_gen = _config_value(config, "action_gen")
-            if action_gen is not None:
-                return _as_bool(action_gen)
-
-        canonical_model_name = str(getattr(engine_client, "model", "") or "")
-        revision = None
-        for stage_config in getattr(engine_client, "stage_configs", []) or []:
-            if getattr(stage_config, "stage_type", None) != "diffusion":
-                continue
-            engine_args = getattr(stage_config, "engine_args", None)
-            revision = _config_value(engine_args, "revision")
-            if revision is not None:
-                break
-
-        resolved_action_gen = resolve_cosmos3_action_gen(canonical_model_name, revision=revision)
-        if resolved_action_gen is not None:
-            return resolved_action_gen
-
-        # Keep released checkpoints usable when metadata is temporarily
-        # unavailable (for example an offline API process with a warm worker).
-        # Check the canonical model independently of --served-model-name aliases.
-        from vllm_omni.model_extras.cosmos3 import is_cosmos3_droid_policy_checkpoint
-
-        return is_cosmos3_droid_policy_checkpoint(canonical_model_name) or (
-            not canonical_model_name and is_cosmos3_droid_policy_checkpoint(model_name)
-        )
-
-    @classmethod
     def _get_policy_server_config(cls, engine_client: Any) -> PolicyServerConfig:
         return PolicyServerConfig.from_model_config(cls._get_model_config(engine_client))
 
     def reset(self, obs: dict) -> None:
-        """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
+        """Reset hook; per-connection state lives in RobotRealtimeConnection."""
 
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""

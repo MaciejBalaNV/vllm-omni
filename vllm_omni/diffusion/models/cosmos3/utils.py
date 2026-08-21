@@ -281,7 +281,7 @@ def _load_robolab_framework_symbol(symbol_name: str):
     )
 
 
-def preflight_robolab_framework_imports() -> None:
+def preflight_cosmos3_action_framework_imports() -> None:
     """Validate every Cosmos Framework symbol used by action policy serving."""
     for symbol_name in _ROBOLAB_FRAMEWORK_IMPORTS:
         _load_robolab_framework_symbol(symbol_name)

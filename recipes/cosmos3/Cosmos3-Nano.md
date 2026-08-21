@@ -51,9 +51,9 @@ mode is selected per request:
   (`domain_name=droid_lerobot`).
 
 - **DROID policy server** — serve `nvidia/Cosmos3-Nano-Policy-DROID` and connect
-  either the unchanged RoboLab Cosmos3 client to the root websocket route `/`,
-  or a generic OpenPI-compatible client to `/v1/realtime/robot/openpi`. This path
-  returns action chunks directly instead of an mp4.
+  RoboLab or another OpenPI-compatible client to
+  `/v1/realtime/robot/openpi`. This endpoint returns action chunks directly
+  instead of an mp4.
 
   Action requests can use `input_reference` or `video_reference` for video input.
   `policy` and `forward_dynamics` can also use an image reference; `inverse_dynamics`
@@ -269,23 +269,27 @@ VIDEO_ID=$(curl -sS -X POST http://localhost:8000/v1/videos \
 curl -sS "http://localhost:8000/v1/videos/$VIDEO_ID" | jq '.action | {shape, dtype, raw_action_dim, domain_id}'
 curl -sS -L "http://localhost:8000/v1/videos/$VIDEO_ID/content" -o cosmos3_inverse_dynamics.mp4
 
-# DROID websocket policy server. Use the tested cosmos-framework revision; a
-# package install is unnecessary and can introduce dependency conflicts.
+# DROID websocket policy server. Use the tested cosmos-framework revision
+# directly from source; installing the package can introduce dependency conflicts.
 export COSMOS_FRAMEWORK_ROOT=/path/to/cosmos-framework
 git -C "$COSMOS_FRAMEWORK_ROOT" checkout c14617c2bc93dacbf69674fb964eec93182933d9
 export PYTHONPATH="$COSMOS_FRAMEWORK_ROOT"
 
-# Verify the four source-only integration modules in the vLLM environment.
+# Validate every cosmos-framework symbol used by the action-policy pipeline
+# before allocating the model.
 python - <<'PY'
-from cosmos_framework.data.generator.action.utils.domain_utils import get_domain_id
-from cosmos_framework.data.generator.action.utils.pose_utils import convert_rotation
-from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
-from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
-print("cosmos-framework RoboLab imports OK; DROID domain:", get_domain_id("droid_lerobot"))
+from vllm_omni.diffusion.models.cosmos3.utils import (
+    get_robolab_domain_id,
+    preflight_cosmos3_action_framework_imports,
+)
+
+preflight_cosmos3_action_framework_imports()
+print("cosmos-framework action imports OK; DROID domain:", get_robolab_domain_id("droid_lerobot"))
 PY
 
 # JSON prompt formatting is a property of this DROID checkpoint's training
-# recipe, not a generic server default. Configure it as a request default.
+# recipe, not a generic server default. The OpenPI endpoint also requires its
+# model-specific binary handshake metadata.
 cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
 {
   "0": {
@@ -313,27 +317,37 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   --host 0.0.0.0 --port 8000 \
   --model-class-name Cosmos3OmniDiffusersPipeline \
   --no-guardrails \
+  --robot-openpi-idle-timeout 0 \
   --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
 
-# The unchanged RoboLab Cosmos3 client connects to:
-#   ws://localhost:8000/
-# It receives one binary msgpack {} handshake, sends a msgpack-numpy
-# observation, and receives {"action": <float32 ndarray>}.
-#
-# A generic OpenPI websocket client can instead connect to:
-#   ws://localhost:8000/v1/realtime/robot/openpi
-# That legacy route receives policy_server_config as its first server message
-# and returns the action array directly. policy_server_config is required only
-# for the legacy route; the RoboLab root route works without it.
+# From a RoboLab checkout:
+python policies/cosmos3/run.py \
+  --remote-uri ws://localhost:8000/v1/realtime/robot/openpi \
+  --task BananaInBowlTask
+
+# For a server started with "--api-key $POLICY_API_KEY", pass the same value as
+# a Bearer token. --remote-token takes precedence over COSMOS3_API_TOKEN.
+COSMOS3_API_TOKEN="$POLICY_API_KEY" python policies/cosmos3/run.py \
+  --remote-uri wss://policy.example/v1/realtime/robot/openpi \
+  --task BananaInBowlTask
 ```
 
-The root compatibility route has no receive-idle timeout and treats every
-request as a fresh session, because RoboLab sends neither session IDs nor reset
-messages. It closes the websocket on malformed requests or inference failures
-instead of sending an error payload that the RoboLab client cannot decode.
-When `--api-key` or `VLLM_API_KEY` is configured, `/` requires the same bearer
-token as `/v1`; the unchanged RoboLab Cosmos3 client does not currently attach
-that header.
+The endpoint sends `policy_server_config` as its initial binary MsgPack
+message and returns the action array directly. RoboLab accepts that direct
+array as well as proxy responses shaped as `{"action": ...}` or
+`{"actions": ...}`, and turns structured server errors into client exceptions.
+
+RoboLab supplies `session_id=robolab-episode-<episode>-env-<env_id>`, so
+parallel environments have independent policy state even though they share
+one WebSocket. The server tracks interleaved session IDs independently.
+The default receive-idle timeout is 30 seconds; set
+`--robot-openpi-idle-timeout 0` when simulator steps between replans can take
+longer, or set another non-negative timeout in seconds.
+
+If vLLM-Omni is started with `--api-key` or `VLLM_API_KEY`, the standard
+OpenPI route uses the normal API authentication middleware. RoboLab's
+`--remote-token` and `COSMOS3_API_TOKEN` send the required
+`Authorization: Bearer ...` header.
 
 #### Notes
 

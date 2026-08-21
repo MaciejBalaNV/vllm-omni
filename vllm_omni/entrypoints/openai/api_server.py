@@ -152,7 +152,6 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_audio_url,
     decode_input_reference,
 )
-from vllm_omni.entrypoints.openpi.auth import add_robolab_authentication_middleware
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
@@ -515,7 +514,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
-        add_robolab_authentication_middleware(app, args)
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
@@ -718,6 +716,8 @@ async def build_async_omni_from_stage_config(
 
     try:
         kwargs = args.get_explicit_kwargs_dict()
+        # This controls only the API-process WebSocket and is not an AsyncOmni option.
+        kwargs.pop("robot_openpi_idle_timeout", None)
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
@@ -830,10 +830,6 @@ async def omni_init_app_state(
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
-            engine_client=engine_client,
-            model_name=model_name,
-        )
-        state.openai_serving_robolab = ServingRealtimeRobotOpenPI.create_robolab_policy_server(
             engine_client=engine_client,
             model_name=model_name,
         )
@@ -1184,7 +1180,6 @@ async def omni_init_app_state(
         stage_configs=state.stage_configs,
     )
     state.openai_serving_realtime_robot = None
-    state.openai_serving_robolab = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
@@ -1748,23 +1743,10 @@ async def realtime_robot_openpi(websocket: WebSocket):
         await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
         await websocket.close()
         return
-    connection = RobotRealtimeConnection(websocket, serving)
-    await connection.handle_connection()
-
-
-@router.websocket("/")
-async def robolab_robot_policy(websocket: WebSocket):
-    """RoboLab-compatible Cosmos3 policy endpoint."""
-    from vllm_omni.entrypoints.openpi.connection import (
-        RoboLabRealtimeConnection,
-    )
-
-    serving = getattr(websocket.app.state, "openai_serving_robolab", None)
-    if serving is None:
-        await websocket.accept()
-        await websocket.close(code=1003, reason="RoboLab policy not available")
-        return
-    connection = RoboLabRealtimeConnection(websocket, serving)
+    state_args = getattr(websocket.app.state, "args", None)
+    configured_timeout = getattr(state_args, "robot_openpi_idle_timeout", 30.0)
+    idle_timeout = None if configured_timeout == 0 else configured_timeout
+    connection = RobotRealtimeConnection(websocket, serving, idle_timeout=idle_timeout)
     await connection.handle_connection()
 
 

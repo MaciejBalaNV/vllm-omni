@@ -1,5 +1,4 @@
 import asyncio
-import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
@@ -18,8 +17,6 @@ class FakeWebSocket:
         self.sent_texts = []
         self.accepted = False
         self.closed = False
-        self.close_code = None
-        self.close_reason = None
 
     async def accept(self):
         self.accepted = True
@@ -33,10 +30,8 @@ class FakeWebSocket:
     async def receive(self):
         return self._messages.pop(0)
 
-    async def close(self, code=1000, reason=None):
+    async def close(self):
         self.closed = True
-        self.close_code = code
-        self.close_reason = reason
 
 
 def _serving_mock():
@@ -263,164 +258,25 @@ def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
     serving.infer.assert_not_called()
 
 
-def test_robolab_connection_uses_empty_handshake_wrapped_actions_and_stateless_requests(monkeypatch):
+def test_handle_connection_can_disable_idle_timeout(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    requests = {
-        b"first": {"endpoint": "infer", "prompt": "first"},
-        b"second": {"prompt": "second"},
-    }
-    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
-    serving = _serving_mock()
-    serving.infer = AsyncMock(return_value=np.zeros((32, 8), dtype=np.float32))
-    websocket = FakeWebSocket(
-        [
-            {"type": "websocket.receive", "bytes": b"first"},
-            {"type": "websocket.receive", "bytes": b"second"},
-            {"type": "websocket.disconnect"},
-        ]
-    )
 
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert websocket.sent_bytes[0] == {}
-    assert len(websocket.sent_bytes) == 3
-    assert set(websocket.sent_bytes[1]) == {"action"}
-    assert websocket.sent_bytes[1]["action"].shape == (32, 8)
-    assert websocket.sent_bytes[2]["action"].shape == (32, 8)
-    assert [call.kwargs for call in serving.infer.await_args_list] == [
-        {"session_id": "robolab-1", "reset": True},
-        {"session_id": "robolab-2", "reset": True},
-    ]
-    assert [call.args for call in serving.infer.await_args_list] == [
-        ({"prompt": "first"},),
-        ({"prompt": "second"},),
-    ]
-    assert websocket.sent_texts == []
-
-
-def test_robolab_connection_rejects_reset_endpoint(monkeypatch):
-    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"endpoint": "reset"})
-    serving = _serving_mock()
-    websocket = FakeWebSocket([{"type": "websocket.receive", "bytes": b"reset"}])
-
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert websocket.sent_bytes == [{}]
-    assert websocket.closed is True
-    assert websocket.close_code == 1003
-    assert websocket.close_reason == "RoboLab route supports only inference requests"
-    serving.infer.assert_not_called()
-    serving.reset.assert_not_called()
-
-
-def test_robolab_handshake_and_action_reply_are_binary_msgpack():
-    request = openpi_connection._pack({"prompt": "pick"})
-    serving = _serving_mock()
-    serving.infer = AsyncMock(return_value=np.zeros((32, 8), dtype=np.float32))
-    websocket = FakeWebSocket(
-        [
-            {"type": "websocket.receive", "bytes": request},
-            {"type": "websocket.disconnect"},
-        ]
-    )
-
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert openpi_connection._unpack(websocket.sent_bytes[0]) == {}
-    response = openpi_connection._unpack(websocket.sent_bytes[1])
-    assert set(response) == {"action"}
-    assert response["action"].shape == (32, 8)
-    assert response["action"].dtype == np.float32
-    assert websocket.sent_texts == []
-
-
-def test_robolab_connection_closes_instead_of_sending_error_reply(monkeypatch):
-    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"prompt": "fail"})
-    serving = _serving_mock()
-    serving.infer = AsyncMock(side_effect=RuntimeError("private failure"))
-    websocket = FakeWebSocket([{"type": "websocket.receive", "bytes": b"request"}])
-
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert websocket.sent_bytes == [{}]
-    assert websocket.sent_texts == []
-    assert websocket.closed is True
-    assert websocket.close_code == 1011
-    assert websocket.close_reason == "Policy inference failed"
-
-
-def test_robolab_connection_rejects_text_frames_without_text_reply(monkeypatch):
-    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    serving = _serving_mock()
-    websocket = FakeWebSocket([{"type": "websocket.receive", "text": "{}"}])
-
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert websocket.sent_bytes == [{}]
-    assert websocket.sent_texts == []
-    assert websocket.closed is True
-    assert websocket.close_code == 1003
-    assert websocket.close_reason == "Binary msgpack requests required"
-    serving.infer.assert_not_called()
-
-
-def test_robolab_connection_does_not_apply_legacy_idle_timeout(monkeypatch):
-    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    monkeypatch.setattr(openpi_connection, "_unpack", lambda _data: {"prompt": "untimed"})
-
-    async def fail_wait_for(awaitable, *, timeout):
-        if asyncio.iscoroutine(awaitable):
-            awaitable.close()
-        pytest.fail(f"RoboLab receive unexpectedly used asyncio.wait_for(timeout={timeout!r})")
+    async def fail_wait_for(*_args, **_kwargs):
+        pytest.fail("asyncio.wait_for should not be used when the idle timeout is disabled")
 
     monkeypatch.setattr(openpi_connection.asyncio, "wait_for", fail_wait_for)
+    websocket = FakeWebSocket([{"type": "websocket.disconnect"}])
     serving = _serving_mock()
-    websocket = FakeWebSocket([])
-    messages = [
-        {"type": "websocket.receive", "bytes": b"request"},
-        {"type": "websocket.disconnect"},
-    ]
 
-    async def receive():
-        return messages.pop(0)
-
-    websocket.receive = receive
-
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert websocket.closed is False
-    serving.infer.assert_awaited_once_with(
-        {"prompt": "untimed"},
-        session_id="robolab-1",
-        reset=True,
+    asyncio.run(
+        openpi_connection.RobotRealtimeConnection(
+            websocket,
+            serving,
+            idle_timeout=None,
+        ).handle_connection()
     )
 
-
-def test_robolab_receive_timeout_is_not_classified_as_idle_timeout(monkeypatch):
-    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
-    serving = _serving_mock()
-    websocket = FakeWebSocket([])
-
-    async def receive():
-        raise TimeoutError("transport receive timed out")
-
-    connection_errors = []
-
-    def capture_connection_error(message):
-        connection_errors.append((message, sys.exc_info()[1]))
-
-    websocket.receive = receive
-    monkeypatch.setattr(openpi_connection.logger, "exception", capture_connection_error)
-
-    asyncio.run(openpi_connection.RoboLabRealtimeConnection(websocket, serving).handle_connection())
-
-    assert len(connection_errors) == 1
-    message, error = connection_errors[0]
-    assert message == "Connection error"
-    assert isinstance(error, TimeoutError)
-    assert str(error) == "transport receive timed out"
+    assert websocket.accepted is True
     assert websocket.closed is False
     serving.infer.assert_not_called()
 
@@ -456,6 +312,31 @@ def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     assert calls[0].kwargs == {"session_id": "session-a", "reset": True}
     assert calls[1].kwargs == {"session_id": "session-a", "reset": False}
     assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
+
+
+def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first-a", "session_id": "session-a"},
+        b"b1": {"prompt": "first-b", "session_id": "session-b"},
+        b"a2": {"prompt": "second-a", "session_id": "session-a"},
+        b"b2": {"prompt": "second-b", "session_id": "session-b"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [{"type": "websocket.receive", "bytes": key} for key in (b"a1", b"b1", b"a2", b"b2")]
+        + [{"type": "websocket.disconnect"}]
+    )
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
+
+    assert [call.kwargs for call in serving.infer.await_args_list] == [
+        {"session_id": "session-a", "reset": True},
+        {"session_id": "session-b", "reset": True},
+        {"session_id": "session-a", "reset": False},
+        {"session_id": "session-b", "reset": False},
+    ]
 
 
 def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):

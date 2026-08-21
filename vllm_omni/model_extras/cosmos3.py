@@ -3,70 +3,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
-
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
-COSMOS3_PIPELINE_NAMES = frozenset(
-    {
-        "Cosmos3OmniDiffusersPipeline",
-        "Cosmos3OmniPipeline",
-    }
-)
 COSMOS3_DROID_POLICY_CHECKPOINT_NAMES = frozenset(
     {
         "cosmos3-nano-policy-droid",
         "cosmos3-edge-policy-droid",
     }
 )
-
-
-def _find_action_gen(config: Any) -> Any:
-    if not isinstance(config, Mapping):
-        return None
-    if "action_gen" in config:
-        return config["action_gen"]
-    for value in config.values():
-        resolved = _find_action_gen(value)
-        if resolved is not None:
-            return resolved
-    return None
-
-
-def resolve_cosmos3_action_gen(model: str | None, *, revision: str | None = None) -> bool | None:
-    """Resolve the action-generation capability from checkpoint metadata.
-
-    The API process cannot rely on the worker-only ``tf_model_config`` in
-    out-of-process deployments. Read the same checkpoint config directly so
-    route admission remains stable across replica and served-name topologies.
-    ``None`` means the capability could not be determined.
-    """
-    if not model:
-        return None
-
-    from vllm.transformers_utils.config import get_hf_file_to_dict
-
-    for config_path in ("transformer/config.json", "config.json"):
-        try:
-            config = get_hf_file_to_dict(config_path, model, revision=revision)
-        except Exception as exc:
-            logger.debug(
-                "Could not inspect Cosmos3 action capability in %s for %s: %s",
-                config_path,
-                model,
-                exc,
-            )
-            continue
-        action_gen = _find_action_gen(config)
-        if action_gen is None:
-            continue
-        if isinstance(action_gen, str):
-            return action_gen.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(action_gen)
-    return None
 
 
 def is_cosmos3_droid_policy_checkpoint(model: str | None) -> bool:

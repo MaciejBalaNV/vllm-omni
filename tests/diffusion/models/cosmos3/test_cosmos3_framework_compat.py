@@ -28,7 +28,7 @@ def test_framework_preflight_checks_every_policy_symbol(monkeypatch) -> None:
 
     monkeypatch.setattr(cosmos3_utils, "lazy_import", record_import)
 
-    cosmos3_utils.preflight_robolab_framework_imports()
+    cosmos3_utils.preflight_cosmos3_action_framework_imports()
 
     expected_symbols = {
         "ActionTransformPipeline",
