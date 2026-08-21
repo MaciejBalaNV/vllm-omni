@@ -1739,8 +1739,20 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
     serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
     if serving is None:
+        logger.warning(
+            "Rejecting robot OpenPI WebSocket: policy serving is disabled. "
+            "The diffusion stage must provide model_config.policy_server_config."
+        )
         await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "Robot policy not available: the diffusion stage did not provide model_config.policy_server_config"
+                ),
+                "code": "unsupported",
+            }
+        )
         await websocket.close()
         return
     state_args = getattr(websocket.app.state, "args", None)

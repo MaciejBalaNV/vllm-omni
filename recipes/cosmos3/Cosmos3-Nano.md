@@ -287,38 +287,22 @@ preflight_cosmos3_action_framework_imports()
 print("cosmos-framework action imports OK; DROID domain:", get_robolab_domain_id("droid_lerobot"))
 PY
 
-# JSON prompt formatting is a property of this DROID checkpoint's training
-# recipe, not a generic server default. The OpenPI endpoint also requires its
-# model-specific binary handshake metadata.
-cat > cosmos3_droid_openpi_stage_overrides.json <<'JSON'
-{
-  "0": {
-    "default_sampling_params": {
-      "extra_args": {
-        "format_prompt_as_json": true
-      }
-    },
-    "model_config": {
-      "policy_server_config": {
-        "image_resolution": [540, 640],
-        "n_external_cameras": 2,
-        "needs_wrist_camera": true,
-        "needs_stereo_camera": false,
-        "needs_session_id": true,
-        "action_space": "joint_position"
-      }
-    }
-  }
-}
-JSON
-
+# The bundled deploy config (vllm_omni/deploy/cosmos3_policy_droid.yaml)
+# selects the registered cosmos3_policy pipeline and carries the DROID
+# checkpoint's serving defaults: JSON prompt formatting (a property of this
+# checkpoint's training recipe, not a generic server default), the
+# model-specific OpenPI binary handshake metadata (policy_server_config), and
+# guardrails off (policy serving emits robot actions; the guardrail stack is
+# not part of it, so --no-guardrails is implied).
+# Policy checkpoints cannot be auto-detected — they share their HF metadata
+# with the T2I/video Cosmos3 checkpoints — so --deploy-config is required.
+# Per-checkpoint model_config tweaks can be layered on top with
+# --stage-overrides; dict overrides deep-merge with the deploy yaml.
 vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   --omni \
   --host 0.0.0.0 --port 8000 \
-  --model-class-name Cosmos3OmniDiffusersPipeline \
-  --no-guardrails \
-  --robot-openpi-idle-timeout 0 \
-  --stage-overrides "$(cat cosmos3_droid_openpi_stage_overrides.json)"
+  --deploy-config cosmos3_policy_droid.yaml \
+  --robot-openpi-idle-timeout 0
 
 # From a RoboLab checkout:
 python policies/cosmos3/run.py \
