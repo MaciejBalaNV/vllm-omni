@@ -35,6 +35,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     pipeline_cfg_resolver,
+    resolve_deploy_config_path,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
@@ -626,6 +627,16 @@ class TestCosmos3PolicyPipeline:
         pipeline = OMNI_PIPELINES["cosmos3_policy"]
         assert pipeline.hf_architectures == ()
         assert pipeline.diffusers_class_name is None
+
+    def test_load_deploy_config_resolves_bare_names(self):
+        """Every load_deploy_config caller (including the engine's direct
+        duplex-config load) must accept the bare --deploy-config name and fall
+        back to the bundled vllm_omni/deploy directory."""
+        deploy = load_deploy_config("cosmos3_policy_droid.yaml")
+        assert deploy.pipeline == "cosmos3_policy"
+        resolved = resolve_deploy_config_path("cosmos3_policy_droid")
+        assert resolved.name == "cosmos3_policy_droid.yaml"
+        assert resolved.is_file()
 
     def test_droid_deploy_yaml_carries_policy_server_config(self):
         deploy = load_deploy_config(get_deploy_config_path("cosmos3_policy_droid.yaml"))

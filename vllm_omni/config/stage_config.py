@@ -603,6 +603,28 @@ def _merge_platforms(
     return merged
 
 
+def resolve_deploy_config_path(path: str | Path) -> Path:
+    """Resolve a deploy-config reference to a concrete file path.
+
+    A bare name with no directory component that does not exist in the current
+    working directory falls back to the bundled ``vllm_omni/deploy`` directory
+    (the ``.yaml`` extension is optional), so e.g.
+    ``--deploy-config cosmos3_policy_droid.yaml`` works regardless of the
+    server's working directory. Every consumer of a user-supplied deploy path
+    must resolve through here so they all agree on the file being loaded.
+    """
+    deploy_path = Path(path)
+    if not deploy_path.exists() and deploy_path.parent == Path("."):
+        bare_name = deploy_path.name
+        if not bare_name.endswith(".yaml"):
+            bare_name = f"{bare_name}.yaml"
+        candidate = _DEPLOY_DIR / bare_name
+        if candidate.exists():
+            logger.info("Deploy config %r resolved to bundled %s", str(path), candidate)
+            return candidate
+    return deploy_path
+
+
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
@@ -631,7 +653,7 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
-    raw_dict = resolve_deploy_yaml(path)
+    raw_dict = resolve_deploy_yaml(resolve_deploy_config_path(path))
     if "stage_args" in raw_dict:
         raise ValueError(
             f"Deploy config {path} uses the removed `stage_args` schema; "

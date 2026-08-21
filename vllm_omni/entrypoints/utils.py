@@ -18,7 +18,7 @@ from vllm_omni.config.config_factory import (
     with_trust_remote_code_override,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import _DEPLOY_DIR
+from vllm_omni.config.stage_config import _DEPLOY_DIR, resolve_deploy_config_path
 from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
@@ -583,7 +583,10 @@ def load_and_resolve_stage_configs(
         the strategy-derived pipeline-wide load-balancer policy (``None`` when no
         strategy set one), returned for the engine to apply.
     """
-    config_path = deploy_config_path if deploy_config_path is not None else resolve_model_config_path(model)
+    if deploy_config_path is not None:
+        config_path = str(resolve_deploy_config_path(deploy_config_path))
+    else:
+        config_path = resolve_model_config_path(model)
     stage_configs, omni_lb_policy = load_stage_configs_from_model(
         model,
         trust_remote_code=trust_remote_code,

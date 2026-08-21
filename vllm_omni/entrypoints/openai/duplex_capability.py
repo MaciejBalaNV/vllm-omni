@@ -23,7 +23,9 @@ def should_enable_duplex_endpoint(
         try:
             from omegaconf import OmegaConf
 
-            raw_config = OmegaConf.load(config_path)
+            from vllm_omni.config.stage_config import resolve_deploy_config_path
+
+            raw_config = OmegaConf.load(resolve_deploy_config_path(config_path))
             session_mode = raw_config.get("session_mode") if hasattr(raw_config, "get") else None
             if session_mode == "duplex":
                 return True
