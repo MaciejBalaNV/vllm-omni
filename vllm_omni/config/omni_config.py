@@ -15,7 +15,6 @@ from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
 from inspect import Parameter, signature
-from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field, model_validator
