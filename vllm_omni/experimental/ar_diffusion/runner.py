@@ -235,9 +235,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     @staticmethod
     def _request_session(
         req: OmniDiffusionRequest,
-    ) -> tuple[str, dict, ARDiffusionTickRequest | None]:
-        extra_args = req.sampling_params.extra_args or {}
-        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+    ) -> tuple[str, Mapping, ARDiffusionTickRequest | None]:
+        extra_args = req.sampling_params.extra_args
+        if extra_args is None:
+            extra_args = {}
+        if not isinstance(extra_args, Mapping):
+            raise ARDiffusionRequestRejectedError(
+                f"AR-Diffusion extra_args must be a mapping, got {type(extra_args).__name__}."
+            )
+        try:
+            tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if tick is not None:
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None

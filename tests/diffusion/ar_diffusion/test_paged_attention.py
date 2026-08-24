@@ -261,6 +261,40 @@ def test_commit_refuses_context_without_all_layer_writes():
         st.commit_paged_context(POS)
 
 
+def test_fused_commit_refuses_context_without_all_layer_writes():
+    _, st = make_state(num_layers=2)
+    contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
+    fctx = contexts[0].forward_ctx
+    fctx.prepare(device=torch.device("cpu"), action_len=0, query_len=BLOCK)
+    query = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    paged_write_attn(
+        contexts[0].to_layer_inputs(),
+        query,
+        key,
+        value,
+        None,
+        None,
+        HEAD_DIM**-0.5,
+    )
+    with pytest.raises(RuntimeError, match=r"missing layers \[1\]"):
+        st.commit_paged_context(POS)
+
+    paged_write_attn(
+        contexts[1].to_layer_inputs(),
+        query,
+        key,
+        value,
+        None,
+        None,
+        HEAD_DIM**-0.5,
+    )
+    st.commit_paged_context(POS)
+    assert st.adapter(POS).completed_chunks == 1
+
+
 def test_unallocated_committing_context_cannot_be_replaced():
     """A commit context is a transaction even before its first lazy write."""
 
@@ -484,6 +518,7 @@ def test_prepare_is_idempotent_and_layers_share_metadata():
     assert i0.block_table is i1.block_table
     assert i0.seq_lens is i1.seq_lens
     assert i0.video_slots is i1.video_slots
+    assert i0.written_mask is i1.written_mask
     assert i0.key_pool is kv._k_pools[0]
     assert i0.value_pool is kv._v_pools[0]
     assert i1.key_pool is kv._k_pools[1]
