@@ -80,8 +80,6 @@ def _unwrap_video(output: Any) -> Any:
     if isinstance(output, list):
         output = output[0]
     if isinstance(output, OmniRequestOutput):
-        if output.is_pipeline_output and output.request_output is not None:
-            return _unwrap_video(output.request_output)
         if not output.images:
             raise ValueError("Cosmos-Dreams returned no video frames.")
         return _unwrap_video(output.images)
