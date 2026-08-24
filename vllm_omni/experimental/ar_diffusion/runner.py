@@ -54,7 +54,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     """
 
     _WARMUP_SID = "__ardiffusion_warmup__"
-    _MAX_RESIDENT_SESSIONS = 1
 
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
@@ -126,7 +125,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
-        self._session_capacity = min(spec.session_capacity, self._MAX_RESIDENT_SESSIONS)
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
@@ -137,12 +135,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             max_model_len=spec.max_model_len,
             available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
             kv_branches=spec.kv_branches,
-            session_capacity=self._session_capacity,
+            session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
             frames_per_block=spec.frames_per_block,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
+            model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
             device=self.device,
         )
+        self._session_capacity = self.kv_cache.session_capacity
         logger.info(
             "AR-Diffusion KV cache: blocks=%d layers=%d local_kv_heads=%d head_size=%d "
             "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s "
@@ -235,18 +235,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     @staticmethod
     def _request_session(
         req: OmniDiffusionRequest,
-    ) -> tuple[str, Mapping, ARDiffusionTickRequest | None]:
-        extra_args = req.sampling_params.extra_args
-        if extra_args is None:
-            extra_args = {}
-        if not isinstance(extra_args, Mapping):
-            raise ARDiffusionRequestRejectedError(
-                f"AR-Diffusion extra_args must be a mapping, got {type(extra_args).__name__}."
-            )
-        try:
-            tick = ARDiffusionTickRequest.from_extra_args(extra_args)
-        except ValueError as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+    ) -> tuple[str, dict, ARDiffusionTickRequest | None]:
+        extra_args = req.sampling_params.extra_args or {}
+        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
         if tick is not None:
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None

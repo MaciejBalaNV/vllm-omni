@@ -65,6 +65,31 @@ On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only) and use
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
+## CPU MP4 response encoding
+
+For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
+host CPU through PyAV/libx264 after generation. The response encoder selects the
+path automatically at runtime: inputs with a supported frame shape, common dtype,
+and RGB per-channel contiguous layout use direct planar frames; other inputs
+fall back to the legacy path before the PyAV container is opened. No CLI flag,
+model declaration, or user configuration is required. Streaming fMP4 output is
+unchanged.
+
+A community benchmark on 2x Xeon 8480C reported the following comparison
+between the legacy and direct planar paths
+([full result](https://github.com/vllm-project/vllm-omni/pull/6288#issuecomment-5337546499)):
+
+| Metric | Legacy | Direct planar | Change |
+| --- | ---: | ---: | ---: |
+| Median wall time | 1.805 s | 1.394 s | -22.8% |
+| Median process CPU time | 3.613 s | 3.207 s | -11.2% |
+| Peak RSS | 3182 MiB | 2794 MiB | -387 MiB (-12.2%) |
+
+Across the 1.0-8.7 s sweep, wall-time improvement was approximately 21.8-22.6%;
+outputs were byte-identical and full decode passed. This is evidence for host
+CPU response encoding. Actual gains depend on the CPU and runtime, and should
+not be interpreted as GPU, DiT, or stage 0 speedups.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
@@ -158,7 +183,7 @@ vllm serve "${MODEL}" \
 Use the profile that matches the per-GPU memory capacity:
 
 | Profile | GPUs | Starting shape | Resident DiT blocks | Attention | Execution | Status |
-|---|---:|---:|---:|---|---|---|
+| --- | ---: | ---: | ---: | --- | --- | --- |
 | `rtx5090` | 2 x 32 GB | 1344x768 | 20 | cuDNN attention | eager | Target-hardware validated |
 | `rtx4090` | 2 x 24 GB | 1024x576 | 12 | cuDNN attention | eager | Capacity-proxy starting point |
 
@@ -177,8 +202,8 @@ increasing it on a different request shape.
 At vLLM-Omni commit `ae6577ea`, one full 50-step T2VA request completed on
 2 x RTX 5090 without OOM:
 
-| Shape | Frames | Client E2E | Sampled peak/GPU | Output validation |
-|---:|---:|---:|---:|---|
+| Shape    | Frames        | Client E2E | Sampled peak/GPU       | Output validation                                            |
+| -------: | ------------: | ---------: | ---------------------: | -----------------------------------------------------------: |
 | 1344x768 | 124 at 24 FPS | 8 min 38 s | approximately 22.6 GiB | H.264 video + 32 kHz stereo AAC; full `ffmpeg` decode passed |
 
 This is a single end-to-end validation run, not a warmed multi-run latency
@@ -247,7 +272,7 @@ vllm serve "${MODEL}" \
 Do not add `--enforce-eager` to this performance configuration. The first
 request includes regional compilation; warm the server once before measuring
 steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
-1. The H3 VAE supports its native `tile` mode, not
+`1`. The H3 VAE supports its native `tile` mode, not
 `spatial_shard_height` or `spatial_shard_width`.
 
 ### Attention Backends
@@ -357,18 +382,47 @@ No restart is needed: `task=fl2va` routes to `FL2VA/transformer`, while
 
 ### Online FP8 quantization
 
-MiniMax H3 supports load-time FP8 quantization of the DiT. The checkpoint
-remains BF16 on disk; vLLM-Omni quantizes eligible weights while loading and
-uses dynamic activation scaling during inference. By default, attention and
-MLP linears in the token refiner and main DiT blocks, the condition
-projection, and all AdaLN projections use FP8. Patch, timestep, and final
-projections remain FP32; the text encoder and VAEs are unchanged.
+MiniMax H3 supports online FP8 quantization of both the DiT and the Qwen3-VL
+text decoder. The checkpoint remains BF16 on disk; vLLM-Omni creates FP8
+weights at runtime and uses dynamic activation scaling during inference. By
+default, `--quantization fp8` quantizes eligible attention and MLP linears in
+the text decoder, token refiner, and main DiT blocks, as well as the DiT
+condition and AdaLN projections. The Qwen vision tower, embeddings, norms,
+RoPE, both VAEs, and the model's FP32 patch, timestep, and output projections
+keep checkpoint precision.
+
+To select a component, use `--diffusion-quantization-config` with
+`{"transformer":{"method":"fp8"}}` for DiT-only FP8 or
+`{"text_encoder":{"method":"fp8"}}` for text-decoder-only FP8. The two
+entries can be combined. The shorthand below enables both components.
 
 Add this option to an existing H3 server command:
 
 ```bash
 --quantization fp8
 ```
+
+#### Single 96 GB GPU, no-offload capacity check
+
+Use the FL2VA-only partition for this capacity test. Loading the combined
+service would also load the Ref2VA DiT and would test a different memory
+budget. A no-offload capacity check should contain none of
+`--enable-cpu-offload`, `--enable-layerwise-offload`, or
+`--enable-distributed-layerwise-offload`. VAE tiling changes decode placement
+but does not offload model weights to the CPU.
+
+The run passes the capacity check when the server initializes, the request
+finishes without CUDA OOM or Xid errors, `peak_used_mib` remains below the
+card's reported `memory_total_mib`, and `ffprobe` reports H.264 video plus
+32 kHz stereo AAC audio. Report the measured headroom rather than assuming
+that every nominal 96 GB SKU exposes the same MiB total.
+
+As a capacity proxy only, the same five-second case on one B300 measured a
+92,946 MiB whole-device first-request peak and a 92,146 MiB worker peak. Its
+encode, diffuse, decode, and client wall times were 8.664 s, 134.504 s,
+6.016 s, and 151.583 s. These numbers suggest that a 96 GB card may fit, but
+they are not an RTX PRO 6000 validation: kernels, allocator behavior, and
+reported device capacity differ across GPUs.
 
 Use `ignored_layers` to keep any otherwise eligible linear in BF16. H3
 resolves the `transformer` component before constructing the DiT, so names do
@@ -386,10 +440,11 @@ For example, keep the first main block's attention projections in BF16 with:
   '{"transformer":{"method":"fp8","ignored_layers":["blocks.0.attn.qkv_proj","blocks.0.attn.out_proj"]}}'
 ```
 
-The structured option replaces `--quantization fp8`. Online FP8 is currently
-incompatible with H3 layerwise offload because the offload path produces a
-weight stride rejected by the Cutlass FP8 kernel. Use resident FP8 with tensor
-parallelism and VAE tiling instead.
+The structured option replaces `--quantization fp8`. Online FP8 can be used
+with H3 layerwise offload and with both DLO transfer paths. The default
+AllGather path uses the ordinary loader to finalize FP8 weights and scales
+before sharding them across ranks. `--dlo-no-use-allgather` instead retains
+complete rank-local tensors and avoids the synchronized request-wave contract.
 
 ## AMD ROCm (gfx942 / gfx950)
 
@@ -475,7 +530,7 @@ vLLM-Omni with MiniMax H3 support, BF16. gfx942 rows measured with the
 `0.26.0+rocm723` wheel (HIP 7.2).
 
 | Workload | Configuration | Observed result |
-|----------|---------------|-----------------|
+| ---------- | --------------- | ----------------- |
 | T2VA, 1344x768, 209 frames, 50 steps | 4x gfx942 (MI300X), FLASH_ATTN, USP4, text-enc TP4, VAE PP4 tile | encode 0.09 s, denoise 244.04 s, decode 4.15 s, 267.42 s client E2E; H.264 24 FPS + 32 kHz stereo AAC |
 | FL2VA, 1344x768, 209 frames, 50 steps | 4x gfx942 (MI300X), FLASH_ATTN, USP4, text-enc TP4, VAE PP4 tile | encode 13.98 s, denoise 257.58 s, decode 4.11 s, 287.07 s client E2E; H.264 24 FPS + 32 kHz stereo AAC |
 | T2VA, 832x480, ~4 s, 40 steps | 1x gfx950 (MI350), FLASH_ATTN, CPU offload | valid MP4 (H.264 + synced audio); ~0.73 s/denoise-step (~1.37 it/s), ~55 s client E2E incl. warmup |
@@ -657,7 +712,7 @@ at most 15 seconds combined.
 ## Official input matrix and limits
 
 | Task | Supported references | Limits |
-|------|----------------------|--------|
+| ------ | ---------------------- | -------- |
 | T2VA | text only | prompt must be non-empty |
 | FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
 | Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
@@ -688,13 +743,17 @@ Omitting `quality` preserves the startup default: it uses the reference path
 normally, or the server-configured profile when the server was started with
 `--cache-backend cache_dit`.
 
+Turbo is independent of this quality switch: `quality` selects a Cache-DiT
+policy, while Turbo changes the active LoRA weights and sampling schedule. See
+[LoRA](#lora) below.
+
 The following result was measured on 4× NVIDIA H200 with SP4, text-encoder
 TP4, 1344×768, 124 frames, 24 FPS, and 50 inference steps. One full
 `lossless` warmup was excluded, followed by three fixed prompt/seed pairs in
 balanced switch order.
 
 | `quality` | Median inference latency | Speedup | SSIM vs `lossless` | PSNR vs `lossless` | Expected trade-off |
-|---|---:|---:|---:|---:|---|
+| --- | ---: | ---: | ---: | ---: | --- |
 | `lossless` | 85.49 s | 1.00× | 1.0000 | exact | Native reference path |
 | `high` | 63.36 s | 1.35× | 0.9709 | 34.98 dB | Faster with measured same-seed deviation |
 
@@ -704,10 +763,49 @@ balanced switch order.
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
 
+## LoRA
+
+### Turbo LoRA
+
+Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+
+```text
+lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+export TURBO_DIR=/path/to/minimax-h3-turbo
+export TURBO_FILE=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
+export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
+```
+
+Start from a non-offloaded FL2VA server command and add
+`--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
+`--lora-path` preloads the adapter; each request still activates it and uses
+the published sampling settings:
+
+```bash
+-F 'num_inference_steps=5' \
+-F 'flow_shift=6' \
+-F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
+-F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
+```
+
+For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
+ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
+dynamic-only and does not support prefusion, DLO, or LoRA composition.
+It also rejects model-level, layerwise, and distributed layerwise offload;
+the legacy dynamic LoRA tensors do not participate in those weight lifecycles.
+The five requested sigma points produce the four denoiser evaluations expected
+by the Turbo artifact.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |
-|-----------|-------------------|-------|
+| ----------- | ------------------- | ------- |
 | `quality` | omitted or `lossless` | Request-level quality intent; `high` dynamically installs H3's conservative Cache-DiT profile |
 | `extra_params.force_refresh_step_hint` | omitted | Optional positive 1-based denoising-step hint for an active Cache-DiT request; pair with `extra_params.force_refresh_step_policy`=`once` or `repeat` |
 | `task` | `t2va`, `fl2va`, or `ref2va` | Passed in `extra_params`; selects the task-specific DiT |
@@ -732,9 +830,9 @@ Users can also use a ComfyUI frontend to interact with a hosted MiniMax-H3 servi
 The four-GPU recommendation was measured on four NVIDIA B300 GPUs with one
 excluded warmup followed by three requests.
 
-| Workload | Configuration | Observed result |
-|----------|---------------|-----------------|
-| FL2VA, 209 frames, 1248x768 | no offload, U4, VPP4 tile, regional compile | 86.964 s mean HTTP client latency |
+| Workload                               | Configuration                               | Observed result                      |
+| -------------------------------------- | ------------------------------------------- | ------------------------------------ |
+| FL2VA, 209 frames, 1248x768            | no offload, U4, VPP4 tile, regional compile | 86.964 s mean HTTP client latency    |
 | Two-video Ref2VA, 362 frames, 1344x768 | no offload, U4, VPP4 tile, regional compile | 784.394 s accounted model-stage mean |
 
 These measurements describe the validated shapes rather than a general
@@ -749,6 +847,13 @@ With eager DiT/text-encoder TP2 and VAE tiling, the 384x672, 107-frame,
 audio spectral cosine 0.9589 (minimum 0.80), and audio RMS ratio 0.9342. The
 resident per-GPU peak was 68.52 GiB for BF16 and 53.51 GiB for FP8, a 22%
 reduction.
+
+For direct human inspection, see the external
+[BF16 versus global-FP8 comparison](https://lishunyang12.github.io/vllm-omni-rankings/scripts/minimax_h3_global_fp8_vs_bf16/),
+which includes matched five-second T2VA, I2VA, and Ref2VA videos. The
+[comparison sources](https://github.com/lishunyang12/vllm-omni-rankings/tree/main/scripts/minimax_h3_global_fp8_vs_bf16)
+also record per-task fidelity metrics and provenance without storing generated
+media in this repository.
 
 ## TeaCache acceleration
 
@@ -834,7 +939,9 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   H3 native `tile` mode only.
 - A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
   pure Ulysses.
-- Online FP8 is not compatible with layerwise offload.
+- Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
+  in host memory on every rank during startup before retaining only each rank's
+  shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
 - Image+audio Ref2VA accepts exactly one image and one audio reference.
 - Video Ref2VA accepts one or more video files, but not an additional standalone

@@ -10,34 +10,6 @@ import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 
-# Set by ARDiffusionPagedForwardContext.prepare() before each KV branch forward and
-# read by the fused write+attend custom op below. The pools are process-lifetime
-# allocations owned by one ARDiffusionKVCache per worker process (CFG-parallel /
-# TP ranks are separate processes), mirroring vLLM's forward-context pattern for
-# keeping multi-GiB cache tensors out of the compiled graph's inputs.
-_CURRENT_PAGED_KV_CACHE: Any = None
-_CURRENT_PAGED_FORWARD_CONTEXT: ARDiffusionPagedForwardContext | None = None
-
-
-def set_current_paged_kv_cache(kv_cache: Any) -> None:
-    global _CURRENT_PAGED_KV_CACHE
-    _CURRENT_PAGED_KV_CACHE = kv_cache
-
-
-def _set_current_paged_forward_context(context: ARDiffusionPagedForwardContext) -> None:
-    """Publish the active context for fused-op write accounting.
-
-    The fused write-and-attend op intentionally keeps the multi-GiB KV pools out
-    of its graph inputs.  For the same reason, commit bookkeeping stays on the
-    host-side forward context and is reached through this process-local binding.
-    AR-Diffusion executes one request per worker at a time, so this mirrors the
-    existing process-local KV-pool binding above.
-    """
-
-    global _CURRENT_PAGED_FORWARD_CONTEXT
-    _CURRENT_PAGED_FORWARD_CONTEXT = context
-
-
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
 
@@ -65,6 +37,9 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     """
 
     layer_idx: torch.Tensor
+    key_pool: torch.Tensor
+    value_pool: torch.Tensor
+    block_size: int
     seq_len: int
     video_slots: torch.Tensor
     action_slots: torch.Tensor
@@ -102,7 +77,6 @@ class ARDiffusionPagedForwardContext:
     max_query_len: int = 0
     max_seq_len: int = 0
     _prepared: bool = False
-    _written_layers: set[int] = field(default_factory=set)
 
     @property
     def block_size(self) -> int:
@@ -378,8 +352,6 @@ class ARDiffusionPagedForwardContext:
         ) = self.build_block_table(action_len=action_len, query_len=query_len, device=device)
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
-        set_current_paged_kv_cache(self.kv_cache)
-        _set_current_paged_forward_context(self)
         self._prepared = True
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
@@ -387,6 +359,9 @@ class ARDiffusionPagedForwardContext:
             raise RuntimeError("ARDiffusionPagedForwardContext.layer_inputs() before prepare()")
         return ARDiffusionPagedLayerInputs(
             layer_idx=_layer_idx_tensor(layer_idx),
+            key_pool=self.kv_cache._k_pools[layer_idx],
+            value_pool=self.kv_cache._v_pools[layer_idx],
+            block_size=int(self.kv_cache.block_size),
             seq_len=int(self.seq_len),
             video_slots=self.current_video_slot_mapping,
             action_slots=self.action_slot_mapping,
@@ -526,6 +501,22 @@ def _resolve_fa_version(head_size: int) -> int:
     return version
 
 
+def _rocm_flash_attn_varlen_func():
+    """Resolve a ROCm varlen kernel, preferring AITER when available.
+
+    The caller gathers paged KV into packed tensors before invoking this
+    function, avoiding AITER releases whose ``block_table`` kernel is broken.
+    """
+    try:
+        from aiter import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+    except ImportError:
+        from flash_attn import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
+
+
 def ar_diffusion_paged_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -562,6 +553,34 @@ def ar_diffusion_paged_attention(
             softmax_scale,
             causal=causal,
         )
+    elif torch.version.hip is not None:
+        # vllm.vllm_flash_attn contains CUDA-only extensions. ROCm's AITER and
+        # upstream flash-attn expose the standard cu_seqlens_k API instead of
+        # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
+        # requires 128-token blocks, while AR-Diffusion uses frame-aligned
+        # 16-token blocks, so gather the visible blocks on-device first.
+        flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
+        cu_seqlens_k = torch.cat([seq_lens.new_zeros(1), torch.cumsum(seq_lens, dim=0, dtype=torch.int32)])
+        positions = torch.arange(int(max_seq_len), device=query_flat.device)
+        logical_blocks = torch.div(positions, key_cache.shape[1], rounding_mode="floor")
+        offsets = positions % key_cache.shape[1]
+        physical_blocks = block_table[:, logical_blocks].long()
+        gathered_k = key_cache[physical_blocks, offsets]
+        gathered_v = value_cache[physical_blocks, offsets]
+        valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+        packed_k = gathered_k[valid]
+        packed_v = gathered_v[valid]
+        out = flash_attn_varlen_func(
+            q=query_flat,
+            k=packed_k,
+            v=packed_v,
+            cu_seqlens_q=query_start_loc,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=int(max_query_len),
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
+            causal=causal,
+        )
     else:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -593,17 +612,18 @@ def ar_diffusion_paged_attention(
 # One opaque op per layer keeps the compiled DiT block fullgraph: dynamo treats
 # it as a single graph node (no eager island, no graph breaks), and the K/V slot
 # writes happen inside the op so write→read ordering with the block-table kernel
-# is internal — no hidden-mutation ordering hazards against a separate reader op
-# and no multi-GiB pool tensors as graph inputs (the flat and paged pool views
-# alias the same storage, which AOTAutograd handles poorly as inputs). Pattern
-# follows sage_attn3.py in-repo and vLLM's own unified attention ops.
+# is internal. The flat pools are explicit mutable inputs: Inductor/CUDA Graph
+# must track their storage lifetime instead of observing an undeclared mutation
+# through a process-global registry.
 def _paged_write_attn_impl(
     query: torch.Tensor,
     k_curr: torch.Tensor,
     v_curr: torch.Tensor,
     k_act: torch.Tensor | None,
     v_act: torch.Tensor | None,
-    layer_idx: torch.Tensor,
+    key_pool: torch.Tensor,
+    value_pool: torch.Tensor,
+    block_size: int,
     video_slots: torch.Tensor,
     action_slots: torch.Tensor,
     block_table: torch.Tensor,
@@ -613,30 +633,17 @@ def _paged_write_attn_impl(
     max_seq_len: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    kv = _CURRENT_PAGED_KV_CACHE
-    if kv is None:
-        raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() set the KV pool registry")
-    layer_idx = int(layer_idx)
-    forward_ctx = _CURRENT_PAGED_FORWARD_CONTEXT
-    if forward_ctx is None:
-        raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() bound its forward context")
-    if forward_ctx.kv_cache is not kv:
-        raise RuntimeError("ar_diffusion_paged_write_attn active KV pool/context mismatch")
-    if forward_ctx.commit_current:
-        forward_ctx._validate_layer_write(layer_idx)
-    k_pool = kv._k_pools[layer_idx]
-    v_pool = kv._v_pools[layer_idx]
-    k_pool[video_slots] = k_curr.to(k_pool.dtype)
-    v_pool[video_slots] = v_curr.to(v_pool.dtype)
+    key_pool[video_slots] = k_curr.to(key_pool.dtype)
+    value_pool[video_slots] = v_curr.to(value_pool.dtype)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        k_pool[action_slots] = k_act.to(k_pool.dtype)
-        v_pool[action_slots] = v_act.to(v_pool.dtype)
-    if forward_ctx.commit_current:
-        forward_ctx._written_layers.add(layer_idx)
+        key_pool[action_slots] = k_act.to(key_pool.dtype)
+        value_pool[action_slots] = v_act.to(value_pool.dtype)
+    key_cache = key_pool.unflatten(0, (-1, block_size))
+    value_cache = value_pool.unflatten(0, (-1, block_size))
     return ar_diffusion_paged_attention(
         query,
-        kv.key_cache(layer_idx),
-        kv.value_cache(layer_idx),
+        key_cache,
+        value_cache,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
@@ -651,14 +658,19 @@ def _paged_write_attn_impl(
 # the module from sys.modules (same as sage_attn3.py).
 if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
 
-    @torch.library.custom_op("vllm_omni::ar_diffusion_paged_write_attn", mutates_args=())
+    @torch.library.custom_op(
+        "vllm_omni::ar_diffusion_paged_write_attn",
+        mutates_args=("key_pool", "value_pool"),
+    )
     def _paged_write_attn_op(
         query: torch.Tensor,
         k_curr: torch.Tensor,
         v_curr: torch.Tensor,
         k_act: torch.Tensor | None,
         v_act: torch.Tensor | None,
-        layer_idx: torch.Tensor,
+        key_pool: torch.Tensor,
+        value_pool: torch.Tensor,
+        block_size: int,
         video_slots: torch.Tensor,
         action_slots: torch.Tensor,
         block_table: torch.Tensor,
@@ -674,7 +686,9 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             v_curr,
             k_act,
             v_act,
-            layer_idx,
+            key_pool,
+            value_pool,
+            block_size,
             video_slots,
             action_slots,
             block_table,
@@ -692,7 +706,9 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         v_curr,
         k_act,
         v_act,
-        layer_idx,
+        key_pool,
+        value_pool,
+        block_size,
         video_slots,
         action_slots,
         block_table,
@@ -715,7 +731,9 @@ def paged_write_attn(
         v_curr,
         k_act,
         v_act,
-        inputs.layer_idx,
+        inputs.key_pool,
+        inputs.value_pool,
+        inputs.block_size,
         inputs.video_slots,
         inputs.action_slots,
         inputs.block_table,
