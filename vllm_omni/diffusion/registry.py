@@ -331,16 +331,6 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos_dreams",
         "CosmosDreamsPipeline",
     ),
-    "SoulXSingerPipeline": (
-        "soulx_singer",
-        "pipeline_soulx_singer_svs",
-        "PipelineSoulXSingerSVS",
-    ),
-    "SoulXSingerSVCPipeline": (
-        "soulx_singer",
-        "pipeline_soulx_singer_svc",
-        "PipelineSoulXSingerSVC",
-    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -393,7 +383,6 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
-    "AudioXPipeline",
     "CosmosDreamsPipeline",
     "CosmosDreamsOmniPipeline",
     "Cosmos3InteractivePipeline",

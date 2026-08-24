@@ -30,9 +30,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 BLOCK = 16
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
 def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boundary=False):
     return ChunkWindowSpec(
         block_size=BLOCK,
@@ -437,7 +434,7 @@ def test_scratch_exhaustion_still_raises():
 
 
 def test_startup_allocation_fails_before_pool_build_when_geometry_exceeds_budget():
-    with pytest.raises(MemoryError, match="startup allocation exceeds available memory"):
+    with pytest.raises(ValueError, match="available device memory cannot fit one session"):
         ARDiffusionKVCache(
             ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=9),
             num_layers=2,
