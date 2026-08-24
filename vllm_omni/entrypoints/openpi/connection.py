@@ -22,6 +22,7 @@ vLLM-native markers:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from typing import Any
 
 import msgspec
@@ -38,6 +39,8 @@ logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
 MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MISSING = object()
+# Upper bound on the per-connection set of seen session ids.
+MAX_TRACKED_SESSIONS = 1024
 
 
 def _pack_numpy(obj: Any) -> Any:
@@ -159,11 +162,32 @@ class RobotRealtimeConnection:
         self.serving = serving
         self._idle_timeout = idle_timeout
         self._current_session_id: str | None = None
-        self._session_call_counts: dict[str, int] = {}
+        # Session ids seen on this connection, most-recently-used last.
+        self._seen_sessions: OrderedDict[str, None] = OrderedDict()
 
     def reset(self) -> None:
         self._current_session_id = None
-        self._session_call_counts.clear()
+        self._seen_sessions.clear()
+
+    def _mark_session_seen(self, session_id: str) -> bool:
+        """Record ``session_id``; return True when it is the first sighting.
+
+        A session's first observation is the one that carries ``reset`` to the
+        policy, so this needs per-session memory.
+        """
+        if session_id in self._seen_sessions:
+            self._seen_sessions.move_to_end(session_id)
+            return False
+
+        self._seen_sessions[session_id] = None
+        if len(self._seen_sessions) > MAX_TRACKED_SESSIONS:
+            evicted, _ = self._seen_sessions.popitem(last=False)
+            logger.debug(
+                "Robot OpenPI connection is tracking more than %d sessions; dropped least-recently-used %s",
+                MAX_TRACKED_SESSIONS,
+                evicted,
+            )
+        return True
 
     async def _send_error(self, message: str) -> None:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
@@ -238,9 +262,7 @@ class RobotRealtimeConnection:
                                 )
                             self._current_session_id = session_id
 
-                        call_count = self._session_call_counts.get(session_id, 0) + 1
-                        self._session_call_counts[session_id] = call_count
-                        reset = call_count == 1
+                        reset = self._mark_session_seen(session_id)
                         actions = await self.serving.infer(
                             obs,
                             session_id=session_id,

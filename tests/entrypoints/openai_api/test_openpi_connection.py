@@ -339,6 +339,48 @@ def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch)
     ]
 
 
+def test_handle_connection_bounds_tracked_sessions_without_resetting_live_ones(monkeypatch):
+    """A client may hold one socket across many episodes, minting a fresh
+    session id per episode and never sending ``reset`` (RoboLab does exactly
+    this). Session tracking must stay bounded, and evicting finished episodes
+    must not disturb the sessions that are still running.
+    """
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "MAX_TRACKED_SESSIONS", 8)
+
+    # One long-lived session interleaved with far more short episodes than the cap.
+    episodes = 40
+    keys = []
+    requests = {}
+    for episode in range(episodes):
+        for session_id in (f"episode-{episode}", "live-env"):
+            key = f"{session_id}@{episode}".encode()
+            keys.append(key)
+            requests[key] = {"prompt": "pick", "session_id": session_id}
+
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [{"type": "websocket.receive", "bytes": key} for key in keys] + [{"type": "websocket.disconnect"}]
+    )
+    connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
+
+    asyncio.run(connection.handle_connection())
+
+    assert len(connection._seen_sessions) <= 8
+
+    resets_by_session: dict[str, list[bool]] = {}
+    for call in serving.infer.await_args_list:
+        resets_by_session.setdefault(call.kwargs["session_id"], []).append(call.kwargs["reset"])
+
+    # Each new episode resets exactly once, on its first observation.
+    for episode in range(episodes):
+        assert resets_by_session[f"episode-{episode}"] == [True]
+    # The continuously active session is never evicted, so it resets only once
+    # despite ``episodes`` other sessions churning past the cap.
+    assert resets_by_session["live-env"] == [True] + [False] * (episodes - 1)
+
+
 def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
     requests = {
