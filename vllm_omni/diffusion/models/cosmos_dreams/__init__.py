@@ -3,6 +3,10 @@
 
 from vllm_omni.diffusion.models.cosmos_dreams.action_contract import CosmosDreamsActionSchema
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
+    CosmosDreamsActionConditioning,
+    CosmosDreamsControlVideoConditioning,
+)
 
 __all__ = [
     "AgiBotKeyboardController",
@@ -10,6 +14,8 @@ __all__ = [
     "AgiBotSceneState",
     "Cosmos3InteractivePipeline",
     "CosmosDreamsActionSchema",
+    "CosmosDreamsActionConditioning",
+    "CosmosDreamsControlVideoConditioning",
     "CosmosDreamsManifest",
     "CosmosDreamsOmniPipeline",
     "CosmosDreamsPipeline",
