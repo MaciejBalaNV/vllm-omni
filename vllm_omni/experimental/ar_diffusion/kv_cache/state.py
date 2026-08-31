@@ -116,7 +116,7 @@ class ARDiffusionKVState:
             )
 
         pending = self._paged_pending.get(kv_branch)
-        if pending is not None and pending.commit_current and not pending._committed:
+        if pending is not None and pending.commit_current and pending._allocated_video and not pending._committed:
             raise RuntimeError("AR-Diffusion paged context replaced before its managed current chunk was committed")
 
         adapter = self.adapter(kv_branch)
@@ -150,8 +150,6 @@ class ARDiffusionKVState:
         ctx = self._paged_pending.get(kv_branch)
         if ctx is None:
             return
-        if ctx.commit_current:
-            ctx.validate_commit_complete()
         if ctx.commit_current and ctx._allocated_video:
             n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
             for _ in range(n_chunks):

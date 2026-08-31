@@ -16,7 +16,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
 )
-from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig, paged_write_attn
+from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
@@ -146,13 +146,8 @@ def make_runner(
 
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
     state = runner._get_or_create_session(session_id)
-    contexts = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)
-    ctx = contexts[0].forward_ctx
-    ctx.prepare(device=torch.device("cpu"), action_len=0, query_len=BLOCK)
-    assert runner.kv_cache is not None
-    zeros = torch.zeros(BLOCK, runner.kv_cache.num_kv_heads, runner.kv_cache.head_size)
-    for layer_ctx in contexts:
-        paged_write_attn(layer_ctx.to_layer_inputs(), zeros, zeros, zeros, None, None, runner.kv_cache.head_size**-0.5)
+    ctx = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
     state.commit_paged_context(kv_branch)
     return state
 
@@ -161,12 +156,8 @@ def commit_one_block(runner: ARDiffusionModelRunner, session_id: str, kv_branch:
     state = runner._get_or_create_session(session_id)
     assert runner.kv_cache is not None
     seq_len = BLOCK * runner.kv_cache.frames_per_block
-    contexts = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)
-    ctx = contexts[0].forward_ctx
-    ctx.prepare(device=torch.device("cpu"), action_len=0, query_len=seq_len)
-    zeros = torch.zeros(seq_len, runner.kv_cache.num_kv_heads, runner.kv_cache.head_size)
-    for layer_ctx in contexts:
-        paged_write_attn(layer_ctx.to_layer_inputs(), zeros, zeros, zeros, None, None, runner.kv_cache.head_size**-0.5)
+    ctx = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
     state.commit_paged_context(kv_branch)
     return state
 
