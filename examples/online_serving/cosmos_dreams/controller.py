@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Transport-neutral AgiBot keyboard control and raw action construction.
+"""AgiBot keyboard control and raw action construction for the WebRTC demo.
 
 The controller deliberately stops at the exported artifact boundary: it emits
 raw physical ``float32[16, 29]`` actions and never reads normalizer statistics

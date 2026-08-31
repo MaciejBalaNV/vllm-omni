@@ -8,12 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from PIL import Image
-
-from vllm_omni.diffusion.models.cosmos_dreams.controller import (
+from controller import (
     AgiBotControllerLimits,
     AgiBotSceneState,
 )
+from PIL import Image
 
 
 def load_scene_bundle(path: Path) -> AgiBotSceneState:

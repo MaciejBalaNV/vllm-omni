@@ -12,8 +12,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-
-from vllm_omni.diffusion.models.cosmos_dreams.runtime import CosmosDreamsTickResult
+from runtime import CosmosDreamsTickResult
 
 
 def video_tensor_to_rgb_frames(video: torch.Tensor) -> list[np.ndarray]:

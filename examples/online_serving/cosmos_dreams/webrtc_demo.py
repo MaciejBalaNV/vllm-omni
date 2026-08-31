@@ -16,18 +16,17 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from demo_support import load_replay_actions, load_scene_bundle
-
-from vllm_omni.diffusion.models.cosmos_dreams.controller import (
+from controller import (
     ACTION_STEPS_PER_TICK,
     AgiBotKeyboardController,
     AgiBotKeyboardResampler,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.realtime import (
+from demo_support import load_replay_actions, load_scene_bundle
+from realtime import (
     BoundedRGBFrameQueue,
     CosmosDreamsLatencyRecorder,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.runtime import CosmosDreamsTickRuntime
+from runtime import CosmosDreamsTickRuntime
 
 logger = logging.getLogger("cosmos_dreams.webrtc")
 

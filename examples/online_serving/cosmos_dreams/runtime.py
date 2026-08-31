@@ -13,8 +13,8 @@ from typing import Any, Protocol
 
 import numpy as np
 import torch
+from controller import AgiBotSceneState
 
-from vllm_omni.diffusion.models.cosmos_dreams.controller import AgiBotSceneState
 from vllm_omni.diffusion.models.cosmos_dreams.tick_adapter import (
     build_cosmos_dreams_action_control,
 )
@@ -252,7 +252,6 @@ class CosmosDreamsTickRuntime:
                 raise ValueError("key_arrival_time must use the same monotonic clock and not be in the future.")
         control = build_cosmos_dreams_action_control(
             torch.as_tensor(action),
-            frame_idx=self._next_frame_idx,
             measure_tick_latency=self.measure_latency,
         )
         request_started = time.perf_counter()
