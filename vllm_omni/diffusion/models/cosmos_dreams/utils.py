@@ -222,6 +222,7 @@ def estimate_kv_memory_bytes(
     num_logical_kv_branches: int = 1,
     session_capacity: int = 1,
     frames_per_block: int = 1,
+    max_scratch_frames_per_branch: int | None = None,
     max_scratch_tokens_per_branch: int = 0,
 ) -> CosmosDreamsKVMemoryEstimate:
     """Estimate the manager floor, scratch reservation, and text pools."""
@@ -237,11 +238,14 @@ def estimate_kv_memory_bytes(
     for name, value in positive.items():
         if value <= 0:
             raise ValueError(f"Cosmos-Dreams KV estimate {name} must be positive, got {value}")
+    if max_scratch_frames_per_branch is not None and max_scratch_frames_per_branch < 0:
+        raise ValueError("Cosmos-Dreams max_scratch_frames_per_branch must be non-negative")
     if max_scratch_tokens_per_branch < 0:
         raise ValueError("Cosmos-Dreams max_scratch_tokens_per_branch must be non-negative")
     page_bytes = int(2 * manifest.tokens_per_frame * num_kv_heads * head_size * dtype.itemsize * num_layers)
     managed_blocks = num_local_kv_branches * (manifest.sink_frames + manifest.window_frames + frames_per_block) + 2
-    scratch_per_branch = frames_per_block + math.ceil(max_scratch_tokens_per_branch / manifest.tokens_per_frame)
+    scratch_frames = frames_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
+    scratch_per_branch = scratch_frames + math.ceil(max_scratch_tokens_per_branch / manifest.tokens_per_frame)
     scratch_blocks = num_local_kv_branches * scratch_per_branch
     self_attention_bytes = managed_blocks * page_bytes
     scratch_bytes = scratch_blocks * page_bytes
