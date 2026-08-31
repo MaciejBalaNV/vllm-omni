@@ -378,7 +378,3 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             )
             vision_hidden = vision_hidden.flatten(1, 2)
             return self.unpatchify(self.proj_out(vision_hidden), num_frames, latent_h, latent_w)
-
-
-# Artifact aliases used by early export manifests.
-Cosmos3InteractiveTransformer = CosmosDreamsTransformer
