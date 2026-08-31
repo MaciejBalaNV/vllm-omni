@@ -300,8 +300,8 @@ class CosmosDreamsManifest:
             raise ValueError("Cosmos-Dreams AR inference requires FPS modulation")
         if not math.isfinite(self.base_fps) or self.base_fps <= 0:
             raise ValueError(f"Cosmos-Dreams base_fps must be positive, got {self.base_fps}")
-        if self.sample_type not in {"ode", "sde"}:
-            raise ValueError(f"Cosmos-Dreams sample_type must be 'ode' or 'sde', got {self.sample_type!r}")
+        if self.sample_type != "sde":
+            raise ValueError(f"Cosmos-Dreams sample_type must be 'sde', got {self.sample_type!r}")
         if not self.t_list:
             raise ValueError("Cosmos-Dreams t_list must not be empty")
         if abs(self.t_list[0] - 1.0) > 1e-6:

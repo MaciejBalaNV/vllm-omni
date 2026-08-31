@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager, nullcontext
 from typing import Any, ClassVar
 
@@ -26,7 +26,6 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
 )
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 from vllm_omni.diffusion.models.cosmos_dreams.normalizer import ActionAffineNormalizer
-from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistilledSampler
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
     CosmosDreamsSessionState,
@@ -170,20 +169,31 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
         if not self.is_distilled_model:
             raise ValueError("Cosmos-Dreams requires a distilled fixed-step checkpoint.")
-        if len(self.manifest.t_list) != 4:
+        scheduler_t_list = tuple(float(value) for value in self._scheduler_init_t_list)
+        if len(scheduler_t_list) != 4:
             raise ValueError(
-                f"Cosmos-Dreams requires exactly four distilled denoise steps, got {len(self.manifest.t_list)}."
+                f"Cosmos-Dreams requires exactly four distilled denoise steps, got {len(scheduler_t_list)}."
             )
+        if len(scheduler_t_list) != len(self.manifest.t_list) or any(
+            not math.isclose(scheduler_value, manifest_value, rel_tol=0.0, abs_tol=1e-8)
+            for scheduler_value, manifest_value in zip(scheduler_t_list, self.manifest.t_list, strict=True)
+        ):
+            raise ValueError(
+                "Cosmos-Dreams scheduler and transformer manifests define different fixed-step schedules: "
+                f"scheduler={scheduler_t_list}, transformer={self.manifest.t_list}."
+            )
+        scheduler_train_timesteps = int(self.scheduler.config.num_train_timesteps)
+        if scheduler_train_timesteps != self.manifest.num_train_timesteps:
+            raise ValueError(
+                "Cosmos-Dreams scheduler and transformer manifests define different training timestep counts: "
+                f"scheduler={scheduler_train_timesteps}, transformer={self.manifest.num_train_timesteps}."
+            )
+        self._distilled_num_steps = len(scheduler_t_list)
         if od_config.parallel_config.sequence_parallel_size > 1:
             raise ValueError(
                 "Cosmos-Dreams supports tensor parallelism but not sequence parallelism; "
                 f"got sequence_parallel_size={od_config.parallel_config.sequence_parallel_size}."
             )
-        self.distilled_sampler = CosmosDreamsDistilledSampler(
-            self.manifest.t_list,
-            sample_type=self.manifest.sample_type,
-            num_train_timesteps=self.manifest.num_train_timesteps,
-        )
         action_schema = self.manifest.action_schema
         if action_schema is None:
             raise ValueError("Cosmos-Dreams requires a validated v2 action_schema.")
@@ -743,6 +753,32 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- Generation --------------------------------------------------------
 
+    def _denoise_chunk(
+        self,
+        velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        initial_noise: torch.Tensor,
+        *,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Run one state-aware chunk with the inherited distilled scheduler."""
+        self._set_timesteps(
+            self._distilled_num_steps,
+            device=initial_noise.device,
+            shift=1.0,
+        )
+        latents = initial_noise.float()
+        for timestep in self.scheduler.timesteps:
+            model_timestep = timestep.expand(latents.shape[0])
+            velocity = velocity_fn(latents, model_timestep)
+            latents = self.scheduler.step(
+                velocity,
+                timestep,
+                latents,
+                generator=generator,
+                return_dict=False,
+            )[0]
+        return latents
+
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         try:
@@ -877,7 +913,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams distilled inference requires guidance_scale=1.0, got {guidance_scale}."
             )
-        if sp.num_inference_steps not in (None, len(self.manifest.t_list)):
+        if sp.num_inference_steps not in (None, self._distilled_num_steps):
             raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams distilled inference uses the checkpoint-defined four-step schedule; "
                 f"got num_inference_steps={sp.num_inference_steps}."
@@ -1051,7 +1087,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 generator=noise_generator,
                 device=self.device,
                 # The reference draws checkpoint-dtype noise, then promotes it
-                # to fp32 inside the distilled sampler.
+                # to fp32 before the scheduler loop.
                 dtype=self.dtype,
             )
 
@@ -1077,11 +1113,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 "denoise_s",
                 enabled=measure_tick_latency,
             ):
-                clean_chunk = self.distilled_sampler.sample(
+                clean_chunk = self._denoise_chunk(
                     velocity_fn,
                     initial_noise,
-                    seed=seed,
-                    frame_idx=chunk_start,
+                    generator=noise_generator,
                 ).to(self.dtype)
 
             action_count = self.manifest.action_tokens_per_frame
