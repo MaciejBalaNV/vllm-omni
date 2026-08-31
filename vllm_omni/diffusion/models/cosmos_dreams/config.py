@@ -88,6 +88,12 @@ def _manifest_sources(config: Any) -> list[dict[str, Any]]:
     return sources
 
 
+def deploy_option(config: Any, key: str, default: Any = None) -> Any:
+    """Read one deploy/checkpoint option from the known config envelopes."""
+
+    return _first(_manifest_sources(config), key, default=default)
+
+
 def _exported_artifact_source(config: Any) -> dict[str, Any]:
     """Return the causal payload embedded in ``transformer/config.json``."""
 
