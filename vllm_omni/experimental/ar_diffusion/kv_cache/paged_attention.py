@@ -80,7 +80,6 @@ class ARDiffusionPagedForwardContext:
     max_query_len: int = 0
     max_seq_len: int = 0
     _prepared: bool = False
-    _written_layers: set[int] = field(default_factory=set)
     _fused_written_mask: torch.Tensor | None = None
 
     @property
@@ -124,128 +123,12 @@ class ARDiffusionPagedForwardContext:
     def num_layers(self) -> int:
         return int(self.kv_cache.num_layers)
 
-    def _validate_layer_idx(self, layer_idx: int) -> int:
-        layer_idx = int(layer_idx)
-        if layer_idx < 0 or layer_idx >= self.num_layers:
-            raise IndexError(f"AR-Diffusion layer index {layer_idx} is outside [0, {self.num_layers})")
-        return layer_idx
-
-    def visible_history_block_ids(self) -> list[int]:
-        """History snapshot trimmed to the sink + sliding-window capacity.
-
-        The manager evicts lazily — out-of-window blocks are only released by
-        the *next* allocation — so between a commit and the following forward
-        the snapshot can hold up to one chunk beyond the window. Attention must
-        never see that overhang: trim to the sink prefix plus the window tail,
-        the shape the dense oracle maintains eagerly and the pool converges to.
-        """
-
-        history = self.history_block_ids
-        max_history_blocks = self.max_video_tokens // self.block_size
-        if len(history) <= max_history_blocks:
-            return list(history)
-        sink_blocks = int(self.kv_cache.spec.sink_chunks)
-        tail_blocks = max_history_blocks - sink_blocks
-        visible = list(history[:sink_blocks])
-        if tail_blocks > 0:
-            visible += history[-tail_blocks:]
-        return visible
-
-    def gather_history(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather one layer's immutable history snapshot into dense K/V.
-
-        ``history_block_ids`` is captured before any current-page allocation.
-        Reading only that snapshot is load-bearing: the manager's live block
-        table also contains in-flight allocations after the first layer writes.
-        The snapshot is additionally trimmed to the visible sink + window span
-        (see :meth:`visible_history_block_ids`).
-        """
-
-        layer_idx = self._validate_layer_idx(layer_idx)
-        key_cache = self.kv_cache.key_cache(layer_idx)
-        value_cache = self.kv_cache.value_cache(layer_idx)
-        visible_block_ids = self.visible_history_block_ids()
-        if not visible_block_ids:
-            shape = (1, 0, int(self.kv_cache.num_kv_heads), int(self.kv_cache.head_size))
-            return key_cache.new_empty(shape), value_cache.new_empty(shape)
-
-        block_ids = torch.as_tensor(
-            visible_block_ids,
-            dtype=torch.long,
-            device=key_cache.device,
-        )
-        keys = key_cache.index_select(0, block_ids).reshape(
-            1,
-            -1,
-            int(self.kv_cache.num_kv_heads),
-            int(self.kv_cache.head_size),
-        )
-        values = value_cache.index_select(0, block_ids).reshape_as(keys)
-        return keys, values
-
-    def _validate_layer_write(self, layer_idx: int) -> int:
-        if not self.commit_current:
-            raise RuntimeError(
-                "AR-Diffusion write-only KV updates require commit_current=True; "
-                "non-committing denoise contexts are read-only"
-            )
-        layer_idx = self._validate_layer_idx(layer_idx)
-        if layer_idx in self._written_layers:
-            raise RuntimeError(f"AR-Diffusion current-page K/V for layer {layer_idx} was written more than once")
-        return layer_idx
-
-    def write_only(
-        self,
-        layer_idx: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> None:
-        """Write one layer's current frame K/V without running attention.
-
-        This is the gathered-dense counterpart of the fused paged op.  It is
-        intentionally unavailable on scratch/non-committing contexts so noisy
-        denoise steps cannot accidentally enter the persistent pool.
-        """
-
-        if not self.commit_current:
-            raise RuntimeError(
-                "AR-Diffusion write_only() requires commit_current=True; non-committing denoise contexts are read-only"
-            )
-        layer_idx = self._validate_layer_write(layer_idx)
-        if key.device != value.device:
-            raise ValueError(f"AR-Diffusion write_only() K/V devices differ: {key.device} != {value.device}")
-        expected = (
-            self.seq_len,
-            int(self.kv_cache.num_kv_heads),
-            int(self.kv_cache.head_size),
-        )
-        if key.ndim == 4 and key.shape[0] == 1:
-            key = key[0]
-        if value.ndim == 4 and value.shape[0] == 1:
-            value = value[0]
-        if tuple(key.shape) != expected or tuple(value.shape) != expected:
-            raise ValueError(
-                "AR-Diffusion write_only() expected K/V shape "
-                f"{expected} (or batch-prefixed (1, ...)), got "
-                f"{tuple(key.shape)} and {tuple(value.shape)}"
-            )
-
-        self.ensure_video_slots(key.device)
-        assert self.current_video_slot_mapping is not None
-        self.kv_cache.write_token_kv(
-            layer_idx,
-            self.current_video_slot_mapping,
-            key,
-            value,
-        )
-        self._written_layers.add(layer_idx)
-
     def validate_commit_complete(self) -> None:
         """Fail closed unless every configured layer wrote the current page."""
 
         if not self.commit_current:
             return
-        written_layers = set(self._written_layers)
+        written_layers: set[int] = set()
         if self._fused_written_mask is not None:
             fused_written_layers = self._fused_written_mask.nonzero(as_tuple=False).flatten().tolist()
             written_layers.update(int(layer_idx) for layer_idx in fused_written_layers)
@@ -259,7 +142,7 @@ class ARDiffusionPagedForwardContext:
             raise RuntimeError("AR-Diffusion cannot commit an incomplete current page: " + detail)
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
-        """Reserve scratch slots for action/state K/V, if present."""
+        """Reserve scratch slots for auxiliary K/V, if present."""
         if action_len <= 0:
             self.action_scratch_block_ids = []
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
@@ -343,7 +226,7 @@ class ARDiffusionPagedForwardContext:
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
         """Host-side, once-per-KV-branch setup (called OUTSIDE torch.compile).
 
-        Allocates the current video/action slots (still lazy: only the KV branch a
+        Allocates the current video/auxiliary slots (still lazy: only the KV branch a
         CFG-parallel rank actually runs reaches its ``_forward_blocks``), builds
         the padded block-table metadata ONCE for all layers, and publishes the
         per-forward write mask. The compiled per-layer code then only
@@ -449,16 +332,6 @@ class ARDiffusionPagedLayerContext:
     def to_layer_inputs(self) -> ARDiffusionPagedLayerInputs:
         """Compiled-region payload; requires ``forward_ctx.prepare()`` first."""
         return self.forward_ctx.layer_inputs(self.layer_idx)
-
-    def gather_history(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather this layer's dense history from the captured block snapshot."""
-
-        return self.forward_ctx.gather_history(self.layer_idx)
-
-    def write_only(self, key: torch.Tensor, value: torch.Tensor) -> None:
-        """Persist this layer's current-frame K/V without running attention."""
-
-        self.forward_ctx.write_only(self.layer_idx, key, value)
 
 
 def is_ar_diffusion_paged_context(value: object) -> bool:

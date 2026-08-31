@@ -26,6 +26,10 @@ from vllm_omni.diffusion.models.cosmos_dreams.utils import (
     split_interleaved_action_vision_tokens,
     zero_null_action_values,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedLayerInputs,
+    paged_write_attn,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -36,7 +40,7 @@ class CosmosDreamsTransformerOutput:
 
 
 class CosmosDreamsJointAttention(Cosmos3CrossAttention):
-    """One softmax over ``[text | committed history | current chunk]``."""
+    """One softmax over text, committed history, and the current chunk."""
 
     def forward(
         self,
@@ -48,7 +52,7 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         dense_history: tuple[torch.Tensor, torch.Tensor] | None = None,
-        paged_context: Any | None = None,
+        paged_context: ARDiffusionPagedLayerInputs | None = None,
         num_frames: int,
         tokens_per_frame: int,
         action_tokens_per_frame: int,
@@ -82,24 +86,28 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
             null_frame_indexes=null_action_frame_indexes,
         )
 
-        key_parts = [text_k[:, :real_text_kv_len]]
-        value_parts = [text_v[:, :real_text_kv_len]]
         if paged_context is not None:
-            history_k, history_v = paged_context.gather_history()
-            if history_k.shape[1]:
-                key_parts.append(history_k)
-                value_parts.append(history_v)
-        elif dense_history is not None:
-            history_k, history_v = dense_history
-            if history_k.shape[1]:
-                key_parts.append(history_k)
-                value_parts.append(history_v)
-        key_parts.append(k)
-        value_parts.append(v)
-        output = self.attn(q, torch.cat(key_parts, dim=1), torch.cat(value_parts, dim=1))
+            output = paged_write_attn(
+                paged_context,
+                q[0],
+                k[0],
+                v[0],
+                text_k[0, :real_text_kv_len],
+                text_v[0, :real_text_kv_len],
+                self.head_dim**-0.5,
+            ).unsqueeze(0)
+        else:
+            key_parts = [text_k[:, :real_text_kv_len]]
+            value_parts = [text_v[:, :real_text_kv_len]]
+            if dense_history is not None:
+                history_k, history_v = dense_history
+                if history_k.shape[1]:
+                    key_parts.append(history_k)
+                    value_parts.append(history_v)
+            key_parts.append(k)
+            value_parts.append(v)
+            output = self.attn(q, torch.cat(key_parts, dim=1), torch.cat(value_parts, dim=1))
 
-        if paged_context is not None and paged_context.commit_current:
-            paged_context.write_only(k, v)
         return self.to_out(output.reshape(batch, seq_len, -1)), k, v
 
 
@@ -392,6 +400,20 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             fps=fps,
             null_action_frame_indexes=null_action_frame_indexes,
         )
+
+        if paged_kv is not None:
+            forward_context = paged_kv[0].forward_ctx
+            if forward_context.seq_len != hidden.shape[1]:
+                raise RuntimeError(
+                    "Cosmos-Dreams paged context token count does not match "
+                    f"this chunk: {forward_context.seq_len} != {hidden.shape[1]}"
+                )
+            forward_context.prepare(
+                device=hidden.device,
+                action_len=real_text_kv_len,
+                query_len=hidden.shape[1],
+            )
+            paged_kv = [layer_context.to_layer_inputs() for layer_context in paged_kv]
 
         current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         with self._offload_context("generator"):

@@ -214,6 +214,9 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             head_size=self.transformer.head_dim,
             dtype=self.dtype,
             session_capacity=self._SESSION_CAPACITY,
+            frames_per_block=1,
+            max_scratch_frames_per_branch=self.manifest.chunk_size,
+            max_scratch_tokens_per_branch=self.manifest.text_cache_max_len,
         )
         logger.info(
             "Cosmos-Dreams KV floor estimate: %.2f GiB (managed %.2f, scratch %.2f, text %.2f)",
@@ -299,7 +302,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             kv_branches=(ARDiffusionKVBranchSpec(self._MAIN_BRANCH, 0),),
             session_capacity=self._SESSION_CAPACITY,
             cross_attention=(ARDiffusionCrossAttentionKVSpec("text", self.manifest.text_cache_max_len),),
-            max_scratch_tokens_per_branch=0,
+            max_scratch_frames_per_branch=self.manifest.chunk_size,
+            max_scratch_tokens_per_branch=self.manifest.text_cache_max_len,
         )
 
     def _validate_bound_kv_geometry(self, state) -> None:
@@ -317,6 +321,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "num_kv_heads": int(cache.num_kv_heads),
             "head_size": int(cache.head_size),
             "tokens_per_frame": int(cache.block_size),
+            "frames_per_block": int(cache.frames_per_block),
+            "max_scratch_frames_per_branch": int(cache.max_scratch_frames_per_branch),
             "window_frames": int(cache.spec.window_chunks),
             "sink_frames": int(cache.spec.sink_chunks),
             "reset_at_boundary": bool(cache.spec.reset_at_boundary),
@@ -327,6 +333,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "num_kv_heads": int(self.transformer.num_kv_heads_local),
             "head_size": int(self.transformer.head_dim),
             "tokens_per_frame": int(self.manifest.tokens_per_frame),
+            "frames_per_block": 1,
+            "max_scratch_frames_per_branch": int(self.manifest.chunk_size),
             "window_frames": int(self.manifest.window_frames),
             "sink_frames": int(self.manifest.sink_frames),
             "reset_at_boundary": False,
@@ -524,6 +532,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 self._MAIN_BRANCH,
                 seq_len=seq_len,
                 commit_current=commit_current,
+                extra_visible_tokens=seq_len,
             )
         else:
             dense_history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
