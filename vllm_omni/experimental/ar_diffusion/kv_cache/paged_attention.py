@@ -10,16 +10,14 @@ import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 
-_LAYER_IDX_TENSORS: dict[tuple[torch.device, int], torch.Tensor] = {}
+_LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
 
-def _layer_idx_tensor(layer_idx: int, device: torch.device) -> torch.Tensor:
-    device = torch.device(device)
-    key = (device, layer_idx)
-    t = _LAYER_IDX_TENSORS.get(key)
+def _layer_idx_tensor(layer_idx: int) -> torch.Tensor:
+    t = _LAYER_IDX_TENSORS.get(layer_idx)
     if t is None:
-        t = torch.tensor(layer_idx, dtype=torch.int64, device=device)
-        _LAYER_IDX_TENSORS[key] = t
+        t = torch.tensor(layer_idx, dtype=torch.int64)
+        _LAYER_IDX_TENSORS[layer_idx] = t
     return t
 
 
@@ -31,15 +29,14 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     tensor *values* change). All layers of one KV branch forward share the same
     metadata tensor objects, built once by ``prepare()``.
 
-    ``layer_idx`` is a 0-dim tensor on the pool device, NOT a python int: all 40
-    DiT blocks share one compiled code object, and an int here becomes a
-    per-layer dynamo value guard (``layer_idx == k``) — 40 cache variants that
-    blow the recompile limit. A tensor input guards on shape/dtype only, so one
-    graph serves every layer and can update ``written_mask`` on-device.
+    ``layer_idx`` is a 0-dim CPU tensor, NOT a python int: all 40 DiT blocks
+    share one compiled code object, and an int here becomes a per-layer dynamo
+    value guard (``layer_idx == k``) — 40 cache variants that blow the
+    recompile limit. A tensor input guards on shape/dtype only, so one graph
+    serves every layer.
     """
 
     layer_idx: torch.Tensor
-    written_mask: torch.Tensor
     key_pool: torch.Tensor
     value_pool: torch.Tensor
     block_size: int
@@ -80,7 +77,6 @@ class ARDiffusionPagedForwardContext:
     max_query_len: int = 0
     max_seq_len: int = 0
     _prepared: bool = False
-    _fused_written_mask: torch.Tensor | None = None
 
     @property
     def block_size(self) -> int:
@@ -118,28 +114,6 @@ class ARDiffusionPagedForwardContext:
                 self.block_size,
             ).to(device=device)
         self._allocated_video = True
-
-    @property
-    def num_layers(self) -> int:
-        return int(self.kv_cache.num_layers)
-
-    def validate_commit_complete(self) -> None:
-        """Fail closed unless every configured layer wrote the current page."""
-
-        if not self.commit_current:
-            return
-        written_layers: set[int] = set()
-        if self._fused_written_mask is not None:
-            fused_written_layers = self._fused_written_mask.nonzero(as_tuple=False).flatten().tolist()
-            written_layers.update(int(layer_idx) for layer_idx in fused_written_layers)
-        expected = set(range(self.num_layers))
-        if written_layers != expected:
-            missing = sorted(expected - written_layers)
-            extra = sorted(written_layers - expected)
-            detail = f"missing layers {missing}"
-            if extra:
-                detail += f", unexpected layers {extra}"
-            raise RuntimeError("AR-Diffusion cannot commit an incomplete current page: " + detail)
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
         """Reserve scratch slots for auxiliary K/V, if present."""
@@ -229,8 +203,8 @@ class ARDiffusionPagedForwardContext:
         Allocates the current video/auxiliary slots (still lazy: only the KV branch a
         CFG-parallel rank actually runs reaches its ``_forward_blocks``), builds
         the padded block-table metadata ONCE for all layers, and publishes the
-        per-forward write mask. The compiled per-layer code then only
-        consumes prebuilt tensors via ``ARDiffusionPagedLayerInputs``.
+        pool registry for the fused custom op. The compiled per-layer code then
+        only consumes prebuilt tensors via ``ARDiffusionPagedLayerInputs``.
         """
         if getattr(self, "_prepared", False):
             return
@@ -244,19 +218,14 @@ class ARDiffusionPagedForwardContext:
         ) = self.build_block_table(action_len=action_len, query_len=query_len, device=device)
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
-        self._fused_written_mask = torch.zeros(self.num_layers, dtype=torch.bool, device=device)
         self._prepared = True
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
         if not getattr(self, "_prepared", False):
             raise RuntimeError("ARDiffusionPagedForwardContext.layer_inputs() before prepare()")
-        if self._fused_written_mask is None:
-            raise RuntimeError("ARDiffusionPagedForwardContext.layer_inputs() missing fused write mask")
-        key_pool = self.kv_cache._k_pools[layer_idx]
         return ARDiffusionPagedLayerInputs(
-            layer_idx=_layer_idx_tensor(layer_idx, key_pool.device),
-            written_mask=self._fused_written_mask,
-            key_pool=key_pool,
+            layer_idx=_layer_idx_tensor(layer_idx),
+            key_pool=self.kv_cache._k_pools[layer_idx],
             value_pool=self.kv_cache._v_pools[layer_idx],
             block_size=int(self.kv_cache.block_size),
             seq_len=int(self.seq_len),
@@ -499,17 +468,15 @@ def ar_diffusion_paged_attention(
 # One opaque op per layer keeps the compiled DiT block fullgraph: dynamo treats
 # it as a single graph node (no eager island, no graph breaks), and the K/V slot
 # writes happen inside the op so write→read ordering with the block-table kernel
-# is internal. The flat pools and per-forward write mask are explicit mutable
-# inputs: Inductor/CUDA Graph must track their storage lifetime instead of
-# observing undeclared mutation through a process-global registry.
+# is internal. The flat pools are explicit mutable inputs: Inductor/CUDA Graph
+# must track their storage lifetime instead of observing an undeclared mutation
+# through a process-global registry.
 def _paged_write_attn_impl(
     query: torch.Tensor,
     k_curr: torch.Tensor,
     v_curr: torch.Tensor,
     k_act: torch.Tensor | None,
     v_act: torch.Tensor | None,
-    layer_idx: torch.Tensor,
-    written_mask: torch.Tensor,
     key_pool: torch.Tensor,
     value_pool: torch.Tensor,
     block_size: int,
@@ -529,7 +496,7 @@ def _paged_write_attn_impl(
         value_pool[action_slots] = v_act.to(value_pool.dtype)
     key_cache = key_pool.unflatten(0, (-1, block_size))
     value_cache = value_pool.unflatten(0, (-1, block_size))
-    out = ar_diffusion_paged_attention(
+    return ar_diffusion_paged_attention(
         query,
         key_cache,
         value_cache,
@@ -541,8 +508,6 @@ def _paged_write_attn_impl(
         softmax_scale=softmax_scale,
         causal=False,
     )
-    written_mask.index_fill_(0, layer_idx.reshape(1), True)
-    return out
 
 
 # hasattr guard keeps registration idempotent across test re-imports that pop
@@ -551,7 +516,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
 
     @torch.library.custom_op(
         "vllm_omni::ar_diffusion_paged_write_attn",
-        mutates_args=("written_mask", "key_pool", "value_pool"),
+        mutates_args=("key_pool", "value_pool"),
     )
     def _paged_write_attn_op(
         query: torch.Tensor,
@@ -559,8 +524,6 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         v_curr: torch.Tensor,
         k_act: torch.Tensor | None,
         v_act: torch.Tensor | None,
-        layer_idx: torch.Tensor,
-        written_mask: torch.Tensor,
         key_pool: torch.Tensor,
         value_pool: torch.Tensor,
         block_size: int,
@@ -579,8 +542,6 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             v_curr,
             k_act,
             v_act,
-            layer_idx,
-            written_mask,
             key_pool,
             value_pool,
             block_size,
@@ -601,8 +562,6 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         v_curr,
         k_act,
         v_act,
-        layer_idx,
-        written_mask,
         key_pool,
         value_pool,
         block_size,
@@ -628,8 +587,6 @@ def paged_write_attn(
         v_curr,
         k_act,
         v_act,
-        inputs.layer_idx,
-        inputs.written_mask,
         inputs.key_pool,
         inputs.value_pool,
         inputs.block_size,
