@@ -532,6 +532,7 @@ class CosmosDreamsActionSchema(_StrictModel):
                 "Cosmos-Dreams action_tokens_per_frame must equal temporal_compression_factor; "
                 f"got {self.action_tokens_per_frame} and {temporal_compression_factor}"
             )
+
     @model_validator(mode="after")
     def verify_target_contract(self) -> CosmosDreamsActionSchema:
         if not self.embodiments:

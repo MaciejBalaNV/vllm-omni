@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import time
 from collections import OrderedDict
@@ -24,21 +23,16 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest, deploy_option
 from vllm_omni.diffusion.models.cosmos_dreams.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
     CosmosDreamsSessionState,
-    append_dense_kv_history,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.streaming_vae import decode_wan_causal_chunk
 from vllm_omni.diffusion.models.cosmos_dreams.tick_adapter import parse_cosmos_dreams_tick
-from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams import (
-    CosmosDreamsTransformer,
-    CosmosDreamsTransformerOutput,
-)
+from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams import CosmosDreamsTransformer
 from vllm_omni.diffusion.models.cosmos_dreams.utils import (
-    estimate_kv_memory_bytes,
     iter_ar_chunk_ranges,
     iter_clean_commit_frames,
     prompt_token_hash,
@@ -54,37 +48,6 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
 )
-
-logger = logging.getLogger(__name__)
-
-
-def _nested_config_value(config: Any, key: str, default: Any = None) -> Any:
-    """Read one deploy/checkpoint option from the known config envelopes."""
-
-    roots = [
-        getattr(config, "custom_pipeline_args", None),
-        getattr(config, "model_config", None),
-        getattr(config, "tf_model_config", None),
-    ]
-    nested_names = (
-        "cosmos_dreams",
-        "causal_manifest",
-        "interactive_config",
-        "diffusion_expert_config",
-    )
-    for root in roots:
-        if not isinstance(root, dict):
-            to_dict = getattr(root, "to_dict", None)
-            root = to_dict() if callable(to_dict) else getattr(root, "params", None)
-        if not isinstance(root, dict):
-            continue
-        for nested_name in nested_names:
-            nested = root.get(nested_name)
-            if isinstance(nested, dict) and nested.get(key) is not None:
-                return nested[key]
-        if root.get(key) is not None:
-            return root[key]
-    return default
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -202,39 +165,20 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             embodiment: ActionAffineNormalizer.from_contract(contract)
             for embodiment, contract in action_schema.normalizers.items()
         }
-        configured_domain_id = _nested_config_value(od_config, "default_domain_id")
+        configured_domain_id = deploy_option(od_config, "default_domain_id")
         artifact_domain_id = action_schema.embodiment_to_domain[action_schema.default_embodiment]
         self.default_domain_id = int(artifact_domain_id if configured_domain_id is None else configured_domain_id)
         self.default_embodiment = action_schema.resolve_embodiment(
             action_schema.default_embodiment,
             self.default_domain_id,
         )
-        self.default_fps = float(_nested_config_value(od_config, "default_fps", 15.0))
+        self.default_fps = float(deploy_option(od_config, "default_fps", 15.0))
         if not math.isfinite(self.default_fps) or self.default_fps <= 0:
             raise ValueError(f"Cosmos-Dreams default_fps must be positive, got {self.default_fps}.")
         self.checkpoint_id = (
             self.manifest.checkpoint_id if self.manifest.checkpoint_id != "unknown" else str(od_config.model)
         )
         self._states: OrderedDict[str, CosmosDreamsSessionState] = OrderedDict()
-
-        estimate = estimate_kv_memory_bytes(
-            self.manifest,
-            num_layers=self.transformer.num_hidden_layers,
-            num_kv_heads=self.transformer.num_kv_heads_local,
-            head_size=self.transformer.head_dim,
-            dtype=self.dtype,
-            session_capacity=self._SESSION_CAPACITY,
-            frames_per_block=1,
-            max_scratch_frames_per_branch=self.manifest.chunk_size,
-            max_scratch_tokens_per_branch=self.manifest.text_cache_max_len,
-        )
-        logger.info(
-            "Cosmos-Dreams KV floor estimate: %.2f GiB (managed %.2f, scratch %.2f, text %.2f)",
-            estimate.total_bytes / 2**30,
-            estimate.self_attention_bytes / 2**30,
-            estimate.scratch_bytes / 2**30,
-            estimate.cross_attention_bytes / 2**30,
-        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Reject artifact tensors that do not map into this exact model."""
@@ -361,6 +305,21 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 f"model manifest ({details}). Fix the deployment configuration and restart."
             )
 
+    def _require_ar_diffusion_kv_state(self):
+        """Return the bound paged KV state, or reject the request.
+
+        Persistent GEN K/V lives only in the runner-owned paged pool, so the
+        pipeline cannot produce correct history without a bound session.
+        """
+
+        state = self._ar_diffusion_kv_state
+        if state is None:
+            raise ARDiffusionRequestRejectedError(
+                "Cosmos-Dreams requires ARDiffusionEngine session binding; "
+                "select engine_backend=vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine."
+            )
+        return state
+
     @contextmanager
     def bind_ar_diffusion_state(self, session_id, state):
         if self._ar_diffusion_kv_state is not None:
@@ -453,26 +412,17 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if cached is not None:
             return cached
 
-        paged_state = self._ar_diffusion_kv_state
-        if paged_state is not None and paged_state.is_cross_attention_populated(self._MAIN_BRANCH, "text"):
-            pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
-            cached = [(entry["k"], entry["v"]) for entry in pooled]
-        else:
+        paged_state = self._require_ar_diffusion_kv_state()
+        if not paged_state.is_cross_attention_populated(self._MAIN_BRANCH, "text"):
             raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
             if real_len > self.manifest.text_cache_max_len:
                 raise ValueError(
                     f"Cosmos-Dreams prompt exceeds text_cache_max_len: {real_len} > {self.manifest.text_cache_max_len}."
                 )
-            if paged_state is None:
-                cached = raw_kv
-            else:
-                padded = self.transformer.pad_text_kv(
-                    raw_kv,
-                    max_len=self.manifest.text_cache_max_len,
-                )
-                paged_state.populate_cross_attention(self._MAIN_BRANCH, "text", padded)
-                pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
-                cached = [(entry["k"], entry["v"]) for entry in pooled]
+            padded = self.transformer.pad_text_kv(raw_kv, max_len=self.manifest.text_cache_max_len)
+            paged_state.populate_cross_attention(self._MAIN_BRANCH, "text", padded)
+        pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
+        cached = [(entry["k"], entry["v"]) for entry in pooled]
         state.text_kv_by_branch[self._MAIN_BRANCH] = cached
         return cached
 
@@ -501,25 +451,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             sampler_id=self.manifest.sampler_id,
         )
 
-    # -- Dense/paged transformer bridge -----------------------------------
-
-    def _append_dense_kv(
-        self,
-        state: CosmosDreamsSessionState,
-        current_kv: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> None:
-        history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
-        state.dense_kv_by_branch[self._MAIN_BRANCH] = append_dense_kv_history(
-            history,
-            current_kv,
-            tokens_per_frame=self.manifest.tokens_per_frame,
-            sink_frames=self.manifest.sink_frames,
-            window_frames=self.manifest.window_frames,
-        )
+    # -- Paged transformer bridge -----------------------------------------
 
     def _transformer_forward(
         self,
-        state: CosmosDreamsSessionState,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         *,
@@ -532,22 +467,16 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         condition_vision: bool,
         null_action_frame_indexes: tuple[int, ...],
         commit_current: bool,
-    ) -> CosmosDreamsTransformerOutput:
-        paged_state = self._ar_diffusion_kv_state
+    ) -> torch.Tensor:
+        paged_state = self._require_ar_diffusion_kv_state()
         seq_len = hidden_states.shape[2] * self.manifest.tokens_per_frame
-        paged_kv = None
-        dense_history = None
-        if paged_state is not None:
-            paged_kv = paged_state.get_kv_caches(
-                self._MAIN_BRANCH,
-                seq_len=seq_len,
-                commit_current=commit_current,
-                extra_visible_tokens=seq_len,
-            )
-        else:
-            dense_history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
-
-        output = self.transformer(
+        paged_kv = paged_state.get_kv_caches(
+            self._MAIN_BRANCH,
+            seq_len=seq_len,
+            commit_current=commit_current,
+            extra_visible_tokens=seq_len,
+        )
+        video = self.transformer(
             hidden_states,
             timestep,
             text_kv=text_kv,
@@ -557,15 +486,11 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             action_latents=action_latents,
             action_domain_ids=action_domain_ids,
             paged_kv=paged_kv,
-            dense_history=dense_history,
             condition_vision=condition_vision,
             null_action_frame_indexes=null_action_frame_indexes,
         )
-        if paged_state is not None:
-            paged_state.commit_paged_context(self._MAIN_BRANCH)
-        elif commit_current:
-            self._append_dense_kv(state, output.current_kv)
-        return output
+        paged_state.commit_paged_context(self._MAIN_BRANCH)
+        return video
 
     # -- Action and latent preparation ------------------------------------
 
@@ -697,7 +622,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _commit_clean_frame(
         self,
-        state: CosmosDreamsSessionState,
         latent: torch.Tensor,
         *,
         frame_idx: int,
@@ -709,7 +633,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         null_action: bool,
     ) -> None:
         self._transformer_forward(
-            state,
             latent.to(self.dtype),
             torch.zeros(1, device=self.device, dtype=torch.float32),
             text_kv=text_kv,
@@ -800,6 +723,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         # raises ARDiffusionRequestRejectedError on invalid input. No session may be
         # created, initialized, evicted, or written before it completes: the
         # rejection contract promises the client an unchanged session.
+        self._require_ar_diffusion_kv_state()
         if len(req.prompts) != 1:
             raise ARDiffusionRequestRejectedError("CosmosDreamsPipeline supports exactly one prompt per request.")
         prompt_data = req.prompts[0]
@@ -823,10 +747,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if typed_tick is not None:
-            if self._ar_diffusion_kv_state is None:
-                raise ARDiffusionRequestRejectedError(
-                    "Cosmos-Dreams typed ticks require ARDiffusionEngine session binding."
-                )
             if typed_tick.prompt is not None and typed_tick.prompt != prompt:
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos-Dreams ar_diffusion_tick.prompt must match the standard request prompt."
@@ -1050,7 +970,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     enabled=measure_tick_latency,
                 ):
                     self._commit_clean_frame(
-                        state,
                         initial_latent,
                         frame_idx=0,
                         text_kv=text_kv,
@@ -1092,8 +1011,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
 
             def velocity_fn(x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-                output = self._transformer_forward(
-                    state,
+                video = self._transformer_forward(
                     x.to(self.dtype),
                     timestep,
                     text_kv=text_kv,
@@ -1106,7 +1024,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     null_action_frame_indexes=null_action_indexes,
                     commit_current=False,
                 )
-                return output.video.float()
+                return video.float()
 
             with self._timed_tick_stage(
                 tick_durations,
@@ -1134,7 +1052,6 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     action_start = local_idx * action_count
                     action_frame = action_chunk[:, action_start : action_start + action_count]
                     self._commit_clean_frame(
-                        state,
                         clean_chunk[:, :, local_idx : local_idx + 1],
                         frame_idx=frame_idx,
                         text_kv=text_kv,
@@ -1181,10 +1098,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                     "ar_diffusion": ARDiffusionChunkMetadata.from_tick(typed_tick).to_dict(),
                 },
             }
-        result = DiffusionOutput(output=output, stage_durations=tick_durations)
-        if close_session and self._ar_diffusion_kv_state is None:
-            self._drop_session(session_id)
-        return result
+        return DiffusionOutput(output=output, stage_durations=tick_durations)
 
 
 # Export-manifest aliases used while the upstream name settles.

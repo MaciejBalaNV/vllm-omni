@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pure packing, mRoPE, cache-accounting, and hashing helpers."""
+"""Pure packing, mRoPE, and hashing helpers."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
 
 import torch
 
@@ -15,7 +13,6 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_vision,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 
 
 def iter_ar_chunk_ranges(start_frame: int, num_frames: int, chunk_size: int) -> Iterator[tuple[int, int]]:
@@ -206,73 +203,3 @@ def prompt_token_hash(token_ids: Sequence[int] | torch.Tensor) -> str:
         values = [int(value) for value in token_ids]
     payload = json.dumps(values, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
-
-
-@dataclass(frozen=True)
-class CosmosDreamsKVMemoryEstimate:
-    page_bytes: int
-    managed_blocks: int
-    scratch_blocks: int
-    self_attention_bytes: int
-    scratch_bytes: int
-    cross_attention_bytes: int
-    total_bytes: int
-
-
-def estimate_kv_memory_bytes(
-    manifest: CosmosDreamsManifest,
-    *,
-    num_layers: int,
-    num_kv_heads: int,
-    head_size: int,
-    dtype: torch.dtype,
-    num_local_kv_branches: int = 1,
-    num_logical_kv_branches: int = 1,
-    session_capacity: int = 1,
-    frames_per_block: int = 1,
-    max_scratch_frames_per_branch: int | None = None,
-    max_scratch_tokens_per_branch: int = 0,
-) -> CosmosDreamsKVMemoryEstimate:
-    """Estimate the manager floor, scratch reservation, and text pools."""
-    positive = {
-        "num_layers": num_layers,
-        "num_kv_heads": num_kv_heads,
-        "head_size": head_size,
-        "num_local_kv_branches": num_local_kv_branches,
-        "num_logical_kv_branches": num_logical_kv_branches,
-        "session_capacity": session_capacity,
-        "frames_per_block": frames_per_block,
-    }
-    for name, value in positive.items():
-        if value <= 0:
-            raise ValueError(f"Cosmos-Dreams KV estimate {name} must be positive, got {value}")
-    if max_scratch_frames_per_branch is not None and max_scratch_frames_per_branch < 0:
-        raise ValueError("Cosmos-Dreams max_scratch_frames_per_branch must be non-negative")
-    if max_scratch_tokens_per_branch < 0:
-        raise ValueError("Cosmos-Dreams max_scratch_tokens_per_branch must be non-negative")
-    page_bytes = int(2 * manifest.tokens_per_frame * num_kv_heads * head_size * dtype.itemsize * num_layers)
-    managed_blocks = num_local_kv_branches * (manifest.sink_frames + manifest.window_frames + frames_per_block) + 2
-    scratch_frames = frames_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
-    scratch_per_branch = scratch_frames + math.ceil(max_scratch_tokens_per_branch / manifest.tokens_per_frame)
-    scratch_blocks = num_local_kv_branches * scratch_per_branch
-    self_attention_bytes = managed_blocks * page_bytes
-    scratch_bytes = scratch_blocks * page_bytes
-    cross_attention_bytes = int(
-        2
-        * session_capacity
-        * num_logical_kv_branches
-        * manifest.text_cache_max_len
-        * num_kv_heads
-        * head_size
-        * dtype.itemsize
-        * num_layers
-    )
-    return CosmosDreamsKVMemoryEstimate(
-        page_bytes=page_bytes,
-        managed_blocks=managed_blocks,
-        scratch_blocks=scratch_blocks,
-        self_attention_bytes=self_attention_bytes,
-        scratch_bytes=scratch_bytes,
-        cross_attention_bytes=cross_attention_bytes,
-        total_bytes=self_attention_bytes + scratch_bytes + cross_attention_bytes,
-    )

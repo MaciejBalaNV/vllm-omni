@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -32,12 +31,6 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 from vllm_omni.platforms import current_omni_platform
 
 
-@dataclass
-class CosmosDreamsTransformerOutput:
-    video: torch.Tensor
-    current_kv: list[tuple[torch.Tensor, torch.Tensor]]
-
-
 class CosmosDreamsJointAttention(Cosmos3CrossAttention):
     """One softmax over text, committed history, and the current chunk."""
 
@@ -50,13 +43,12 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
         real_text_kv_len: int,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        dense_history: tuple[torch.Tensor, torch.Tensor] | None = None,
-        paged_context: ARDiffusionPagedLayerInputs | None = None,
+        paged_context: ARDiffusionPagedLayerInputs,
         num_frames: int,
         tokens_per_frame: int,
         action_tokens_per_frame: int,
         null_action_frame_indexes: tuple[int, ...] = (),
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         if hidden_states.shape[0] != 1:
             raise ValueError(f"Cosmos-Dreams causal attention supports batch_size=1, got {hidden_states.shape[0]}")
         if real_text_kv_len <= 0 or real_text_kv_len > text_k.shape[1]:
@@ -66,8 +58,6 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
             )
         if text_k.shape != text_v.shape:
             raise ValueError(f"Cosmos-Dreams text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}")
-        if dense_history is not None and paged_context is not None:
-            raise ValueError("Cosmos-Dreams attention accepts either dense_history or paged_context, not both")
 
         batch, seq_len, _ = hidden_states.shape
         q = self.to_q(hidden_states).view(batch, seq_len, self.num_heads_local, self.head_dim)
@@ -85,29 +75,16 @@ class CosmosDreamsJointAttention(Cosmos3CrossAttention):
             null_frame_indexes=null_action_frame_indexes,
         )
 
-        if paged_context is not None:
-            output = paged_write_attn(
-                paged_context,
-                q[0],
-                k[0],
-                v[0],
-                text_k[0, :real_text_kv_len],
-                text_v[0, :real_text_kv_len],
-                self.head_dim**-0.5,
-            ).unsqueeze(0)
-        else:
-            key_parts = [text_k[:, :real_text_kv_len]]
-            value_parts = [text_v[:, :real_text_kv_len]]
-            if dense_history is not None:
-                history_k, history_v = dense_history
-                if history_k.shape[1]:
-                    key_parts.append(history_k)
-                    value_parts.append(history_v)
-            key_parts.append(k)
-            value_parts.append(v)
-            output = self.attn(q, torch.cat(key_parts, dim=1), torch.cat(value_parts, dim=1))
-
-        return self.to_out(output.reshape(batch, seq_len, -1)), k, v
+        output = paged_write_attn(
+            paged_context,
+            q[0],
+            k[0],
+            v[0],
+            text_k[0, :real_text_kv_len],
+            text_v[0, :real_text_kv_len],
+            self.head_dim**-0.5,
+        ).unsqueeze(0)
+        return self.to_out(output.reshape(batch, seq_len, -1))
 
 
 class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
@@ -156,17 +133,12 @@ class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
         self,
         hidden_states: torch.Tensor,
         **attention_kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         residual = hidden_states
         attention_input = self.input_layernorm(hidden_states)
-        attention_output, current_k, current_v = self.cross_attention(
-            attention_input,
-            **attention_kwargs,
-        )
-        hidden_states = residual + attention_output
+        hidden_states = residual + self.cross_attention(attention_input, **attention_kwargs)
         residual = hidden_states
-        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, current_k, current_v
+        return residual + self.mlp(self.post_attention_layernorm(hidden_states))
 
 
 class CosmosDreamsTransformer(Cosmos3VFMTransformer):
@@ -309,15 +281,14 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         fps: float,
         action_latents: torch.Tensor | None,
         action_domain_ids: torch.Tensor,
-        paged_kv: list[Any] | None = None,
-        dense_history: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        paged_kv: list[Any],
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
-    ) -> CosmosDreamsTransformerOutput:
+    ) -> torch.Tensor:
         """Denoise or clean-commit one current chunk.
 
         ``paged_kv`` is non-committing during denoise and committing only for a
-        one-frame clean refresh. Dense history is the permanent numerical oracle.
+        one-frame clean refresh; it is the only source of GEN K/V history.
         """
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
             raise ValueError(
@@ -327,14 +298,8 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             raise ValueError(f"Cosmos-Dreams timestep must have shape [1] or [1,1], got {tuple(timestep.shape)}")
         if len(text_kv) != self.num_hidden_layers:
             raise ValueError(f"Cosmos-Dreams expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}")
-        if paged_kv is not None and dense_history is not None:
-            raise ValueError("Cosmos-Dreams forward accepts either paged_kv or dense_history, not both")
-        if paged_kv is not None and len(paged_kv) != self.num_hidden_layers:
+        if len(paged_kv) != self.num_hidden_layers:
             raise ValueError(f"Cosmos-Dreams expected {self.num_hidden_layers} paged contexts, got {len(paged_kv)}")
-        if dense_history is not None and len(dense_history) != self.num_hidden_layers:
-            raise ValueError(
-                f"Cosmos-Dreams expected {self.num_hidden_layers} dense history layers, got {len(dense_history)}"
-            )
 
         _, _, num_frames, latent_h, latent_w = hidden_states.shape
         grid_h, grid_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)
@@ -375,40 +340,35 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             null_action_frame_indexes=null_action_frame_indexes,
         )
 
-        if paged_kv is not None:
-            forward_context = paged_kv[0].forward_ctx
-            if forward_context.seq_len != hidden.shape[1]:
-                raise RuntimeError(
-                    "Cosmos-Dreams paged context token count does not match "
-                    f"this chunk: {forward_context.seq_len} != {hidden.shape[1]}"
-                )
-            forward_context.prepare(
-                device=hidden.device,
-                action_len=real_text_kv_len,
-                query_len=hidden.shape[1],
+        forward_context = paged_kv[0].forward_ctx
+        if forward_context.seq_len != hidden.shape[1]:
+            raise RuntimeError(
+                "Cosmos-Dreams paged context token count does not match "
+                f"this chunk: {forward_context.seq_len} != {hidden.shape[1]}"
             )
-            paged_kv = [layer_context.to_layer_inputs() for layer_context in paged_kv]
+        forward_context.prepare(
+            device=hidden.device,
+            action_len=real_text_kv_len,
+            query_len=hidden.shape[1],
+        )
+        layer_inputs = [layer_context.to_layer_inputs() for layer_context in paged_kv]
 
-        current_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
         with self._offload_context("generator"):
             for layer_idx, layer in enumerate(self.gen_layers):
                 text_k, text_v = text_kv[layer_idx]
-                layer_output = layer(
+                hidden = layer(
                     hidden,
                     text_k=text_k,
                     text_v=text_v,
                     real_text_kv_len=real_text_kv_len,
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
-                    dense_history=None if dense_history is None else dense_history[layer_idx],
-                    paged_context=None if paged_kv is None else paged_kv[layer_idx],
+                    paged_context=layer_inputs[layer_idx],
                     num_frames=num_frames,
                     tokens_per_frame=self.manifest.tokens_per_frame,
                     action_tokens_per_frame=action_count,
                     null_action_frame_indexes=null_action_frame_indexes,
                 )
-                hidden, current_k, current_v = layer_output
-                current_kv.append((current_k, current_v))
             hidden = self.norm_moe_gen(hidden)
             _, vision_hidden = split_interleaved_action_vision_tokens(
                 hidden,
@@ -417,8 +377,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
                 vision_tokens_per_frame=grid_h * grid_w,
             )
             vision_hidden = vision_hidden.flatten(1, 2)
-            video = self.unpatchify(self.proj_out(vision_hidden), num_frames, latent_h, latent_w)
-        return CosmosDreamsTransformerOutput(video=video, current_kv=current_kv)
+            return self.unpatchify(self.proj_out(vision_hidden), num_frames, latent_h, latent_w)
 
 
 # Artifact aliases used by early export manifests.
