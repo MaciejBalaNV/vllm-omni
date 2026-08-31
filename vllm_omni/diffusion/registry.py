@@ -321,16 +321,6 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos_dreams",
         "CosmosDreamsPipeline",
     ),
-    "CosmosDreamsOmniPipeline": (
-        "cosmos_dreams",
-        "pipeline_cosmos_dreams",
-        "CosmosDreamsPipeline",
-    ),
-    "Cosmos3InteractivePipeline": (
-        "cosmos_dreams",
-        "pipeline_cosmos_dreams",
-        "CosmosDreamsPipeline",
-    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -384,8 +374,6 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
     "CosmosDreamsPipeline",
-    "CosmosDreamsOmniPipeline",
-    "Cosmos3InteractivePipeline",
 }
 
 
@@ -611,8 +599,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "CosmosDreamsPipeline": "get_cosmos_dreams_post_process_func",
-    "CosmosDreamsOmniPipeline": "get_cosmos_dreams_post_process_func",
-    "Cosmos3InteractivePipeline": "get_cosmos_dreams_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
@@ -627,8 +613,6 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
     "CosmosDreamsPipeline": "get_cosmos_dreams_ir_op_priority_func",
-    "CosmosDreamsOmniPipeline": "get_cosmos_dreams_ir_op_priority_func",
-    "Cosmos3InteractivePipeline": "get_cosmos_dreams_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -661,8 +645,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "CosmosDreamsPipeline": "get_cosmos_dreams_pre_process_func",
-    "CosmosDreamsOmniPipeline": "get_cosmos_dreams_pre_process_func",
-    "Cosmos3InteractivePipeline": "get_cosmos_dreams_pre_process_func",
 }
 
 

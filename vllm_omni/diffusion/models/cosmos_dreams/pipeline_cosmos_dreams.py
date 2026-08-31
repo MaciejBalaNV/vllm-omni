@@ -118,6 +118,9 @@ def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
+# The registry resolves process funcs by name against this model's own
+# module, so reusing the Cosmos3 implementations means re-exporting them
+# under a Cosmos-Dreams name rather than registering them directly.
 def get_cosmos_dreams_post_process_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_post_process_func(od_config)
 
@@ -127,11 +130,10 @@ def get_cosmos_dreams_ir_op_priority_func(od_config: OmniDiffusionConfig):
 
 
 class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
-    """Cosmos3-Interactive inference with dense-or-paged persistent GEN K/V.
+    """Cosmos3-Interactive inference over persistent paged GEN K/V.
 
-    The default diffusion engine exercises the dense numerical-oracle path.
-    When the AR-Diffusion runner binds a state, the exact same attention uses
-    paged storage and gathers one layer of immutable history at a time.
+    Requires the AR-Diffusion runner: history lives only in the runner-owned
+    paged pool, so every forward runs inside a bound session.
     """
 
     # The engine's generic warmup request is 512x512 with a one-step sampler,
@@ -1096,8 +1098,3 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 },
             }
         return DiffusionOutput(output=output, stage_durations=tick_durations)
-
-
-# Export-manifest aliases used while the upstream name settles.
-CosmosDreamsOmniPipeline = CosmosDreamsPipeline
-Cosmos3InteractivePipeline = CosmosDreamsPipeline
