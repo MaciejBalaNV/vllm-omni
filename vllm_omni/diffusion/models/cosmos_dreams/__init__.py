@@ -9,12 +9,10 @@ from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
 )
 
 __all__ = [
-    "Cosmos3InteractivePipeline",
     "CosmosDreamsActionSchema",
     "CosmosDreamsActionConditioning",
     "CosmosDreamsControlVideoConditioning",
     "CosmosDreamsManifest",
-    "CosmosDreamsOmniPipeline",
     "CosmosDreamsPipeline",
     "get_cosmos_dreams_post_process_func",
     "get_cosmos_dreams_pre_process_func",
@@ -24,8 +22,6 @@ __all__ = [
 def __getattr__(name: str):
     if name in {
         "CosmosDreamsPipeline",
-        "CosmosDreamsOmniPipeline",
-        "Cosmos3InteractivePipeline",
         "get_cosmos_dreams_pre_process_func",
         "get_cosmos_dreams_post_process_func",
     }:
