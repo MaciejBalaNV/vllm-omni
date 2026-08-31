@@ -7,12 +7,11 @@ import argparse
 from pathlib import Path
 
 import torch
-from demo_support import load_scene_bundle
-
-from vllm_omni.diffusion.models.cosmos_dreams.controller import (
+from controller import (
     AgiBotKeyboardController,
     build_scheduled_action_chunk,
 )
+from demo_support import load_scene_bundle
 
 
 def parse_args() -> argparse.Namespace:

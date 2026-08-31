@@ -17,7 +17,6 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     Cosmos3VFMTransformer,
     _apply_rotary_pos_emb,
     _tf_config_get,
-    compute_mrope_position_ids_text,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 from vllm_omni.diffusion.models.cosmos_dreams.utils import (
@@ -244,33 +243,6 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
     def num_kv_heads_local(self) -> int:
         return self.num_key_value_heads // get_tensor_model_parallel_world_size()
 
-    def encode_text_kv(
-        self,
-        text_ids: torch.Tensor,
-        text_mask: torch.Tensor,
-    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], int]:
-        """Return post-RoPE UND K/V trimmed to the real prompt length."""
-        if text_ids.shape != text_mask.shape or text_ids.shape[0] != 1:
-            raise ValueError(
-                "Cosmos-Dreams text IDs/mask must have matching batch-one shape, "
-                f"got {tuple(text_ids.shape)} and {tuple(text_mask.shape)}"
-            )
-        real_len = int(text_mask[0].sum().item())
-        if real_len <= 0:
-            raise ValueError("Cosmos-Dreams prompt must contain at least one real text token")
-        position_ids, _ = compute_mrope_position_ids_text(real_len, temporal_offset=0)
-        if real_len < text_ids.shape[1]:
-            position_ids = torch.cat(
-                [position_ids, torch.zeros(3, text_ids.shape[1] - real_len, dtype=position_ids.dtype)],
-                dim=1,
-            )
-        position_ids = position_ids.unsqueeze(1).to(text_ids.device)
-        dummy = torch.empty(0, device=text_ids.device, dtype=self.proj_in.weight.dtype)
-        cos, sin = self.language_model.rotary_emb(dummy, position_ids=position_ids)
-        with self._offload_context("reasoner"):
-            full_kv = self.language_model(text_ids, (cos.unsqueeze(2), sin.unsqueeze(2)))
-        return [(key[:, :real_len], value[:, :real_len]) for key, value in full_kv], real_len
-
     @staticmethod
     def pad_text_kv(
         layer_kv: list[tuple[torch.Tensor, torch.Tensor]],
@@ -315,6 +287,8 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
                 temporal_modality_margin=self.temporal_modality_margin,
                 fps=fps,
                 base_fps=self.base_fps,
+                temporal_compression_factor=self.temporal_compression_factor,
+                enable_fps_modulation=self.enable_fps_modulation,
                 action_tokens_per_frame=self.manifest.action_tokens_per_frame,
                 null_action_frames=absolute_null_frames,
             )

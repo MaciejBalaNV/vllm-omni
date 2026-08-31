@@ -458,7 +458,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
             cached = [(entry["k"], entry["v"]) for entry in pooled]
         else:
-            raw_kv, real_len = self.transformer.encode_text_kv(text_ids, text_mask)
+            raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
             if real_len > self.manifest.text_cache_max_len:
                 raise ValueError(
                     f"Cosmos-Dreams prompt exceeds text_cache_max_len: {real_len} > {self.manifest.text_cache_max_len}."

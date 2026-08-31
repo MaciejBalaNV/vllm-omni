@@ -11,6 +11,10 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+    compute_mrope_position_ids_action,
+    compute_mrope_position_ids_vision,
+)
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 
 
@@ -105,6 +109,8 @@ def build_interleaved_mrope_position_ids(
     temporal_modality_margin: int,
     fps: float,
     base_fps: float = 24.0,
+    temporal_compression_factor: int = 4,
+    enable_fps_modulation: bool = True,
     action_tokens_per_frame: int = 4,
     null_action_frames: Iterable[int] = (),
 ) -> torch.Tensor:
@@ -128,37 +134,39 @@ def build_interleaved_mrope_position_ids(
     null_frames = {int(frame) for frame in null_action_frames}
     patch_count = grid_h * grid_w
     base_offset = float(text_temporal_offset + temporal_modality_margin)
-    frame_stride = float(base_fps) / float(fps)
-    position_parts: list[torch.Tensor] = []
-    h_ids = torch.arange(grid_h, dtype=torch.float32).view(-1, 1).expand(-1, grid_w).flatten()
-    w_ids = torch.arange(grid_w, dtype=torch.float32).view(1, -1).expand(grid_h, -1).flatten()
+    vision_ids, _ = compute_mrope_position_ids_vision(
+        grid_t=num_frames,
+        grid_h=grid_h,
+        grid_w=grid_w,
+        temporal_offset=base_offset,
+        fps=fps,
+        base_fps=base_fps,
+        temporal_compression_factor=temporal_compression_factor,
+        base_temporal_compression_factor=temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=frame_start,
+    )
+    # Each action token represents one pixel-rate step ending at its latent
+    # frame. Flattening the frame/action axes gives the base helper the exact
+    # sequence it expects; Dreams only owns the final per-frame interleaving.
+    action_start_offset = frame_start * action_tokens_per_frame - action_tokens_per_frame + 1
+    action_ids, _ = compute_mrope_position_ids_action(
+        grid_t=num_frames * action_tokens_per_frame,
+        temporal_offset=base_offset,
+        action_fps=fps,
+        base_fps=base_fps,
+        base_temporal_compression_factor=temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=action_start_offset,
+    )
 
-    for local_frame in range(num_frames):
-        absolute_frame = frame_start + local_frame
-        vision_t = base_offset + absolute_frame * frame_stride
-        if absolute_frame in null_frames and local_frame == 0:
-            action_t = torch.full((action_tokens_per_frame,), vision_t, dtype=torch.float32)
-        else:
-            substep = frame_stride / action_tokens_per_frame
-            action_t = (
-                vision_t
-                - frame_stride
-                + substep
-                * torch.arange(
-                    1,
-                    action_tokens_per_frame + 1,
-                    dtype=torch.float32,
-                )
-            )
-        zeros = torch.zeros(action_tokens_per_frame, dtype=torch.float32)
-        action_ids = torch.stack([action_t, zeros, zeros], dim=0)
-        vision_ids = torch.stack(
-            [torch.full((patch_count,), vision_t, dtype=torch.float32), h_ids, w_ids],
-            dim=0,
-        )
-        position_parts.extend((action_ids, vision_ids))
-
-    return torch.cat(position_parts, dim=1)
+    action_ids = action_ids.view(3, num_frames, action_tokens_per_frame)
+    vision_ids = vision_ids.view(3, num_frames, patch_count)
+    if frame_start in null_frames:
+        # The first null-action supertoken in an AR unit is colocated with its
+        # vision frame; later null frames retain the architectural action IDs.
+        action_ids[0, 0].fill_(vision_ids[0, 0, 0])
+    return torch.cat([action_ids, vision_ids], dim=2).flatten(1, 2)
 
 
 def zero_null_action_values(
