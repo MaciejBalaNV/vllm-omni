@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -68,6 +69,28 @@ def _admission_float(value: Any, name: str) -> float:
         return float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams {name} must be numeric, got {value!r}.") from exc
+
+
+@dataclass(frozen=True)
+class _RequestControls:
+    """One request's control fields, normalized across both tick transports.
+
+    The typed ``ar_diffusion_tick`` envelope and the flat ``extra_args``
+    mapping carry the same information, so normalizing once keeps admission
+    free of per-field protocol branching. ``None`` means "not supplied": the
+    defaults that depend on session state stay at their use site.
+    """
+
+    session_id: str
+    reset: bool
+    close_session: bool
+    tick: bool
+    measure_tick_latency: bool
+    domain_id: Any
+    domain_name: Any
+    frame_idx: Any
+    num_latent_frames: Any
+    action: Any
 
 
 def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
@@ -212,39 +235,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- AR-Diffusion pipeline capability ---------------------------------
 
-    def _validate_ar_diffusion_deploy_overrides(self) -> None:
-        od_config = getattr(self, "od_config", None)
-        raw = getattr(od_config, "ar_diffusion_kv_config", None)
-        if raw is None:
-            model_config = getattr(od_config, "model_config", None)
-            if isinstance(model_config, dict):
-                raw = model_config.get("ar_diffusion_kv_config")
-        if raw is None:
-            return
-
-        def configured(name: str, default: Any) -> Any:
-            if isinstance(raw, dict):
-                return raw.get(name, default)
-            return getattr(raw, name, default)
-
-        actual_window = configured("window_chunks", None) or self.manifest.window_frames
-        actual_sink = configured("sink_chunks", 0) or self.manifest.sink_frames
-        actual_reset = bool(configured("reset_at_boundary", False))
-        mismatches = []
-        if int(actual_window) != self.manifest.window_frames:
-            mismatches.append(f"window_chunks={actual_window} (manifest={self.manifest.window_frames})")
-        if int(actual_sink) != self.manifest.sink_frames:
-            mismatches.append(f"sink_chunks={actual_sink} (manifest={self.manifest.sink_frames})")
-        if actual_reset:
-            mismatches.append("reset_at_boundary=True (manifest=False)")
-        if mismatches:
-            raise ValueError(
-                "Cosmos-Dreams AR-Diffusion window geometry is fixed by the model manifest; "
-                "deployment overrides would diverge from the dense oracle: " + ", ".join(mismatches)
-            )
-
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        self._validate_ar_diffusion_deploy_overrides()
         return ARDiffusionKVCacheSpec(
             num_layers=self.transformer.num_hidden_layers,
             num_kv_heads=self.transformer.num_kv_heads_local,
@@ -261,12 +252,14 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
 
     def _validate_bound_kv_geometry(self, state) -> None:
-        """Reject engine overrides that would diverge from the dense oracle.
+        """Reject a resolved KV cache that contradicts the model manifest.
 
         ``window_frames`` and ``sink_frames`` are checkpoint-manifest semantics
-        for Cosmos-Dreams, not performance-only engine knobs. The generic AR
-        runner permits deployment overrides for other models, so validate the
-        resolved cache here before it can be bound to a model session.
+        for Cosmos-Dreams, not performance-only engine knobs, but the generic AR
+        runner lets a deployment override the values this pipeline reports in
+        ``ar_diffusion_kv_cache_spec()``. This is the single geometry gate: it
+        reads the cache the runner actually built, so it covers both an
+        override and any clamping the runner applied on top of it.
         """
 
         cache = state.kv_cache
@@ -389,6 +382,37 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 "or close_session=True at end."
             )
 
+    def _request_controls(self, sp, extra: Mapping, typed_tick) -> _RequestControls:
+        """Read one request's controls from whichever transport supplied them."""
+
+        if typed_tick is not None:
+            typed = parse_cosmos_dreams_tick(typed_tick)
+            return _RequestControls(
+                session_id=str(typed_tick.session_id),
+                reset=typed_tick.reset,
+                close_session=typed_tick.close_session,
+                tick=True,
+                measure_tick_latency=typed.measure_tick_latency,
+                domain_id=typed.domain_id,
+                domain_name=typed.domain_name,
+                frame_idx=typed.frame_idx,
+                num_latent_frames=typed.num_latent_frames,
+                action=typed.action,
+            )
+        tick = bool(extra.get("chunk_only", False))
+        return _RequestControls(
+            session_id=str(extra.get("session_id") or self._bound_session_id or "default"),
+            reset=bool(extra.get("reset", False)),
+            close_session=bool(extra.get("close_session", False)),
+            tick=tick,
+            measure_tick_latency=tick and bool(extra.get("measure_tick_latency", False)),
+            domain_id=self._get_sp_param(sp, "domain_id", None),
+            domain_name=self._get_sp_param(sp, "domain_name", None),
+            frame_idx=extra.get("frame_idx"),
+            num_latent_frames=extra.get("num_latent_frames"),
+            action=self._get_sp_param(sp, "action", None),
+        )
+
     # -- Session and conditioning -----------------------------------------
 
     def _get_or_create_state(self, session_id: str) -> CosmosDreamsSessionState:
@@ -496,13 +520,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _prepare_raw_action(
         self,
-        sp,
         *,
         embodiment: str,
-        action_value: Any = None,
+        action_value: Any,
     ) -> torch.Tensor | None:
-        if action_value is None:
-            action_value = self._get_sp_param(sp, "action", None)
         if action_value is None:
             return None
         action = load_action_tensor(action_value)
@@ -712,9 +733,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             # survives for a corrected retry or an explicit reset.
             raise
         except Exception:
-            extra = req.sampling_params.extra_args or {}
-            session_id = str(extra.get("session_id") or self._bound_session_id or "default")
-            self._drop_session(session_id)
+            # Binding is mandatory, so the bound id is the request's session.
+            self._drop_session(self._bound_session_id)
             raise
 
     def _forward_impl(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -743,7 +763,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
         try:
             typed_tick = ARDiffusionTickRequest.from_extra_args(extra)
-            typed_inputs = parse_cosmos_dreams_tick(typed_tick) if typed_tick is not None else None
+            controls = self._request_controls(sp, extra, typed_tick)
         except ValueError as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if typed_tick is not None:
@@ -751,24 +771,16 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ARDiffusionRequestRejectedError(
                     "Cosmos-Dreams ar_diffusion_tick.prompt must match the standard request prompt."
                 )
-        session_id = str(
-            typed_tick.session_id
-            if typed_tick is not None
-            else extra.get("session_id") or self._bound_session_id or "default"
-        )
+        session_id = controls.session_id
         if self._bound_session_id is not None and session_id != self._bound_session_id:
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams request session {session_id!r} does not match bound session {self._bound_session_id!r}."
             )
 
-        reset = typed_tick.reset if typed_tick is not None else bool(extra.get("reset", False))
-        close_session = typed_tick.close_session if typed_tick is not None else bool(extra.get("close_session", False))
-        tick = typed_tick is not None or bool(extra.get("chunk_only", False))
-        measure_tick_latency = tick and (
-            typed_inputs.measure_tick_latency
-            if typed_inputs is not None
-            else bool(extra.get("measure_tick_latency", False))
-        )
+        reset = controls.reset
+        close_session = controls.close_session
+        tick = controls.tick
+        measure_tick_latency = controls.measure_tick_latency
         tick_output_type = "latent" if sp.output_type == "latent" else "video"
         existing_state = self._states.get(session_id)
         if reset or existing_state is None or existing_state.fingerprint is None:
@@ -800,10 +812,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
-        domain_name = (
-            typed_inputs.domain_name if typed_inputs is not None else self._get_sp_param(sp, "domain_name", None)
-        )
-        domain_value = typed_inputs.domain_id if typed_inputs is not None else self._get_sp_param(sp, "domain_id", None)
+        domain_name = controls.domain_name
+        domain_value = controls.domain_id
         if domain_value is None and domain_name is None:
             domain_value = self.default_domain_id
         if domain_value is not None:
@@ -860,10 +870,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             embodiment=embodiment,
         )
         start_frame = 0 if state_was_new else existing_state.next_frame_idx
-        requested_frame_idx = _admission_int(
-            typed_inputs.frame_idx if typed_inputs is not None else extra.get("frame_idx", start_frame),
-            "frame_idx",
-        )
+        requested_frame_idx = _admission_int(_first_not_none(controls.frame_idx, start_frame), "frame_idx")
         if state_was_new:
             if requested_frame_idx != 0:
                 raise ARDiffusionRequestRejectedError(
@@ -880,11 +887,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 )
 
         try:
-            raw_action = self._prepare_raw_action(
-                sp,
-                embodiment=embodiment,
-                action_value=typed_inputs.action if typed_inputs is not None else None,
-            )
+            raw_action = self._prepare_raw_action(embodiment=embodiment, action_value=controls.action)
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         try:
@@ -898,11 +901,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
         if tick:
             tick_frames = _admission_int(
-                (
-                    typed_inputs.num_latent_frames
-                    if typed_inputs is not None
-                    else extra.get("num_latent_frames", self.manifest.chunk_size)
-                ),
+                _first_not_none(controls.num_latent_frames, self.manifest.chunk_size),
                 "num_latent_frames",
             )
             if tick_frames <= 0:
