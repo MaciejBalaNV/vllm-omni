@@ -7,7 +7,7 @@ import math
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -681,14 +681,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> torch.Tensor:
         """Decode only the new tick block with session-owned Wan features."""
 
-        execution_context = getattr(self.vae, "_execution_context", None)
-        with execution_context() if callable(execution_context) else nullcontext():
-            result = decode_wan_causal_chunk(
-                self.vae,
-                self._denormalize_vae_latents(latents),
-                feature_cache=state.vae_decoder_feat_cache,
-                initialized=state.vae_decoder_initialized,
-            )
+        result = decode_wan_causal_chunk(
+            self.vae,
+            self._denormalize_vae_latents(latents),
+            feature_cache=state.vae_decoder_feat_cache,
+            initialized=state.vae_decoder_initialized,
+        )
         state.record_incremental_decode(
             input_frames=int(latents.shape[2]),
             feature_cache=result.feature_cache,
