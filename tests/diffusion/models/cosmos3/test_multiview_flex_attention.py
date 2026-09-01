@@ -740,3 +740,27 @@ def test_backend_validation_is_reusable_and_lists_choices() -> None:
     assert validate_multiview_backend("triton") == "triton"
     with pytest.raises(ValueError, match=r"must be one of \['fa4', 'triton'\]"):
         validate_multiview_backend("tirton")
+
+
+def test_fa4_layout_registers_the_opaque_kernel_op() -> None:
+    """The FA4 launch must reach Dynamo as one custom op, not as traced CuTe.
+
+    Calling ``flash_attn.cute``'s entry point directly from the regionally
+    compiled GEN block makes Dynamo trace FA4's JIT compile-cache lookup and
+    guard on that cache's contents; the CUTLASS ``arith.const`` frame then hits
+    the recompile limit and the process falls back to eager.  Constructing an
+    fa4 layout is what registers the boundary, and it happens host-side so the
+    registration never runs under Dynamo.
+    """
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+
+    MultiviewLayout(
+        num_views=2,
+        latent_frames=8,
+        patch_height=4,
+        patch_width=4,
+        backend="fa4",
+        max_und_tokens=_FA4_MAX_UND,
+    )
+
+    assert hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4")

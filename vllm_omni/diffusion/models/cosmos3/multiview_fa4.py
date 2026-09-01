@@ -160,6 +160,94 @@ def _validate(
         raise ValueError("Cosmos3 multiview FA4 k_group_ids must have one entry per padded key token.")
 
 
+# Wrapping the FA4 launch as a torch.library custom op keeps it opaque to
+# torch.compile, mirroring the SageAttention3 and FastVideo VSA backends.  FA4's
+# Python entry point is a JIT compile-cache lookup, so a raw call lets Dynamo
+# trace flash_attn/cute/interface.py, cache_utils.py and the CUTLASS DSL and
+# then guard on the *contents* of FA4's own kernel cache
+# (``___dict_contains(..., _flash_attn_fwd.compile_cache.cache)``).  Those
+# guards fail as FA4 compiles more kernels, and the CUTLASS ``arith.const``
+# frame reaches Dynamo's recompile limit and is dropped to eager for the rest of
+# the process.  The custom op gives Dynamo one Tensor -> Tensor boundary
+# instead, so the surrounding GEN block stays a single graph.  The hasattr guard
+# keeps this idempotent across test re-imports that pop the module from
+# sys.modules.
+if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
+
+    @torch.library.custom_op("vllm_omni::cosmos3_multiview_fa4", mutates_args=())
+    def _cosmos3_multiview_fa4_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        partial_counts: torch.Tensor,
+        partial_indices: torch.Tensor,
+        full_counts: torch.Tensor,
+        full_indices: torch.Tensor,
+        q_word_base: torch.Tensor,
+        k_group_ids: torch.Tensor,
+        allowed_words: torch.Tensor,
+        q_block_size: int,
+        kv_block_size: int,
+    ) -> torch.Tensor:
+        """``MultiviewBlockSparsity`` flattened to the tensors/ints a schema allows.
+
+        The ``mask_mod`` cannot cross the boundary -- it is a ``cute.jit``
+        callable, not a schema type -- so it is re-resolved here from the
+        process-level ``_load_fa4`` singleton, which costs one dict lookup.
+        """
+        entry = _load_fa4()
+        # FA4 accepts singleton batch/head dims and broadcasts them; the
+        # multiview mask is identical across both.
+        block_sparse = entry.block_sparse_cls(
+            mask_block_cnt=partial_counts[None, None],
+            mask_block_idx=partial_indices[None, None],
+            full_block_cnt=full_counts[None, None],
+            full_block_idx=full_indices[None, None],
+            block_size=(q_block_size, kv_block_size),
+        )
+        out = entry.flash_attn_func(
+            q,
+            k,
+            v,
+            mask_mod=entry.mask_mod,
+            # Same order as MultiviewBlockSparsity.aux_tensors(), which is the
+            # order _build_mask_mod indexes them in.
+            aux_tensors=[q_word_base, k_group_ids, allowed_words],
+            block_sparse_tensors=block_sparse,
+            # pack_gqa is left to FA4's own heuristic.  Cosmos3 defaults to 32 query
+            # heads over 8 KV heads, so packing matters here, and FA4 handles it with
+            # a head-broadcast block map: it maps packed row blocks back through
+            # block_sparse_utils.sparse_tensor_m_block, and only force-disables
+            # packing when the map's head dim is not 1 (ours is).
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+        # FA4 may hand back a view of its own workspace; a custom op must not
+        # return a tensor aliasing anything it does not own.
+        return out.contiguous()
+
+    @_cosmos3_multiview_fa4_op.register_fake
+    def _(
+        q,
+        k,
+        v,
+        partial_counts,
+        partial_indices,
+        full_counts,
+        full_indices,
+        q_word_base,
+        k_group_ids,
+        allowed_words,
+        q_block_size,
+        kv_block_size,
+    ):
+        # FA4 returns the query layout unchanged: [B, S_q_padded, H_q, D].
+        return torch.empty_like(q)
+
+
+_cosmos3_multiview_fa4_op = torch.ops.vllm_omni.cosmos3_multiview_fa4
+
+
 def multiview_fa4_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -170,8 +258,14 @@ def multiview_fa4_attention(
 
     ``softmax_scale`` is left to FA4's default of ``1/sqrt(head_dim)``, which is
     also the FlexAttention default the Triton path relies on.
+
+    Validation stays outside the custom op so shape errors name this function
+    rather than a schema mismatch, and because it only reads sizes the layout
+    already fixes -- no per-request guard comes out of it.  ``_load_fa4`` is
+    deliberately *not* called here: touching that global from traced code would
+    make Dynamo guard on a NamedTuple of CuTe callables, which is the thing this
+    boundary exists to avoid.
     """
-    entry = _load_fa4()
     _validate(q, k, v, sparsity)
 
     if (sparsity.q_block_size, sparsity.kv_block_size) != (256, 128):
@@ -181,28 +275,17 @@ def multiview_fa4_attention(
             f"({sparsity.q_block_size}, {sparsity.kv_block_size})."
         )
 
-    # FA4 accepts singleton batch/head dims and broadcasts them; the multiview
-    # mask is identical across both.
-    block_sparse = entry.block_sparse_cls(
-        mask_block_cnt=sparsity.partial_counts[None, None],
-        mask_block_idx=sparsity.partial_indices[None, None],
-        full_block_cnt=sparsity.full_counts[None, None],
-        full_block_idx=sparsity.full_indices[None, None],
-        block_size=(sparsity.q_block_size, sparsity.kv_block_size),
-    )
-    out = entry.flash_attn_func(
+    return _cosmos3_multiview_fa4_op(
         q,
         k,
         v,
-        mask_mod=entry.mask_mod,
-        aux_tensors=sparsity.aux_tensors(),
-        block_sparse_tensors=block_sparse,
-        # pack_gqa is left to FA4's own heuristic.  Cosmos3 defaults to 32 query
-        # heads over 8 KV heads, so packing matters here, and FA4 handles it with
-        # a head-broadcast block map: it maps packed row blocks back through
-        # block_sparse_utils.sparse_tensor_m_block, and only force-disables
-        # packing when the map's head dim is not 1 (ours is).
+        sparsity.partial_counts,
+        sparsity.partial_indices,
+        sparsity.full_counts,
+        sparsity.full_indices,
+        sparsity.q_word_base,
+        sparsity.k_group_ids,
+        sparsity.allowed_words,
+        sparsity.q_block_size,
+        sparsity.kv_block_size,
     )
-    if isinstance(out, tuple):
-        out = out[0]
-    return out

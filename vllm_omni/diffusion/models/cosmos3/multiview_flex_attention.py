@@ -162,6 +162,14 @@ class MultiviewLayout:
     def __post_init__(self) -> None:
         _validate_attention_scope(self.attention_scope)
         validate_multiview_backend(self.backend)
+        if self.backend == "fa4":
+            # Importing here registers vllm_omni::cosmos3_multiview_fa4 while we
+            # are still host-side.  The attention call site imports the module
+            # lazily too, but that site is inside the regionally compiled GEN
+            # block, and registering a torch.library op from under Dynamo is not
+            # something to rely on.  The module itself defers every CuTe/CUTLASS
+            # import to _load_fa4, so this stays safe on CPU-only hosts.
+            from . import multiview_fa4  # noqa: F401
         if self.max_und_tokens <= 0:
             raise ValueError(f"Cosmos3 multiview max_und_tokens must be positive, got {self.max_und_tokens}.")
         if self.num_views <= 0 or self.latent_frames <= 0:
