@@ -1,10 +1,11 @@
 # Cosmos-Dreams offline parity runner
 
-This runner accepts the reference interactive jsonl plus its optional pickle
+This runner accepts the reference interactive JSONL plus an optional NPZ
 payload. A record may contain `prompt`/`ai_caption`, `input_video`/`video`/`image`,
 `action`, `fps`/`conditioning_fps`, `domain_id`, and
-`domain_name`/`embodiment`, or point to a pickle with `pickle_path`,
-`pkl_path`, or `data_path`. The first source frame is used as the causal prefix;
+`domain_name`/`embodiment`, or point to an NPZ file with `npz_path` or
+`data_path`. NPZ object arrays are rejected; store strings as NumPy Unicode
+scalars and tensors as numeric arrays. The first source frame is used as the causal prefix;
 action rows are validated and normalized using the selected embodiment's
 exported raw dimension, layout, and normalizer before being padded to 64
 dimensions. Mixed-layout checkpoints select the entry through `domain_name` or
