@@ -201,7 +201,6 @@ def test_cosmos3_multiview_extra_registry() -> None:
         {
             "multiview",
             "wsm",
-            "attention_scope",
             "flow_shift",
             "max_sequence_length",
             "negative_prompt",

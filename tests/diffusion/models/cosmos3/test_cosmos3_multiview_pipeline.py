@@ -187,7 +187,6 @@ def test_multiview_pipeline_registration_contract() -> None:
         _DIFFUSION_IR_OP_PRIORITY_FUNCS,
         _DIFFUSION_MODELS,
         _DIFFUSION_POST_PROCESS_FUNCS,
-        _DIFFUSION_PRE_PROCESS_FUNCS,
         _NO_CACHE_ACCELERATION,
     )
 
@@ -196,7 +195,6 @@ def test_multiview_pipeline_registration_contract() -> None:
         "pipeline_cosmos3_multiview",
         "Cosmos3MultiviewPipeline",
     )
-    assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_multiview_pre_process_func"
     assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_post_process_func"
     assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_ir_op_priority_func"
     assert "Cosmos3MultiviewPipeline" in _NO_CACHE_ACCELERATION

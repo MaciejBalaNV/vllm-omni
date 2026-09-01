@@ -19,16 +19,15 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .multiview_flex_attention import (
+    DEFAULT_MAX_UND_TOKENS,
     MultiviewLayout,
     expand_multiview_condition_frame_indexes,
     validate_multiview_backend,
 )
 from .pipeline_cosmos3 import (
-    COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH,
     COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE,
     COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS,
     COSMOS3_TRANSFER_SYSTEM_PROMPT,
@@ -40,6 +39,7 @@ from .pipeline_cosmos3 import (
 from .transfer import (
     IMAGE_EXTENSIONS,
     TRANSFER_HINT_KEYS,
+    as_bool,
     media_to_uint8_cthw,
     uint8_cthw_to_normalized_5d,
 )
@@ -54,17 +54,11 @@ COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 93
 COSMOS3_MULTIVIEW_DEFAULT_FPS = 10.0
 
-# The sparse attention pads its UND stream to a fixed capacity so the compiled
-# kernel sees one shape for the whole process (see MultiviewLayout.max_und_tokens).
-# That makes the prompt ceiling variant-owned rather than per-request: a request
-# may lower max_sequence_length, but raising it would resize the packed key
-# tensor and reintroduce a recompile per prompt length. Bump this constant if the
-# golden fixture ever shows the reference negative prompt being truncated.
-COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
-# _tokenize_prompt truncates to max_sequence_length and then appends eos and
-# vision_start, so this is the longest UND stream the transformer can ever see.
+# The tokenizer appends eos and vision_start after truncating. Derive the
+# request ceiling from the sparse attention's single fixed UND capacity so the
+# two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
-COSMOS3_MULTIVIEW_MAX_UND_TOKENS = COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH + COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
+COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
 COSMOS3_MULTIVIEW_EMPHASIS = (
     "Follow the wsm control videos precisely for every camera view: shape, contour, position, and motion must "
     "align with the wsm signal at every frame."
@@ -88,14 +82,6 @@ def _mapping(value: Any, name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError(f"Cosmos3 multiview {name} must be an object, got {type(value).__name__}.")
     return value
-
-
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
 
 
 def _media_kind(value: Any) -> str:
@@ -170,16 +156,6 @@ def _resolve_multiview_resolution(sp: Any, multiview: Mapping[str, Any]) -> str:
     return str(resolution)
 
 
-def get_cosmos3_multiview_pre_process_func(od_config: OmniDiffusionConfig):
-    """Multiview media is declared per camera and prepared inside the pipeline."""
-    del od_config
-
-    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        return request
-
-    return pre_process_func
-
-
 class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     """Bidirectional one-shot 11-view RGB generation with WSM control."""
 
@@ -237,7 +213,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3 multiview max_views must equal the exported camera list length: "
                 f"max_views={max_views}, cameras={len(self.multiview_cameras)}."
             )
-        if not _as_bool(multiview_config.get("share_vision_temporal_positions", True), True):
+        if not as_bool(multiview_config.get("share_vision_temporal_positions", True), True):
             raise ValueError("Cosmos3 multiview requires share_vision_temporal_positions=true.")
         self.multiview_attention_scope = str(multiview_config.get("attention_scope", "same_view_or_frame"))
         self.multiview_backend = self._resolve_attention_backend(multiview_config)
@@ -491,7 +467,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if frame_rate != COSMOS3_MULTIVIEW_DEFAULT_FPS:
             raise ValueError(f"Cosmos3 multiview v1 is pinned to 10 FPS, got {frame_rate}.")
 
-        condition_video_as_image = _as_bool(multiview.get("condition_video_as_image"), False)
+        condition_video_as_image = as_bool(multiview.get("condition_video_as_image"), False)
         has_vision = self._view_value(views[0], "vision") is not None
         vision_kind = _media_kind(self._view_value(views[0], "vision")) if has_vision else None
         target_pixels = None
@@ -553,12 +529,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 f"control={tuple(control_latents.shape)}, target={tuple(latents.shape)}."
             )
 
-        requested_scope = self._get_sp_param(sp, "attention_scope", self.multiview_attention_scope)
-        if requested_scope != self.multiview_attention_scope:
-            raise ValueError(
-                "Cosmos3 multiview attention_scope is checkpoint-defined and read-only: "
-                f"expected={self.multiview_attention_scope!r}, got={requested_scope!r}."
-            )
         max_sequence_length = int(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
             or COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
@@ -578,7 +548,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             condition_frame_indexes=tuple(condition_indexes),
             attention_scope=self.multiview_attention_scope,  # type: ignore[arg-type]
             backend=self.multiview_backend,
-            max_und_tokens=COSMOS3_MULTIVIEW_MAX_UND_TOKENS,
         )
 
         # Same contract as the other Cosmos3 pipelines: no packaged default, an
@@ -667,6 +636,5 @@ __all__ = [
     "COSMOS3_MADS_CAMERAS",
     "Cosmos3MultiviewPipeline",
     "get_cosmos3_ir_op_priority_func",
-    "get_cosmos3_multiview_pre_process_func",
     "get_cosmos3_post_process_func",
 ]
