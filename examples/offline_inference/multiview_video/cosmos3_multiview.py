@@ -111,10 +111,12 @@ def main() -> None:
         model=args.model,
         dtype="bfloat16",
         model_class_name="Cosmos3MultiviewPipeline",
-        enforce_eager=True,
+        enforce_eager=False,
         ulysses_degree=1,
         ring_degree=1,
         cfg_parallel_size=1,
+        diffusion_compile_granularity="regional",
+        diffusion_compile_dynamic=False,
     )
     result = omni.generate(prompt, sampling_params)
     video, metadata = _extract_payload(result)
