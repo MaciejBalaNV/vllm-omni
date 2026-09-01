@@ -264,6 +264,17 @@ class CosmosDreamsActionSchema(_StrictModel):
         }
 
     @property
+    def digest(self) -> str:
+        """Identity of the whole contract, provenance included.
+
+        Reached dynamically as ``getattr(conditioning, "digest")`` by
+        ``CosmosDreamsManifest.conditioning_digest``, so a search for
+        ``.digest`` callers will not find it.
+        """
+
+        return canonical_sha256(self.model_dump(mode="json", exclude_none=True))
+
+    @property
     def embodiment_to_domain(self) -> dict[str, int]:
         return {name: contract.domain_id for name, contract in self.embodiments.items()}
 
