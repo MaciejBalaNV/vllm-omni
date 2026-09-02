@@ -28,3 +28,7 @@ python examples/offline_inference/cosmos_dreams/cosmos_dreams.py \
 Use `--output-type latent --output sample_0.pt` for the pre-VAE parity gate.
 Full rollouts send both `reset=True` and `close_session=True`, preventing the
 default session from leaking history into the next sample.
+
+Omit both `--height` and `--width` to infer an aligned, aspect-preserving
+canvas from the input media, or to use the deployment default when the record
+has no media. Supply both flags to request any policy-valid explicit canvas.

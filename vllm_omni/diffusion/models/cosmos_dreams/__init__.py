@@ -7,15 +7,23 @@ from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
     CosmosDreamsActionConditioning,
     CosmosDreamsControlVideoConditioning,
 )
+from vllm_omni.diffusion.models.cosmos_dreams.geometry import (
+    CosmosDreamsGeometry,
+    CosmosDreamsResolutionPolicy,
+    resolve_cosmos_dreams_geometry,
+)
 
 __all__ = [
     "CosmosDreamsActionSchema",
     "CosmosDreamsActionConditioning",
     "CosmosDreamsControlVideoConditioning",
+    "CosmosDreamsGeometry",
     "CosmosDreamsManifest",
     "CosmosDreamsPipeline",
+    "CosmosDreamsResolutionPolicy",
     "get_cosmos_dreams_post_process_func",
     "get_cosmos_dreams_pre_process_func",
+    "resolve_cosmos_dreams_geometry",
 ]
 
 
