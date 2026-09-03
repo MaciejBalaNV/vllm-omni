@@ -9,7 +9,7 @@
 # pipeline cannot be auto-detected and must be selected explicitly:
 #
 #   vllm serve nvidia/Cosmos3-Nano-Policy-DROID --omni \
-#     --deploy-config cosmos3_policy_droid.yaml
+#     --deploy-config /absolute/path/to/vllm-omni/vllm_omni/deploy/cosmos3_policy_droid.yaml
 #
 # Per-checkpoint model_config tweaks (e.g. policy_server_config values) can
 # still be layered on top with --stage-overrides; dict overrides deep-merge

@@ -15,7 +15,7 @@ Cosmos3OmniDiffusersPipeline``) with the T2I/video Cosmos3 checkpoints, which
 must keep resolving through the default single-stage diffusion fallback.
 Select this pipeline explicitly via a deploy yaml ``pipeline:`` key, e.g.
 ``vllm serve nvidia/Cosmos3-Nano-Policy-DROID --omni --deploy-config
-cosmos3_policy_droid.yaml``.
+/absolute/path/to/vllm-omni/vllm_omni/deploy/cosmos3_policy_droid.yaml``.
 """
 
 from vllm_omni.config.stage_config import (

@@ -300,10 +300,11 @@ PY
 # with the T2I/video Cosmos3 checkpoints — so --deploy-config is required.
 # Per-checkpoint model_config tweaks can be layered on top with
 # --stage-overrides; dict overrides deep-merge with the deploy yaml.
+export VLLM_OMNI_ROOT=/absolute/path/to/vllm-omni
 vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   --omni \
   --host 0.0.0.0 --port 8000 \
-  --deploy-config cosmos3_policy_droid.yaml \
+  --deploy-config "$VLLM_OMNI_ROOT/vllm_omni/deploy/cosmos3_policy_droid.yaml" \
   --robot-openpi-idle-timeout 0
 
 # From a RoboLab checkout:

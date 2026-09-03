@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
 from functools import wraps
 from inspect import Parameter, signature
+from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field, model_validator
@@ -47,7 +48,6 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
-    resolve_deploy_config_path,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -330,6 +330,18 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
     return result
 
 
+def _resolve_deploy_path(deploy_config_path: str) -> Path:
+    deploy_path = Path(deploy_config_path)
+    if not deploy_path.exists() and deploy_path.parent == Path("."):
+        bare_name = deploy_path.name
+        if not bare_name.endswith(".yaml"):
+            bare_name = f"{bare_name}.yaml"
+        candidate = _DEPLOY_DIR / bare_name
+        if candidate.exists():
+            return candidate
+    return deploy_path
+
+
 def _get_deploy_config(
     pipeline_cfg: PipelineConfig,
     user_deploy_config: DeployConfig | None,
@@ -337,11 +349,11 @@ def _get_deploy_config(
 ) -> tuple[DeployConfig, str | None]:
     """Select user-provided, pipeline-default, or empty deploy settings."""
     if user_deploy_config is not None:
-        loaded_path = str(resolve_deploy_config_path(deploy_config_path)) if deploy_config_path is not None else None
+        loaded_path = str(_resolve_deploy_path(deploy_config_path)) if deploy_config_path is not None else None
         return copy.deepcopy(user_deploy_config), loaded_path
 
     if deploy_config_path is not None:
-        resolved_path = resolve_deploy_config_path(deploy_config_path)
+        resolved_path = _resolve_deploy_path(deploy_config_path)
         if not resolved_path.exists():
             raise FileNotFoundError(f"Deploy config not found: {resolved_path}")
         return load_deploy_config(resolved_path), str(resolved_path)

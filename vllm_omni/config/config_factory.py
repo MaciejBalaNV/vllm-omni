@@ -8,6 +8,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from transformers import PretrainedConfig
@@ -29,7 +30,6 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     normalize_pipeline_cli_overrides,
-    resolve_deploy_config_path,
 )
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
@@ -342,7 +342,11 @@ class StageConfigFactory:
         """Load an explicit deploy YAML once for resolution and construction."""
         if deploy_config_path is None:
             return None
-        deploy_path = resolve_deploy_config_path(deploy_config_path)
+        deploy_path = Path(deploy_config_path)
+        if not deploy_path.exists() and deploy_path.parent == Path("."):
+            candidate = _DEPLOY_DIR / deploy_path
+            if candidate.exists():
+                deploy_path = candidate
         if not deploy_path.exists():
             raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
         return load_deploy_config(deploy_path)
