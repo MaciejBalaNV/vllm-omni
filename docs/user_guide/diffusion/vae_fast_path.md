@@ -89,3 +89,11 @@ convolution share and any layout-transpose kernels:
 python benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \
     --size 1280x720 --frames 189 --fast-path off,lossless,channels_last --profile
 ```
+
+The same script benchmarks multi-GPU VAE decode when launched with `torchrun`;
+the decode is timed across all ranks and rank 0 reports:
+
+```bash
+torchrun --nproc-per-node 2 benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \
+    --vae-patch-parallel-size 2 --vae-parallel-mode tile
+```
