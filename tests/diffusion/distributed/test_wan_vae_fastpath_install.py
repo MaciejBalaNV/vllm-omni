@@ -274,7 +274,7 @@ def test_resample_return_bias_is_none_without_kernels() -> None:
     assert torch.equal(out, WanResample.forward(resample, x, feat_cache=[None], feat_idx=[0]))
 
     # First chunk of a temporal up block: one input frame, the time conv is skipped ("Rep").
-    block = WanResidualUpBlock(8, 8, num_res_blocks=1, temperal_upsample=True, up_flag=True).eval()
+    block = WanResidualUpBlock(8, 8, num_res_blocks=1, temporal_upsample=True, up_flag=True).eval()
     for module in block.modules():
         setattr(module, fastpath_forwards.CFG_ATTR, fastpath_forwards.FastPathConfig())
     x = torch.randn(1, 8, 1, 6, 10)

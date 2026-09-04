@@ -26,7 +26,7 @@ def decode_frames(vae, z: torch.Tensor) -> torch.Tensor:
     # Each temporal upsampler doubles the frames of every chunk after the first
     # (the first chunk drops the extra leading frames), so steady-state chunks
     # produce ``2 ** num_temporal_upsamplers`` frames each.
-    frames_per_chunk = 2 ** sum(bool(flag) for flag in getattr(vae.decoder, "temperal_upsample", ()))
+    frames_per_chunk = 2 ** sum(bool(flag) for flag in getattr(vae.decoder, "temporal_upsample", ()))
 
     output: torch.Tensor | None = None
     offset = 0
