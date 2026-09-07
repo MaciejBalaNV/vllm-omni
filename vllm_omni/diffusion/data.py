@@ -1082,7 +1082,7 @@ class OmniDiffusionConfig:
             OffloadStrategy,
             materialize_legacy_offload_flags,
         )
-        
+
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
