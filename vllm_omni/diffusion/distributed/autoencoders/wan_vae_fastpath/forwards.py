@@ -141,9 +141,11 @@ def rms_norm_fastpath(
     ``bias`` is the un-added per-channel bias of the convolution that produced
     ``x``; only the channels-last kernel absorbs it, every other path adds it
     first with ATen's rounding. ``None`` means the caller must run the reference
-    forward (tensor bias, channel-last norm, unsupported dtype, gamma/activation
-    dtype mismatch) and is responsible for adding ``bias`` itself.
+    forward (autograd, tensor bias, channel-last norm, unsupported dtype,
+    gamma/activation dtype mismatch) and is responsible for adding ``bias`` itself.
     """
+    if torch.is_grad_enabled():
+        return None
     if not getattr(norm, "channel_first", False):
         return None
     norm_bias = norm.bias

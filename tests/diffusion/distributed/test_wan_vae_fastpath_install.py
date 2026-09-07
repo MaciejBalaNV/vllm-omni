@@ -131,6 +131,24 @@ def test_omni_wan_vae_decode_override_is_bitwise_exact(dtype: torch.dtype) -> No
     assert actual_tiled.shape == expected_tiled.shape
 
 
+def test_omni_wan_vae_decode_preserves_autograd() -> None:
+    torch.manual_seed(0)
+    reference = AutoencoderKLWan(**TINY_RESIDUAL).eval()
+    candidate = OmniAutoencoderKLWan(**TINY_RESIDUAL).eval()
+    candidate.load_state_dict(reference.state_dict())
+    install_wan_vae_fastpath(candidate)
+
+    reference_latents = torch.randn(1, 4, 2, 6, 8, requires_grad=True)
+    candidate_latents = reference_latents.detach().clone().requires_grad_()
+    expected = reference.decode(reference_latents, return_dict=False)[0]
+    actual = candidate.decode(candidate_latents, return_dict=False)[0]
+
+    torch.testing.assert_close(actual, expected)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(candidate_latents.grad, reference_latents.grad)
+
+
 def test_install_is_idempotent_and_reversible() -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     keys_before = set(vae.state_dict())
@@ -315,6 +333,7 @@ def test_rms_norm_vae_substitute_is_not_matched() -> None:
     assert fastpath_forwards.is_diffusers_rms_norm(norm)
 
 
+@torch.no_grad()
 def test_rms_norm_fastpath_declines_tensor_bias_and_dtype_mismatch() -> None:
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
 
@@ -327,6 +346,27 @@ def test_rms_norm_fastpath_declines_tensor_bias_and_dtype_mismatch() -> None:
     x = torch.randn(1, 8, 2, 4, 4)
     out = fastpath_forwards.rms_norm_fastpath(norm, x)
     assert out is not None and torch.equal(out, norm(x))
+
+
+def test_rms_norm_forward_preserves_autograd() -> None:
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+
+    torch.manual_seed(0)
+    reference = WanRMS_norm(8, images=False)
+    candidate = WanRMS_norm(8, images=False)
+    candidate.load_state_dict(reference.state_dict())
+    reference_input = torch.randn(1, 8, 1, 4, 4, requires_grad=True)
+    candidate_input = reference_input.detach().clone().requires_grad_()
+
+    expected = reference(reference_input)
+    assert fastpath_forwards.rms_norm_fastpath(candidate, candidate_input) is None
+    actual = fastpath_forwards.rms_norm_forward(candidate, candidate_input)
+    torch.testing.assert_close(actual, expected)
+
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(candidate_input.grad, reference_input.grad)
+    torch.testing.assert_close(candidate.gamma.grad, reference.gamma.grad)
 
 
 def test_omni_diffusion_config_validates_vae_fast_path() -> None:

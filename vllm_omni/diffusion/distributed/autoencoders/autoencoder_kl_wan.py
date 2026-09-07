@@ -50,7 +50,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             return super().decode(z, return_dict=return_dict)
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True):
-        if not is_installed(self):
+        if torch.is_grad_enabled() or not is_installed(self):
             return super()._decode(z, return_dict=return_dict)
 
         # Same tiling dispatch as diffusers; only the chunk loop changes.
