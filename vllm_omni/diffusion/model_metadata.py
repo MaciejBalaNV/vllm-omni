@@ -98,9 +98,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
     "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
     "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "Cosmos3OmniPipeline": DiffusionModelMetadata(final_output_type="video"),
-    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(final_output_type="video"),
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",

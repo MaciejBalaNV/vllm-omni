@@ -203,6 +203,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3MultiviewPipeline": {
         "extra_body_params": COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS,
         "extra_output_params": frozenset(),
+    },
     "Magi2Pipeline": {
         "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,
         "extra_output_params": MAGI2_EXTRA_OUTPUT_PARAMS,
