@@ -54,7 +54,6 @@ def test_varying_prompt_lengths_do_not_recompile_the_flex_kernel(monkeypatch: py
         latent_frames=_LATENT_FRAMES,
         patch_height=_PATCH,
         patch_width=_PATCH,
-        condition_frame_indexes=(0, _LATENT_FRAMES // 2),
         max_und_tokens=_MAX_UND,
     )
     device, dtype = torch.device("cuda"), torch.bfloat16

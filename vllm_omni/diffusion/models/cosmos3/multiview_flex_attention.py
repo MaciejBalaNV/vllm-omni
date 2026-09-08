@@ -10,7 +10,7 @@ the training implementation is used as a behavioral oracle, not as source.
 from __future__ import annotations
 
 import math
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
@@ -18,7 +18,7 @@ import torch
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.attention.flex_attention import flex_attention as torch_flex_attention
 
-AttentionScope = Literal["all_views", "same_view", "same_view_or_frame"]
+AttentionScope = Literal["all_views", "same_view", "decomposed"]
 
 SPARSE_Q_BLOCK_SIZE = 64
 SPARSE_KV_BLOCK_SIZE = 64
@@ -74,7 +74,7 @@ _BACKEND_BLOCK_SIZES: dict[str, tuple[int, int]] = {
 # ``vision_start`` framing tokens the tokenizer appends after truncating.
 DEFAULT_MAX_UND_TOKENS = 4096 + 2
 
-_VALID_ATTENTION_SCOPES = frozenset({"all_views", "same_view", "same_view_or_frame"})
+_VALID_ATTENTION_SCOPES = frozenset({"all_views", "same_view", "decomposed"})
 
 
 MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted(_BACKEND_BLOCK_SIZES))
@@ -109,14 +109,15 @@ class MaskItem:
 
     ``token_shape`` is ``(latent_frames, patch_height, patch_width)``.  Frames
     are camera-major: all frames of view zero, followed by all frames of view
-    one.  ``condition_mask`` is true for clean frames.
+    one. ``seconds_per_frame`` is the positive wall-clock duration of one
+    latent frame and must agree for items sharing the view grid.
     """
 
     token_shape: tuple[int, int, int]
-    condition_mask: torch.Tensor
     num_views: int
     view_offset: int = 0
     is_control: bool = False
+    seconds_per_frame: float = 1.0
 
     def __post_init__(self) -> None:
         latent_t, patch_h, patch_w = self.token_shape
@@ -127,13 +128,15 @@ class MaskItem:
                 "Cosmos3 multiview latent frames must be divisible by num_views: "
                 f"latent_t={latent_t}, num_views={self.num_views}."
             )
-        if self.condition_mask.ndim != 1 or self.condition_mask.numel() != latent_t:
+        if (
+            isinstance(self.seconds_per_frame, bool)
+            or not isinstance(self.seconds_per_frame, int | float)
+            or not math.isfinite(self.seconds_per_frame)
+            or self.seconds_per_frame <= 0
+        ):
             raise ValueError(
-                "Cosmos3 multiview condition_mask must have one value per latent frame: "
-                f"shape={tuple(self.condition_mask.shape)}, latent_t={latent_t}."
+                f"Cosmos3 multiview seconds_per_frame must be finite and positive, got {self.seconds_per_frame!r}."
             )
-        if self.condition_mask.dtype is not torch.bool:
-            raise TypeError(f"Cosmos3 multiview condition_mask must have dtype bool, got {self.condition_mask.dtype}.")
 
     @property
     def num_tokens(self) -> int:
@@ -148,8 +151,10 @@ class MultiviewLayout:
     latent_frames: int
     patch_height: int
     patch_width: int
-    condition_frame_indexes: tuple[int, ...] = ()
-    attention_scope: AttentionScope = "same_view_or_frame"
+    attention_scope: AttentionScope = "decomposed"
+    decomposed_temporal_window_seconds: float | None = None
+    control_attends_sensor: bool = False
+    seconds_per_frame: float = 1.0
     backend: str = "triton"
     #: Capacity the UND stream is padded to, independent of any one prompt's
     #: length, so the compiled attention sees a single shape.  See
@@ -181,13 +186,30 @@ class MultiviewLayout:
             )
         if self.patch_height <= 0 or self.patch_width <= 0:
             raise ValueError("Cosmos3 multiview patch dimensions must be positive.")
-        invalid = [index for index in self.condition_frame_indexes if not 0 <= index < self.latent_frames]
-        if invalid:
+        if self.decomposed_temporal_window_seconds is not None and (
+            isinstance(self.decomposed_temporal_window_seconds, bool)
+            or not isinstance(self.decomposed_temporal_window_seconds, int | float)
+            or not math.isfinite(self.decomposed_temporal_window_seconds)
+            or self.decomposed_temporal_window_seconds < 0
+        ):
             raise ValueError(
-                f"Cosmos3 multiview condition frame indexes are outside the packed latent stream: {invalid}."
+                "Cosmos3 multiview decomposed_temporal_window_seconds must be null or a finite "
+                f"non-negative number, got {self.decomposed_temporal_window_seconds!r}."
             )
-        if tuple(sorted(set(self.condition_frame_indexes))) != self.condition_frame_indexes:
-            raise ValueError("Cosmos3 multiview condition frame indexes must be sorted and unique.")
+        if not isinstance(self.control_attends_sensor, bool):
+            raise TypeError(
+                "Cosmos3 multiview control_attends_sensor must be boolean, "
+                f"got {type(self.control_attends_sensor).__name__}."
+            )
+        if (
+            isinstance(self.seconds_per_frame, bool)
+            or not isinstance(self.seconds_per_frame, int | float)
+            or not math.isfinite(self.seconds_per_frame)
+            or self.seconds_per_frame <= 0
+        ):
+            raise ValueError(
+                f"Cosmos3 multiview seconds_per_frame must be finite and positive, got {self.seconds_per_frame!r}."
+            )
 
     @property
     def item_tokens(self) -> int:
@@ -203,27 +225,19 @@ class MultiviewLayout:
         return _BACKEND_BLOCK_SIZES[self.backend]
 
     def mask_items(self, device: torch.device) -> tuple[MaskItem, ...]:
-        """Build the packed items, resolving clean frames by packed position.
+        """Build the packed control and target items.
 
-        Both the control/target role and the set of clean frames follow the
-        same positional rule -- every item but the last is a fully clean
-        control -- so both come from ``resolve_item_condition_frames``.
+        Attention visibility is independent of target conditioning state, so
+        mask items contain only the semantic fields read by the predicate.
+        Both streams use the same rate, making timestamp a function of
+        ``(view_id, frame_id)`` within every discrete semantic run.
         """
+        del device
         shape = (self.latent_frames, self.patch_height, self.patch_width)
-        items = []
-        for item_index in range(self.NUM_ITEMS):
-            clean_frames = resolve_item_condition_frames(
-                item_index,
-                self.NUM_ITEMS,
-                self.condition_frame_indexes,
-                self.latent_frames,
-            )
-            condition_mask = torch.zeros(self.latent_frames, dtype=torch.bool, device=device)
-            if clean_frames:
-                condition_mask[torch.tensor(clean_frames, dtype=torch.int64, device=device)] = True
-            is_control = item_index < self.NUM_ITEMS - 1
-            items.append(MaskItem(shape, condition_mask, self.num_views, is_control=is_control))
-        return tuple(items)
+        return (
+            MaskItem(shape, self.num_views, is_control=True, seconds_per_frame=self.seconds_per_frame),
+            MaskItem(shape, self.num_views, is_control=False, seconds_per_frame=self.seconds_per_frame),
+        )
 
     def cache_key(self) -> tuple[Any, ...]:
         return (
@@ -231,8 +245,10 @@ class MultiviewLayout:
             self.latent_frames,
             self.patch_height,
             self.patch_width,
-            self.condition_frame_indexes,
             self.attention_scope,
+            self.decomposed_temporal_window_seconds,
+            self.control_attends_sensor,
+            self.seconds_per_frame,
             self.backend,
             self.max_und_tokens,
         )
@@ -245,11 +261,13 @@ class MultiviewFlexMetadata:
     sample_id: torch.Tensor
     frame_id: torch.Tensor
     view_id: torch.Tensor
-    is_noisy: torch.Tensor
     is_control: torch.Tensor
     is_und: torch.Tensor
+    timestamp: torch.Tensor
     query_start: int
     attention_scope: AttentionScope
+    decomposed_temporal_window_seconds: float | None = None
+    control_attends_sensor: bool = False
 
     @property
     def kv_len(self) -> int:
@@ -265,9 +283,9 @@ class MultiviewFlexMetadata:
             self.sample_id[query_slice],
             self.frame_id[query_slice],
             self.view_id[query_slice],
-            self.is_noisy[query_slice],
             self.is_control[query_slice],
             self.is_und[query_slice],
+            self.timestamp[query_slice],
         )
 
     def key_vectors(self) -> tuple[torch.Tensor, ...]:
@@ -275,10 +293,23 @@ class MultiviewFlexMetadata:
             self.sample_id,
             self.frame_id,
             self.view_id,
-            self.is_noisy,
             self.is_control,
             self.is_und,
+            self.timestamp,
         )
+
+    def query_grouping_vectors(self) -> tuple[torch.Tensor, ...]:
+        """Discrete query fields that define semantic runs.
+
+        Timestamp is deliberately excluded: under the validated single-rate
+        camera layout it is a function of ``(view_id, frame_id)``. UND and
+        padding runs use the fixed ``-1.0`` sentinel.
+        """
+        return self.query_vectors()[:-1]
+
+    def key_grouping_vectors(self) -> tuple[torch.Tensor, ...]:
+        """Discrete key fields that define semantic runs; see query variant."""
+        return self.key_vectors()[:-1]
 
 
 @dataclass(frozen=True)
@@ -286,7 +317,7 @@ class MultiviewAttentionContext:
     """Runtime wrapper that keeps the request-local caches on the transformer."""
 
     layout: MultiviewLayout
-    mask_cache: MutableMapping[tuple[Any, ...], BlockMask]
+    mask_cache: MutableMapping[tuple[Any, ...], BlockMask | MultiviewBlockSparsity]
     buffer_cache: MutableMapping[tuple[Any, ...], torch.Tensor] = field(default_factory=dict)
 
 
@@ -320,27 +351,15 @@ def expand_multiview_condition_frame_indexes(
     return [view * frames_per_view + frame for view in range(num_views) for frame in filtered]
 
 
-def resolve_item_condition_frames(
-    item_index: int,
-    num_items: int,
-    condition_frame_indexes: Sequence[int],
-    latent_t: int,
-) -> list[int]:
-    """Controls are fully clean; only the final target uses request indexes."""
-    if not 0 <= item_index < num_items:
-        raise IndexError(f"Cosmos3 multiview item_index={item_index} outside num_items={num_items}.")
-    if item_index < num_items - 1:
-        return list(range(latent_t))
-    return sorted({int(index) for index in condition_frame_indexes if 0 <= int(index) < latent_t})
-
-
 def build_multiview_flex_metadata(
     seq_len: int,
     full_q_offsets: Sequence[int],
     items_per_sample: Sequence[Sequence[MaskItem]] | Sequence[MaskItem],
     device: torch.device | str,
     num_und: int,
-    attention_scope: AttentionScope = "same_view_or_frame",
+    attention_scope: AttentionScope = "decomposed",
+    decomposed_temporal_window_seconds: float | None = None,
+    control_attends_sensor: bool = False,
 ) -> MultiviewFlexMetadata:
     """Build metadata without ever materializing a token-by-token dense mask.
 
@@ -349,6 +368,18 @@ def build_multiview_flex_metadata(
     larger than ``num_und`` because UND is padded independently.
     """
     attention_scope = _validate_attention_scope(attention_scope)
+    if decomposed_temporal_window_seconds is not None and (
+        isinstance(decomposed_temporal_window_seconds, bool)
+        or not isinstance(decomposed_temporal_window_seconds, int | float)
+        or not math.isfinite(decomposed_temporal_window_seconds)
+        or decomposed_temporal_window_seconds < 0
+    ):
+        raise ValueError(
+            "Cosmos3 multiview decomposed_temporal_window_seconds must be null or a finite "
+            f"non-negative number, got {decomposed_temporal_window_seconds!r}."
+        )
+    if not isinstance(control_attends_sensor, bool):
+        raise TypeError("Cosmos3 multiview control_attends_sensor must be boolean.")
     device = torch.device(device)
     if seq_len <= 0 or num_und < 0 or num_und > seq_len:
         raise ValueError(f"Invalid Cosmos3 multiview sequence geometry: seq_len={seq_len}, num_und={num_und}.")
@@ -373,17 +404,24 @@ def build_multiview_flex_metadata(
     sample_id = torch.full((seq_len,), -1, dtype=torch.int64, device=device)
     frame_id = torch.full_like(sample_id, -1)
     view_id = torch.full_like(sample_id, -1)
-    is_noisy = torch.zeros(seq_len, dtype=torch.bool, device=device)
-    is_control = torch.zeros_like(is_noisy)
-    is_und = torch.zeros_like(is_noisy)
+    is_control = torch.zeros(seq_len, dtype=torch.bool, device=device)
+    is_und = torch.zeros_like(is_control)
+    timestamp = torch.full((seq_len,), -1.0, dtype=torch.float32, device=device)
     sample_id[:num_und] = 0
     is_und[:num_und] = True
 
     view_offsets = {item.view_offset for item in items}
-    if attention_scope == "same_view_or_frame" and len(view_offsets) > 1:
-        raise ValueError(
-            "Cosmos3 same_view_or_frame attention does not support mixed view offsets (for example LiDAR)."
-        )
+    if attention_scope == "decomposed" and len(view_offsets) > 1 and decomposed_temporal_window_seconds is None:
+        raise ValueError("Cosmos3 decomposed attention does not support mixed view offsets without a temporal window.")
+
+    rates_by_view_offset: dict[int, float] = {}
+    for item in items:
+        expected = rates_by_view_offset.setdefault(item.view_offset, item.seconds_per_frame)
+        if not math.isclose(item.seconds_per_frame, expected):
+            raise ValueError(
+                "Cosmos3 multiview items sharing a view offset must use the same seconds_per_frame: "
+                f"offset={item.view_offset}, got {item.seconds_per_frame}, expected {expected}."
+            )
 
     for item_index, (item, start, end) in enumerate(zip(items, offsets[:-1], offsets[1:], strict=True)):
         if end - start != item.num_tokens:
@@ -401,58 +439,85 @@ def build_multiview_flex_metadata(
             dtype=torch.int64,
             device=device,
         ).repeat_interleave(frames_per_view * spatial_tokens)
-        noisy_frames = (~item.condition_mask.to(device=device)).repeat_interleave(spatial_tokens)
+        item_timestamps = item_frames.to(torch.float32) * item.seconds_per_frame
         sample_id[start:end] = 0
         frame_id[start:end] = item_frames
         view_id[start:end] = item_views
-        is_noisy[start:end] = noisy_frames
         is_control[start:end] = item.is_control
+        timestamp[start:end] = item_timestamps
 
     return MultiviewFlexMetadata(
         sample_id=sample_id,
         frame_id=frame_id,
         view_id=view_id,
-        is_noisy=is_noisy,
         is_control=is_control,
         is_und=is_und,
+        timestamp=timestamp,
         query_start=offsets[0],
         attention_scope=attention_scope,
+        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+        control_attends_sensor=control_attends_sensor,
     )
 
 
-def _pair_allowed(
-    q_sample: torch.Tensor,
-    q_frame: torch.Tensor,
-    q_view: torch.Tensor,
-    q_noisy: torch.Tensor,
-    q_control: torch.Tensor,
-    k_sample: torch.Tensor,
-    k_frame: torch.Tensor,
-    k_view: torch.Tensor,
-    k_noisy: torch.Tensor,
-    k_control: torch.Tensor,
-    k_und: torch.Tensor,
+def _make_pair_allowed(
+    q_vectors: tuple[torch.Tensor, ...],
+    k_vectors: tuple[torch.Tensor, ...],
     attention_scope: AttentionScope,
-) -> torch.Tensor:
-    # Sentinel equality deliberately isolates padding from real tokens while
-    # giving every padded query at least one padded key. This avoids relying on
-    # backend-specific handling of an empty softmax row.
-    same_sample = q_sample == k_sample
-    same_view = q_view == k_view
-    same_frame = q_frame == k_frame
-    if attention_scope == "all_views":
-        in_scope = torch.ones_like(same_view)
-    elif attention_scope == "same_view":
-        in_scope = same_view
-    else:
-        in_scope = same_view | same_frame
+    decomposed_temporal_window_seconds: float | None,
+    control_attends_sensor: bool,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Build the exact pair predicate with tensor-only traced configuration.
 
-    rgb_pair = (~q_control) & (~k_control) & in_scope
-    clean_rgb_pair = rgb_pair & (~q_noisy) & (~k_noisy)
-    noisy_rgb_query = rgb_pair & q_noisy
-    rgb_to_control = (~q_control) & k_control & same_view
-    control_to_control = q_control & k_control & same_view
-    return same_sample & (k_und | clean_rgb_pair | noisy_rgb_query | rgb_to_control | control_to_control)
+    The returned closure is stored on Triton's ``BlockMask`` and traced by
+    Inductor. Materialize scalar options here, outside that closure, so Python
+    strings, booleans, and floats cannot become dynamic captured scalars. The
+    custom FA4 path uses the same closure eagerly to build its packed run table.
+    """
+    device = q_vectors[2].device
+    reaches_every_view = torch.tensor(attention_scope == "all_views", device=device)
+    is_decomposed = torch.tensor(attention_scope == "decomposed", device=device)
+    control_reaches_sensor = torch.tensor(control_attends_sensor, device=device)
+    has_temporal_window = torch.tensor(decomposed_temporal_window_seconds is not None, device=device)
+    temporal_window = torch.tensor(
+        0.0 if decomposed_temporal_window_seconds is None else decomposed_temporal_window_seconds,
+        dtype=torch.float32,
+        device=device,
+    )
+    temporal_window_eps = torch.tensor(1e-4, dtype=torch.float32, device=device)
+
+    def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
+        q_sample = q_vectors[0][q_index]
+        q_frame = q_vectors[1][q_index]
+        q_view = q_vectors[2][q_index]
+        q_control = q_vectors[3][q_index]
+        q_timestamp = q_vectors[5][q_index]
+        k_sample = k_vectors[0][kv_index]
+        k_frame = k_vectors[1][kv_index]
+        k_view = k_vectors[2][kv_index]
+        k_control = k_vectors[3][kv_index]
+        k_und = k_vectors[4][kv_index]
+        k_timestamp = k_vectors[5][kv_index]
+
+        # Sentinel equality deliberately isolates padding from real tokens
+        # while giving every padded query at least one padded key.
+        same_sample = q_sample == k_sample
+        same_view = q_view == k_view
+        same_frame = q_frame == k_frame
+        timestamp_gap = q_timestamp - k_timestamp
+        within_temporal_window = (timestamp_gap >= -temporal_window_eps) & (
+            timestamp_gap <= temporal_window + temporal_window_eps
+        )
+        reaches_own_instant = is_decomposed & torch.where(has_temporal_window, within_temporal_window, same_frame)
+        in_scope = reaches_every_view | same_view | reaches_own_instant
+
+        sensor_to_sensor = (~q_control) & (~k_control) & in_scope
+        sensor_to_control = (~q_control) & k_control & same_view
+        control_to_control = q_control & k_control & same_view
+        control_to_sensor = control_reaches_sensor & q_control & (~k_control) & same_view
+        return same_sample & (k_und | sensor_to_sensor | sensor_to_control | control_to_control | control_to_sensor)
+
+    return pair_allowed
 
 
 def multiview_pair_predicate(
@@ -461,32 +526,30 @@ def multiview_pair_predicate(
     kv_index: torch.Tensor,
 ) -> torch.Tensor:
     """Evaluate the exact token visibility predicate (also used as mask_mod)."""
-    q_vectors = metadata.query_vectors()
-    k_vectors = metadata.key_vectors()
-    return _pair_allowed(
-        q_vectors[0][q_index],
-        q_vectors[1][q_index],
-        q_vectors[2][q_index],
-        q_vectors[3][q_index],
-        q_vectors[4][q_index],
-        k_vectors[0][kv_index],
-        k_vectors[1][kv_index],
-        k_vectors[2][kv_index],
-        k_vectors[3][kv_index],
-        k_vectors[4][kv_index],
-        k_vectors[5][kv_index],
+    pair_allowed = _make_pair_allowed(
+        metadata.query_vectors(),
+        metadata.key_vectors(),
         metadata.attention_scope,
+        metadata.decomposed_temporal_window_seconds,
+        metadata.control_attends_sensor,
     )
+    return pair_allowed(q_index, kv_index)
 
 
-def _semantic_groups(vectors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-    stacked = torch.stack([vector.to(torch.int64) for vector in vectors], dim=0)
-    changed = torch.ones(stacked.shape[1], dtype=torch.bool, device=stacked.device)
-    if stacked.shape[1] > 1:
-        changed[1:] = torch.any(stacked[:, 1:] != stacked[:, :-1], dim=0)
+def _semantic_groups(vectors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return run IDs and first-token indexes without converting field dtypes."""
+    if not vectors:
+        raise ValueError("Cosmos3 multiview semantic grouping requires at least one field.")
+    seq_len = vectors[0].numel()
+    if any(vector.numel() != seq_len for vector in vectors):
+        raise ValueError("Cosmos3 multiview semantic grouping fields must have equal lengths.")
+    changed = torch.zeros(seq_len, dtype=torch.bool, device=vectors[0].device)
+    changed[:1] = True
+    for vector in vectors:
+        changed[1:] |= vector[1:] != vector[:-1]
     group_ids = changed.to(torch.int64).cumsum(0) - 1
     representatives = torch.nonzero(changed, as_tuple=False).flatten()
-    return group_ids, tuple(vector[representatives] for vector in vectors)
+    return group_ids, representatives
 
 
 def _block_group_presence(group_ids: torch.Tensor, block_size: int, num_groups: int) -> torch.Tensor:
@@ -543,7 +606,7 @@ class MultiviewBlockSparsity:
     remaining fields are the exact per-element fallback used inside partially
     masked tiles: a token-to-run id for each side plus the packed truth table
     over run pairs.  Together they encode ``multiview_pair_predicate`` without
-    the kernel knowing anything about views, frames, or noise levels.
+    the kernel knowing anything about views, frames, or timestamps.
     """
 
     partial_counts: torch.Tensor
@@ -573,12 +636,19 @@ class MultiviewBlockSparsity:
 
     def to_block_mask(self) -> BlockMask:
         metadata = self.metadata
+        pair_allowed = _make_pair_allowed(
+            metadata.query_vectors(),
+            metadata.key_vectors(),
+            metadata.attention_scope,
+            metadata.decomposed_temporal_window_seconds,
+            metadata.control_attends_sensor,
+        )
 
         def mask_mod(
             batch: torch.Tensor, head: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
         ) -> torch.Tensor:
             del batch, head
-            return multiview_pair_predicate(metadata, q_idx, kv_idx)
+            return pair_allowed(q_idx, kv_idx)
 
         return BlockMask.from_kv_blocks(
             self.partial_counts[None, None],
@@ -610,25 +680,19 @@ def build_multiview_block_sparsity(
     """
     q_vectors = metadata.query_vectors()
     k_vectors = metadata.key_vectors()
-    q_group_ids, q_reps = _semantic_groups(q_vectors)
-    k_group_ids, k_reps = _semantic_groups(k_vectors)
+    q_group_ids, q_representatives = _semantic_groups(metadata.query_grouping_vectors())
+    k_group_ids, k_representatives = _semantic_groups(metadata.key_grouping_vectors())
 
-    group_allowed = _pair_allowed(
-        q_reps[0][:, None],
-        q_reps[1][:, None],
-        q_reps[2][:, None],
-        q_reps[3][:, None],
-        q_reps[4][:, None],
-        k_reps[0][None, :],
-        k_reps[1][None, :],
-        k_reps[2][None, :],
-        k_reps[3][None, :],
-        k_reps[4][None, :],
-        k_reps[5][None, :],
+    pair_allowed = _make_pair_allowed(
+        q_vectors,
+        k_vectors,
         metadata.attention_scope,
+        metadata.decomposed_temporal_window_seconds,
+        metadata.control_attends_sensor,
     )
-    q_presence = _block_group_presence(q_group_ids, q_block_size, len(q_reps[0]))
-    k_presence = _block_group_presence(k_group_ids, kv_block_size, len(k_reps[0]))
+    group_allowed = pair_allowed(q_representatives[:, None], k_representatives[None, :])
+    q_presence = _block_group_presence(q_group_ids, q_block_size, q_representatives.numel())
+    k_presence = _block_group_presence(k_group_ids, kv_block_size, k_representatives.numel())
 
     # Float16 represents these tiny integer overlap counts exactly and gives a
     # fast tensor-core projection on CUDA. CPU tests use float32 matmul.
@@ -726,6 +790,8 @@ def get_multiview_attention_plan(
         device=device,
         num_und=real_und_len,
         attention_scope=layout.attention_scope,
+        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
+        control_attends_sensor=layout.control_attends_sensor,
     )
     sparsity = build_multiview_block_sparsity(
         metadata,

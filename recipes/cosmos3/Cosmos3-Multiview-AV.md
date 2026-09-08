@@ -24,7 +24,11 @@ Cosmos3 Nano fields):
 {
   "backbone_type": "cosmos3_multiview",
   "multiview": {
-    "attention_scope": "same_view_or_frame",
+    "causal_training_strategy": "none",
+    "attention_scope": "decomposed",
+    "decomposed_temporal_window_seconds": null,
+    "control_attends_sensor": false,
+    "align_temporal_positions_across_views": false,
     "backend": "triton",
     "max_views": 11,
     "share_vision_temporal_positions": true,

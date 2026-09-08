@@ -88,7 +88,7 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
 
     # Two views x four latent frames x 8x8 patches -> 256 tokens per item,
     # 512 packed GEN tokens, which is exactly two 256-row FA4 query blocks.
-    layout = MultiviewLayout(2, 4, 8, 8, condition_frame_indexes=(0, 2), backend="fa4", max_und_tokens=_MAX_UND)
+    layout = MultiviewLayout(2, 4, 8, 8, backend="fa4", max_und_tokens=_MAX_UND)
     gen = layout.gen_tokens
     context = MultiviewAttentionContext(layout, {})
 
@@ -131,7 +131,7 @@ def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int) -> Non
     tensors = None
     outputs = {}
     for backend in ("triton", "fa4"):
-        layout = MultiviewLayout(2, 4, 8, 8, condition_frame_indexes=(0, 2), backend=backend, max_und_tokens=_MAX_UND)
+        layout = MultiviewLayout(2, 4, 8, 8, backend=backend, max_und_tokens=_MAX_UND)
         gen = layout.gen_tokens
         if tensors is None:
             tensors = (

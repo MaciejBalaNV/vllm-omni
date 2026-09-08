@@ -228,12 +228,19 @@ def compute_mrope_position_ids_vision(
     base_temporal_compression_factor: int | None = None,
     enable_fps_modulation: bool = True,
     start_frame_offset: int = 0,
+    temporal_position_period: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
     Creates a (t, h, w) position grid with spatial indices reset per segment
-    (Qwen3VL-style). Flattened in t-major order.
+    (Qwen3VL-style). Flattened in t-major order. When
+    ``temporal_position_period`` is set, camera-major frame indexes wrap at
+    that period before optional FPS scaling so corresponding views align.
     """
+    if temporal_position_period is not None and temporal_position_period <= 0:
+        raise ValueError(f"Cosmos3 temporal_position_period must be positive, got {temporal_position_period}.")
+    if fps is not None and (not math.isfinite(fps) or fps <= 0):
+        raise ValueError(f"Cosmos3 vision FPS must be finite and positive, got {fps!r}.")
     fps_modulation = enable_fps_modulation and fps is not None
 
     if fps_modulation:
@@ -245,6 +252,8 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
@@ -252,10 +261,11 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
+        frame_indices = torch.arange(grid_t, dtype=torch.long)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
-            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
-            + int(temporal_offset)
-            + start_frame_offset
+            frame_indices.view(-1, 1).expand(-1, grid_h * grid_w).flatten() + int(temporal_offset) + start_frame_offset
         )
 
     h_index = torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -1539,6 +1549,7 @@ class Cosmos3VFMTransformer(nn.Module):
         t_sound: int | None = None,
         num_vision_items: int = 1,
         share_vision_temporal_positions: bool = False,
+        temporal_position_period: int | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
         if num_vision_items <= 0:
@@ -1567,6 +1578,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     base_fps=self.base_fps,
                     temporal_compression_factor=self.temporal_compression_factor,
                     enable_fps_modulation=self.enable_fps_modulation,
+                    temporal_position_period=temporal_position_period,
                 )
                 gen_positions.extend([v_pos] * num_vision_items)
             else:
@@ -1581,6 +1593,7 @@ class Cosmos3VFMTransformer(nn.Module):
                         base_fps=self.base_fps,
                         temporal_compression_factor=self.temporal_compression_factor,
                         enable_fps_modulation=self.enable_fps_modulation,
+                        temporal_position_period=temporal_position_period,
                     )
                     gen_positions.append(v_pos)
             if action_frames > 0:
@@ -1678,6 +1691,7 @@ class Cosmos3VFMTransformer(nn.Module):
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
         multiview_layout: Any | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
@@ -1826,6 +1840,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 t_sound=s_sound,
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+                temporal_position_period=temporal_position_period,
             )
             self.cached_freqs_gen = freqs_gen
 

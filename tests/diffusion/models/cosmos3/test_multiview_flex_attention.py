@@ -26,7 +26,12 @@ _TRITON_MAX_UND = 64
 _FA4_MAX_UND = 128
 
 
-def _tiny_metadata(attention_scope: str = "same_view_or_frame"):
+def _tiny_metadata(
+    attention_scope: str = "decomposed",
+    *,
+    decomposed_temporal_window_seconds: float | None = None,
+    control_attends_sensor: bool = False,
+):
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
         build_multiview_flex_metadata,
@@ -34,14 +39,14 @@ def _tiny_metadata(attention_scope: str = "same_view_or_frame"):
 
     control = MaskItem(
         token_shape=(4, 1, 1),
-        condition_mask=torch.ones(4, dtype=torch.bool),
         num_views=2,
         is_control=True,
+        seconds_per_frame=0.5,
     )
     target = MaskItem(
         token_shape=(4, 1, 1),
-        condition_mask=torch.tensor([True, False, True, False]),
         num_views=2,
+        seconds_per_frame=0.5,
     )
     return build_multiview_flex_metadata(
         seq_len=10,
@@ -50,18 +55,36 @@ def _tiny_metadata(attention_scope: str = "same_view_or_frame"):
         device="cpu",
         num_und=2,
         attention_scope=attention_scope,
+        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+        control_attends_sensor=control_attends_sensor,
     )
+
+
+def test_attention_scope_defaults_are_decomposed() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
+        MultiviewLayout,
+        build_multiview_flex_metadata,
+    )
+
+    metadata = build_multiview_flex_metadata(
+        seq_len=2,
+        full_q_offsets=(0, 2),
+        items_per_sample=(MaskItem(token_shape=(2, 1, 1), num_views=1),),
+        device="cpu",
+        num_und=0,
+    )
+
+    assert MultiviewLayout(1, 2, 1, 1).attention_scope == "decomposed"
+    assert metadata.attention_scope == "decomposed"
 
 
 def test_expand_multiview_condition_indexes_camera_major() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         expand_multiview_condition_frame_indexes,
-        resolve_item_condition_frames,
     )
 
     assert expand_multiview_condition_frame_indexes([1, 0, 1, -1, 99], 3, 12) == [0, 1, 4, 5, 8, 9]
-    assert resolve_item_condition_frames(0, 2, [0, 4], 8) == list(range(8))
-    assert resolve_item_condition_frames(1, 2, [4, 0, 4, 99], 8) == [0, 4]
 
 
 def test_metadata_is_camera_major_and_marks_padding() -> None:
@@ -72,8 +95,8 @@ def test_metadata_is_camera_major_and_marks_padding() -> None:
 
     item = MaskItem(
         token_shape=(6, 1, 2),
-        condition_mask=torch.tensor([True, False, False, True, False, False]),
         num_views=2,
+        seconds_per_frame=0.4,
     )
     metadata = build_multiview_flex_metadata(
         seq_len=18,
@@ -88,7 +111,11 @@ def test_metadata_is_camera_major_and_marks_padding() -> None:
     assert metadata.is_und.tolist() == [True, True, True] + [False] * 15
     assert metadata.frame_id[4:16].tolist() == [0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2]
     assert metadata.view_id[4:16].tolist() == [0] * 6 + [1] * 6
-    assert metadata.is_noisy[4:16].tolist() == [False, False, True, True, True, True] * 2
+    torch.testing.assert_close(
+        metadata.timestamp[4:16],
+        torch.tensor([0.0, 0.0, 0.4, 0.4, 0.8, 0.8] * 2),
+    )
+    assert not hasattr(metadata, "is_noisy")
 
 
 # Truth table transcribed from the Multiview-AV visibility spec, one row per
@@ -103,32 +130,24 @@ def test_metadata_is_camera_major_and_marks_padding() -> None:
 #   "same_view" - visible only when the two tokens share a view
 #   "in_scope"  - visible when the pair falls inside the attention scope
 _SPEC_VISIBILITY = {
-    # Control tokens are own-view-only and never read RGB.
     ("control", "und"): "always",
     ("control", "control"): "same_view",
-    ("control", "rgb_clean"): "never",
-    ("control", "rgb_noisy"): "never",
-    # A clean (conditioned) RGB token must never see a noisy RGB token.
-    ("rgb_clean", "und"): "always",
-    ("rgb_clean", "control"): "same_view",
-    ("rgb_clean", "rgb_clean"): "in_scope",
-    ("rgb_clean", "rgb_noisy"): "never",
-    # A noisy RGB token sees every in-scope RGB token, clean or noisy.
-    ("rgb_noisy", "und"): "always",
-    ("rgb_noisy", "control"): "same_view",
-    ("rgb_noisy", "rgb_clean"): "in_scope",
-    ("rgb_noisy", "rgb_noisy"): "in_scope",
+    ("control", "sensor"): "configured_same_view",
+    ("sensor", "und"): "always",
+    ("sensor", "control"): "same_view",
+    ("sensor", "sensor"): "in_scope",
 }
 
 
 def _token_role(vectors: tuple[torch.Tensor, ...], index: int) -> str:
     """Classify one token into the role vocabulary the spec table is keyed on."""
-    _sample, _frame, _view, is_noisy, is_control, is_und = (bool(vector[index]) for vector in vectors)
+    is_control = bool(vectors[3][index])
+    is_und = bool(vectors[4][index])
     if is_und:
         return "und"
     if is_control:
         return "control"
-    return "rgb_noisy" if is_noisy else "rgb_clean"
+    return "sensor"
 
 
 def _spec_visible(
@@ -138,7 +157,10 @@ def _spec_visible(
     same_sample: bool,
     same_view: bool,
     same_frame: bool,
+    within_temporal_window: bool,
     attention_scope: str,
+    has_temporal_window: bool,
+    control_attends_sensor: bool,
 ) -> bool:
     """Resolve one table cell; the scope wording is also taken from the spec."""
     if not same_sample:
@@ -150,18 +172,30 @@ def _spec_visible(
         return True
     if rule == "same_view":
         return same_view
+    if rule == "configured_same_view":
+        return control_attends_sensor and same_view
     if attention_scope == "all_views":
         return True
     if attention_scope == "same_view":
         return same_view
-    return same_view or same_frame
+    return same_view or (within_temporal_window if has_temporal_window else same_frame)
 
 
-@pytest.mark.parametrize("attention_scope", ["all_views", "same_view", "same_view_or_frame"])
-def test_visibility_predicate_matches_spec_truth_table(attention_scope: str) -> None:
+@pytest.mark.parametrize("attention_scope", ["all_views", "same_view", "decomposed"])
+@pytest.mark.parametrize("control_attends_sensor", [False, True])
+@pytest.mark.parametrize("temporal_window", [None, 0.5])
+def test_visibility_predicate_matches_spec_truth_table(
+    attention_scope: str,
+    control_attends_sensor: bool,
+    temporal_window: float | None,
+) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import multiview_pair_predicate
 
-    metadata = _tiny_metadata(attention_scope)
+    metadata = _tiny_metadata(
+        attention_scope,
+        decomposed_temporal_window_seconds=temporal_window,
+        control_attends_sensor=control_attends_sensor,
+    )
     q_index = torch.arange(metadata.q_len)[:, None]
     kv_index = torch.arange(metadata.kv_len)[None, :]
     actual = multiview_pair_predicate(metadata, q_index, kv_index)
@@ -172,9 +206,11 @@ def test_visibility_predicate_matches_spec_truth_table(attention_scope: str) -> 
     covered = set()
     for q in range(metadata.q_len):
         q_sample, q_frame, q_view = (int(vector[q]) for vector in q_vectors[:3])
+        q_timestamp = float(q_vectors[5][q])
         q_role = _token_role(q_vectors, q)
         for k in range(metadata.kv_len):
             k_sample, k_frame, k_view = (int(vector[k]) for vector in k_vectors[:3])
+            k_timestamp = float(k_vectors[5][k])
             k_role = _token_role(k_vectors, k)
             covered.add((q_role, k_role))
             expected[q, k] = _spec_visible(
@@ -183,16 +219,20 @@ def test_visibility_predicate_matches_spec_truth_table(attention_scope: str) -> 
                 same_sample=q_sample == k_sample,
                 same_view=q_view == k_view,
                 same_frame=q_frame == k_frame,
+                within_temporal_window=-1e-4 <= q_timestamp - k_timestamp <= (temporal_window or 0.0) + 1e-4,
                 attention_scope=attention_scope,
+                has_temporal_window=temporal_window is not None,
+                control_attends_sensor=control_attends_sensor,
             )
 
     # The fixture must exercise every row of the table, or the table is not
     # actually being checked.
     assert covered == set(_SPEC_VISIBILITY)
+    assert actual[:, :2].all(), "every real GEN query must see all UND keys from its sample"
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("attention_scope", ["all_views", "same_view", "same_view_or_frame"])
+@pytest.mark.parametrize("attention_scope", ["all_views", "same_view", "decomposed"])
 def test_padding_queries_attend_only_padding(attention_scope: str) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
@@ -202,7 +242,6 @@ def test_padding_queries_attend_only_padding(attention_scope: str) -> None:
 
     item = MaskItem(
         token_shape=(2, 1, 2),
-        condition_mask=torch.tensor([True, False]),
         num_views=1,
     )
     metadata = build_multiview_flex_metadata(
@@ -235,14 +274,127 @@ def test_visibility_rule_examples() -> None:
     def visible(q: int, keys: list[int]) -> list[bool]:
         return multiview_pair_predicate(metadata, torch.tensor(q), torch.tensor(keys)).tolist()
 
-    # Control view zero: UND + own-view control only.
+    # Control view zero: UND + own-view control only while the optional edge is off.
     assert visible(0, [0, 1, 2, 3, 4, 6]) == [True, True, True, True, False, False]
-    # Clean RGB view zero/frame zero cannot see noisy RGB, but can see the
-    # clean same-frame token in view one and its own-view control.
-    assert visible(4, [2, 3, 6, 7, 8, 9]) == [True, True, True, False, True, False]
-    # Noisy RGB view zero/frame one sees every RGB token in its view plus the
-    # same-frame token in view one, but not the other-view/different-frame token.
+    # Sensor view zero/frame zero sees all same-view sensor keys and the same
+    # frame in the other view, regardless of conditioning/noise state.
+    assert visible(4, [2, 3, 6, 7, 8, 9]) == [True, True, True, True, True, False]
+    # Sensor view zero/frame one has the same decomposed footprint.
     assert visible(5, [2, 3, 6, 7, 8, 9]) == [True, True, True, True, False, True]
+
+    enabled = _tiny_metadata(control_attends_sensor=True)
+    assert multiview_pair_predicate(enabled, torch.tensor(0), torch.tensor([6, 7, 8])).tolist() == [True, True, False]
+
+
+@pytest.mark.parametrize(
+    ("q_timestamp", "k_timestamp", "window", "expected"),
+    [
+        (1.0, 1.0, 0.5, True),
+        (1.0, 0.5, 0.5, True),
+        (1.0, 0.4998, 0.5, False),
+        (1.0, 1.00009, 0.5, True),
+        (1.0, 1.0002, 0.5, False),
+    ],
+)
+def test_decomposed_temporal_window_boundaries(
+    q_timestamp: float,
+    k_timestamp: float,
+    window: float,
+    expected: bool,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MultiviewFlexMetadata,
+        multiview_pair_predicate,
+    )
+
+    metadata = MultiviewFlexMetadata(
+        sample_id=torch.tensor([0, 0]),
+        frame_id=torch.tensor([0, 1]),
+        view_id=torch.tensor([1, 0]),
+        is_control=torch.tensor([False, False]),
+        is_und=torch.tensor([False, False]),
+        timestamp=torch.tensor([k_timestamp, q_timestamp]),
+        query_start=1,
+        attention_scope="decomposed",
+        decomposed_temporal_window_seconds=window,
+    )
+    actual = multiview_pair_predicate(metadata, torch.tensor(0), torch.tensor(0))
+    assert bool(actual) is expected
+
+
+def test_traced_pair_predicate_captures_tensor_configuration_only() -> None:
+    import inspect
+
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _make_pair_allowed
+
+    metadata = _tiny_metadata(decomposed_temporal_window_seconds=0.5, control_attends_sensor=True)
+    pair_allowed = _make_pair_allowed(
+        metadata.query_vectors(),
+        metadata.key_vectors(),
+        metadata.attention_scope,
+        metadata.decomposed_temporal_window_seconds,
+        metadata.control_attends_sensor,
+    )
+    captured = inspect.getclosurevars(pair_allowed).nonlocals
+
+    assert captured
+    for value in captured.values():
+        if isinstance(value, tuple):
+            assert value and all(isinstance(item, torch.Tensor) for item in value)
+        else:
+            assert isinstance(value, torch.Tensor)
+
+
+def test_attention_metadata_has_no_condition_or_noise_state() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+
+    i2v_layout = MultiviewLayout(2, 4, 1, 1)
+    t2v_layout = MultiviewLayout(2, 4, 1, 1)
+    assert i2v_layout.cache_key() == t2v_layout.cache_key()
+    assert "condition_frame_indexes" not in MultiviewLayout.__dataclass_fields__
+    assert not hasattr(_tiny_metadata(), "is_noisy")
+
+
+def test_semantic_groups_preserve_fractional_field_values() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _semantic_groups
+
+    group_ids, representatives = _semantic_groups((torch.tensor([0.1, 0.9, 1.1]),))
+    assert group_ids.tolist() == [0, 1, 2]
+    assert representatives.tolist() == [0, 1, 2]
+
+
+def test_semantic_groups_collapse_repeated_discrete_runs() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _semantic_groups
+
+    group_ids, representatives = _semantic_groups((torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2]),))
+    assert group_ids.tolist() == [0, 0, 0, 1, 1, 1, 2, 2, 2]
+    assert representatives.tolist() == [0, 3, 6]
+
+
+def test_multiview_semantic_group_count_scales_with_layout_not_tokens() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _semantic_groups
+
+    metadata = _tiny_metadata()
+    _, q_representatives = _semantic_groups(metadata.query_grouping_vectors())
+    _, k_representatives = _semantic_groups(metadata.key_grouping_vectors())
+
+    # Two items x four camera-major latent cells. The key stream additionally
+    # has one UND run; this fixture has no UND or GEN padding.
+    assert q_representatives.numel() == 2 * 4
+    assert k_representatives.numel() == 1 + 2 * 4
+
+
+def test_timestamp_is_constant_within_every_discrete_semantic_run() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _semantic_groups
+
+    metadata = _tiny_metadata(decomposed_temporal_window_seconds=0.5)
+    for vectors, grouping_vectors in (
+        (metadata.query_vectors(), metadata.query_grouping_vectors()),
+        (metadata.key_vectors(), metadata.key_grouping_vectors()),
+    ):
+        group_ids, representatives = _semantic_groups(grouping_vectors)
+        timestamp = vectors[-1]
+        torch.testing.assert_close(timestamp, timestamp[representatives][group_ids])
 
 
 def test_compressed_block_mask_and_request_cache() -> None:
@@ -257,7 +409,6 @@ def test_compressed_block_mask_and_request_cache() -> None:
         latent_frames=4,
         patch_height=1,
         patch_width=1,
-        condition_frame_indexes=(0, 2),
         max_und_tokens=_TRITON_MAX_UND,
     )
     cache = {}
@@ -282,6 +433,40 @@ def test_compressed_block_mask_and_request_cache() -> None:
     assert different_branch.shape == first.shape
 
 
+def test_mask_cache_separates_every_predicate_and_backend_setting() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MultiviewAttentionContext,
+        MultiviewLayout,
+        get_multiview_attention_plan,
+    )
+
+    cache = {}
+    layouts = [
+        MultiviewLayout(2, 4, 1, 1, max_und_tokens=_TRITON_MAX_UND),
+        MultiviewLayout(2, 4, 1, 1, attention_scope="same_view", max_und_tokens=_TRITON_MAX_UND),
+        MultiviewLayout(
+            2,
+            4,
+            1,
+            1,
+            decomposed_temporal_window_seconds=0.5,
+            max_und_tokens=_TRITON_MAX_UND,
+        ),
+        MultiviewLayout(2, 4, 1, 1, control_attends_sensor=True, max_und_tokens=_TRITON_MAX_UND),
+        MultiviewLayout(2, 4, 1, 1, seconds_per_frame=0.4, max_und_tokens=_TRITON_MAX_UND),
+        MultiviewLayout(2, 4, 1, 1, backend="fa4", max_und_tokens=_FA4_MAX_UND),
+    ]
+    for layout in layouts:
+        get_multiview_attention_plan(
+            MultiviewAttentionContext(layout, cache),
+            real_und_len=3,
+            real_q_len=layout.gen_tokens,
+            device=torch.device("cpu"),
+        )
+
+    assert len(cache) == len(layouts)
+
+
 def test_und_padding_is_independent_of_prompt_length() -> None:
     """UND pads to the layout capacity, never to the individual prompt length.
 
@@ -298,7 +483,7 @@ def test_und_padding_is_independent_of_prompt_length() -> None:
         get_multiview_block_mask,
     )
 
-    layout = MultiviewLayout(2, 4, 1, 1, condition_frame_indexes=(0, 2), max_und_tokens=200)
+    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=200)
     context = MultiviewAttentionContext(layout, {})
 
     shapes = set()
@@ -358,7 +543,7 @@ def test_und_capacity_padding_does_not_change_attention_output() -> None:
 
     outputs = []
     for max_und_tokens in (5, 64, 200):
-        layout = MultiviewLayout(2, 4, 1, 1, condition_frame_indexes=(0, 2), max_und_tokens=max_und_tokens)
+        layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=max_und_tokens)
         outputs.append(
             padded_multiview_flex_attention(q, k, v, k_und, v_und, MultiviewAttentionContext(layout, {}, {}))
         )
@@ -378,7 +563,7 @@ def test_block_mask_uses_canonical_full_width_contiguous_layout() -> None:
         get_multiview_block_mask,
     )
 
-    layout = MultiviewLayout(2, 4, 8, 8, condition_frame_indexes=(0, 2), max_und_tokens=_TRITON_MAX_UND)
+    layout = MultiviewLayout(2, 4, 8, 8, max_und_tokens=_TRITON_MAX_UND)
     block_mask, geometry = get_multiview_block_mask(
         MultiviewAttentionContext(layout, {}),
         real_und_len=3,
@@ -400,7 +585,14 @@ def test_block_mask_uses_canonical_full_width_contiguous_layout() -> None:
         assert int(counts.max()) <= num_kv_blocks
 
 
-def test_compressed_block_mask_matches_dense_token_projection() -> None:
+@pytest.mark.parametrize("attention_scope", ["all_views", "same_view", "decomposed"])
+@pytest.mark.parametrize("control_attends_sensor", [False, True])
+@pytest.mark.parametrize("temporal_window", [None, 0.5])
+def test_compressed_block_mask_matches_dense_token_projection(
+    attention_scope: str,
+    control_attends_sensor: bool,
+    temporal_window: float | None,
+) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MultiviewAttentionContext,
         MultiviewLayout,
@@ -411,7 +603,17 @@ def test_compressed_block_mask_matches_dense_token_projection() -> None:
 
     q_block_size = 64
     kv_block_size = 64
-    layout = MultiviewLayout(2, 4, 8, 8, condition_frame_indexes=(0, 2), max_und_tokens=_TRITON_MAX_UND)
+    layout = MultiviewLayout(
+        2,
+        4,
+        8,
+        8,
+        attention_scope=attention_scope,
+        decomposed_temporal_window_seconds=temporal_window,
+        control_attends_sensor=control_attends_sensor,
+        seconds_per_frame=0.5,
+        max_und_tokens=_TRITON_MAX_UND,
+    )
     block_mask, geometry = get_multiview_block_mask(
         MultiviewAttentionContext(layout, {}),
         real_und_len=3,
@@ -429,6 +631,8 @@ def test_compressed_block_mask_matches_dense_token_projection() -> None:
         device="cpu",
         num_und=3,
         attention_scope=layout.attention_scope,
+        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
+        control_attends_sensor=layout.control_attends_sensor,
     )
     dense = multiview_pair_predicate(
         metadata,
@@ -467,7 +671,7 @@ def test_flex_attention_matches_dense_masked_gqa_oracle() -> None:
     )
 
     torch.manual_seed(4)
-    layout = MultiviewLayout(2, 4, 1, 1, condition_frame_indexes=(0, 2), max_und_tokens=_TRITON_MAX_UND)
+    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=_TRITON_MAX_UND)
     context = MultiviewAttentionContext(layout, {})
     q = torch.randn(1, 8, 4, 8)
     k = torch.randn(1, 8, 2, 8)
@@ -512,7 +716,7 @@ def test_packing_buffers_are_reused_and_never_leak_stale_rows() -> None:
     )
 
     torch.manual_seed(11)
-    layout = MultiviewLayout(2, 4, 1, 1, condition_frame_indexes=(0, 2), max_und_tokens=_TRITON_MAX_UND)
+    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=_TRITON_MAX_UND)
     q = torch.randn(1, 8, 4, 8)
     k = torch.randn(1, 8, 2, 8)
     v = torch.randn(1, 8, 2, 8)
@@ -560,16 +764,15 @@ def test_flex_attention_explicitly_pins_triton_backend(monkeypatch: pytest.Monke
     }
 
 
-def test_same_view_or_frame_rejects_mixed_view_offsets() -> None:
+def test_decomposed_without_window_rejects_mixed_view_offsets() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
         build_multiview_flex_metadata,
     )
 
-    condition = torch.ones(2, dtype=torch.bool)
     items = (
-        MaskItem((2, 1, 1), condition, num_views=1, view_offset=0, is_control=True),
-        MaskItem((2, 1, 1), condition, num_views=1, view_offset=10),
+        MaskItem((2, 1, 1), num_views=1, view_offset=0, is_control=True),
+        MaskItem((2, 1, 1), num_views=1, view_offset=10),
     )
     with pytest.raises(ValueError, match="mixed view offsets"):
         build_multiview_flex_metadata(
@@ -578,7 +781,27 @@ def test_same_view_or_frame_rejects_mixed_view_offsets() -> None:
             items_per_sample=items,
             device="cpu",
             num_und=1,
-            attention_scope="same_view_or_frame",
+            attention_scope="decomposed",
+        )
+
+
+def test_metadata_rejects_inconsistent_rates_on_one_view_grid() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
+        build_multiview_flex_metadata,
+    )
+
+    items = (
+        MaskItem((2, 1, 1), num_views=1, is_control=True, seconds_per_frame=0.4),
+        MaskItem((2, 1, 1), num_views=1, seconds_per_frame=0.5),
+    )
+    with pytest.raises(ValueError, match="same seconds_per_frame"):
+        build_multiview_flex_metadata(
+            seq_len=5,
+            full_q_offsets=(1, 3, 5),
+            items_per_sample=items,
+            device="cpu",
+            num_und=1,
         )
 
 
@@ -613,7 +836,7 @@ def test_fa4_layout_uses_the_block_geometry_the_sm100_kernel_demands() -> None:
         get_multiview_block_mask,
     )
 
-    layout = MultiviewLayout(2, 4, 1, 1, condition_frame_indexes=(0, 2), backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(2, 4, 1, 1, backend="fa4", max_und_tokens=_FA4_MAX_UND)
     context = MultiviewAttentionContext(layout, {})
     first, geometry = get_multiview_attention_plan(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
     second, _ = get_multiview_attention_plan(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
@@ -652,7 +875,7 @@ def test_run_table_reproduces_the_pair_predicate_exactly() -> None:
         multiview_pair_predicate,
     )
 
-    layout = MultiviewLayout(2, 4, 2, 2, condition_frame_indexes=(0, 2), backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(2, 4, 2, 2, backend="fa4", max_und_tokens=_FA4_MAX_UND)
     sparsity, _ = _fa4_plan(layout, real_und_len=3)
     metadata = sparsity.metadata
 
@@ -672,7 +895,7 @@ def test_run_table_reproduces_the_pair_predicate_exactly() -> None:
 def test_packed_allowed_bits_round_trip() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
 
-    layout = MultiviewLayout(2, 4, 2, 2, condition_frame_indexes=(0, 2), backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(2, 4, 2, 2, backend="fa4", max_und_tokens=_FA4_MAX_UND)
     sparsity, _ = _fa4_plan(layout, real_und_len=3)
 
     num_q_groups, num_k_groups = sparsity.group_allowed.shape
@@ -698,7 +921,7 @@ def test_fa4_block_map_matches_dense_token_projection() -> None:
     # A UND length that fills its KV block exactly is what makes fully-allowed
     # tiles reachable here: every real query attends every real UND token, but a
     # block padded out with sentinels is partial by construction.
-    layout = MultiviewLayout(2, 4, 8, 8, condition_frame_indexes=(0, 2), backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(2, 4, 8, 8, backend="fa4", max_und_tokens=_FA4_MAX_UND)
     sparsity, geometry = _fa4_plan(layout, real_und_len=128)
     metadata = sparsity.metadata
 

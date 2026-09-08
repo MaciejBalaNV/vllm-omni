@@ -9,6 +9,7 @@ item and one RGB target item are packed camera-major and denoised together.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -43,7 +44,7 @@ from .transfer import (
     media_to_uint8_cthw,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import _tf_config_get
+from .transformer_cosmos3 import COSMOS3_MULTIVIEW_BACKBONE_TYPE, _tf_config_get
 from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 from .utils import VIDEO_RES_SIZE_INFO
 
@@ -156,6 +157,117 @@ def _resolve_multiview_resolution(sp: Any, multiview: Mapping[str, Any]) -> str:
     return str(resolution)
 
 
+def _resolve_temporal_position_period(latent_frames: int, num_views: int, align_across_views: bool) -> int | None:
+    if not align_across_views:
+        return None
+    if num_views <= 0 or latent_frames <= 0 or latent_frames % num_views:
+        raise ValueError(
+            "Aligning Cosmos3 multiview temporal positions requires positive latent frames divisible by num_views: "
+            f"latent_frames={latent_frames}, num_views={num_views}."
+        )
+    return latent_frames // num_views
+
+
+def _required_deployment_field(config: Mapping[str, Any], name: str) -> Any:
+    if name not in config:
+        raise ValueError(f"Cosmos3 multiview transformer config requires field {name!r}.")
+    return config[name]
+
+
+def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
+    """Validate the flat exported contract before model initialization.
+
+    The backbone is inspected before multiview-specific fields so selecting
+    this pipeline for another Cosmos3 variant reports the actual mismatch.
+    Within a multiview config, the training strategy is inspected first:
+    teacher-forcing artifacts have a different replay/cached-memory runtime
+    contract, so their generic fields must not obscure the targeted rejection.
+    """
+    backbone_type = _tf_config_get(model_config, "backbone_type", None)
+    if backbone_type != COSMOS3_MULTIVIEW_BACKBONE_TYPE:
+        raise ValueError(
+            "Cosmos3MultiviewPipeline requires transformer/config.json "
+            f"backbone_type={COSMOS3_MULTIVIEW_BACKBONE_TYPE!r}, got {backbone_type!r}."
+        )
+
+    raw_config = _tf_config_get(model_config, "multiview", None)
+    if raw_config is None:
+        raise ValueError("Cosmos3 multiview transformer config must contain a 'multiview' object.")
+    if hasattr(raw_config, "to_dict"):
+        raw_config = raw_config.to_dict()
+    config = _mapping(raw_config, "transformer config")
+
+    strategy = _required_deployment_field(config, "causal_training_strategy")
+    if not isinstance(strategy, str):
+        raise TypeError("Cosmos3 multiview causal_training_strategy must be a string.")
+    if strategy in {"teacher_forcing", "teacher_forcing_dcm"}:
+        raise ValueError(
+            f"Cosmos3 multiview {strategy} artifacts require replay/cached-memory inference, "
+            "which vLLM-Omni does not support. Export a bidirectional causal_training_strategy='none' checkpoint."
+        )
+    if strategy != "none":
+        raise ValueError(f"Cosmos3 multiview causal_training_strategy must be 'none' for vLLM-Omni, got {strategy!r}.")
+
+    attention_scope = _required_deployment_field(config, "attention_scope")
+    if not isinstance(attention_scope, str):
+        raise TypeError("Cosmos3 multiview attention_scope must be a string.")
+    if attention_scope not in {"all_views", "same_view", "decomposed"}:
+        raise ValueError(
+            "Cosmos3 multiview attention_scope must be one of ['all_views', 'decomposed', 'same_view']; "
+            f"got {attention_scope!r}."
+        )
+
+    temporal_window = _required_deployment_field(config, "decomposed_temporal_window_seconds")
+    if temporal_window is not None:
+        if isinstance(temporal_window, bool) or not isinstance(temporal_window, int | float):
+            raise TypeError("Cosmos3 multiview decomposed_temporal_window_seconds must be null or a number.")
+        if not math.isfinite(temporal_window) or temporal_window < 0:
+            raise ValueError("Cosmos3 multiview decomposed_temporal_window_seconds must be finite and non-negative.")
+        temporal_window = float(temporal_window)
+
+    for field_name in (
+        "control_attends_sensor",
+        "align_temporal_positions_across_views",
+        "share_vision_temporal_positions",
+    ):
+        if not isinstance(_required_deployment_field(config, field_name), bool):
+            raise TypeError(f"Cosmos3 multiview {field_name} must be boolean.")
+    if not config["share_vision_temporal_positions"]:
+        raise ValueError("Cosmos3 multiview requires share_vision_temporal_positions=true.")
+
+    cameras = _required_deployment_field(config, "cameras")
+    if (
+        not isinstance(cameras, list)
+        or not cameras
+        or not all(isinstance(camera, str) and camera for camera in cameras)
+    ):
+        raise TypeError("Cosmos3 multiview cameras must be a non-empty list of strings.")
+    if len(cameras) != len(set(cameras)):
+        raise ValueError("Cosmos3 multiview cameras must be unique.")
+    if tuple(cameras) != COSMOS3_MADS_CAMERAS:
+        raise ValueError(
+            "Cosmos3 Multiview-AV v1 requires the fixed 11-camera MADS order: "
+            f"expected={list(COSMOS3_MADS_CAMERAS)}, got={cameras}."
+        )
+    max_views = _required_deployment_field(config, "max_views")
+    if isinstance(max_views, bool) or not isinstance(max_views, int):
+        raise TypeError("Cosmos3 multiview max_views must be an integer.")
+    if max_views != len(cameras):
+        raise ValueError(
+            "Cosmos3 multiview max_views must equal the exported camera list length: "
+            f"max_views={max_views}, cameras={len(cameras)}."
+        )
+
+    backend = _required_deployment_field(config, "backend")
+    if not isinstance(backend, str):
+        raise TypeError("Cosmos3 multiview backend must be a string.")
+    validate_multiview_backend(backend)
+    return {
+        **config,
+        "decomposed_temporal_window_seconds": temporal_window,
+    }
+
+
 class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     """Bidirectional one-shot 11-view RGB generation with WSM control."""
 
@@ -165,6 +277,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     dummy_run_num_frames: ClassVar[int] = 0
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
         parallel_config = od_config.parallel_config
         sequence_parallel_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
         cfg_parallel_size = int(getattr(parallel_config, "cfg_parallel_size", 1) or 1)
@@ -191,31 +304,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3MultiviewPipeline requires transformer/config.json backbone_type='cosmos3_multiview'."
             )
 
-        model_config = od_config.tf_model_config
-        multiview_config = _tf_config_get(model_config, "multiview", None)
-        if multiview_config is None:
-            raise ValueError("Cosmos3 multiview transformer config must contain a 'multiview' object.")
-        if hasattr(multiview_config, "to_dict"):
-            multiview_config = multiview_config.to_dict()
-        multiview_config = _mapping(multiview_config, "transformer config")
-        cameras = multiview_config.get("cameras")
-        if not isinstance(cameras, Sequence) or isinstance(cameras, str | bytes) or not cameras:
-            raise ValueError("Cosmos3 multiview transformer config must contain a non-empty cameras list.")
-        self.multiview_cameras = tuple(str(camera) for camera in cameras)
-        if self.multiview_cameras != COSMOS3_MADS_CAMERAS:
-            raise ValueError(
-                "Cosmos3 Multiview-AV v1 requires the fixed 11-camera MADS order: "
-                f"expected={list(COSMOS3_MADS_CAMERAS)}, got={list(self.multiview_cameras)}."
-            )
-        max_views = int(multiview_config.get("max_views", len(self.multiview_cameras)))
-        if max_views != len(self.multiview_cameras):
-            raise ValueError(
-                "Cosmos3 multiview max_views must equal the exported camera list length: "
-                f"max_views={max_views}, cameras={len(self.multiview_cameras)}."
-            )
-        if not as_bool(multiview_config.get("share_vision_temporal_positions", True), True):
-            raise ValueError("Cosmos3 multiview requires share_vision_temporal_positions=true.")
-        self.multiview_attention_scope = str(multiview_config.get("attention_scope", "same_view_or_frame"))
+        self.multiview_cameras = tuple(multiview_config["cameras"])
+        self.multiview_attention_scope = multiview_config["attention_scope"]
+        self.multiview_decomposed_temporal_window_seconds = multiview_config["decomposed_temporal_window_seconds"]
+        self.multiview_control_attends_sensor = multiview_config["control_attends_sensor"]
+        self.multiview_align_temporal_positions_across_views = multiview_config["align_temporal_positions_across_views"]
         self.multiview_backend = self._resolve_attention_backend(multiview_config)
 
     @staticmethod
@@ -231,7 +324,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         load time instead of on the first generated frame.
         """
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
-        backend = str(override if override else multiview_config.get("backend", "triton"))
+        backend = override if override else _required_deployment_field(multiview_config, "backend")
+        if not isinstance(backend, str):
+            raise TypeError("Cosmos3 multiview attention backend must be a string.")
         try:
             return validate_multiview_backend(backend)
         except ValueError as exc:
@@ -458,12 +553,16 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError(f"Cosmos3 multiview height is fixed at {height}, got {sp.height}.")
         if sp.width is not None and int(sp.width) != width:
             raise ValueError(f"Cosmos3 multiview width is fixed at {width}, got {sp.width}.")
-        frame_rate = float(
-            self._get_sp_param(sp, "resolved_frame_rate", None)
-            or self._get_sp_param(sp, "frame_rate", None)
-            or self._get_sp_param(sp, "fps", None)
-            or COSMOS3_MULTIVIEW_DEFAULT_FPS
-        )
+        frame_rate_value = self._get_sp_param(sp, "resolved_frame_rate", None)
+        if frame_rate_value is None:
+            frame_rate_value = self._get_sp_param(sp, "frame_rate", None)
+        if frame_rate_value is None:
+            frame_rate_value = self._get_sp_param(sp, "fps", None)
+        if frame_rate_value is None:
+            frame_rate_value = COSMOS3_MULTIVIEW_DEFAULT_FPS
+        frame_rate = float(frame_rate_value)
+        if not math.isfinite(frame_rate) or frame_rate <= 0:
+            raise ValueError(f"Cosmos3 multiview FPS must be finite and positive, got {frame_rate!r}.")
         if frame_rate != COSMOS3_MULTIVIEW_DEFAULT_FPS:
             raise ValueError(f"Cosmos3 multiview v1 is pinned to 10 FPS, got {frame_rate}.")
 
@@ -528,6 +627,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "Cosmos3 multiview WSM and target latent shapes must match: "
                 f"control={tuple(control_latents.shape)}, target={tuple(latents.shape)}."
             )
+        actual_latent_t = int(latents.shape[2])
+        temporal_position_period = _resolve_temporal_position_period(
+            actual_latent_t,
+            num_views,
+            self.multiview_align_temporal_positions_across_views,
+        )
 
         max_sequence_length = int(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
@@ -542,11 +647,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         patch_h, patch_w, _, _ = self.transformer._pad_to_patch_size(latents.shape[3], latents.shape[4])
         layout = MultiviewLayout(
             num_views=num_views,
-            latent_frames=latent_t,
+            latent_frames=actual_latent_t,
             patch_height=patch_h,
             patch_width=patch_w,
-            condition_frame_indexes=tuple(condition_indexes),
             attention_scope=self.multiview_attention_scope,  # type: ignore[arg-type]
+            decomposed_temporal_window_seconds=self.multiview_decomposed_temporal_window_seconds,
+            control_attends_sensor=self.multiview_control_attends_sensor,
+            seconds_per_frame=self.vae_scale_factor_temporal / frame_rate,
             backend=self.multiview_backend,
         )
 
@@ -597,6 +704,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             "noisy_frame_mask": velocity_mask,
             "control_latents": [control_latents],
             "transfer_share_vision_temporal_positions": True,
+            "temporal_position_period": temporal_position_period,
             "multiview_layout": layout,
         }
         latents = self.diffuse(

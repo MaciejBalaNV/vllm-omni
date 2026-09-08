@@ -24,6 +24,33 @@ def _views(cameras: tuple[str, ...], *, vision: bool = False) -> list[dict]:
     return result
 
 
+def _deployment_config() -> dict:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import COSMOS3_MADS_CAMERAS
+
+    return {
+        "causal_training_strategy": "none",
+        "attention_scope": "decomposed",
+        "decomposed_temporal_window_seconds": None,
+        "control_attends_sensor": True,
+        "align_temporal_positions_across_views": True,
+        "share_vision_temporal_positions": True,
+        "backend": "triton",
+        "cameras": list(COSMOS3_MADS_CAMERAS),
+        "max_views": len(COSMOS3_MADS_CAMERAS),
+    }
+
+
+def _deployment_model_config(multiview: dict) -> dict:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+    )
+
+    return {
+        "backbone_type": COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+        "multiview": multiview,
+    }
+
+
 def test_multiview_padding_replicates_last_frame_and_rejects_empty_media() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
         _pad_multiview_view_video,
@@ -83,6 +110,17 @@ def test_multiview_resolution_does_not_inherit_image_default() -> None:
 
     sp.extra_args["resolution"] = "480"
     assert _resolve_multiview_resolution(sp, {}) == "480"
+
+
+def test_multiview_temporal_position_period_validates_actual_latent_geometry() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _resolve_temporal_position_period,
+    )
+
+    assert _resolve_temporal_position_period(6, 2, True) == 3
+    assert _resolve_temporal_position_period(5, 2, False) is None
+    with pytest.raises(ValueError, match="divisible by num_views"):
+        _resolve_temporal_position_period(5, 2, True)
 
 
 def test_multiview_skips_generic_dummy_warmup() -> None:
@@ -212,8 +250,9 @@ def test_attention_backend_env_overrides_the_checkpoint(monkeypatch: pytest.Monk
     resolve = Cosmos3MultiviewPipeline._resolve_attention_backend
 
     monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
-    assert resolve({}) == "triton"
     assert resolve({"backend": "fa4"}) == "fa4"
+    with pytest.raises(ValueError, match="requires field 'backend'"):
+        resolve({})
 
     monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, "fa4")
     assert resolve({"backend": "triton"}) == "fa4"
@@ -226,8 +265,113 @@ def test_attention_backend_env_overrides_the_checkpoint(monkeypatch: pytest.Monk
 
     monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, "fa5")
     with pytest.raises(ValueError, match=COSMOS3_MULTIVIEW_BACKEND_ENV):
-        resolve({})
+        resolve({"backend": "triton"})
 
     monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
     with pytest.raises(ValueError, match="multiview.backend"):
         resolve({"backend": "tirton"})
+
+
+def test_multiview_deployment_contract_accepts_current_generic_artifact() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    config = _deployment_config()
+    assert _validated_multiview_deployment_config(_deployment_model_config(config)) == config
+
+
+@pytest.mark.parametrize("backbone_type", [None, "cosmos3", "cosmos3_edge"])
+def test_multiview_deployment_contract_rejects_wrong_backbone_before_multiview_fields(
+    backbone_type: str | None,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    with pytest.raises(ValueError, match="backbone_type='cosmos3_multiview'"):
+        _validated_multiview_deployment_config({"backbone_type": backbone_type})
+
+
+@pytest.mark.parametrize("strategy", ["teacher_forcing", "teacher_forcing_dcm"])
+def test_multiview_deployment_contract_rejects_teacher_forcing_before_generic_fields(strategy: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    with pytest.raises(ValueError, match="replay/cached-memory inference"):
+        _validated_multiview_deployment_config(_deployment_model_config({"causal_training_strategy": strategy}))
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "causal_training_strategy",
+        "attention_scope",
+        "decomposed_temporal_window_seconds",
+        "control_attends_sensor",
+        "align_temporal_positions_across_views",
+        "share_vision_temporal_positions",
+        "backend",
+        "cameras",
+        "max_views",
+    ],
+)
+def test_multiview_deployment_contract_rejects_missing_fields(missing_field: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    config = _deployment_config()
+    del config[missing_field]
+    with pytest.raises(ValueError, match=missing_field):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("causal_training_strategy", 0),
+        ("attention_scope", "same_view_or_frame"),
+        ("decomposed_temporal_window_seconds", True),
+        ("control_attends_sensor", "true"),
+        ("align_temporal_positions_across_views", 1),
+        ("share_vision_temporal_positions", "true"),
+        ("backend", 1),
+        ("cameras", "camera_front_wide_120fov"),
+        ("max_views", True),
+    ],
+)
+def test_multiview_deployment_contract_rejects_malformed_fields(field: str, bad_value: object) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    config = _deployment_config()
+    config[field] = bad_value
+    with pytest.raises((TypeError, ValueError), match=field):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
+
+
+@pytest.mark.parametrize("bad_value", [True, "0.5"])
+def test_multiview_deployment_contract_rejects_temporal_window_type(bad_value: object) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    config = _deployment_config()
+    config["decomposed_temporal_window_seconds"] = bad_value
+    with pytest.raises(TypeError, match="decomposed_temporal_window_seconds"):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
+
+
+@pytest.mark.parametrize("bad_value", [-0.1, float("inf"), float("nan")])
+def test_multiview_deployment_contract_rejects_temporal_window_value(bad_value: float) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    config = _deployment_config()
+    config["decomposed_temporal_window_seconds"] = bad_value
+    with pytest.raises(ValueError, match="decomposed_temporal_window_seconds"):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
