@@ -18,6 +18,7 @@ from typing import Any, ClassVar
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -34,6 +35,7 @@ from .pipeline_cosmos3 import (
     COSMOS3_TRANSFER_SYSTEM_PROMPT,
     COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT,
     Cosmos3OmniDiffusersPipeline,
+    _ceil_video_num_frames,
     get_cosmos3_ir_op_priority_func,
     get_cosmos3_post_process_func,
 )
@@ -48,12 +50,24 @@ from .transformer_cosmos3 import COSMOS3_MULTIVIEW_BACKBONE_TYPE, _tf_config_get
 from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 from .utils import VIDEO_RES_SIZE_INFO
 
+logger = init_logger(__name__)
+
 # Overrides transformer config multiview.backend, so the Triton and FA4 sparse
 # attention paths can be compared without editing the checkpoint.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 
+# Per-camera frame count when the request supplies none.
 COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 93
-COSMOS3_MULTIVIEW_DEFAULT_FPS = 10.0
+# Frame rate when the request supplies none. The MADS WSM transfer recipes train
+# on native 30 FPS clips, so the fps-modulated temporal mRoPE and the prompt
+# metadata are on-distribution only at 30.
+COSMOS3_MULTIVIEW_DEFAULT_FPS = 30.0
+# Rates and frame counts outside these bounds are allowed with a warning.
+COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE = (10.0, 30.0)
+COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE = (24, 300)
+# The negative prompt carries the same duration/FPS and resolution sentences as
+# the positive prompt. Requests may override this through sampling params.
+COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE = "same"
 
 # The tokenizer appends eos and vision_start after truncating. Derive the
 # request ceiling from the sparse attention's single fixed UND capacity so the
@@ -166,6 +180,72 @@ def _resolve_temporal_position_period(latent_frames: int, num_views: int, align_
             f"latent_frames={latent_frames}, num_views={num_views}."
         )
     return latent_frames // num_views
+
+
+def _resolve_multiview_frame_rate(value: Any) -> float:
+    """Resolve the request frame rate; ``None`` selects the default.
+
+    Any finite positive rate is accepted: fps only feeds the fps-modulated
+    temporal mRoPE, the prompt metadata, and the mask timestamps. Rates outside
+    the recommended range are allowed with a warning.
+    """
+    if value is None:
+        return COSMOS3_MULTIVIEW_DEFAULT_FPS
+    if isinstance(value, bool):
+        raise TypeError("Cosmos3 multiview FPS must be a number, not a boolean.")
+    try:
+        frame_rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cosmos3 multiview FPS must be a number, got {value!r}.") from exc
+    if not math.isfinite(frame_rate) or frame_rate <= 0:
+        raise ValueError(f"Cosmos3 multiview FPS must be finite and positive, got {value!r}.")
+    low, high = COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE
+    if not low <= frame_rate <= high:
+        logger.warning(
+            "Cosmos3 multiview FPS %s is outside the recommended range [%s, %s]; the model was trained "
+            "at %s FPS, so quality may be degraded.",
+            frame_rate,
+            low,
+            high,
+            COSMOS3_MULTIVIEW_DEFAULT_FPS,
+        )
+    return frame_rate
+
+
+def _resolve_multiview_num_frames(value: Any, temporal_compression_factor: int) -> int:
+    """Resolve the per-camera frame count, rounding up to the VAE grid.
+
+    ``None`` and the ``OmniDiffusionSamplingParams`` legacy image default of one
+    frame select the variant default. Other lengths are rounded up to the Wan
+    VAE's ``4k+1`` grid instead of being rejected, so 200 becomes 201.
+    """
+    if value is None or (not isinstance(value, bool) and value == 1):
+        return COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES
+    if isinstance(value, bool):
+        raise TypeError("Cosmos3 multiview num_frames must be an integer, not a boolean.")
+    try:
+        num_frames = int(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cosmos3 multiview num_frames must be an integer, got {value!r}.") from exc
+    if num_frames <= 1:
+        raise ValueError(f"Cosmos3 multiview num_frames must be greater than 1, got {value!r}.")
+    rounded = _ceil_video_num_frames(num_frames, temporal_compression_factor)
+    if rounded != num_frames:
+        logger.info(
+            "Rounded Cosmos3 multiview num_frames from %d to %d for temporal compression factor %d.",
+            num_frames,
+            rounded,
+            temporal_compression_factor,
+        )
+    low, high = COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE
+    if not low <= rounded <= high:
+        logger.warning(
+            "Cosmos3 multiview num_frames %d is outside the recommended range [%d, %d]; quality may be degraded.",
+            rounded,
+            low,
+            high,
+        )
+    return rounded
 
 
 def _required_deployment_field(config: Mapping[str, Any], name: str) -> Any:
@@ -538,13 +618,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         requested_num_frames = multiview.get("num_frames")
         if requested_num_frames is None:
             requested_num_frames = sp.num_frames
-        # OmniDiffusionSamplingParams retains a legacy image-oriented default
-        # of one frame; this video-only variant owns the 93-frame default.
-        if requested_num_frames in (None, 1):
-            requested_num_frames = COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES
-        num_frames = int(requested_num_frames)
-        if num_frames <= 0 or (num_frames - 1) % self.vae_scale_factor_temporal:
-            raise ValueError(f"Cosmos3 multiview num_frames must satisfy 4k+1 for the Wan VAE, got {num_frames}.")
+        num_frames = _resolve_multiview_num_frames(requested_num_frames, self.vae_scale_factor_temporal)
         resolution = _resolve_multiview_resolution(sp, multiview)
         if resolution != "480":
             raise ValueError(f"Cosmos3 multiview v1 supports only resolution='480', got {resolution!r}.")
@@ -558,13 +632,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             frame_rate_value = self._get_sp_param(sp, "frame_rate", None)
         if frame_rate_value is None:
             frame_rate_value = self._get_sp_param(sp, "fps", None)
-        if frame_rate_value is None:
-            frame_rate_value = COSMOS3_MULTIVIEW_DEFAULT_FPS
-        frame_rate = float(frame_rate_value)
-        if not math.isfinite(frame_rate) or frame_rate <= 0:
-            raise ValueError(f"Cosmos3 multiview FPS must be finite and positive, got {frame_rate!r}.")
-        if frame_rate != COSMOS3_MULTIVIEW_DEFAULT_FPS:
-            raise ValueError(f"Cosmos3 multiview v1 is pinned to 10 FPS, got {frame_rate}.")
+        frame_rate = _resolve_multiview_frame_rate(frame_rate_value)
 
         condition_video_as_image = as_bool(multiview.get("condition_video_as_image"), False)
         has_vision = self._view_value(views[0], "vision") is not None
@@ -682,7 +750,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             prompt_suffix=COSMOS3_MULTIVIEW_EMPHASIS,
             use_duration_template=True,
             use_resolution_template=True,
-            negative_metadata_mode="none",
+            negative_metadata_mode=str(
+                self._get_sp_param(sp, "negative_metadata_mode", COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE)
+            ),
             aspect_ratio_override="16,9",
         )
 

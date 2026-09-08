@@ -50,8 +50,16 @@ Cosmos3 Nano fields):
 ```
 
 The scheduler directory must describe the regular FlowUniPC scheduler. The
-request pins 35 steps, guidance 6.0, flow shift 10, 93 frames per camera, 10
-FPS, and 480p (832×480).
+request defaults to 35 steps, guidance 6.0, flow shift 10, and 480p (832×480),
+and the resolution is fixed. Frame rate and per-camera frame count are
+request-driven. When omitted, fps defaults to 30 and num_frames to 93.
+
+30 FPS is the training rate: the MADS WSM transfer recipes read their clips at
+native 30 FPS and stamp "30 FPS" into the training captions, so the
+fps-modulated temporal mRoPE and the prompt metadata are on-distribution only
+there. Other rates are accepted with a warning outside [10, 30], and frame
+counts are rounded up to the VAE's `4k+1` grid (200 becomes 201) instead of
+being rejected.
 
 ## Sparse attention backend
 
@@ -110,12 +118,22 @@ python examples/offline_inference/multiview_video/cosmos3_multiview.py \
   --input /data/mv_i2v_wsm.json \
   --negative-prompt-json recipes/cosmos3/negative_prompt.json \
   --output-dir outputs/mv_i2v_wsm \
-  --seed 42
+  --seed 42 --fps 30 --num-frames 200
 ```
 
 `--negative-prompt-json` applies the required serialization for you; a
 `negative_prompt` string in the input JSON takes precedence over it. Omit both
 only for runs where reference parity does not matter.
+
+`--fps` and `--num-frames` override every record, so one input file can be run
+at several rates or lengths without editing it. Records may also use the field
+names `guidance`, `num_steps`, and `shift` as aliases for `guidance_scale`,
+`num_inference_steps`, and `flow_shift`; the vLLM-Omni names win when both are
+present.
+
+By default the negative prompt carries the same duration/FPS and resolution
+sentences as the positive prompt; set `negative_metadata_mode` in the request's
+extra args to change it.
 
 The example writes `vision_viewNN_<camera>.mp4` for all eleven cameras plus
 `sample_outputs.json`. Sequence parallelism, CFG parallelism, cache-DiT,

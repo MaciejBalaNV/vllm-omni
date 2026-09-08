@@ -141,6 +141,8 @@ def _run_request(
     output_dir: Path,
     seed: int,
     fallback_negative_prompt: str | None,
+    fps_override: float | None = None,
+    num_frames_override: int | None = None,
 ) -> dict[str, Any]:
     multiview_value = request.get("multiview")
     if not isinstance(multiview_value, dict):
@@ -158,23 +160,44 @@ def _run_request(
     # Keep the resolved value with the variant-owned multiview parameters so
     # top-level Imaginaire inputs and native vLLM-Omni inputs behave identically.
     multiview["resolution"] = resolution
-    num_frames = int(multiview.get("num_frames", request.get("num_frames", 93)))
-    fps = float(request.get("fps", 10))
+
+    # Frame rate and per-camera frame count are pipeline-owned: when neither the
+    # CLI nor the record sets them, the pipeline applies its defaults (30 FPS,
+    # 93 frames) and rounds frame counts up to the VAE's 4k+1 grid. CLI
+    # overrides win over record values.
+    num_frames = num_frames_override
+    if num_frames is None:
+        num_frames = _first_present(multiview, "num_frames")
+    if num_frames is None:
+        num_frames = _first_present(request, "num_frames")
+    fps = fps_override if fps_override is not None else _first_present(request, "fps")
 
     extra_args = {
         "multiview": multiview,
         "resolution": resolution,
         "wsm": request.get("wsm", {}),
     }
+    # Records may also use the field names ``guidance``, ``num_steps``, and
+    # ``shift``; the vLLM-Omni names win when both are present.
+    flow_shift = _first_present(request, "flow_shift", "shift")
+    if flow_shift is not None:
+        extra_args["flow_shift"] = float(flow_shift)
+    sampling_kwargs: dict[str, Any] = {}
+    if num_frames is not None:
+        num_frames = int(num_frames)
+        # Keep the record's variant-owned copy in step with the resolved value.
+        multiview["num_frames"] = num_frames
+        sampling_kwargs["num_frames"] = num_frames
+    if fps is not None:
+        sampling_kwargs["fps"] = float(fps)
     sampling_params = OmniDiffusionSamplingParams(
         height=height,
         width=width,
-        num_frames=num_frames,
-        fps=fps,
-        num_inference_steps=int(request.get("num_inference_steps", 35)),
-        guidance_scale=float(request.get("guidance_scale", 6.0)),
+        num_inference_steps=int(_first_present(request, "num_inference_steps", "num_steps", default=35)),
+        guidance_scale=float(_first_present(request, "guidance_scale", "guidance", default=6.0)),
         seed=seed,
         extra_args=extra_args,
+        **sampling_kwargs,
     )
     prompt = {
         "prompt": str(request.get("prompt", "")),
@@ -191,7 +214,7 @@ def _run_request(
 
     frames_per_view = int(metadata.get("multiview", {}).get("frames_per_view", sampling_params.num_frames))
     cameras = metadata.get("multiview", {}).get("cameras") or [view["camera_key"] for view in views]
-    output_fps = float(metadata.get("multiview", {}).get("fps", sampling_params.fps or 10))
+    output_fps = float(metadata.get("multiview", {}).get("fps", sampling_params.fps or 30))
     if len(frames) != len(cameras) * frames_per_view:
         raise ValueError(f"Expected {len(cameras) * frames_per_view} camera-major frames, got {len(frames)}.")
 
@@ -218,6 +241,15 @@ def _run_request(
     return manifest
 
 
+def _first_present(record: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Return the first non-null value among ``keys``, in priority order."""
+    for key in keys:
+        value = record.get(key)
+        if value is not None:
+            return value
+    return default
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="Exported Cosmos3 Multiview-AV Diffusers directory")
@@ -235,6 +267,24 @@ def main() -> None:
         help=(
             "Structured negative prompt to serialize with json.dumps defaults. The pipeline ships no default "
             "negative prompt, so reference-parity runs must supply the reference one here."
+        ),
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help=(
+            "Frame rate for every record, overriding any record value. "
+            "Unset: the record's fps, else the pipeline default of 30 FPS."
+        ),
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help=(
+            "Per-camera frame count for every record, overriding any record value. "
+            "The pipeline rounds it up to the VAE's 4k+1 grid; unset defaults to 93."
         ),
     )
     args = parser.parse_args()
@@ -278,6 +328,8 @@ def main() -> None:
             output_dir=output_dir,
             seed=seed,
             fallback_negative_prompt=fallback_negative_prompt,
+            fps_override=args.fps,
+            num_frames_override=args.num_frames,
         )
         manifests.append({**manifest, "output_dir": str(output_dir)})
 

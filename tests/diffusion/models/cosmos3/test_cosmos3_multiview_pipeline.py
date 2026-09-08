@@ -190,6 +190,63 @@ def test_multiview_negative_prompt_is_caller_supplied() -> None:
     assert not (Path(module.__file__).with_name("negative_prompt_multiview.json")).exists()
 
 
+def test_multiview_negative_prompt_metadata_mode_defaults_to_same() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE,
+    )
+
+    # The negative prompt carries the same duration/FPS and resolution
+    # sentences as the positive one.
+    assert COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE == "same"
+
+
+def test_multiview_frame_rate_is_request_driven_and_defaults_to_training_rate() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_DEFAULT_FPS,
+        _resolve_multiview_frame_rate,
+    )
+
+    # 30 FPS is the training rate and only the fallback, not a pin.
+    assert COSMOS3_MULTIVIEW_DEFAULT_FPS == 30.0
+    assert _resolve_multiview_frame_rate(None) == 30.0
+    assert _resolve_multiview_frame_rate(30) == 30.0
+    assert _resolve_multiview_frame_rate(10) == 10.0
+    assert _resolve_multiview_frame_rate(29.97) == pytest.approx(29.97)
+    # Outside the recommended range is a warning, not an error.
+    assert _resolve_multiview_frame_rate(60) == 60.0
+    for bad in (0, -5, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            _resolve_multiview_frame_rate(bad)
+    with pytest.raises(TypeError):
+        _resolve_multiview_frame_rate(True)
+    with pytest.raises(TypeError):
+        _resolve_multiview_frame_rate("fast")
+
+
+def test_multiview_num_frames_round_up_to_vae_grid() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES,
+        _resolve_multiview_num_frames,
+    )
+
+    assert COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES == 93
+    assert _resolve_multiview_num_frames(None, 4) == 93
+    # OmniDiffusionSamplingParams' legacy image default selects the variant default.
+    assert _resolve_multiview_num_frames(1, 4) == 93
+    assert _resolve_multiview_num_frames(93, 4) == 93
+    # 200 is rounded up to 201 instead of being rejected.
+    assert _resolve_multiview_num_frames(200, 4) == 201
+    assert _resolve_multiview_num_frames(201, 4) == 201
+    assert _resolve_multiview_num_frames("200", 4) == 201
+    for bad in (0, -3):
+        with pytest.raises(ValueError, match="greater than 1"):
+            _resolve_multiview_num_frames(bad, 4)
+    with pytest.raises(TypeError):
+        _resolve_multiview_num_frames(True, 4)
+    with pytest.raises(TypeError):
+        _resolve_multiview_num_frames("many", 4)
+
+
 def test_multiview_transformer_resolver() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import resolve_cosmos3_transformer_cls
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
