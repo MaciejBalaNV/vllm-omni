@@ -92,19 +92,55 @@ def _resolve_seed(request: dict[str, Any], base_seed: int, sample_index: int) ->
     return int(value)
 
 
+def _request_output_metadata(value: Any) -> dict[str, Any]:
+    """Return the pipeline metadata the engine attaches to a request output.
+
+    The formatter puts decoded frames in ``images`` and the pipeline's
+    ``metadata`` envelope under ``multimodal_output["metadata"]``.
+    """
+    multimodal_output = getattr(value, "multimodal_output", None)
+    if isinstance(multimodal_output, dict):
+        metadata = multimodal_output.get("metadata")
+    else:
+        metadata = getattr(multimodal_output, "metadata", None)
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def _extract_payload(value: Any) -> tuple[Any, dict[str, Any]]:
     if isinstance(value, list) and len(value) == 1:
         return _extract_payload(value[0])
-    if isinstance(value, OmniRequestOutput):
-        if value.images:
-            return _extract_payload(value.images[0] if len(value.images) == 1 else value.images)
-        raise ValueError("Cosmos3 multiview inference returned no video output.")
+    if isinstance(value, OmniRequestOutput) or (
+        not isinstance(value, dict | list | np.ndarray | torch.Tensor) and hasattr(value, "images")
+    ):
+        if not value.images:
+            raise ValueError("Cosmos3 multiview inference returned no video output.")
+        video, metadata = _extract_payload(value.images[0] if len(value.images) == 1 else value.images)
+        return video, {**_request_output_metadata(value), **metadata}
     if isinstance(value, dict):
         metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
         payload = value.get("payload") if isinstance(value.get("payload"), dict) else value
         if "video" in payload:
             return payload["video"], metadata
     return value, {}
+
+
+def _resolve_frames_per_view(frames: list[Any], cameras: list[str], metadata: dict[str, Any]) -> int:
+    """Per-camera frame count of the camera-major output.
+
+    The pipeline reports it in its metadata; without that, it is derived from
+    the frame count. The requested ``num_frames`` is not a valid fallback: the
+    pipeline rounds it up to the VAE grid.
+    """
+    reported = metadata.get("multiview", {}).get("frames_per_view")
+    if reported is not None:
+        frames_per_view = int(reported)
+    elif cameras and len(frames) % len(cameras) == 0:
+        frames_per_view = len(frames) // len(cameras)
+    else:
+        raise ValueError(f"Cannot split {len(frames)} camera-major frames evenly across {len(cameras)} cameras.")
+    if frames_per_view <= 0 or len(frames) != len(cameras) * frames_per_view:
+        raise ValueError(f"Expected {len(cameras) * frames_per_view} camera-major frames, got {len(frames)}.")
+    return frames_per_view
 
 
 def _frame_list(video: Any) -> list[Any]:
@@ -209,11 +245,9 @@ def _run_request(
     video, metadata = _extract_payload(result)
     frames = _frame_list(video)
 
-    frames_per_view = int(metadata.get("multiview", {}).get("frames_per_view", sampling_params.num_frames))
     cameras = metadata.get("multiview", {}).get("cameras") or [view["camera_key"] for view in views]
+    frames_per_view = _resolve_frames_per_view(frames, cameras, metadata)
     output_fps = float(metadata.get("multiview", {}).get("fps", sampling_params.fps or 30))
-    if len(frames) != len(cameras) * frames_per_view:
-        raise ValueError(f"Expected {len(cameras) * frames_per_view} camera-major frames, got {len(frames)}.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     files_by_camera = {}
