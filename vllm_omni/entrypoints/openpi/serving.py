@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ActionOutput = np.ndarray | dict[str, np.ndarray]
+ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -159,6 +159,7 @@ class ServingRealtimeRobotOpenPI:
         # params, so start from a clone of the diffusion stage's defaults
         # (e.g. a policy deploy yaml's ``extra_args``) and layer the OpenPI
         # protocol fields on top.
+        seed = obs.pop("seed", None)
         sampling_params = OmniDiffusionSamplingParams()
         for default_params in get_default_sampling_params_list(self.engine_client):
             if isinstance(default_params, OmniDiffusionSamplingParams):
@@ -175,7 +176,10 @@ class ServingRealtimeRobotOpenPI:
         )
 
         prompt = obs.get("prompt", "")
-        sampling_params.extra_args = extra_args
+        sampling_params = OmniDiffusionSamplingParams(
+            seed=int(seed) if seed is not None else None,
+            extra_args=extra_args,
+        )
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,

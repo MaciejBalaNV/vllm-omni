@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import json
@@ -274,6 +274,18 @@ def test_build_request_clones_stage_defaults_before_protocol_fields():
     request_a.sampling_params.extra_args["nested"]["values"].append("request-a")
     assert request_b.sampling_params.extra_args["nested"] == {"values": []}
     assert default_params.extra_args["nested"] == {"values": []}
+
+
+def test_build_request_forwards_seed_to_sampling_params():
+    """``seed`` in the inference message is the engine-level seed; omitted, the request auto-seeds."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    seeded = serving._build_request({"prompt": "pick up the object", "seed": 42}, session_id="s", reset=True)
+    unseeded = serving._build_request({"prompt": "pick up the object"}, session_id="s", reset=False)
+
+    assert seeded.sampling_params.seed == 42
+    assert "seed" not in seeded.sampling_params.extra_args["robot_obs"]
+    assert isinstance(unseeded.sampling_params.seed, int)
 
 
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
