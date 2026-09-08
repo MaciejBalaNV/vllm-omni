@@ -60,9 +60,7 @@ def _resolve_model_mode(request: dict[str, Any], views: list[dict[str, Any]]) ->
     inferred_mode = "image2video" if any(vision_present) else "text2video"
     model_mode = str(request.get("model_mode", inferred_mode)).strip().lower()
     if model_mode not in SUPPORTED_MODEL_MODES:
-        raise ValueError(
-            f"Unsupported model_mode {model_mode!r}; expected one of {sorted(SUPPORTED_MODEL_MODES)}."
-        )
+        raise ValueError(f"Unsupported model_mode {model_mode!r}; expected one of {sorted(SUPPORTED_MODEL_MODES)}.")
     if model_mode == "image2video" and not all(vision_present):
         raise ValueError("model_mode='image2video' requires vision input for every camera view.")
     if model_mode == "text2video" and any(vision_present):
@@ -81,8 +79,7 @@ def _resolve_resolution(request: dict[str, Any], multiview: dict[str, Any]) -> t
     resolution = str(nested if nested is not None else top_level if top_level is not None else "480")
     if resolution not in SUPPORTED_RESOLUTIONS:
         raise ValueError(
-            f"Unsupported Cosmos3 multiview resolution {resolution!r}; "
-            f"expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
+            f"Unsupported Cosmos3 multiview resolution {resolution!r}; expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
         )
     width, height = SUPPORTED_RESOLUTIONS[resolution]
     return resolution, width, height
