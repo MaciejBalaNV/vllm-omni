@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+from functools import wraps
 from types import SimpleNamespace
 
 import pytest
@@ -287,6 +288,133 @@ def test_channels_last_level_converts_conv_weights_and_restores_them() -> None:
 
     uninstall_wan_vae_fastpath(vae)
     assert all(m.weight.is_contiguous() for m in conv3d + conv2d)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("assign", [False, True])
+def test_uninstall_restores_mixed_layouts_and_keeps_weight_updates(assign: bool) -> None:
+    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+    convs = [module for module in vae.decoder.modules() if isinstance(module, (nn.Conv2d, nn.Conv3d))]
+    convs.append(vae.post_quant_conv)
+    for index, conv in enumerate(convs):
+        if index % 3 == 1:
+            conv.to(memory_format=torch.channels_last_3d if isinstance(conv, nn.Conv3d) else torch.channels_last)
+        elif index % 3 == 2:
+            conv.weight.data = conv.weight.data.transpose(-1, -2)
+    vae.post_quant_conv.register_buffer("layout_probe", torch.randn(2, 3, 4, 5, 6).transpose(-1, -2))
+    vae.decoder.conv_out.weight.grad = torch.randn_like(vae.decoder.conv_out.weight)
+    grad_strides = vae.decoder.conv_out.weight.grad.stride()
+    strides = {name: tensor.stride() for name, tensor in vae.state_dict().items()}
+    # An explicit alias is safe to replace, but must remain an instance
+    # attribute after uninstall, with its exact original identity.
+    original_forward = vae.decoder.forward
+    vae.decoder.forward = original_forward
+    original_cfg = object()
+    setattr(vae.decoder, fastpath_forwards.CFG_ATTR, original_cfg)
+
+    assert install_wan_vae_fastpath(vae, level="channels_last").installed
+    updated = {name: tensor.contiguous() + 0.25 for name, tensor in vae.state_dict().items()}
+    vae.load_state_dict(updated, assign=assign)
+    uninstall_wan_vae_fastpath(vae)
+
+    assert vae.decoder.__dict__["forward"] is original_forward
+    assert getattr(vae.decoder, fastpath_forwards.CFG_ATTR) is original_cfg
+    for name, tensor in vae.state_dict().items():
+        assert tensor.stride() == strides[name], name
+        assert torch.equal(tensor, updated[name]), name
+    if not assign:
+        assert vae.decoder.conv_out.weight.grad.stride() == grad_strides
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("level", ["lossless", "channels_last"])
+@pytest.mark.parametrize(
+    "target",
+    [
+        "decoder",
+        "decoder.conv_in",
+        "decoder.up_blocks.0.upsampler",
+        "decoder.up_blocks.0.upsampler.resample",
+        "decoder.up_blocks.0.upsampler.resample.1",
+        "decoder.up_blocks.0.avg_shortcut",
+        "decoder.norm_out",
+        "decoder.nonlinearity",
+        "post_quant_conv",
+    ],
+)
+def test_installer_declines_forward_wrappers_it_would_bypass(target: str, level: str) -> None:
+    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+    module = vae.get_submodule(target)
+    original_forward = module.forward
+    calls = []
+
+    @wraps(original_forward)
+    def wrapped(*args, **kwargs):
+        calls.append(True)
+        return original_forward(*args, **kwargs)
+
+    module.forward = wrapped
+    originals = {name: (tensor.data_ptr(), tensor.stride()) for name, tensor in vae.state_dict().items()}
+    report = install_wan_vae_fastpath(vae, level=level)
+    assert not report.installed and target in report.reason and "custom forward" in report.reason
+    assert not is_installed(vae) and not hasattr(vae, REPORT_ATTR)
+    assert all(fastpath_forwards.CFG_ATTR not in child.__dict__ for child in vae.modules())
+    assert {name: (tensor.data_ptr(), tensor.stride()) for name, tensor in vae.state_dict().items()} == originals
+    uninstall_wan_vae_fastpath(vae)
+    assert module.forward is wrapped
+    vae.decode(torch.randn(1, 4, 2, 6, 8))
+    assert calls
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("pre_hook", [False, True])
+def test_installer_declines_convolution_hooks_it_would_bypass(pre_hook: bool) -> None:
+    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+    conv = vae.decoder.conv_in
+    calls = []
+
+    def hook(*args):
+        calls.append(True)
+
+    handle = conv.register_forward_pre_hook(hook) if pre_hook else conv.register_forward_hook(hook)
+    try:
+        report = install_wan_vae_fastpath(vae, level="channels_last")
+        assert not report.installed and "decoder.conv_in" in report.reason and "forward hooks" in report.reason
+        vae.decode(torch.randn(1, 4, 2, 6, 8))
+        assert calls
+    finally:
+        handle.remove()
+
+
+@torch.no_grad()
+def test_installer_preserves_wrappers_and_hooks_on_modules_it_still_calls() -> None:
+    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+    original_forward = vae.decoder.mid_block.forward
+    wrapper_calls = []
+    hook_calls = []
+
+    def wrapped(*args, **kwargs):
+        wrapper_calls.append(True)
+        return original_forward(*args, **kwargs)
+
+    def hook(*args):
+        hook_calls.append(True)
+
+    vae.decoder.mid_block.forward = wrapped
+    handle = vae.decoder.register_forward_hook(hook)
+    try:
+        latents = torch.randn(1, 4, 2, 6, 8)
+        expected = vae.decode(latents).sample
+        wrapper_calls.clear()
+        hook_calls.clear()
+        assert install_wan_vae_fastpath(vae).installed
+        actual = vae.decode(latents).sample
+        assert torch.equal(actual, expected)
+        assert len(wrapper_calls) == len(hook_calls) == 2
+        uninstall_wan_vae_fastpath(vae)
+        assert vae.decoder.mid_block.forward is wrapped
+    finally:
+        handle.remove()
 
 
 def test_installer_refuses_unsupported_targets() -> None:

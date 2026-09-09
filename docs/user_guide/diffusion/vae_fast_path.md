@@ -45,6 +45,9 @@ stages:
 - The fast path is installed once per VAE instance when the pipeline is
   initialized. It rebinds the forwards of the loaded decoder modules; parameter
   names, `state_dict` keys and weight loading are unchanged.
+- Installation is skipped, with a logged reason, if a custom forward wrapper
+  or forward hook would be replaced or bypassed by the fused paths. Wrappers
+  and hooks on modules that the fast path still calls normally are preserved.
 - Every fused kernel validates its inputs and falls back to the exact PyTorch
   expression for anything it does not support (unusual dtypes or layouts, CPU
   tensors, autograd enabled, `torch.compile` tracing).

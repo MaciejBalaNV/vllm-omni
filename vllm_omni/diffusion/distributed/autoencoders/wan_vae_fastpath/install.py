@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from functools import partial
 from types import MethodType
 from typing import Any
 
@@ -14,6 +15,7 @@ import torch
 import torch.nn as nn
 from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    DupUp3D,
     WanCausalConv3d,
     WanDecoder3d,
     WanResample,
@@ -32,6 +34,15 @@ VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
 REPORT_ATTR = "_vllm_omni_wan_fastpath_report"
 _UNDO_ATTR = "_vllm_omni_wan_fastpath_undo"
+
+_REPLACEMENT_FORWARDS = {
+    WanDecoder3d: forwards.decoder_forward,
+    WanCausalConv3d: forwards.causal_conv_forward,
+    WanResidualBlock: forwards.residual_block_forward,
+    WanResidualUpBlock: forwards.residual_up_block_forward,
+    WanResample: forwards.resample_forward,
+    WanUpsample: forwards.upsample_forward,
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,28 @@ def _convert_conv_memory_format(modules: list[nn.Module], *, channels_last: bool
     return count
 
 
+@torch.no_grad()
+def _restore_module_layouts(
+    module: nn.Module,
+    tensor_strides: Mapping[str, tuple[int, ...]],
+    grad_strides: Mapping[str, tuple[int, ...]],
+) -> None:
+    """Restore layouts of the current tensors, retaining any updates made while installed."""
+
+    def restore(tensor: torch.Tensor, strides: tuple[int, ...]) -> None:
+        if tensor.stride() != strides:
+            restored = torch.empty_strided(tensor.shape, strides, device=tensor.device, dtype=tensor.dtype)
+            restored.copy_(tensor)
+            tensor.data = restored
+
+    for name, strides in tensor_strides.items():
+        restore(getattr(module, name), strides)
+    for name, strides in grad_strides.items():
+        grad = getattr(module, name).grad
+        if grad is not None:
+            restore(grad, strides)
+
+
 def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanVaeFastPathReport:
     """Install the Wan decoder fast path on one loaded ``AutoencoderKLWan``. Idempotent.
 
@@ -112,6 +145,45 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     if isinstance(parallel_mode, str) and parallel_mode.startswith("spatial_shard"):
         return _skip(level, f"vae_parallel_mode={parallel_mode!r} is not supported")
 
+    modules = [(f"decoder.{name}" if name else "decoder", module) for name, module in decoder.named_modules()]
+    post_quant_conv = getattr(vae, "post_quant_conv", None)
+    if type(post_quant_conv) is WanCausalConv3d:
+        modules.append(("post_quant_conv", post_quant_conv))
+    bindings: list[tuple[nn.Module, Callable[..., Any]]] = []
+    convs: list[nn.Module] = []
+    bypassed: set[nn.Module] = set()
+    for _, module in modules:
+        replacement = _REPLACEMENT_FORWARDS.get(type(module))
+        if forwards.is_diffusers_rms_norm(module):
+            replacement = forwards.rms_norm_forward
+            bypassed.add(module)
+        if replacement is not None:
+            bindings.append((module, replacement))
+        if isinstance(module, (nn.Conv2d, nn.Conv3d)):
+            convs.append(module)
+        if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
+            type(module) is WanCausalConv3d and module is not post_quant_conv
+        ):
+            bypassed.add(module)
+        if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
+            bypassed.update((module.resample, module.resample[1]))
+
+    replaced = {module for module, _ in bindings}
+    for name, module in modules:
+        if module in replaced or module in bypassed:
+            current_forward = module.forward
+            # An explicit alias of the class method is safe and will be restored
+            # as the same instance attribute. Arbitrary wrappers cannot be
+            # composed with replacement forwards or direct functional calls.
+            if not (
+                isinstance(current_forward, MethodType)
+                and current_forward.__self__ is module
+                and current_forward.__func__ is type(module).forward
+            ):
+                return _skip(level, f"{name} has a custom forward that the fast path would replace or bypass")
+        if module in bypassed and (module._forward_pre_hooks or module._forward_hooks):
+            return _skip(level, f"{name} has forward hooks that the fast path would bypass")
+
     device = next((p.device for p in decoder.parameters()), torch.device("cpu"))
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
     if device.type == "cuda":
@@ -140,29 +212,8 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
             setattr(module, forwards.CFG_ATTR, cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
-        bind(decoder, forwards.decoder_forward)
-        convs: list[nn.Module] = []
-        for module in decoder.modules():
-            module_type = type(module)
-            if module_type is WanCausalConv3d:
-                bind(module, forwards.causal_conv_forward)
-                convs.append(module)
-            elif module_type is WanResidualBlock:
-                bind(module, forwards.residual_block_forward)
-            elif module_type is WanResidualUpBlock:
-                bind(module, forwards.residual_up_block_forward)
-            elif module_type is WanResample:
-                bind(module, forwards.resample_forward)
-            elif module_type is WanUpsample:
-                bind(module, forwards.upsample_forward)
-            elif forwards.is_diffusers_rms_norm(module):
-                bind(module, forwards.rms_norm_forward)
-            elif isinstance(module, (nn.Conv2d, nn.Conv3d)):
-                convs.append(module)
-        post_quant_conv = getattr(vae, "post_quant_conv", None)
-        if type(post_quant_conv) is WanCausalConv3d:
-            bind(post_quant_conv, forwards.causal_conv_forward)
-            convs.append(post_quant_conv)
+        for module, replacement in bindings:
+            bind(module, replacement)
 
         if cfg.channels_last:
             # Keep the original storage only until installation commits. An OOM
@@ -170,6 +221,19 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
             # restore its tensors without allocating or calling Module.to again.
             for module in convs:
                 for owner in module.modules():
+                    tensor_strides = {
+                        name: tensor.stride()
+                        for name, tensor in (
+                            *owner.named_parameters(recurse=False),
+                            *owner.named_buffers(recurse=False),
+                        )
+                    }
+                    grad_strides = {
+                        name: parameter.grad.stride()
+                        for name, parameter in owner.named_parameters(recurse=False)
+                        if parameter.grad is not None
+                    }
+                    undo.append(partial(_restore_module_layouts, owner, tensor_strides, grad_strides))
                     for name, parameter in owner.named_parameters(recurse=False):
                         rollback.callback(owner._parameters.__setitem__, name, parameter)
                         rollback.callback(setattr, parameter, "data", parameter.data)
@@ -180,7 +244,6 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
                         rollback.callback(owner._buffers.__setitem__, name, buffer)
                         rollback.callback(setattr, buffer, "data", buffer.data)
             converted = _convert_conv_memory_format(convs, channels_last=True)
-            undo.append(lambda: _convert_conv_memory_format(convs, channels_last=False))
             logger.info("Wan VAE decoder: %d convolution weights converted to channels-last layout", converted)
 
         report = WanVaeFastPathReport(
@@ -206,7 +269,7 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
 
 
 def uninstall_wan_vae_fastpath(vae: nn.Module) -> None:
-    """Undo :func:`install_wan_vae_fastpath` on one VAE (intended for tests)."""
+    """Restore original forwards and tensor layouts, retaining current weight values."""
     undo = vae.__dict__.pop(_UNDO_ATTR, None)
     vae.__dict__.pop(REPORT_ATTR, None)
     for restore in reversed(undo or []):
