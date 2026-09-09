@@ -238,6 +238,16 @@ def _conv_without_bias(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
     return F.conv3d(x, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
 
 
+def _deferred_conv_bias(conv: nn.Module, output: torch.Tensor) -> torch.Tensor | None:
+    """Round a deferred bias as autocast would inside the producing convolution.
+
+    Use the output dtype: autocast can change it even when the input and
+    parameters are fp32. Matching dtypes keep the original parameter without
+    allocating a copy.
+    """
+    return None if conv.bias is None else conv.bias.to(dtype=output.dtype)
+
+
 # Per conv module: {(x.shape, cache_frames, dtype, layout): cuDNN padding is bitwise
 # identical to a pre-padded input}. ``False`` routes that shape to the padded path.
 _SPATIAL_PAD_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKeyDictionary()
@@ -328,7 +338,6 @@ def _run_cached_causal_conv(
     ):
         fold_bias = return_bias and conv.bias is not None
         bias = None if fold_bias else conv.bias
-        returned_bias = conv.bias if fold_bias else None
 
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).
@@ -339,13 +348,13 @@ def _run_cached_causal_conv(
             if pair is not None:
                 assembled, cache_list[index] = pair
                 out = _conv_with_spatial_padding(conv, assembled, bias, verdicts, key)
-                return (out, returned_bias) if return_bias else out
+                return (out, _deferred_conv_bias(conv, out)) if return_bias else out
 
         pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T)
         if pair is not None:
             conv_input, cache_list[index] = pair
             out = F.conv3d(conv_input, conv.weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
-            return (out, returned_bias) if return_bias else out
+            return (out, _deferred_conv_bias(conv, out)) if return_bias else out
 
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
     if cache_x.shape[2] < CACHE_T and payload is not None:
@@ -522,7 +531,7 @@ def resample_forward(
     if return_bias and _is_upsample_conv_pair(self.resample) and _kernels_allowed(x):
         upsample, conv = self.resample[0], self.resample[1]
         x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
-        pending_bias = conv.bias
+        pending_bias = _deferred_conv_bias(conv, x)
     else:
         x = self.resample(x)
     x = _split_batch_and_frames(x, batch, frames)
@@ -584,7 +593,7 @@ def residual_block_forward(
         and _kernels_allowed(x)
     ):
         residual = _conv_without_bias(shortcut, x)
-        residual_bias = shortcut.bias
+        residual_bias = _deferred_conv_bias(shortcut, residual)
     else:
         residual = shortcut(x)
     x = _norm_act(self.norm1, self.nonlinearity, x)

@@ -620,6 +620,68 @@ def test_resample_forward_can_leave_conv_bias_pending(dtype: torch.dtype, mode: 
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", LOW_PRECISION)
+@pytest.mark.parametrize("force_prepad", [False, True])
+def test_cached_conv_deferred_bias_matches_autocast(dtype: torch.dtype, force_prepad: bool, monkeypatch) -> None:
+    """FP32 parameters and inputs must defer the bias in the convolution's output dtype."""
+    torch.manual_seed(8)
+    conv = WanCausalConv3d(32, 32, 3, padding=1).cuda().eval()
+    conv.bias.copy_(torch.randn_like(conv.bias))
+    if force_prepad:
+        monkeypatch.setattr(dm, "cat_time_5d", lambda *args, **kwargs: None)
+    cache = [None]
+    with torch.autocast("cuda", dtype=dtype):
+        for _ in range(2):
+            x = torch.randn(1, 32, 2, 6, 10, device="cuda")
+            expected = conv(x, cache[0])
+            out, bias = fp._run_cached_causal_conv(conv, x, cache, 0, return_bias=True)
+            assert out.dtype == dtype and bias is not None and bias.dtype == dtype
+            actual = dm.add_bias_residual(out, bias, torch.zeros_like(out), None)
+            assert actual is not None
+            assert _bits_equal(actual.contiguous(), expected.contiguous())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", LOW_PRECISION)
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_residual_block_deferred_bias_matches_autocast(dtype: torch.dtype, channels_last: bool) -> None:
+    """Exercise conv1/conv2 and a non-identity shortcut with FP32 weights under autocast."""
+    torch.manual_seed(8)
+    block = WanResidualBlock(32, 64, dropout=0.0).cuda().eval()
+    for conv in (block.conv1, block.conv2, block.conv_shortcut):
+        conv.bias.copy_(torch.randn_like(conv.bias))
+        if channels_last:
+            conv.to(memory_format=torch.channels_last_3d)
+    x = torch.randn(1, 32, 2, 6, 10, device="cuda")
+    with torch.autocast("cuda", dtype=dtype):
+        expected = block(x, feat_cache=[None, None], feat_idx=[0])
+        setattr(block, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last))
+        actual = fp.residual_block_forward(block, x, feat_cache=[None, None], feat_idx=[0])
+    assert actual.dtype == expected.dtype == dtype
+    assert _bits_equal(actual.contiguous(), expected.contiguous())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", LOW_PRECISION)
+@pytest.mark.parametrize("mode", ["upsample2d", "upsample3d"])
+def test_resample_deferred_bias_matches_autocast(dtype: torch.dtype, mode: str) -> None:
+    """The upsampler's FP32 bias must be rounded before its deferred addition."""
+    torch.manual_seed(8)
+    resample = WanResample(32, mode=mode).cuda().eval()
+    resample.resample[1].bias.copy_(torch.randn_like(resample.resample[1].bias))
+    reference_cache = [None]
+    candidate_cache = [None]
+    with torch.autocast("cuda", dtype=dtype):
+        for _ in range(2):
+            x = torch.randn(1, 32, 1, 6, 10, device="cuda")
+            expected = resample(x, feat_cache=reference_cache, feat_idx=[0])
+            out, bias = fp.resample_forward(resample, x, candidate_cache, [0], return_bias=True)
+            assert out.dtype == dtype and bias is not None and bias.dtype == dtype
+            actual = out + bias.view(1, -1, 1, 1, 1)
+            assert _bits_equal(actual.contiguous(), expected.contiguous())
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 @pytest.mark.parametrize("with_bias_x", [True, False])
 @pytest.mark.parametrize("with_bias_h", [True, False])
