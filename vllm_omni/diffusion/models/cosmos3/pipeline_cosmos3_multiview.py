@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS, validate_multiview_request
 
 from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
@@ -41,7 +42,6 @@ from .pipeline_cosmos3 import (
 )
 from .transfer import (
     IMAGE_EXTENSIONS,
-    TRANSFER_HINT_KEYS,
     as_bool,
     media_to_uint8_cthw,
     uint8_cthw_to_normalized_5d,
@@ -77,19 +77,6 @@ COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVI
 COSMOS3_MULTIVIEW_EMPHASIS = (
     "Follow the wsm control videos precisely for every camera view: shape, contour, position, and motion must "
     "align with the wsm signal at every frame."
-)
-COSMOS3_MADS_CAMERAS = (
-    "camera_front_wide_120fov",
-    "camera_cross_right_120fov",
-    "camera_rear_right_70fov",
-    "camera_rear_tele_30fov",
-    "camera_rear_left_70fov",
-    "camera_cross_left_120fov",
-    "camera_front_tele_30fov",
-    "camera_front_fisheye_200fov",
-    "camera_left_fisheye_200fov",
-    "camera_right_fisheye_200fov",
-    "camera_rear_fisheye_200fov",
 )
 
 
@@ -417,63 +404,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _parse_multiview_request(self, sp: Any) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
         extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
-        multiview = _mapping(extra.get("multiview"), "extra_args['multiview']")
-        unknown_multiview_fields = set(multiview) - {
-            "views",
-            "condition_video_as_image",
-            "condition_frame_indexes_vision",
-            "num_frames",
-            "resolution",
-        }
-        if unknown_multiview_fields:
-            raise ValueError(f"Unsupported Cosmos3 multiview fields: {sorted(unknown_multiview_fields)}.")
-        raw_views = multiview.get("views")
-        if not isinstance(raw_views, Sequence) or isinstance(raw_views, str | bytes) or not raw_views:
-            raise ValueError("Cosmos3 multiview.views must contain at least one camera view.")
-        views = [_mapping(view, f"view {index}") for index, view in enumerate(raw_views)]
-        allowed_view_fields = {"camera_key", "vision_path", "control_path", "vision", "control"}
-        for index, view in enumerate(views):
-            unknown_view_fields = set(view) - allowed_view_fields
-            if unknown_view_fields:
-                raise ValueError(f"Unsupported Cosmos3 multiview view {index} fields: {sorted(unknown_view_fields)}.")
-        camera_keys = [str(view.get("camera_key", "")) for view in views]
-        if any(not key for key in camera_keys) or len(set(camera_keys)) != len(camera_keys):
-            raise ValueError(f"Cosmos3 multiview camera_key values must be non-empty and unique: {camera_keys}.")
-        if tuple(camera_keys) != self.multiview_cameras:
-            raise ValueError(
-                "Cosmos3 multiview camera order must exactly match the exported checkpoint order: "
-                f"expected={list(self.multiview_cameras)}, got={camera_keys}."
-            )
-        if any("lidar" in key.lower() for key in camera_keys) or extra.get("lidar") is not None:
-            raise ValueError("Cosmos3 multiview v1 does not support LiDAR items.")
-
-        selected_hints = [key for key in TRANSFER_HINT_KEYS if extra.get(key) is not None]
-        if selected_hints != ["wsm"]:
-            raise ValueError(
-                f"Cosmos3 multiview requires exactly one top-level precomputed WSM hint; selected={selected_hints}."
-            )
-        wsm = extra.get("wsm")
-        if wsm is not True and (not isinstance(wsm, Mapping) or len(wsm) != 0):
-            raise ValueError(
-                "Cosmos3 multiview WSM controls must be supplied per view; "
-                "top-level wsm must be true or an empty object."
-            )
-
-        vision_present = [view.get("vision_path", view.get("vision")) is not None for view in views]
-        control_present = [view.get("control_path", view.get("control")) is not None for view in views]
-        if any(vision_present) and not all(vision_present):
-            raise ValueError("Cosmos3 multiview vision inputs must be supplied for every camera or none.")
-        if not all(control_present):
-            raise ValueError("Cosmos3 multiview requires a precomputed control input for every camera.")
-
-        for field, present in (("vision", vision_present), ("control", control_present)):
-            if not any(present):
-                continue
-            values = [view.get(f"{field}_path", view.get(field)) for view in views]
-            kinds = {_media_kind(value) for value in values}
-            if len(kinds) != 1:
-                raise ValueError(f"Cosmos3 multiview {field} inputs must be all images or all videos, got {kinds}.")
-        return multiview, views
+        return validate_multiview_request(extra, self.multiview_cameras, media_kind=_media_kind)
 
     @staticmethod
     def _view_value(view: Mapping[str, Any], field: str) -> Any:
