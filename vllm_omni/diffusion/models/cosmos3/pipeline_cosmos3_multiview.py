@@ -57,7 +57,7 @@ logger = init_logger(__name__)
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 
 # Per-camera frame count when the request supplies none.
-COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 93
+COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
 # Frame rate when the request supplies none. The MADS WSM transfer recipes train
 # on native 30 FPS clips, so the fps-modulated temporal mRoPE and the prompt
 # metadata are on-distribution only at 30.
