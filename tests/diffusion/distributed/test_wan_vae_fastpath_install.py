@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -168,6 +169,87 @@ def test_install_is_idempotent_and_reversible() -> None:
     assert "forward" not in vae.decoder.__dict__
     assert all("forward" not in module.__dict__ for module in vae.decoder.modules())
     assert all(fastpath_forwards.CFG_ATTR not in module.__dict__ for module in vae.decoder.modules())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("failure_stage", ["binding", "conversion", "report"])
+def test_failed_install_restores_original_state(failure_stage: str, monkeypatch) -> None:
+    installer = importlib.import_module(install_wan_vae_fastpath.__module__)
+    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
+    # Preserve mixed original layouts, an existing forward, gradients and a
+    # buffer: Module.to can replace tensors as well as change their storage.
+    vae.decoder.conv_in.to(memory_format=torch.channels_last_3d)
+    vae.decoder.forward = vae.decoder.forward
+    setattr(vae.decoder, fastpath_forwards.CFG_ATTR, object())
+    vae.decoder.conv_out.weight.grad = torch.randn_like(vae.decoder.conv_out.weight)
+    vae.post_quant_conv.register_buffer("rollback_probe", torch.randn(2, 3, 4, 5, 6))
+    attributes = {
+        module: {
+            name: module.__dict__[name] for name in ("forward", fastpath_forwards.CFG_ATTR) if name in module.__dict__
+        }
+        for module in vae.modules()
+    }
+    parameters = dict(vae.named_parameters())
+    buffers = dict(vae.named_buffers())
+    gradients = {name: parameter.grad for name, parameter in parameters.items()}
+    tensors = [*parameters.values(), *buffers.values(), *(grad for grad in gradients.values() if grad is not None)]
+    originals = [(tensor, tensor.data_ptr(), tensor.stride(), tensor.clone()) for tensor in tensors]
+    latents = torch.randn(1, 4, 2, 6, 8)
+    expected = vae.decode(latents, return_dict=False)[0]
+
+    with monkeypatch.context() as patch:
+        if failure_stage == "binding":
+            conv_type = type(vae.post_quant_conv)
+            original_setattr = conv_type.__setattr__
+
+            def fail_binding(module, name, value):
+                original_setattr(module, name, value)
+                if module is vae.post_quant_conv and name == fastpath_forwards.CFG_ATTR:
+                    raise RuntimeError("injected installation failure")
+
+            patch.setattr(conv_type, "__setattr__", fail_binding)
+        elif failure_stage == "conversion":
+            original_to = vae.post_quant_conv.to
+
+            def fail_conversion(*args, **kwargs):
+                original_to(*args, **kwargs)
+                assert vae.decoder.conv_out.weight.is_contiguous(memory_format=torch.channels_last_3d)
+                raise torch.OutOfMemoryError("injected installation failure")
+
+            patch.setattr(vae.post_quant_conv, "to", fail_conversion)
+        else:
+            original_info = installer.logger.info
+
+            def fail_report(message, *args, **kwargs):
+                if message.startswith("Wan VAE fast path (%s) installed"):
+                    assert is_installed(vae)
+                    raise RuntimeError("injected installation failure")
+                original_info(message, *args, **kwargs)
+
+            patch.setattr(installer.logger, "info", fail_report)
+
+        with pytest.raises(RuntimeError, match="injected installation failure"):
+            install_wan_vae_fastpath(vae, level="channels_last")
+
+    assert not is_installed(vae)
+    assert not hasattr(vae, REPORT_ATTR)
+    assert not hasattr(vae, installer._UNDO_ATTR)
+    for module, original in attributes.items():
+        actual = {
+            name: module.__dict__[name] for name in ("forward", fastpath_forwards.CFG_ATTR) if name in module.__dict__
+        }
+        assert actual == original
+    assert all(dict(vae.named_parameters())[name] is parameter for name, parameter in parameters.items())
+    assert all(dict(vae.named_buffers())[name] is buffer for name, buffer in buffers.items())
+    assert all(parameters[name].grad is grad for name, grad in gradients.items())
+    for tensor, pointer, strides, values in originals:
+        assert tensor.data_ptr() == pointer
+        assert tensor.stride() == strides
+        assert torch.equal(tensor, values)
+    uninstall_wan_vae_fastpath(vae)  # Safe and unnecessary after automatic rollback.
+    assert torch.equal(vae.decode(latents, return_dict=False)[0], expected)
+    assert install_wan_vae_fastpath(vae, level="channels_last").installed
+    uninstall_wan_vae_fastpath(vae)
 
 
 def test_load_state_dict_after_install_updates_patched_modules() -> None:

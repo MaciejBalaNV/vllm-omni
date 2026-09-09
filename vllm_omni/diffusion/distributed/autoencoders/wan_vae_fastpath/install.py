@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import Any
@@ -119,66 +120,89 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
         )
     cfg = forwards.FastPathConfig(fused_silu_dtypes=fused_silu_dtypes, channels_last=level == "channels_last")
 
-    undo: list[Callable[[], None]] = []
-    patched: dict[str, int] = {}
+    with ExitStack() as rollback:
+        undo: list[Callable[[], None]] = []
+        patched: dict[str, int] = {}
 
-    def bind(module: nn.Module, forward: Callable[..., Any]) -> None:
-        module.forward = MethodType(forward, module)
-        setattr(module, forwards.CFG_ATTR, cfg)
-        patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
+        def bind(module: nn.Module, forward: Callable[..., Any]) -> None:
+            original = {
+                name: module.__dict__[name] for name in ("forward", forwards.CFG_ATTR) if name in module.__dict__
+            }
 
-        def restore(module: nn.Module = module) -> None:
-            module.__dict__.pop("forward", None)
-            module.__dict__.pop(forwards.CFG_ATTR, None)
+            def restore() -> None:
+                module.__dict__.pop("forward", None)
+                module.__dict__.pop(forwards.CFG_ATTR, None)
+                module.__dict__.update(original)
 
-        undo.append(restore)
+            rollback.callback(restore)
+            undo.append(restore)
+            module.forward = MethodType(forward, module)
+            setattr(module, forwards.CFG_ATTR, cfg)
+            patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
-    bind(decoder, forwards.decoder_forward)
-    convs: list[nn.Module] = []
-    for module in decoder.modules():
-        module_type = type(module)
-        if module_type is WanCausalConv3d:
-            bind(module, forwards.causal_conv_forward)
-            convs.append(module)
-        elif module_type is WanResidualBlock:
-            bind(module, forwards.residual_block_forward)
-        elif module_type is WanResidualUpBlock:
-            bind(module, forwards.residual_up_block_forward)
-        elif module_type is WanResample:
-            bind(module, forwards.resample_forward)
-        elif module_type is WanUpsample:
-            bind(module, forwards.upsample_forward)
-        elif forwards.is_diffusers_rms_norm(module):
-            bind(module, forwards.rms_norm_forward)
-        elif isinstance(module, (nn.Conv2d, nn.Conv3d)):
-            convs.append(module)
-    post_quant_conv = getattr(vae, "post_quant_conv", None)
-    if type(post_quant_conv) is WanCausalConv3d:
-        bind(post_quant_conv, forwards.causal_conv_forward)
-        convs.append(post_quant_conv)
+        bind(decoder, forwards.decoder_forward)
+        convs: list[nn.Module] = []
+        for module in decoder.modules():
+            module_type = type(module)
+            if module_type is WanCausalConv3d:
+                bind(module, forwards.causal_conv_forward)
+                convs.append(module)
+            elif module_type is WanResidualBlock:
+                bind(module, forwards.residual_block_forward)
+            elif module_type is WanResidualUpBlock:
+                bind(module, forwards.residual_up_block_forward)
+            elif module_type is WanResample:
+                bind(module, forwards.resample_forward)
+            elif module_type is WanUpsample:
+                bind(module, forwards.upsample_forward)
+            elif forwards.is_diffusers_rms_norm(module):
+                bind(module, forwards.rms_norm_forward)
+            elif isinstance(module, (nn.Conv2d, nn.Conv3d)):
+                convs.append(module)
+        post_quant_conv = getattr(vae, "post_quant_conv", None)
+        if type(post_quant_conv) is WanCausalConv3d:
+            bind(post_quant_conv, forwards.causal_conv_forward)
+            convs.append(post_quant_conv)
 
-    if cfg.channels_last:
-        converted = _convert_conv_memory_format(convs, channels_last=True)
-        undo.append(lambda: _convert_conv_memory_format(convs, channels_last=False))
-        logger.info("Wan VAE decoder: %d convolution weights converted to channels-last layout", converted)
+        if cfg.channels_last:
+            # Keep the original storage only until installation commits. An OOM
+            # may interrupt Module.to partway through a module, so rollback must
+            # restore its tensors without allocating or calling Module.to again.
+            for module in convs:
+                for owner in module.modules():
+                    for name, parameter in owner.named_parameters(recurse=False):
+                        rollback.callback(owner._parameters.__setitem__, name, parameter)
+                        rollback.callback(setattr, parameter, "data", parameter.data)
+                        rollback.callback(setattr, parameter, "grad", parameter.grad)
+                        if parameter.grad is not None:
+                            rollback.callback(setattr, parameter.grad, "data", parameter.grad.data)
+                    for name, buffer in owner.named_buffers(recurse=False):
+                        rollback.callback(owner._buffers.__setitem__, name, buffer)
+                        rollback.callback(setattr, buffer, "data", buffer.data)
+            converted = _convert_conv_memory_format(convs, channels_last=True)
+            undo.append(lambda: _convert_conv_memory_format(convs, channels_last=False))
+            logger.info("Wan VAE decoder: %d convolution weights converted to channels-last layout", converted)
 
-    report = WanVaeFastPathReport(
-        level=level,
-        installed=True,
-        patched=dict(patched),
-        fused_silu_dtypes=tuple(str(dtype).removeprefix("torch.") for dtype in sorted(fused_silu_dtypes, key=str)),
-        channels_last=cfg.channels_last,
-    )
-    setattr(vae, REPORT_ATTR, report)
-    setattr(vae, _UNDO_ATTR, undo)
-    logger.info(
-        "Wan VAE fast path (%s) installed: patched=%s fused_silu=%s channels_last=%s",
-        level,
-        report.patched,
-        report.fused_silu_dtypes or "off",
-        report.channels_last,
-    )
-    return report
+        report = WanVaeFastPathReport(
+            level=level,
+            installed=True,
+            patched=dict(patched),
+            fused_silu_dtypes=tuple(str(dtype).removeprefix("torch.") for dtype in sorted(fused_silu_dtypes, key=str)),
+            channels_last=cfg.channels_last,
+        )
+        rollback.callback(vae.__dict__.pop, REPORT_ATTR, None)
+        rollback.callback(vae.__dict__.pop, _UNDO_ATTR, None)
+        setattr(vae, _UNDO_ATTR, undo)
+        setattr(vae, REPORT_ATTR, report)
+        logger.info(
+            "Wan VAE fast path (%s) installed: patched=%s fused_silu=%s channels_last=%s",
+            level,
+            report.patched,
+            report.fused_silu_dtypes or "off",
+            report.channels_last,
+        )
+        rollback.pop_all()
+        return report
 
 
 def uninstall_wan_vae_fastpath(vae: nn.Module) -> None:
