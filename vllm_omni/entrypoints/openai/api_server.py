@@ -1504,9 +1504,7 @@ async def realtime_robot_openpi(websocket: WebSocket):
         await websocket.send_json(
             {
                 "type": "error",
-                "error": (
-                    "Robot policy not available: the diffusion stage did not provide model_config.policy_server_config"
-                ),
+                "error": "Robot policy not available",
                 "code": "unsupported",
             }
         )
