@@ -67,10 +67,17 @@ def main() -> None:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--server", default="http://localhost:8091")
     parser.add_argument("--sync", action="store_true", help="Use /v1/videos/sync instead of a background job")
+    parser.add_argument(
+        "--num-inference-steps", type=int, help="Number of diffusion steps, overriding the manifest value"
+    )
     parser.add_argument("--output", type=Path, default=Path("multiview.mp4"))
     parser.add_argument("--timeout", type=float, default=3600, help="HTTP and job polling timeout in seconds")
     args = parser.parse_args()
+    if args.num_inference_steps is not None and args.num_inference_steps < 1:
+        parser.error("--num-inference-steps must be positive")
     data, paths = prepare_request(json.loads(args.manifest.read_text()), args.manifest.resolve().parent)
+    if args.num_inference_steps is not None:
+        data["num_inference_steps"] = str(args.num_inference_steps)
     api_key = os.environ.get("VLLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     server = args.server.rstrip("/")
