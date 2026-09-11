@@ -172,7 +172,7 @@ def _worker(rank, world_size, port, case, backend, compile_blocks):
     from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
     from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
-    device = torch.device("cuda", rank)
+    device = current_omni_platform.get_torch_device(rank)
     current_omni_platform.set_device(device)
     # Bound collective hangs, including failures during HSDP cache population.
     dist.init_process_group(
@@ -304,7 +304,7 @@ def _recompile_worker(rank, port):
     from vllm_omni.diffusion.models.cosmos3 import multiview_flex_attention as sparse
     from vllm_omni.diffusion.models.cosmos3.multiview_parallel import multiview_ulysses_attention
 
-    device = torch.device("cuda", rank)
+    device = current_omni_platform.get_torch_device(rank)
     current_omni_platform.set_device(device)
     dist.init_process_group(
         "nccl",
