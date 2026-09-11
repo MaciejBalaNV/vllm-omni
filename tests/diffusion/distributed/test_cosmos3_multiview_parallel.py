@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel]
 
@@ -172,7 +173,7 @@ def _worker(rank, world_size, port, case, backend, compile_blocks):
     from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    current_omni_platform.set_device(device)
     # Bound collective hangs, including failures during HSDP cache population.
     dist.init_process_group(
         "nccl",
@@ -304,7 +305,7 @@ def _recompile_worker(rank, port):
     from vllm_omni.diffusion.models.cosmos3.multiview_parallel import multiview_ulysses_attention
 
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    current_omni_platform.set_device(device)
     dist.init_process_group(
         "nccl",
         init_method=f"tcp://127.0.0.1:{port}",
