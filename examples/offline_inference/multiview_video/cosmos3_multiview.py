@@ -1,6 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+r"""Cosmos3 Multiview-AV inference with an exported checkpoint and request JSON/JSONL.
+
+Usage examples (run from the repository root):
+
+    # Single GPU
+    python examples/offline_inference/multiview_video/cosmos3_multiview.py \
+        --model /models/cosmos3-multiview --input request.json
+
+    # Four GPUs: CFGP2 x Ulysses CP2
+    python examples/offline_inference/multiview_video/cosmos3_multiview.py \
+        --model /models/cosmos3-multiview --input request.json \
+        --cfg-parallel-size 2 --ulysses-degree 2
+
+    # Two GPUs: HSDP weight sharding
+    python examples/offline_inference/multiview_video/cosmos3_multiview.py \
+        --model /models/cosmos3-multiview --input request.json \
+        --use-hsdp --hsdp-shard-size 2
+
+    # Two GPUs: tensor parallelism
+    python examples/offline_inference/multiview_video/cosmos3_multiview.py \
+        --model /models/cosmos3-multiview --input request.json \
+        --tensor-parallel-size 2
+
+CP uses strict Ulysses. HSDP and TP cannot be combined.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,6 +39,7 @@ import numpy as np
 import torch
 from diffusers.utils import export_to_video
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -196,7 +223,7 @@ def _run_request(
 
     # Frame rate and per-camera frame count are pipeline-owned: when neither the
     # CLI nor the record sets them, the pipeline applies its defaults (30 FPS,
-    # 93 frames) and rounds frame counts up to the VAE's 4k+1 grid. CLI
+    # 201 frames) and rounds frame counts up to the VAE's 4k+1 grid. CLI
     # overrides win over record values.
     num_frames = num_frames_override
     if num_frames is None:
@@ -315,9 +342,16 @@ def main() -> None:
         default=None,
         help=(
             "Per-camera frame count for every record, overriding any record value. "
-            "The pipeline rounds it up to the VAE's 4k+1 grid; unset defaults to 93."
+            "The pipeline rounds it up to the VAE's 4k+1 grid; unset defaults to 201."
         ),
     )
+    parser.add_argument("--cfg-parallel-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--ulysses-degree", type=int, default=1)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--use-hsdp", action="store_true")
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    parser.add_argument("--hsdp-replicate-size", type=int, default=1)
+    parser.add_argument("--enforce-eager", action="store_true", help="Disable regional transformer compilation")
     args = parser.parse_args()
 
     requests = _load_requests(args.input)
@@ -327,14 +361,20 @@ def main() -> None:
         # of the reference's serialization, so keep json.dumps unconfigured.
         fallback_negative_prompt = json.dumps(json.loads(args.negative_prompt_json.read_text()))
 
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
+    )
     omni = Omni(
         model=args.model,
         dtype="bfloat16",
         model_class_name="Cosmos3MultiviewPipeline",
-        enforce_eager=False,
-        ulysses_degree=1,
-        ring_degree=1,
-        cfg_parallel_size=1,
+        enforce_eager=args.enforce_eager,
+        parallel_config=parallel_config,
         diffusion_compile_granularity="regional",
         diffusion_compile_dynamic=False,
     )

@@ -1,5 +1,27 @@
 # Cosmos Multiview-AV uploads
 
+## Multi-GPU serving
+
+Use the existing engine parallelism flags; the video API payload is unchanged:
+
+```bash
+vllm serve /models/cosmos3-multiview --omni \
+  --model-class-name Cosmos3MultiviewPipeline --num-gpus 4 \
+  --cfg-parallel-size 2 --ulysses-degree 2 --port 8091
+```
+
+For HSDP on those same four GPUs, add `--use-hsdp --hsdp-shard-size 4`.
+For TP2 x CP2, replace `--cfg-parallel-size 2` with `--tensor-parallel-size 2`.
+HSDP and TP are mutually exclusive. Single-GPU execution remains the default.
+Triton and FA4 use the same sparse visibility rules; FA4 requires datacenter
+Blackwell and the optional `fa4` extra.
+
+See the
+[offline script](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/multiview_video/cosmos3_multiview.py)
+for usage examples.
+
+## Upload contract
+
 `POST /v1/videos` and `POST /v1/videos/sync` accept all camera inputs in the HTTP request.
 See the [video API reference](../../../serving/videos_api.md) for endpoint and response details.
 Send the files as repeated `input_references` parts and the camera manifest as

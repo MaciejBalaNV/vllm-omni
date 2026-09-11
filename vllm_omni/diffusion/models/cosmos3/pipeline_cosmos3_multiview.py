@@ -30,6 +30,7 @@ from .multiview_flex_attention import (
     expand_multiview_condition_frame_indexes,
     validate_multiview_backend,
 )
+from .multiview_parallel import validate_multiview_parallel_config
 from .pipeline_cosmos3 import (
     COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE,
     COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS,
@@ -345,22 +346,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
-        parallel_config = od_config.parallel_config
-        sequence_parallel_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
-        cfg_parallel_size = int(getattr(parallel_config, "cfg_parallel_size", 1) or 1)
-        tensor_parallel_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
-        pipeline_parallel_size = int(getattr(parallel_config, "pipeline_parallel_size", 1) or 1)
-        vae_parallel_size = int(getattr(parallel_config, "vae_patch_parallel_size", 1) or 1)
-        if sequence_parallel_size > 1:
-            raise ValueError("Cosmos3 multiview v1 does not support sequence parallelism.")
-        if cfg_parallel_size > 1:
-            raise ValueError("Cosmos3 multiview v1 uses single-GPU sequential CFG; cfg_parallel_size must be 1.")
-        if tensor_parallel_size > 1 or pipeline_parallel_size > 1 or vae_parallel_size > 1:
-            raise ValueError(
-                "Cosmos3 multiview v1 is single-GPU: tensor, pipeline, and VAE parallel sizes must all be 1."
-            )
-        if bool(getattr(parallel_config, "use_hsdp", False)):
-            raise ValueError("Cosmos3 multiview v1 does not support HSDP.")
+        validate_multiview_parallel_config(
+            od_config.parallel_config,
+            num_attention_heads=int(_tf_config_get(od_config.tf_model_config, "num_attention_heads", 32)),
+            num_key_value_heads=int(_tf_config_get(od_config.tf_model_config, "num_key_value_heads", 8)),
+            intermediate_size=int(_tf_config_get(od_config.tf_model_config, "intermediate_size", 12288)),
+        )
         if od_config.enable_session_state_manager:
             raise ValueError("Cosmos3 multiview v1 does not support enable_session_state_manager.")
         super().__init__(od_config=od_config, prefix=prefix)

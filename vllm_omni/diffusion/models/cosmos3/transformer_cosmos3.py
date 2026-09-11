@@ -845,8 +845,6 @@ class Cosmos3CrossAttention(nn.Module):
         if multiview_layout is not None:
             if control_token_sizes is not None or control_weights is not None:
                 raise ValueError("Cosmos3 multiview attention cannot use the multi-control attention path.")
-            if _is_sp_active():
-                raise ValueError("Cosmos3 multiview attention does not support sequence parallelism in v1.")
             out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
         elif control_token_sizes is not None or control_weights is not None:
             if control_token_sizes is None or control_weights is None:

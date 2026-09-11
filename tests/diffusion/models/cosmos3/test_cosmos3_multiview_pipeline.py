@@ -229,10 +229,10 @@ def test_multiview_num_frames_round_up_to_vae_grid() -> None:
         _resolve_multiview_num_frames,
     )
 
-    assert COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES == 93
-    assert _resolve_multiview_num_frames(None, 4) == 93
+    assert COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES == 201
+    assert _resolve_multiview_num_frames(None, 4) == 201
     # OmniDiffusionSamplingParams' legacy image default selects the variant default.
-    assert _resolve_multiview_num_frames(1, 4) == 93
+    assert _resolve_multiview_num_frames(1, 4) == 201
     assert _resolve_multiview_num_frames(93, 4) == 93
     # 200 is rounded up to 201 instead of being rejected.
     assert _resolve_multiview_num_frames(200, 4) == 201

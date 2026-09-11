@@ -13,10 +13,13 @@ from .multiview_flex_attention import (
     MultiviewLayout,
     padded_multiview_flex_attention,
 )
+from .multiview_parallel import multiview_ulysses_attention
 from .transformer_cosmos3 import (
     COSMOS3_MULTIVIEW_BACKBONE_TYPE,
     Cosmos3CrossAttention,
     Cosmos3VFMTransformer,
+    _get_ulysses_state,
+    _is_sp_active,
     _tf_config_get,
 )
 
@@ -38,7 +41,15 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
                 "Cosmos3 multiview cross-attention expected MultiviewAttentionContext, "
                 f"got {type(multiview_layout).__name__}."
             )
-        output = padded_multiview_flex_attention(q, k, v, k_und, v_und, multiview_layout)
+        if _is_sp_active():
+            size, rank, group = _get_ulysses_state()
+            if group is None:
+                raise RuntimeError("Cosmos3 multiview CP is active without an initialized Ulysses group.")
+            output = multiview_ulysses_attention(
+                q, k, v, k_und, v_und, multiview_layout, group=group, rank=rank, world_size=size
+            )
+        else:
+            output = padded_multiview_flex_attention(q, k, v, k_und, v_und, multiview_layout)
         return output.reshape(q.shape[0], q.shape[1], -1)
 
 
