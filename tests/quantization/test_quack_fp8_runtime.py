@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks for Quack runtime scales and inference-compatible warmup."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,12 +14,56 @@ from vllm_omni.quantization import quack_fp8
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_non_daemon_keeps_default_compilation(monkeypatch):
-    import_module = Mock(side_effect=AssertionError("must not import or patch the pool"))
+def test_compile_adapter_checks_daemon_when_tuning_starts(monkeypatch):
+    # spawn imports the worker module while unpickling its target, before
+    # _bootstrap installs the child Process (and its actual daemon flag).
+    process = SimpleNamespace(daemon=False)
+    pool = SimpleNamespace(
+        pool_scope=Mock(spec=[], side_effect=AssertionError("compiler child requested")),
+        suppress_pool=nullcontext,
+    )
+    monkeypatch.setattr(quack_fp8, "current_process", lambda: process)
+    monkeypatch.setattr(quack_fp8, "import_module", lambda name: pool)
+    quack_fp8._configure_quack_compilation()  # import-time installation
+    process.daemon = True  # worker target starts after _bootstrap
+    with pool.pool_scope() as active_pool:
+        assert active_pool is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_non_daemon_keeps_default_compilation(monkeypatch, fail):
+    events = []
+    original_pool = object()
+
+    @contextmanager
+    def original_scope():
+        events.append("enter")
+        try:
+            yield original_pool
+        finally:
+            events.append("exit")
+
+    pool = SimpleNamespace(
+        pool_scope=original_scope,
+        suppress_pool=Mock(side_effect=AssertionError("must keep the normal compiler pool")),
+    )
     monkeypatch.setattr(quack_fp8, "current_process", lambda: SimpleNamespace(daemon=False))
-    monkeypatch.setattr(quack_fp8, "import_module", import_module)
+    monkeypatch.setattr(quack_fp8, "import_module", lambda name: pool)
     quack_fp8._configure_quack_compilation()
-    import_module.assert_not_called()
+
+    def compile_candidates():
+        with pool.pool_scope() as active_pool:
+            assert active_pool is original_pool
+            if fail:
+                raise RuntimeError("compile failed")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="compile failed"):
+            compile_candidates()
+    else:
+        compile_candidates()
+    assert events == ["enter", "exit"]
+    pool.suppress_pool.assert_not_called()
 
 
 @pytest.mark.parametrize("missing_module", ["quack.cache", "quack.cache.async_compile"])
@@ -79,19 +123,22 @@ def test_daemon_compilation_suppresses_pool_without_constructing_executor(monkey
     assert pool.get_active_pool() is original_pool
 
 
-def test_daemon_autotuning_benchmarks_candidates_and_reuses_disk_cache(monkeypatch, tmp_path):
+@pytest.mark.parametrize("l2_rotate", [False, True])
+def test_daemon_autotuning_benchmarks_candidates_and_reuses_disk_cache(monkeypatch, tmp_path, l2_rotate):
     # Exercise Quack's real tuning loop with a CPU benchmark stand-in. Optional
     # because the quack extra is not installed in every CPU test environment.
     autotuner = pytest.importorskip("quack.autotuner")
     async_compile = pytest.importorskip("quack.cache.async_compile")
     monkeypatch.setenv("QUACK_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("QUACK_FORCE_CACHE_UPDATE", raising=False)
-    monkeypatch.setattr(quack_fp8, "current_process", lambda: SimpleNamespace(daemon=True))
+    process = SimpleNamespace(daemon=False)
+    monkeypatch.setattr(quack_fp8, "current_process", lambda: process)
     monkeypatch.setattr(autotuner, "_gpu_warmup", lambda: None)
     monkeypatch.setattr(async_compile, "_make_executor", Mock(side_effect=AssertionError("compiler child requested")))
     # Arrange for monkeypatch to restore the process-local adapter after this test.
     monkeypatch.setattr(async_compile, "pool_scope", async_compile.pool_scope)
     quack_fp8._configure_quack_compilation()
+    process.daemon = True
     candidates = []
 
     def kernel(x, *, tile):
@@ -104,12 +151,21 @@ def test_daemon_autotuning_benchmarks_candidates_and_reuses_disk_cache(monkeypat
         tile = candidates[-1]
         return [{16: 3.0, 32: 1.0, 64: 2.0}[tile]] * len(quantiles)
 
+    if l2_rotate:
+        monkeypatch.setattr(autotuner, "_pick_l2_rotate_count", lambda *args: 1)
+        monkeypatch.setattr(autotuner, "_clone_l2_rotate_inputs", lambda args, kwargs, count: ([args], [kwargs]))
+
+        def bench_l2_rotate(fn, arg_sets, kwarg_sets, *, extra_kwargs, quantiles):
+            return benchmark(lambda: fn(*arg_sets[0], **kwarg_sets[0], **extra_kwargs), quantiles)
+
+        monkeypatch.setattr(autotuner, "_bench_cuda_graph_l2_rotate", bench_l2_rotate)
+
     def make_tuner():
         return autotuner.Autotuner(
             kernel,
             key=[],
             configs=[autotuner.AutotuneConfig(tile=tile) for tile in (16, 32, 64)],
-            do_bench=benchmark,
+            do_bench=None if l2_rotate else benchmark,
             cache_results=True,
         )
 

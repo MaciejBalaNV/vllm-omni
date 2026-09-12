@@ -57,8 +57,6 @@ def _set_persistent_cache_dir() -> None:
 
 def _configure_quack_compilation() -> None:
     """Keep autotuning in daemon workers without starting compiler children."""
-    if not current_process().daemon:
-        return
     try:
         async_compile = import_module("quack.cache.async_compile")
     except ModuleNotFoundError as exc:
@@ -66,24 +64,35 @@ def _configure_quack_compilation() -> None:
         if exc.name not in {"quack.cache", "quack.cache.async_compile"}:
             raise
         return
-    if getattr(async_compile.pool_scope, "_omni_in_process", False):
+    if getattr(async_compile.pool_scope, "_omni_daemon_safe", False):
         return
+    original_pool_scope = async_compile.pool_scope
     suppress_pool = async_compile.suppress_pool
+    logged_in_process = False
 
     @contextmanager
-    def in_process_pool_scope():
+    def daemon_safe_pool_scope():
+        nonlocal logged_in_process
+        # spawn may import this module before _bootstrap installs the child
+        # Process and its daemon flag. Check when tuning starts, not at import.
+        if not current_process().daemon:
+            with original_pool_scope() as pool:
+                yield pool
+            return
         # Quack 0.6.4 imports pool_scope inside its autotuner's cold-cache
         # benchmark loop. Suppression makes jit_cache compile/load locally,
         # so no CompilePending is raised and the loop never needs pool.poll.
         # Replacing the scope also avoids constructing an unused executor.
         # Candidate pruning, benchmarking, winner selection and disk caching
         # stay in Quack. This adaptation is local to this daemon process.
+        if not logged_in_process:
+            logger.info("Quack autotuning will compile candidates in-process in this daemon worker.")
+            logged_in_process = True
         with suppress_pool():
             yield None
 
-    in_process_pool_scope._omni_in_process = True
-    async_compile.pool_scope = in_process_pool_scope
-    logger.info("Quack autotuning will compile candidates in-process in this daemon worker.")
+    daemon_safe_pool_scope._omni_daemon_safe = True
+    async_compile.pool_scope = daemon_safe_pool_scope
 
 
 def _load_quack():
