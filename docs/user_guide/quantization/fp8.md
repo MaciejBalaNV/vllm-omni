@@ -57,47 +57,20 @@ keeps the unfused FlashInfer path.
 
 #### Compile cache and warmup
 
-quack has two caches: compiled kernels (`.o`) and autotuning results
-(`.autotune.json`). Kernel compilation is cached by layout, dtype, configuration,
-and other specialization arguments; tuning also depends on tensor shapes and
-strides. A cold tuning run can compile and benchmark many candidate kernels.
-Persisting compiled kernels alone does not prevent benchmarking again after a
-worker restart.
+quack caches compiled kernels (`.o`) and autotuning results (`.autotune.json`).
+A cold run compiles and benchmarks candidate kernels; later runs reuse the cache
+for matching shapes, layouts, and dtypes. Software changes can invalidate it.
 
-vLLM-Omni points `QUACK_CACHE_DIR` at `~/.cache/vllm_omni/quack` unless explicitly
-overridden. Quack 0.3.11's public autotune decorator already enables disk caching
-of tuning results; `QUACK_CACHE_AUTOTUNING=1` also enables it for callers that
-otherwise default it off. In containers, use a writable, persistent directory on
-the serving machine. Set cache controls before Quack is imported:
+vLLM-Omni points the cache at `~/.cache/vllm_omni/quack` (override with
+`QUACK_CACHE_DIR`). In containers, use a writable, persistent path so compiled
+kernels and tuning results survive restarts. Set cache controls before Quack is
+imported. If tuning repeats, leave `QUACK_FORCE_CACHE_UPDATE` unset and use
+`QUACK_PRINT_AUTOTUNING=1` to inspect tuning activity.
 
-```bash
-QUACK_CACHE_ENABLED=1 \
-QUACK_CACHE_AUTOTUNING=1 \
-QUACK_CACHE_DIR=/path/to/persistent/quack-cache \
-vllm serve <model> --omni --enforce-eager
-```
-
-On supported GPUs with quack installed, `--enforce-eager` keeps Quack GEMMs active
-while disabling the separate `torch.compile` layer. Do not combine this with
-`--force-cutlass-fp8` when testing Quack. If tuning repeats, check that
-`QUACK_FORCE_CACHE_UPDATE` is unset and set `QUACK_PRINT_AUTOTUNING=1` to inspect
-tuning activity. Even `QUACK_FORCE_CACHE_UPDATE=0` is a nonempty override in
-Quack 0.3.11. Keep the GPU and software environment consistent when reusing a
-cache; dependency or kernel-source changes can invalidate compiled artifacts.
-
-To skip the autotuning search while still using Quack, set
-`VLLM_OMNI_QUACK_FP8_AUTOTUNE=0` (default: `1`). This calls Quack's public
-`gemm(..., tuned=False)` entry point, which uses a heuristic/default kernel
-configuration. First-use JIT compilation may still occur, and steady-state
-performance may be lower than with a tuned configuration. This option does not
-disable `torch.compile`; use `--enforce-eager` separately when diagnosing graph
-recompilation.
-
-The wrapper keeps scale validation outside Dynamo tracing so that each layer's
-scale addresses and the growing validation cache do not specialize Torch graphs.
-The surrounding computation can still be compiled, with a graph break at scale
-validation. Quack GEMM is called through its public custom-op entry point with
-the combined scale passed as a device tensor.
+Multi-GPU diffusion workers compile Quack candidates in-process because daemon
+workers cannot create compiler children. Autotuning and caching remain enabled,
+including with sequence parallelism. Cold tuning may take longer because
+candidate compilation runs sequentially.
 
 To pre-warm specific shapes (e.g. at image build time):
 
@@ -107,11 +80,9 @@ from vllm_omni.quantization.quack_fp8 import warmup_quack_fp8
 warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ```
 
-The helper uses inference mode, no bias, and a transposed contiguous `[N, K]`
-weight, matching vLLM's per-tensor FP8 weight layout. Warmup must match the
-request's shapes, dtypes, strides, bias presence, and tuning mode. A startup
-dummy request or a different video size may leave additional configurations
-to compile or tune on the first real request.
+The helper uses inference mode, no bias, and vLLM's transposed weight layout.
+Warmup must match the request's shapes, dtypes, strides, and bias presence;
+the startup dummy run may leave additional configurations to compile or tune.
 
 > The PyPI package is `quack-kernels` (imported as `quack`); plain `pip install
 > quack` is an unrelated statistics library. Requires CUDA 12.9+ and Python 3.12.

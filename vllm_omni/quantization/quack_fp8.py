@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from importlib import import_module
+from multiprocessing import current_process
 
 import torch
 from vllm.logger import init_logger
@@ -41,10 +44,6 @@ def quack_enabled() -> bool:
     return _is_quack_capable()
 
 
-def _quack_autotune_enabled() -> bool:
-    return os.environ.get("VLLM_OMNI_QUACK_FP8_AUTOTUNE", "1").lower() in _TRUTHY
-
-
 def _set_persistent_cache_dir() -> None:
     if os.environ.get("QUACK_CACHE_DIR"):
         return
@@ -54,6 +53,37 @@ def _set_persistent_cache_dir() -> None:
         or os.path.join(os.path.expanduser("~"), ".cache")
     )
     os.environ["QUACK_CACHE_DIR"] = os.path.join(root, "vllm_omni", "quack")
+
+
+def _configure_quack_compilation() -> None:
+    """Keep autotuning in daemon workers without starting compiler children."""
+    if not current_process().daemon:
+        return
+    try:
+        async_compile = import_module("quack.cache.async_compile")
+    except ModuleNotFoundError as exc:
+        # Older Quack releases compile synchronously and have no async pool.
+        if exc.name not in {"quack.cache", "quack.cache.async_compile"}:
+            raise
+        return
+    if getattr(async_compile.pool_scope, "_omni_in_process", False):
+        return
+    suppress_pool = async_compile.suppress_pool
+
+    @contextmanager
+    def in_process_pool_scope():
+        # Quack 0.6.4 imports pool_scope inside its autotuner's cold-cache
+        # benchmark loop. Suppression makes jit_cache compile/load locally,
+        # so no CompilePending is raised and the loop never needs pool.poll.
+        # Replacing the scope also avoids constructing an unused executor.
+        # Candidate pruning, benchmarking, winner selection and disk caching
+        # stay in Quack. This adaptation is local to this daemon process.
+        with suppress_pool():
+            yield None
+
+    in_process_pool_scope._omni_in_process = True
+    async_compile.pool_scope = in_process_pool_scope
+    logger.info("Quack autotuning will compile candidates in-process in this daemon worker.")
 
 
 def _load_quack():
@@ -76,10 +106,10 @@ def _load_quack():
         torch2cute_dtype_map.setdefault(torch.float8_e4m3fn, cutlass.Float8E4M3FN)
         torch2cute_dtype_map.setdefault(torch.float8_e5m2, cutlass.Float8E5M2)
 
+        _configure_quack_compilation()
         _gemm_interface = gemm_interface
         logger.info(
-            "Quack FP8 fused-bias GEMM enabled (CuteDSL, autotune=%s, cache=%s).",
-            _quack_autotune_enabled(),
+            "Quack FP8 fused-bias GEMM enabled (CuteDSL, cache=%s).",
             os.environ["QUACK_CACHE_DIR"],
         )
         return gemm_interface
@@ -104,7 +134,7 @@ def quack_scaled_fp8_mm(
     alpha = scale_a.reshape(1).float() * scale_b.reshape(1).float()
     # Keep alpha as a device tensor: calibrated scale values are runtime data,
     # not Python constants to specialize the compiled GEMM on.
-    gemm.gemm(a, b, out=out, bias=bias, alpha=alpha, tuned=_quack_autotune_enabled())
+    gemm.gemm(a, b, out=out, bias=bias, alpha=alpha, tuned=True)
     return out
 
 
