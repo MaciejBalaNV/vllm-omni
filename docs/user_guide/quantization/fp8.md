@@ -57,20 +57,18 @@ keeps the unfused FlashInfer path.
 
 #### Compile cache and warmup
 
-quack caches compiled kernels (`.o`) and autotuning results (`.autotune.json`).
-A cold run compiles and benchmarks candidate kernels; later runs reuse the cache
-for matching shapes, layouts, and dtypes. Software changes can invalidate it.
+quack JIT-compiles its kernel once per distinct GEMM shape (tens of seconds, longer
+the first time across all autotuned configs). The compiled `.o` files are cached on
+disk and reused on later runs, so this is a one-time cost — **not** per request.
 
-vLLM-Omni points the cache at `~/.cache/vllm_omni/quack` (override with
-`QUACK_CACHE_DIR`). In containers, use a writable, persistent path so compiled
-kernels and tuning results survive restarts. Set cache controls before Quack is
-imported. If tuning repeats, leave `QUACK_FORCE_CACHE_UPDATE` unset and use
-`QUACK_PRINT_AUTOTUNING=1` to inspect tuning activity.
-
-Multi-GPU diffusion workers compile Quack candidates in-process because daemon
-workers cannot create compiler children. Autotuning and caching remain enabled,
-including with sequence parallelism. Cold tuning may take longer because
-candidate compilation runs sequentially.
+vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
+`QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
+In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
+the image — so the first cold start does not recompile. The engine's startup dummy
+run exercises the kernels, but new shapes, layouts, dtypes, or bias settings may
+still need compilation or tuning. The warmup helper uses inference mode and
+transposed weights without bias. Daemon workers compile candidates in-process
+while retaining autotuning and caching.
 
 To pre-warm specific shapes (e.g. at image build time):
 
@@ -79,10 +77,6 @@ from vllm_omni.quantization.quack_fp8 import warmup_quack_fp8
 # (M, K, N) per linear; M = number of tokens for your resolution/frame count
 warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ```
-
-The helper uses inference mode, no bias, and vLLM's transposed weight layout.
-Warmup must match the request's shapes, dtypes, strides, and bias presence;
-the startup dummy run may leave additional configurations to compile or tune.
 
 > The PyPI package is `quack-kernels` (imported as `quack`); plain `pip install
 > quack` is an unrelated statistics library. Requires CUDA 12.9+ and Python 3.12.
