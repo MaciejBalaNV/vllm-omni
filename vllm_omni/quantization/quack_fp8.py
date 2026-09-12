@@ -41,6 +41,10 @@ def quack_enabled() -> bool:
     return _is_quack_capable()
 
 
+def _quack_autotune_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_QUACK_FP8_AUTOTUNE", "1").lower() in _TRUTHY
+
+
 def _set_persistent_cache_dir() -> None:
     if os.environ.get("QUACK_CACHE_DIR"):
         return
@@ -73,7 +77,11 @@ def _load_quack():
         torch2cute_dtype_map.setdefault(torch.float8_e5m2, cutlass.Float8E5M2)
 
         _gemm_interface = gemm_interface
-        logger.info("Quack FP8 fused-bias GEMM enabled (CuteDSL).")
+        logger.info(
+            "Quack FP8 fused-bias GEMM enabled (CuteDSL, autotune=%s, cache=%s).",
+            _quack_autotune_enabled(),
+            os.environ["QUACK_CACHE_DIR"],
+        )
         return gemm_interface
     except Exception as exc:  # noqa: BLE001
         logger.warning("Quack FP8 unavailable, using FlashInfer: %s", exc)
@@ -94,13 +102,16 @@ def quack_scaled_fp8_mm(
         return None
     out = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=out_dtype)
     alpha = scale_a.reshape(1).float() * scale_b.reshape(1).float()
-    gemm.gemm(a, b, out=out, bias=bias, alpha=alpha, tuned=True)
+    # Keep alpha as a device tensor: calibrated scale values are runtime data,
+    # not Python constants to specialize the compiled GEMM on.
+    gemm.gemm(a, b, out=out, bias=bias, alpha=alpha, tuned=_quack_autotune_enabled())
     return out
 
 
 _valid_scale_ptrs: set[tuple[int, int]] = set()
 
 
+@torch.compiler.disable
 def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     """True when both per-tensor scales are finite and positive.
 
@@ -109,6 +120,10 @@ def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     make ``alpha = scale_a * scale_b`` overflow to ``+inf`` and return an all-inf tile.
     Cache only positive results: a buffer still holding the sentinel is re-checked and
     picks up the fast path once the real scale is written.
+
+    Keep pointer checks and the mutable cache outside Dynamo tracing. Otherwise
+    different layers' scale addresses/cache updates specialize the surrounding
+    graph and trigger recompilation even when GEMM shapes are identical.
     """
     key = (scale_a.data_ptr(), scale_b.data_ptr())
     if key in _valid_scale_ptrs:
@@ -155,17 +170,21 @@ def install_quack_fp8_patch() -> None:
     logger.info("Patched FlashInfer FP8 ScaledMM to use quack fused-bias GEMM.")
 
 
+@torch.inference_mode()
 def warmup_quack_fp8(
     shapes: list[tuple[int, int, int]],
     device: str = "cuda",
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
+    """Warm no-bias GEMMs with the transposed weight layout used by vLLM."""
     if _load_quack() is None:
         return
     scale = torch.ones(1, device=device, dtype=torch.float32)
     for m, k, n in shapes:
         a = torch.zeros(m, k, device=device, dtype=torch.float8_e4m3fn)
-        b = torch.zeros(k, n, device=device, dtype=torch.float8_e4m3fn)
+        # ModelOpt transposes the contiguous [N, K] checkpoint weight after
+        # loading. A contiguous [K, N] here would warm a different cache key.
+        b = torch.zeros(n, k, device=device, dtype=torch.float8_e4m3fn).t()
         quack_scaled_fp8_mm(a, b, scale, scale, out_dtype)
     if torch.cuda.is_available():
         torch.accelerator.synchronize()
