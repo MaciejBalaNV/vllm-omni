@@ -80,7 +80,14 @@ python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
 # Use the synchronous endpoint:
 python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
   request.json --server http://localhost:8091 --sync --output multiview.mp4
+
+# Override the manifest's frame count and resolution:
+python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
+  request.json --num-frames 29 --resolution 480 --output multiview.mp4
 ```
+
+`--num-frames` must be positive. `--resolution` currently accepts only `480`
+(832×480), the resolution supported by the Cosmos3 multiview pipeline.
 
 Relative input paths resolve against the manifest's directory. The default
 client submits a background job, polls it, and downloads the existing video
