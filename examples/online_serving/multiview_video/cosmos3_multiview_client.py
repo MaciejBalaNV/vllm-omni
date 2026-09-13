@@ -70,14 +70,28 @@ def main() -> None:
     parser.add_argument(
         "--num-inference-steps", type=int, help="Number of diffusion steps, overriding the manifest value"
     )
+    parser.add_argument("--num-frames", type=int, help="Number of video frames, overriding the manifest value")
+    parser.add_argument(
+        "--resolution", choices=("480",), help="Video resolution (480 = 832x480), overriding the manifest value"
+    )
     parser.add_argument("--output", type=Path, default=Path("multiview.mp4"))
     parser.add_argument("--timeout", type=float, default=3600, help="HTTP and job polling timeout in seconds")
     args = parser.parse_args()
-    if args.num_inference_steps is not None and args.num_inference_steps < 1:
-        parser.error("--num-inference-steps must be positive")
-    data, paths = prepare_request(json.loads(args.manifest.read_text()), args.manifest.resolve().parent)
-    if args.num_inference_steps is not None:
-        data["num_inference_steps"] = str(args.num_inference_steps)
+    for key in ("num_inference_steps", "num_frames"):
+        value = getattr(args, key)
+        if value is not None and value < 1:
+            parser.error(f"--{key.replace('_', '-')} must be positive")
+    manifest = json.loads(args.manifest.read_text())
+    if args.resolution is not None:
+        extra = manifest.setdefault("extra_params", {})
+        multiview = extra.setdefault("multiview", copy.deepcopy(manifest.get("multiview", {})))
+        multiview["resolution"] = args.resolution
+        extra["resolution"] = args.resolution
+        manifest["width"], manifest["height"] = 832, 480
+    data, paths = prepare_request(manifest, args.manifest.resolve().parent)
+    for key in ("num_inference_steps", "num_frames"):
+        if getattr(args, key) is not None:
+            data[key] = str(getattr(args, key))
     api_key = os.environ.get("VLLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     server = args.server.rstrip("/")
