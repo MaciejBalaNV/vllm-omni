@@ -140,7 +140,6 @@ def quack_scaled_fp8_mm(
 _valid_scale_ptrs: set[tuple[int, int]] = set()
 
 
-@torch.compiler.disable
 def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     """True when both per-tensor scales are finite and positive.
 
@@ -150,9 +149,8 @@ def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     Cache only positive results: a buffer still holding the sentinel is re-checked and
     picks up the fast path once the real scale is written.
 
-    Exclude pointer checks and cache updates from tracing to avoid recompilation
-    for each layer's scale addresses. For Cosmos3-Super-Image2Video-4Step request time (193 frames,
-    720p, single GB200) is: ~13 min on ToT vs. ~22 s with this fix.
+    Called inside the dispatch custom op, so pointer checks and cache updates
+    neither specialize Dynamo graphs on each layer's addresses nor break them.
     """
     key = (scale_a.data_ptr(), scale_b.data_ptr())
     if key in _valid_scale_ptrs:
@@ -163,6 +161,40 @@ def _scales_valid(scale_a: torch.Tensor, scale_b: torch.Tensor) -> bool:
     if ok:
         _valid_scale_ptrs.add(key)
     return ok
+
+
+@torch.library.custom_op("vllm_omni::quack_fp8_scaled_mm", mutates_args=())
+def _quack_fp8_scaled_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Keep scale validation and runtime fallback inside one opaque graph node."""
+    if scale_a.numel() == 1 and scale_b.numel() == 1 and _scales_valid(scale_a, scale_b):
+        try:
+            out = quack_scaled_fp8_mm(a, b, scale_a, scale_b, out_dtype, bias)
+            if out is not None:
+                return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning_once("Quack FP8 GEMM failed (%s); using FlashInfer.", exc)
+
+    # Use the same fallback as FlashInferFP8ScaledMMLinearKernel, without
+    # passing its Python instance through the custom-op schema. Unpopulated
+    # scales also take this path: FlashInfer tolerates the profiling sentinel.
+    from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm
+
+    out = flashinfer_scaled_fp8_mm(a, b, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b, bias=bias)
+    # FlashInfer's separate bias add may promote the dtype. Both branches must
+    # match the fake kernel's output metadata, including with an FP32 bias.
+    return out.to(out_dtype)
+
+
+@_quack_fp8_scaled_mm.register_fake
+def _quack_fp8_scaled_mm_fake(a, b, scale_a, scale_b, out_dtype, bias=None):
+    return torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=out_dtype)
 
 
 def install_quack_fp8_patch() -> None:
@@ -182,17 +214,7 @@ def install_quack_fp8_patch() -> None:
         return
 
     def apply_scaled_mm(self, *, A, B, out_dtype, As, Bs, bias, output_shape):  # noqa: N803
-        # An unpopulated scale makes alpha overflow to +inf; hand those calls to
-        # FlashInfer, whose bmm_fp8 tolerates them.
-        if As.numel() != 1 or Bs.numel() != 1 or not _scales_valid(As, Bs):
-            return original(self, A=A, B=B, out_dtype=out_dtype, As=As, Bs=Bs, bias=bias, output_shape=output_shape)
-        try:
-            out = quack_scaled_fp8_mm(A, B, As, Bs, out_dtype, bias)
-            if out is not None:
-                return out.view(*output_shape)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning_once("Quack FP8 GEMM failed (%s); using FlashInfer.", exc)
-        return original(self, A=A, B=B, out_dtype=out_dtype, As=As, Bs=Bs, bias=bias, output_shape=output_shape)
+        return _quack_fp8_scaled_mm(A, B, As, Bs, out_dtype, bias).view(*output_shape)
 
     apply_scaled_mm._omni_quack_patched = True
     FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = apply_scaled_mm

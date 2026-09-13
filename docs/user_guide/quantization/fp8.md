@@ -70,6 +70,13 @@ still need compilation or tuning. The warmup helper uses inference mode and
 transposed weights without bias. Daemon workers compile candidates in-process
 while retaining autotuning and caching.
 
+Scale validation and Quack/FlashInfer dispatch run inside a PyTorch custom op.
+This keeps layer-specific scale addresses and validation-cache updates out of
+Dynamo tracing without introducing a graph break. Unpopulated scales and Quack
+failures still fall back to FlashInfer at runtime. CUDA graph capture additionally
+requires warming the dispatch with populated scales; Python validation and
+dispatch do not rerun during CUDA graph replay.
+
 To pre-warm specific shapes (e.g. at image build time):
 
 ```python
