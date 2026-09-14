@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 
 from .multiview_flex_attention import (
     MultiviewAttentionContext,
@@ -17,6 +18,7 @@ from .multiview_parallel import multiview_ulysses_attention
 from .transformer_cosmos3 import (
     COSMOS3_MULTIVIEW_BACKBONE_TYPE,
     Cosmos3CrossAttention,
+    Cosmos3GenDecoderLayer,
     Cosmos3VFMTransformer,
     _get_ulysses_state,
     _is_sp_active,
@@ -53,9 +55,55 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
         return output.reshape(q.shape[0], q.shape[1], -1)
 
 
+class Cosmos3MultiviewGenDecoderLayer(Cosmos3GenDecoderLayer):
+    """Bound post-attention norm/MLP activations for long multiview sequences."""
+
+    # Bound the total token rows across the batch in each norm/MLP call.
+    _mlp_chunk_size = 65536
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Assemble local chunk outputs before doing a single TP reduction.
+        self.mlp.down_proj.reduce_results = False
+
+    def _forward_mlp_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.post_attention_layernorm(hidden_states))
+
+    @torch.compiler.disable(recursive=False)
+    def _forward_mlp_chunked(self, hidden_states: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        # Keep the loop out of the graph so compilation cannot unroll it and
+        # retain intermediates across chunks. Child calls may still compile.
+        batch, sequence_length, hidden_size = hidden_states.shape
+        # Flatten before the compiled call so its strides do not depend on the
+        # full sequence length. Any copy for a batched slice is chunk-sized.
+        chunk = self._forward_mlp_chunk(hidden_states[:, :chunk_size].reshape(-1, hidden_size))
+        output = chunk.new_empty(batch, sequence_length, hidden_size)
+        output[:, :chunk_size] = chunk.view(batch, chunk_size, hidden_size)
+        del chunk
+        for start in range(chunk_size, sequence_length, chunk_size):
+            end = min(start + chunk_size, sequence_length)
+            output[:, start:end] = self._forward_mlp_chunk(hidden_states[:, start:end].reshape(-1, hidden_size)).view(
+                batch, end - start, hidden_size
+            )
+        return output
+
+    def _forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch, sequence_length, _ = hidden_states.shape
+        chunk_size = max(1, self._mlp_chunk_size // batch)
+        if sequence_length <= chunk_size:
+            output = self._forward_mlp_chunk(hidden_states)
+        else:
+            output = self._forward_mlp_chunked(hidden_states, chunk_size)
+        if self.mlp.down_proj.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
+
+
 class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
     """Cosmos3 Nano weights with request-local multiview block-mask caching."""
 
+    _gen_layer_cls = Cosmos3MultiviewGenDecoderLayer
+    _repeated_blocks = ["Cosmos3MultiviewGenDecoderLayer"]
     _cross_attention_cls = Cosmos3MultiviewCrossAttention
 
     @staticmethod

@@ -989,6 +989,9 @@ class Cosmos3GenDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
+    def _forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.post_attention_layernorm(hidden_states))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1028,8 +1031,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
+        hidden_states = residual + self._forward_mlp(hidden_states)
 
         return hidden_states
 
