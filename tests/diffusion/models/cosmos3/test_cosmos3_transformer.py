@@ -194,6 +194,7 @@ def test_multiview_transformer_installs_sparse_cross_attention_and_clears_mask_c
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
         COSMOS3_MULTIVIEW_BACKBONE_TYPE,
         Cosmos3MultiviewCrossAttention,
+        Cosmos3MultiviewGenDecoderLayer,
         Cosmos3MultiviewVFMTransformer,
     )
 
@@ -208,6 +209,9 @@ def test_multiview_transformer_installs_sparse_cross_attention_and_clears_mask_c
     )
 
     assert isinstance(model.gen_layers[0].cross_attention, Cosmos3MultiviewCrossAttention)
+    assert type(model.gen_layers[0]) is Cosmos3MultiviewGenDecoderLayer
+    assert model.gen_layers[0].mlp.down_proj.reduce_results is False
+    assert model._repeated_blocks == ["Cosmos3MultiviewGenDecoderLayer"]
     model._multiview_mask_cache[("fixture",)] = object()
     model._multiview_buffer_cache[("fixture",)] = torch.empty(0)
     model.cached_kv = []
