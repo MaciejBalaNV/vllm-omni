@@ -17,6 +17,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
+    FLUX2_KLEIN_MAX_INPUT_IMAGES,
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
 )
@@ -205,6 +206,18 @@ def test_vae_fast_path_roundtrip():
 def test_invalid_vae_fast_path_is_rejected():
     with pytest.raises(ValueError, match="vae_fast_path"):
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_flux2_klein_sets_generic_multimodal_limit():
+    od_config = OmniDiffusionConfig(
+        model="black-forest-labs/FLUX.2-klein-9B",
+        model_class_name="Flux2KleinPipeline",
+    )
+
+    od_config.update_multimodal_support()
+
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == FLUX2_KLEIN_MAX_INPUT_IMAGES
 
 
 def test_task_type_roundtrip():
