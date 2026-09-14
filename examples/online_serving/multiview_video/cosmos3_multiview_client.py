@@ -14,13 +14,40 @@ from typing import Any
 
 import httpx
 
+SUPPORTED_RESOLUTIONS = {"480": (832, 480), "720": (1280, 720)}
 
-def prepare_request(manifest: dict[str, Any], base_dir: Path) -> tuple[dict[str, str], list[Path]]:
+
+def prepare_request(
+    manifest: dict[str, Any], base_dir: Path, *, resolution_override: str | None = None
+) -> tuple[dict[str, str], list[Path]]:
     """Accept an offline manifest or a video API request containing extra_params."""
     extra = copy.deepcopy(manifest.get("extra_params", {}))
     if "multiview" not in extra:
         extra["multiview"] = copy.deepcopy(manifest["multiview"])
     extra.setdefault("wsm", manifest.get("wsm", True))
+    if resolution_override is None:
+        declarations = {
+            str(value)
+            for value in (manifest.get("resolution"), extra.get("resolution"), extra["multiview"].get("resolution"))
+            if value is not None
+        }
+        if len(declarations) > 1:
+            raise ValueError(f"Conflicting Cosmos3 multiview resolutions: {sorted(declarations)}.")
+        resolution = next(iter(declarations), "480")
+    else:
+        resolution = str(resolution_override)
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        raise ValueError(
+            f"Unsupported Cosmos3 multiview resolution {resolution!r}; expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
+        )
+    width, height = SUPPORTED_RESOLUTIONS[resolution]
+    for key, expected in (("width", width), ("height", height)):
+        if resolution_override is None and manifest.get(key) is not None and int(manifest[key]) != expected:
+            raise ValueError(
+                f"Cosmos3 multiview resolution={resolution!r} requires {key}={expected}, got {manifest[key]}."
+            )
+    extra["resolution"] = resolution
+    extra["multiview"]["resolution"] = resolution
     paths = []
     for view in extra["multiview"]["views"]:
         for role in ("control", "vision"):
@@ -41,7 +68,12 @@ def prepare_request(manifest: dict[str, Any], base_dir: Path) -> tuple[dict[str,
                 raise FileNotFoundError(path)
             view[f"{role}_reference_index"] = len(paths)
             paths.append(path)
-    data = {"prompt": str(manifest.get("prompt", "")), "extra_params": json.dumps(extra)}
+    data = {
+        "prompt": str(manifest.get("prompt", "")),
+        "extra_params": json.dumps(extra),
+        "width": str(width),
+        "height": str(height),
+    }
     for key in (
         "model",
         "fps",
@@ -51,8 +83,6 @@ def prepare_request(manifest: dict[str, Any], base_dir: Path) -> tuple[dict[str,
         "flow_shift",
         "seed",
         "negative_prompt",
-        "width",
-        "height",
     ):
         if manifest.get(key) is not None:
             data[key] = str(manifest[key])
@@ -72,7 +102,9 @@ def main() -> None:
     )
     parser.add_argument("--num-frames", type=int, help="Number of video frames, overriding the manifest value")
     parser.add_argument(
-        "--resolution", choices=("480",), help="Video resolution (480 = 832x480), overriding the manifest value"
+        "--resolution",
+        choices=tuple(SUPPORTED_RESOLUTIONS),
+        help="Video resolution (480 = 832x480, 720 = 1280x720), overriding the manifest value; defaults to 480",
     )
     parser.add_argument("--output", type=Path, default=Path("multiview.mp4"))
     parser.add_argument("--timeout", type=float, default=3600, help="HTTP and job polling timeout in seconds")
@@ -82,13 +114,7 @@ def main() -> None:
         if value is not None and value < 1:
             parser.error(f"--{key.replace('_', '-')} must be positive")
     manifest = json.loads(args.manifest.read_text())
-    if args.resolution is not None:
-        extra = manifest.setdefault("extra_params", {})
-        multiview = extra.setdefault("multiview", copy.deepcopy(manifest.get("multiview", {})))
-        multiview["resolution"] = args.resolution
-        extra["resolution"] = args.resolution
-        manifest["width"], manifest["height"] = 832, 480
-    data, paths = prepare_request(manifest, args.manifest.resolve().parent)
+    data, paths = prepare_request(manifest, args.manifest.resolve().parent, resolution_override=args.resolution)
     for key in ("num_inference_steps", "num_frames"):
         if getattr(args, key) is not None:
             data[key] = str(getattr(args, key))

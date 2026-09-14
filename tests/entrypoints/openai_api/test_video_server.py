@@ -2508,9 +2508,14 @@ def multiview_upload_dir(test_client, monkeypatch, tmp_path):
 @pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
 @pytest.mark.parametrize("vision", [False, True])
 @pytest.mark.parametrize("suffix", [".mp4", ".png"])
-def test_multiview_uploads_reach_camera_roles(endpoint, vision, suffix, test_client, multiview_upload_dir, mocker):
+@pytest.mark.parametrize("resolution", [None, "480", "720"])
+def test_multiview_uploads_reach_camera_roles(
+    endpoint, vision, suffix, resolution, test_client, multiview_upload_dir, mocker
+):
     _mock_encode_video_bytes(mocker, b"multiview-output")
     extra, files = _multiview_upload_request(vision, suffix)
+    if resolution is not None:
+        extra["multiview"]["resolution"] = resolution
     response = test_client.post(endpoint, data={"prompt": "drive", "extra_params": json.dumps(extra)}, files=files)
     assert response.status_code == 200
     if not endpoint.endswith("/sync"):
@@ -2523,6 +2528,8 @@ def test_multiview_uploads_reach_camera_roles(endpoint, vision, suffix, test_cli
     assert len(engine.captured_multiview_bytes) == 11
     assert "video" not in engine.captured_prompt.get("multi_modal_data", {})
     assert "reference_index" not in json.dumps(engine.captured_sampling_params_list[0].extra_args)
+    if resolution is not None:
+        assert engine.captured_sampling_params_list[0].extra_args["multiview"]["resolution"] == resolution
     assert not list(multiview_upload_dir.iterdir())
 
 

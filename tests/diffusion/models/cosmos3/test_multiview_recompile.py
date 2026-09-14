@@ -80,3 +80,31 @@ def test_varying_prompt_lengths_do_not_recompile_the_flex_kernel(monkeypatch: py
     assert counter.frame_count == 1, (
         f"prompt length is still a recompile trigger: {counter.frame_count} graphs for 5 prompt lengths"
     )
+
+
+def test_switching_resolutions_reuses_warmed_flex_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch._dynamo
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    import vllm_omni.diffusion.models.cosmos3.multiview_flex_attention as module
+
+    counter = CompileCounterWithBackend("inductor")
+    monkeypatch.setattr(
+        module,
+        "_compiled_flex_attention",
+        torch.compile(module.torch_flex_attention, dynamic=False, backend=counter),
+    )
+    torch._dynamo.reset()
+    counter.clear()
+    layouts = [module.MultiviewLayout(2, 2, h, w, max_und_tokens=_MAX_UND) for h, w in ((15, 26), (23, 40))]
+    tensors = []
+    for layout in layouts:
+        q = torch.randn(1, layout.gen_tokens, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, layout.gen_tokens, _KV_HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        tensors.append((q, k, torch.randn_like(k)))
+
+    # Same spatial geometry as 480p/720p, shortened to one latent frame per
+    # camera. New requests clear their caches and vary the text length.
+    for index, und_len in ((0, 100), (1, 200), (0, 300), (1, 400), (0, 500)):
+        _run_generation(module, layouts[index], *tensors[index], und_len)
+    assert counter.frame_count == 2, f"expected one graph per resolution, got {counter.frame_count}"

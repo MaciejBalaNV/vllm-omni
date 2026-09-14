@@ -45,7 +45,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 SUPPORTED_MODEL_MODES = {"image2video", "text2video"}
-SUPPORTED_RESOLUTIONS = {"480": (832, 480)}
+SUPPORTED_RESOLUTIONS = {"480": (832, 480), "720": (1280, 720)}
 
 
 def _safe_camera_name(camera: str) -> str:
@@ -95,9 +95,11 @@ def _resolve_model_mode(request: dict[str, Any], views: list[dict[str, Any]]) ->
     return model_mode
 
 
-def _resolve_resolution(request: dict[str, Any], multiview: dict[str, Any]) -> tuple[str, int, int]:
-    top_level = request.get("resolution")
-    nested = multiview.get("resolution")
+def _resolve_resolution(
+    request: dict[str, Any], multiview: dict[str, Any], override: str | None = None
+) -> tuple[str, int, int]:
+    top_level = override if override is not None else request.get("resolution")
+    nested = override if override is not None else multiview.get("resolution")
     if top_level is not None and nested is not None and str(top_level) != str(nested):
         raise ValueError(
             "Conflicting Cosmos3 multiview resolutions: "
@@ -203,6 +205,7 @@ def _run_request(
     fallback_negative_prompt: str | None,
     fps_override: float | None = None,
     num_frames_override: int | None = None,
+    resolution_override: str | None = None,
 ) -> dict[str, Any]:
     multiview_value = request.get("multiview")
     if not isinstance(multiview_value, dict):
@@ -216,7 +219,7 @@ def _run_request(
     views: list[dict[str, Any]] = views_value
 
     model_mode = _resolve_model_mode(request, views)
-    resolution, width, height = _resolve_resolution(request, multiview)
+    resolution, width, height = _resolve_resolution(request, multiview, resolution_override)
     # Keep the resolved value with the variant-owned multiview parameters so
     # top-level Imaginaire inputs and native vLLM-Omni inputs behave identically.
     multiview["resolution"] = resolution
@@ -345,6 +348,14 @@ def main() -> None:
             "The pipeline rounds it up to the VAE's 4k+1 grid; unset defaults to 201."
         ),
     )
+    parser.add_argument(
+        "--resolution",
+        choices=tuple(SUPPORTED_RESOLUTIONS),
+        help=(
+            "Video resolution (480 = 832x480, 720 = 1280x720) for every record, overriding any record value. "
+            "Unset: the record's resolution, else 480."
+        ),
+    )
     parser.add_argument("--cfg-parallel-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--ulysses-degree", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -401,6 +412,7 @@ def main() -> None:
             fallback_negative_prompt=fallback_negative_prompt,
             fps_override=args.fps,
             num_frames_override=args.num_frames,
+            resolution_override=args.resolution,
         )
         manifests.append({**manifest, "output_dir": str(output_dir)})
 

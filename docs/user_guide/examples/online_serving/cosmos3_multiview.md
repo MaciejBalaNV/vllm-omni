@@ -83,11 +83,30 @@ python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
 
 # Override the manifest's frame count and resolution:
 python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
-  request.json --num-frames 29 --resolution 480 --output multiview.mp4
+  request.json --num-frames 29 --resolution 720 --output multiview.mp4
 ```
 
-`--num-frames` must be positive. `--resolution` currently accepts only `480`
-(832×480), the resolution supported by the Cosmos3 multiview pipeline.
+`--num-frames` must be positive. `--resolution` accepts `480` (832×480) and
+`720` (1280×720), per camera. When the flag is omitted, the client uses the
+manifest's resolution, defaulting to `480` if none is supplied.
+
+Offline manifests may specify top-level `resolution` or `multiview.resolution`;
+API manifests use `extra_params.resolution` or
+`extra_params.multiview.resolution`. Integer and string values are accepted.
+The client rejects conflicting resolution declarations and width/height values
+that disagree with the selected size. A CLI override replaces the resolution
+declarations and sets the matching width/height without editing the input file.
+
+Direct HTTP requests can set `extra_params.multiview.resolution` to `"720"`
+and omit width/height, or explicitly supply width `1280` and height `720`.
+The pipeline prefers the nested multiview resolution over
+`extra_params.resolution`, then defaults to `"480"`. Explicit dimensions must
+match the selected bucket. All eleven cameras use the same resolution.
+
+720p increases memory and compute requirements. With the current VAE and
+transformer patch defaults it has approximately 2.36 times as many spatial
+tokens as 480p. Measure latency and peak memory for the desired clip length
+and existing execution topology.
 
 Relative input paths resolve against the manifest's directory. The default
 client submits a background job, polls it, and downloads the existing video

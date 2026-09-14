@@ -112,6 +112,140 @@ def test_multiview_resolution_does_not_inherit_image_default() -> None:
     assert _resolve_multiview_resolution(sp, {}) == "480"
 
 
+@pytest.mark.parametrize("resolution", [480, "480", 720, "720"])
+def test_multiview_resolution_accepts_both_buckets_and_preserves_precedence(resolution) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_resolution
+
+    sp = SimpleNamespace(resolution=640, extra_args={"resolution": resolution})
+    assert _resolve_multiview_resolution(sp, {}) == str(resolution)
+    sp.extra_args["resolution"] = "unsupported"
+    assert _resolve_multiview_resolution(sp, {"resolution": resolution}) == str(resolution)
+
+
+@pytest.mark.parametrize("resolution", [256, 704, "1080", "720p", True])
+def test_multiview_resolution_rejects_unsupported_buckets(resolution) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_resolution
+
+    with pytest.raises(ValueError, match="supports resolutions '480' and '720'"):
+        _resolve_multiview_resolution(SimpleNamespace(extra_args={}), {"resolution": resolution})
+
+
+@pytest.mark.parametrize("resolution,width,height", [("480", 832, 480), ("720", 1280, 720)])
+@pytest.mark.parametrize("dimension", ["width", "height"])
+def test_multiview_rejects_mismatched_dimensions_before_loading_media(resolution, width, height, dimension) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.multiview_cameras = ("front", "rear")
+    pipeline.vae_scale_factor_temporal = 4
+    sp = SimpleNamespace(
+        extra_args={"wsm": {}, "multiview": {"views": _views(pipeline.multiview_cameras), "resolution": resolution}},
+        num_frames=29,
+        width=width,
+        height=height,
+    )
+    setattr(sp, dimension, getattr(sp, dimension) + 16)
+    with pytest.raises(ValueError, match=f"resolution='{resolution}' requires {dimension}="):
+        pipeline.forward(SimpleNamespace(prompts=["drive"], sampling_params=sp))
+
+
+@pytest.mark.parametrize(
+    "resolution,width,height,patch_hw", [("480", 832, 480, (15, 26)), ("720", 1280, 720, (23, 40))]
+)
+@pytest.mark.parametrize("has_vision", [False, True])
+def test_multiview_forward_propagates_resolution(monkeypatch, resolution, width, height, patch_hw, has_vision) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.float32
+    pipeline.vae_scale_factor_spatial = 16
+    pipeline.vae_scale_factor_temporal = 4
+    pipeline.is_distilled_model = False
+    pipeline.multiview_cameras = ("front", "rear")
+    pipeline.multiview_align_temporal_positions_across_views = False
+    pipeline.multiview_attention_scope = "decomposed"
+    pipeline.multiview_decomposed_temporal_window_seconds = None
+    pipeline.multiview_control_attends_sensor = False
+    pipeline.multiview_backend = "triton"
+    transformer = object.__new__(Cosmos3MultiviewVFMTransformer)
+    torch.nn.Module.__init__(transformer)
+    transformer.latent_channel_size = 3
+    transformer.latent_patch_size = 2
+    pipeline.transformer = transformer
+    pipeline.scheduler = SimpleNamespace(timesteps=torch.tensor([1]))
+    monkeypatch.setattr(pipeline, "_set_timesteps", lambda *args, **kwargs: None)
+
+    prepared = []
+
+    def prepare(views, *, field, height, width, num_frames, keep_first):
+        prepared.append((field, height, width, num_frames, keep_first))
+        # Broadcast camera markers to avoid allocating full-resolution input clips.
+        markers = torch.tensor([0.25] * num_frames + [0.75] * num_frames)
+        return markers.view(1, 1, -1, 1, 1).expand(1, 3, -1, height, width)
+
+    monkeypatch.setattr(pipeline, "_prepare_camera_major_pixels", prepare)
+    monkeypatch.setattr(pipeline, "_encode_video_tensor", lambda video: video[:, :, ::4, ::16, ::16].clone())
+
+    def decode(latents):
+        assert latents.shape[-2:] == (height // 16, width // 16)
+        return latents[:, :, :1, :1, :1].expand(1, 3, 5, height, width)
+
+    monkeypatch.setattr(pipeline, "_decode_latents", decode)
+    prompts = []
+
+    def tokenize(prompt, *args, **kwargs):
+        prompts.append(prompt)
+        return torch.ones(1, 2, dtype=torch.long), torch.ones(1, 2, dtype=torch.long)
+
+    monkeypatch.setattr(pipeline, "_tokenize_prompt", tokenize)
+
+    def diffuse(*, latents, shared_kwargs, velocity_mask, condition_latents, **kwargs):
+        assert latents.shape == (1, 3, 4, height // 16, width // 16)
+        control = shared_kwargs["control_latents"][0]
+        assert control.shape == latents.shape
+        assert shared_kwargs["video_shape"] == tuple(latents.shape[2:])
+        layout = shared_kwargs["multiview_layout"]
+        assert (layout.patch_height, layout.patch_width) == patch_hw
+        assert layout.gen_tokens == 2 * 4 * patch_hw[0] * patch_hw[1]
+        assert velocity_mask.flatten().tolist() == ([0, 1, 0, 1] if has_vision else [1, 1, 1, 1])
+        if has_vision:
+            torch.testing.assert_close(condition_latents[:, :, ::2], control[:, :, ::2])
+        # Exercise the real patch padding/crop before the per-camera decoder.
+        return transformer.unpatchify(transformer.patchify(control, *control.shape[2:]), *control.shape[2:])
+
+    monkeypatch.setattr(pipeline, "diffuse", diffuse)
+    sp = OmniDiffusionSamplingParams(
+        num_frames=5,
+        num_inference_steps=1,
+        width=width,
+        height=height,
+        seed=42,
+        extra_args={
+            "wsm": {},
+            "multiview": {
+                "resolution": resolution,
+                "views": _views(pipeline.multiview_cameras, vision=has_vision),
+                "condition_video_as_image": True,
+            },
+        },
+    )
+    result = pipeline.forward(SimpleNamespace(prompts=["drive"], sampling_params=sp))
+    assert prepared == ([("vision", height, width, 5, True)] if has_vision else []) + [
+        ("control", height, width, 5, False)
+    ]
+    assert len(prompts) == 2
+    assert all(f"This video is of {height}x{width} resolution." in prompt for prompt in prompts)
+    video = result.output["payload"]["video"]
+    assert video.shape == (1, 3, 10, height, width)
+    assert video[0, 0, :, -1, -1].tolist() == [0.25] * 5 + [0.75] * 5
+    assert result.output["metadata"]["multiview"]["cameras"] == ["front", "rear"]
+
+
 def test_multiview_temporal_position_period_validates_actual_latent_geometry() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
         _resolve_temporal_position_period,
