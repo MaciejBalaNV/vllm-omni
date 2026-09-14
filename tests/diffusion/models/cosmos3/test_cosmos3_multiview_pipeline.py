@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,19 @@ import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+MULTIVIEW_BUCKETS = [
+    ("480", "1,1", 640, 640, (20, 20)),
+    ("480", "4,3", 736, 544, (17, 23)),
+    ("480", "3,4", 544, 736, (23, 17)),
+    ("480", "16,9", 832, 480, (15, 26)),
+    ("480", "9,16", 480, 832, (26, 15)),
+    ("720", "1,1", 960, 960, (30, 30)),
+    ("720", "4,3", 1104, 832, (26, 35)),
+    ("720", "3,4", 832, 1104, (35, 26)),
+    ("720", "16,9", 1280, 720, (23, 40)),
+    ("720", "9,16", 720, 1280, (40, 23)),
+]
 
 
 def _views(cameras: tuple[str, ...], *, vision: bool = False) -> list[dict]:
@@ -140,7 +154,14 @@ def test_multiview_rejects_mismatched_dimensions_before_loading_media(resolution
     pipeline.multiview_cameras = ("front", "rear")
     pipeline.vae_scale_factor_temporal = 4
     sp = SimpleNamespace(
-        extra_args={"wsm": {}, "multiview": {"views": _views(pipeline.multiview_cameras), "resolution": resolution}},
+        extra_args={
+            "wsm": {},
+            "aspect_ratio": "16:9",
+            "multiview": {
+                "views": _views(pipeline.multiview_cameras),
+                "resolution": resolution,
+            },
+        },
         num_frames=29,
         width=width,
         height=height,
@@ -150,11 +171,12 @@ def test_multiview_rejects_mismatched_dimensions_before_loading_media(resolution
         pipeline.forward(SimpleNamespace(prompts=["drive"], sampling_params=sp))
 
 
-@pytest.mark.parametrize(
-    "resolution,width,height,patch_hw", [("480", 832, 480, (15, 26)), ("720", 1280, 720, (23, 40))]
-)
+@pytest.mark.parametrize("resolution,aspect_ratio,width,height,patch_hw", MULTIVIEW_BUCKETS)
+@pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("has_vision", [False, True])
-def test_multiview_forward_propagates_resolution(monkeypatch, resolution, width, height, patch_hw, has_vision) -> None:
+def test_multiview_forward_propagates_resolution(
+    monkeypatch, resolution, aspect_ratio, width, height, patch_hw, automatic, has_vision
+) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -203,6 +225,10 @@ def test_multiview_forward_propagates_resolution(monkeypatch, resolution, width,
         return torch.ones(1, 2, dtype=torch.long), torch.ones(1, 2, dtype=torch.long)
 
     monkeypatch.setattr(pipeline, "_tokenize_prompt", tokenize)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview.media_hw",
+        lambda value: (height, width),
+    )
 
     def diffuse(*, latents, shared_kwargs, velocity_mask, condition_latents, **kwargs):
         assert latents.shape == (1, 3, 4, height // 16, width // 16)
@@ -229,21 +255,134 @@ def test_multiview_forward_propagates_resolution(monkeypatch, resolution, width,
             "wsm": {},
             "multiview": {
                 "resolution": resolution,
+                "aspect_ratio": "auto" if automatic else aspect_ratio,
                 "views": _views(pipeline.multiview_cameras, vision=has_vision),
                 "condition_video_as_image": True,
             },
         },
     )
-    result = pipeline.forward(SimpleNamespace(prompts=["drive"], sampling_params=sp))
+    request_prompt = json.dumps({"caption": "drive", "aspect_ratio": "21:9"}) if automatic else "drive"
+    result = pipeline.forward(SimpleNamespace(prompts=[request_prompt], sampling_params=sp))
     assert prepared == ([("vision", height, width, 5, True)] if has_vision else []) + [
         ("control", height, width, 5, False)
     ]
     assert len(prompts) == 2
-    assert all(f"This video is of {height}x{width} resolution." in prompt for prompt in prompts)
+    if automatic:
+        metadata_prompt, _ = json.JSONDecoder().raw_decode(prompts[0])
+        assert metadata_prompt["aspect_ratio"] == aspect_ratio
+        assert metadata_prompt["resolution"] == {"H": height, "W": width}
+    else:
+        assert f"This video is of {height}x{width} resolution." in prompts[0]
+    assert f"This video is of {height}x{width} resolution." in prompts[1]
     video = result.output["payload"]["video"]
     assert video.shape == (1, 3, 10, height, width)
     assert video[0, 0, :, -1, -1].tolist() == [0.25] * 5 + [0.75] * 5
-    assert result.output["metadata"]["multiview"]["cameras"] == ["front", "rear"]
+    metadata = result.output["metadata"]["multiview"]
+    assert metadata["cameras"] == ["front", "rear"]
+    assert (metadata["resolution"], metadata["aspect_ratio"], metadata["width"], metadata["height"]) == (
+        resolution,
+        aspect_ratio,
+        width,
+        height,
+    )
+
+
+@pytest.mark.parametrize("resolution,aspect_ratio,width,height,patch_hw", MULTIVIEW_BUCKETS)
+@pytest.mark.parametrize("kind", ["tensor", "array", "frames", "image_path", "video_path"])
+def test_multiview_auto_uses_first_wsm_input(
+    tmp_path, monkeypatch, resolution, aspect_ratio, width, height, patch_hw, kind
+):
+    import numpy as np
+    from PIL import Image
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_geometry
+
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    if kind == "tensor":
+        control = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(1)
+    elif kind == "array":
+        control = frame[None]
+    elif kind == "frames":
+        control = [Image.fromarray(frame)]
+    elif kind == "image_path":
+        control = tmp_path / "control.png"
+        Image.fromarray(frame).save(control)
+    else:
+        import imageio.v3 as iio
+
+        control = tmp_path / "control.mp4"
+
+        def first_frame_only(path):
+            assert path == control
+            yield frame
+            pytest.fail("Aspect ratio detection must not decode a second video frame")
+
+        monkeypatch.setattr(iio, "imiter", first_frame_only)
+    # Other cameras and even this camera's vision input cannot change selection.
+    views = [
+        {"camera_key": "front", "control": control, "vision_path": "unread-vision.mp4"},
+        {"camera_key": "rear", "control_path": "unread-control.mp4"},
+    ]
+    sp = SimpleNamespace(extra_args={"resolution": resolution}, width=None, height=None)
+    assert _resolve_multiview_geometry(sp, {}, views) == (resolution, aspect_ratio, width, height)
+
+
+@pytest.mark.parametrize("source_hw", [(1080, 1920), (1920, 1080), (731, 991), (1000, 1000), (147, 170)])
+@pytest.mark.parametrize("resolution", ["480", "720"])
+def test_multiview_auto_matches_cosmos_bucket_selection(monkeypatch, source_hw, resolution):
+    from vllm_omni.diffusion.models.cosmos3.action import find_closest_target_size
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_geometry
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview.media_hw",
+        lambda _: source_hw,
+    )
+    sp = SimpleNamespace(extra_args={"resolution": resolution})
+    result = _resolve_multiview_geometry(sp, {}, [{"camera_key": "front", "control": "input.mp4"}])
+    assert result[2:] == find_closest_target_size(*source_hw, resolution)
+
+
+def test_multiview_explicit_ratio_precedence_bypasses_detection(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_geometry
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview.media_hw",
+        lambda _: pytest.fail("Explicit aspect ratio must bypass input probing"),
+    )
+    sp = SimpleNamespace(extra_args={"aspect_ratio": "9:16"})
+    assert _resolve_multiview_geometry(sp, {}, []) == ("480", "9,16", 480, 832)
+    assert _resolve_multiview_geometry(sp, {"aspect_ratio": "32:18"}, []) == ("480", "16,9", 832, 480)
+
+
+@pytest.mark.parametrize("probe_result", [None, (0, 640), (-1, 640), OSError("corrupt media")])
+def test_multiview_auto_reports_unreadable_first_wsm(monkeypatch, probe_result):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_geometry
+
+    def probe(_):
+        if isinstance(probe_result, Exception):
+            raise probe_result
+        return probe_result
+
+    monkeypatch.setattr("vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview.media_hw", probe)
+    with pytest.raises(ValueError, match="camera 'front'.*'broken.mp4'"):
+        _resolve_multiview_geometry(
+            SimpleNamespace(extra_args={}),
+            {},
+            [{"camera_key": "front", "control_path": "broken.mp4"}],
+        )
+
+
+@pytest.mark.parametrize("dimension", ["width", "height"])
+def test_multiview_auto_validates_dimension_constraints(monkeypatch, dimension):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _resolve_multiview_geometry
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview.media_hw",
+        lambda _: (1080, 1080),
+    )
+    sp = SimpleNamespace(extra_args={}, **{dimension: 480})
+    with pytest.raises(ValueError, match=f"requires {dimension}=640"):
+        _resolve_multiview_geometry(sp, {}, [{"camera_key": "front", "control_path": "square.mp4"}])
 
 
 def test_multiview_temporal_position_period_validates_actual_latent_geometry() -> None:

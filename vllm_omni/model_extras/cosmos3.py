@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -63,11 +64,35 @@ COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
         "max_sequence_length",
         "negative_prompt",
         "resolution",
+        "aspect_ratio",
         "fps",
         "frame_rate",
         "resolved_frame_rate",
     }
 )
+
+COSMOS3_MULTIVIEW_ASPECT_RATIOS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+
+def normalize_multiview_aspect_ratio(value: Any) -> str:
+    """Normalize the explicit bucket label, or select automatic WSM sizing."""
+    if value is None or value == "auto":
+        return "auto"
+    parts = str(value).strip().replace(":", ",").split(",")
+    if len(parts) == 2:
+        try:
+            width, height = (int(part.strip()) for part in parts)
+        except ValueError:
+            pass
+        else:
+            if width > 0 and height > 0:
+                divisor = math.gcd(width, height)
+                ratio = f"{width // divisor},{height // divisor}"
+                if ratio in COSMOS3_MULTIVIEW_ASPECT_RATIOS:
+                    return ratio
+    raise ValueError(
+        f"Unsupported Cosmos3 multiview aspect_ratio={value!r}; expected auto, 1:1, 4:3, 3:4, 16:9, or 9:16."
+    )
 
 
 COSMOS3_MADS_CAMERAS = (
@@ -113,9 +138,12 @@ def validate_multiview_request(
         "condition_frame_indexes_vision",
         "num_frames",
         "resolution",
+        "aspect_ratio",
     }
     if unknown:
         raise ValueError(f"Unsupported Cosmos3 multiview fields: {sorted(unknown)}.")
+    ratio = multiview.get("aspect_ratio")
+    normalize_multiview_aspect_ratio(extra.get("aspect_ratio") if ratio is None else ratio)
     raw_views = multiview.get("views")
     if not isinstance(raw_views, Sequence) or isinstance(raw_views, str | bytes) or not raw_views:
         raise ValueError("Cosmos3 multiview.views must contain at least one camera view.")

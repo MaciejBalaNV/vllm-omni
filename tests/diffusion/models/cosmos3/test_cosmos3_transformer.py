@@ -438,7 +438,21 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
         )
 
 
-@pytest.mark.parametrize("height,width,patch_hw", [(30, 52, (15, 26)), (45, 80, (23, 40))])
+@pytest.mark.parametrize(
+    "height,width,patch_hw",
+    [
+        (40, 40, (20, 20)),
+        (34, 46, (17, 23)),
+        (46, 34, (23, 17)),
+        (30, 52, (15, 26)),
+        (52, 30, (26, 15)),
+        (60, 60, (30, 30)),
+        (52, 69, (26, 35)),
+        (69, 52, (35, 26)),
+        (45, 80, (23, 40)),
+        (80, 45, (40, 23)),
+    ],
+)
 def test_multiview_resolution_patch_round_trip(height, width, patch_hw) -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 
@@ -447,7 +461,7 @@ def test_multiview_resolution_patch_round_trip(height, width, patch_hw) -> None:
     model.latent_patch_size = 2
     model.latent_channel_size = 3
     # Distinct values across cameras, frames, rows and columns expose ordering
-    # mistakes and loss of the last real row when the 720p latent is padded.
+    # mistakes and loss of the last real row or column when a latent is padded.
     latents = torch.arange(3 * 4 * height * width, dtype=torch.float32).reshape(1, 3, 4, height, width)
     tokens = model.patchify(latents, t=4, h=height, w=width)
     assert tokens.shape == (1, 4 * patch_hw[0] * patch_hw[1], 12)

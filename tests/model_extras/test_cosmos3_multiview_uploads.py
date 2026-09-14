@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The manifest contract can be checked without importing the inference runtime."""
 
+import ast
 import copy
 import importlib.util
 import json
@@ -169,7 +170,8 @@ def test_client_converts_local_manifest_to_upload_indexes(tmp_path, envelope):
 
 @pytest.mark.parametrize("mode", ["async", "sync", "failed"])
 @pytest.mark.parametrize("resolution", [None, "480", "720"])
-def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, mode, resolution):
+@pytest.mark.parametrize("aspect_ratio", [None, "auto", "3:4", "9:16"])
+def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, mode, resolution, aspect_ratio):
     httpx = pytest.importorskip("httpx")
     spec = importlib.util.spec_from_file_location(
         "multiview_client", _ROOT / "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
@@ -185,6 +187,9 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
         view["control_path"] = filename
     manifest_path = tmp_path / "manifest.json"
     request_manifest = {"prompt": "drive", **extra}
+    if aspect_ratio is not None:
+        request_manifest["aspect_ratio"] = "1:1"
+        request_manifest["multiview"]["aspect_ratio"] = "16:9"
     if resolution is not None:
         # The CLI must replace conflicting fields and stale dimensions together.
         request_manifest.update(resolution="480", width=832, height=480)
@@ -201,10 +206,16 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
             assert b"control_reference_index" in body
             assert b"control_path" not in body
             expected_resolution = resolution or "480"
-            width, height = (1280, 720) if expected_resolution == "720" else (832, 480)
             assert f'"resolution": "{expected_resolution}"'.encode() in body
-            assert f'name="width"\r\n\r\n{width}\r\n'.encode() in body
-            assert f'name="height"\r\n\r\n{height}\r\n'.encode() in body
+            expected_ratio = (aspect_ratio or "auto").replace(":", ",")
+            assert f'"aspect_ratio": "{expected_ratio}"'.encode() in body
+            if expected_ratio == "auto":
+                assert b'name="width"' not in body
+                assert b'name="height"' not in body
+            else:
+                width, height = client.SUPPORTED_RESOLUTIONS[expected_resolution][expected_ratio]
+                assert f'name="width"\r\n\r\n{width}\r\n'.encode() in body
+                assert f'name="height"\r\n\r\n{height}\r\n'.encode() in body
             for index in range(11):
                 assert f"media-{index}".encode() in body
             if mode == "sync":
@@ -226,7 +237,8 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
         "argv",
         ["client", str(manifest_path), "--output", str(output)]
         + (["--sync"] if mode == "sync" else [])
-        + (["--resolution", resolution] if resolution is not None else []),
+        + (["--resolution", resolution] if resolution is not None else [])
+        + (["--aspect-ratio", aspect_ratio] if aspect_ratio is not None else []),
     )
     if mode == "failed":
         with pytest.raises(RuntimeError, match="corrupt input"):
@@ -266,7 +278,8 @@ def test_client_preserves_resolution_and_manifest(tmp_path, multiview_client, en
     resolved = json.loads(data["extra_params"])
     expected = "480" if location == "omitted" else "720"
     assert resolved["resolution"] == resolved["multiview"]["resolution"] == expected
-    assert (data["width"], data["height"]) == (("832", "480") if expected == "480" else ("1280", "720"))
+    assert "width" not in data and "height" not in data
+    assert resolved["multiview"]["aspect_ratio"] == "auto"
     assert paths == [tmp_path / "control.mp4"]
     assert request == before
 
@@ -289,6 +302,95 @@ def test_client_rejects_resolution_conflicts(tmp_path, multiview_client, locatio
 
 @pytest.mark.parametrize("dimensions", [{"width": 832}, {"height": 480}])
 def test_client_rejects_dimensions_that_disagree_with_resolution(tmp_path, multiview_client, dimensions):
-    request = {"multiview": {"views": [], "resolution": "720"}, **dimensions}
+    request = {"multiview": {"views": [], "resolution": "720", "aspect_ratio": "16:9"}, **dimensions}
     with pytest.raises(ValueError, match="resolution='720' requires"):
         multiview_client.prepare_request(request, tmp_path)
+
+
+def test_client_buckets_match_runtime_without_importing_inference(multiview_client):
+    tree = ast.parse((_ROOT / "vllm_omni/diffusion/models/cosmos3/utils.py").read_text())
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "VIDEO_RES_SIZE_INFO"
+    )
+    canonical = ast.literal_eval(assignment.value)
+    assert multiview_client.SUPPORTED_RESOLUTIONS == {key: canonical[key] for key in ("480", "720")}
+    assert set(contract.COSMOS3_MULTIVIEW_ASPECT_RATIOS) == set(canonical["480"]) == set(canonical["720"])
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        ("1:1", "1,1"),
+        ("4,3", "4,3"),
+        (" 6 : 8 ", "3,4"),
+        ("32:18", "16,9"),
+        ("9:16", "9,16"),
+    ],
+)
+def test_ratio_normalization_matches_client(multiview_client, value, expected):
+    assert contract.normalize_multiview_aspect_ratio(value) == expected
+    assert multiview_client.normalize_aspect_ratio(value) == expected
+
+
+@pytest.mark.parametrize("value", ["21:9", "0:1", "-1:1", "4:0", "", "square", True, 1.5, "1.5:1", [4, 3]])
+def test_invalid_ratios_rejected_by_contract_and_client(multiview_client, value):
+    for normalize in (contract.normalize_multiview_aspect_ratio, multiview_client.normalize_aspect_ratio):
+        with pytest.raises(ValueError, match="aspect_ratio"):
+            normalize(value)
+    extra = manifest()
+    extra["multiview"]["aspect_ratio"] = value
+    with pytest.raises(ValueError, match="aspect_ratio"):
+        contract.resolve_multiview_uploads(extra, [f"{index}.mp4" for index in range(11)])
+
+
+@pytest.mark.parametrize("resolution", ["480", "720"])
+@pytest.mark.parametrize("ratio", ["1:1", "4:3", "3:4", "16:9", "9:16"])
+@pytest.mark.parametrize("location", ["top", "extra", "nested"])
+def test_client_explicit_aspect_ratios(tmp_path, multiview_client, resolution, ratio, location):
+    extra = {"resolution": resolution, "multiview": {"views": []}}
+    request = {"extra_params": extra}
+    target = {"top": request, "extra": extra, "nested": extra["multiview"]}[location]
+    target["aspect_ratio"] = ratio
+    before = copy.deepcopy(request)
+    data, _ = multiview_client.prepare_request(request, tmp_path)
+    normalized = ratio.replace(":", ",")
+    assert (int(data["width"]), int(data["height"])) == multiview_client.SUPPORTED_RESOLUTIONS[resolution][normalized]
+    assert json.loads(data["extra_params"])["multiview"]["aspect_ratio"] == normalized
+    assert request == before
+
+
+def test_client_ratio_conflicts_and_independent_overrides(tmp_path, multiview_client):
+    request = {
+        "aspect_ratio": "1:1",
+        "multiview": {"views": [], "aspect_ratio": "9:16", "resolution": "720"},
+        "width": 832,
+        "height": 480,
+    }
+    with pytest.raises(ValueError, match="Conflicting.*aspect ratios"):
+        multiview_client.prepare_request(request, tmp_path)
+    # A resolution override cannot hide an unrelated aspect-ratio conflict.
+    with pytest.raises(ValueError, match="Conflicting.*aspect ratios"):
+        multiview_client.prepare_request(request, tmp_path, resolution_override="480")
+    explicit, _ = multiview_client.prepare_request(request, tmp_path, aspect_ratio_override="3:4")
+    assert (explicit["width"], explicit["height"]) == ("832", "1104")
+    automatic, _ = multiview_client.prepare_request(request, tmp_path, aspect_ratio_override="auto")
+    assert "width" not in automatic and "height" not in automatic
+    assert json.loads(automatic["extra_params"])["resolution"] == "720"
+    request["aspect_ratio"] = "18:32"
+    resolved, _ = multiview_client.prepare_request(request, tmp_path, resolution_override="480")
+    assert (resolved["width"], resolved["height"]) == ("480", "832")
+
+
+@pytest.mark.parametrize("dimensions", [{"width": 640}, {"height": 640}, {"width": 640, "height": 640}])
+def test_client_auto_preserves_only_explicit_dimension_constraints(tmp_path, multiview_client, dimensions):
+    request = {"multiview": {"views": []}, **dimensions}
+    data, _ = multiview_client.prepare_request(request, tmp_path)
+    assert {key: int(data[key]) for key in ("width", "height") if key in data} == dimensions
+    overridden, _ = multiview_client.prepare_request(request, tmp_path, resolution_override="720")
+    assert "width" not in overridden and "height" not in overridden

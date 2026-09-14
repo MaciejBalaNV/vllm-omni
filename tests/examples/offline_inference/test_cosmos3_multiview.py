@@ -46,7 +46,7 @@ def test_request_fields_control_mode_resolution_and_seed(cosmos3_multiview: Modu
     request = {"model_mode": "image2video", "resolution": "480", "seed": 123}
 
     assert cosmos3_multiview._resolve_model_mode(request, views) == "image2video"
-    assert cosmos3_multiview._resolve_resolution(request, {}) == ("480", 832, 480)
+    assert cosmos3_multiview._resolve_resolution(request, {}) == "480"
     assert cosmos3_multiview._resolve_seed(request, base_seed=42, sample_index=7) == 123
     assert cosmos3_multiview._resolve_seed({}, base_seed=42, sample_index=7) == 49
 
@@ -66,23 +66,69 @@ def test_model_mode_must_match_per_view_vision_inputs(cosmos3_multiview: ModuleT
 )
 def test_resolution_manifest_fields(cosmos3_multiview, resolution, width, height):
     resolve = cosmos3_multiview._resolve_resolution
-    assert resolve({"resolution": resolution}, {}) == (str(resolution), width, height)
-    assert resolve({}, {"resolution": resolution}) == (str(resolution), width, height)
-    assert resolve({"resolution": str(resolution)}, {"resolution": resolution}) == (str(resolution), width, height)
-    assert resolve({}, {}) == ("480", 832, 480)
+    assert resolve({"resolution": resolution}, {}) == str(resolution)
+    assert resolve({}, {"resolution": resolution}) == str(resolution)
+    assert resolve({"resolution": str(resolution)}, {"resolution": resolution}) == str(resolution)
+    assert resolve({}, {}) == "480"
 
 
 def test_resolution_conflicts_and_invalid_buckets(cosmos3_multiview):
     resolve = cosmos3_multiview._resolve_resolution
     with pytest.raises(ValueError, match="Conflicting"):
         resolve({"resolution": "480"}, {"resolution": "720"})
-    assert resolve({"resolution": "480"}, {"resolution": "720"}, "720") == ("720", 1280, 720)
+    assert resolve({"resolution": "480"}, {"resolution": "720"}, "720") == "720"
     for resolution in (256, 704, "1080", "720p", True):
         with pytest.raises(ValueError, match="Unsupported"):
             resolve({"resolution": resolution}, {})
 
 
-def test_cli_resolution_overrides_every_jsonl_record(cosmos3_multiview, monkeypatch, tmp_path):
+def test_aspect_ratio_manifest_fields_and_overrides(cosmos3_multiview):
+    resolve = cosmos3_multiview._resolve_aspect_ratio
+    assert resolve({}, {}) == "auto"
+    assert resolve({"aspect_ratio": "auto"}, {}) == "auto"
+    assert resolve({"aspect_ratio": "16:9"}, {"aspect_ratio": "32,18"}) == "16,9"
+    assert resolve({}, {"aspect_ratio": "9:16"}) == "9,16"
+    with pytest.raises(ValueError, match="Conflicting"):
+        resolve({"aspect_ratio": "1:1"}, {"aspect_ratio": "auto"})
+    assert resolve({"aspect_ratio": "1:1"}, {"aspect_ratio": "9:16"}, "auto") == "auto"
+    with pytest.raises(ValueError, match="Unsupported"):
+        resolve({"aspect_ratio": "21:9"}, {})
+
+
+@pytest.mark.parametrize("override,expected", [(None, (640, None)), ("auto", (None, None)), ("3:4", (544, 736))])
+def test_dimensions_are_constraints_until_geometry_override(cosmos3_multiview, tmp_path, override, expected):
+    class StopBeforeGenerationError(Exception):
+        pass
+
+    class FakeOmni:
+        def generate(self, prompt, sp):
+            assert (sp.width, sp.height) == expected
+            raise StopBeforeGenerationError
+
+    request = {"width": 640, "multiview": {"views": [{"camera_key": "front", "control_path": "wsm.mp4"}]}}
+    with pytest.raises(StopBeforeGenerationError):
+        cosmos3_multiview._run_request(
+            FakeOmni(),
+            request,
+            output_dir=tmp_path,
+            seed=42,
+            fallback_negative_prompt=None,
+            aspect_ratio_override=override,
+        )
+    if override is None:
+        request["aspect_ratio"] = "9:16"
+        with pytest.raises(ValueError, match="requires width=480"):
+            cosmos3_multiview._run_request(
+                FakeOmni(),
+                request,
+                output_dir=tmp_path,
+                seed=42,
+                fallback_negative_prompt=None,
+            )
+
+
+@pytest.mark.parametrize("aspect_override", [None, "auto", "9:16", "1:1"])
+def test_cli_resolution_overrides_every_jsonl_record(cosmos3_multiview, monkeypatch, tmp_path, aspect_override):
     records = [
         {"name": "a", "resolution": "480", "multiview": {"resolution": "720", "views": [{"camera_key": "front"}]}},
         {"name": "b", "multiview": {"views": [{"camera_key": "rear"}]}},
@@ -91,12 +137,16 @@ def test_cli_resolution_overrides_every_jsonl_record(cosmos3_multiview, monkeypa
     input_path = tmp_path / "requests.jsonl"
     input_path.write_text("".join(json.dumps(record) + "\n" for record in records))
     captured = []
+    expected_ratio = (aspect_override or "auto").replace(":", ",")
+    # The fake pipeline detects portrait inputs when the client leaves sizing open.
+    output_ratio = "9,16" if expected_ratio == "auto" else expected_ratio
+    output_width, output_height = cosmos3_multiview.SUPPORTED_RESOLUTIONS["720"][output_ratio]
 
     class FakeOmni:
         def generate(self, prompt, sampling_params):
             captured.append(sampling_params)
             # Actual-sized frames ensure export never receives a 480p canvas.
-            return {"payload": {"video": np.zeros((1, 1, 720, 1280, 3), dtype=np.float32)}}
+            return {"payload": {"video": np.zeros((1, 1, output_height, output_width, 3), dtype=np.float32)}}
 
     exported_shapes = []
     monkeypatch.setattr(cosmos3_multiview, "Omni", lambda **kwargs: FakeOmni())
@@ -116,22 +166,47 @@ def test_cli_resolution_overrides_every_jsonl_record(cosmos3_multiview, monkeypa
             str(tmp_path),
             "--resolution",
             "720",
-        ],
+        ]
+        + (["--aspect-ratio", aspect_override] if aspect_override is not None else []),
     )
     cosmos3_multiview.main()
     assert len(captured) == 2
     for sp in captured:
-        assert (sp.width, sp.height) == (1280, 720)
+        assert (sp.width, sp.height) == ((None, None) if expected_ratio == "auto" else (output_width, output_height))
+        assert sp.extra_args["multiview"]["aspect_ratio"] == expected_ratio
         assert sp.extra_args["resolution"] == sp.extra_args["multiview"]["resolution"] == "720"
-    assert exported_shapes == [(720, 1280, 3)] * 2
+    assert exported_shapes == [(output_height, output_width, 3)] * 2
     manifests = [json.loads(line) for line in (tmp_path / "sample_outputs.jsonl").read_text().splitlines()]
     assert [manifest["resolution"] for manifest in manifests] == ["720", "720"]
+    assert [manifest["aspect_ratio"] for manifest in manifests] == [output_ratio, output_ratio]
     assert cosmos3_multiview._load_requests(input_path) == before
 
 
-@pytest.mark.parametrize("resolution,width,height", [("480", 832, 480), ("720", 1280, 720)])
+@pytest.mark.parametrize(
+    "resolution,ratio,width,height",
+    [
+        ("480", "1,1", 640, 640),
+        ("480", "4,3", 736, 544),
+        ("480", "3,4", 544, 736),
+        ("480", "16,9", 832, 480),
+        ("480", "9,16", 480, 832),
+        ("720", "1,1", 960, 960),
+        ("720", "4,3", 1104, 832),
+        ("720", "3,4", 832, 1104),
+        ("720", "16,9", 1280, 720),
+        ("720", "9,16", 720, 1280),
+    ],
+)
+@pytest.mark.parametrize("automatic", [False, True])
 def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
-    cosmos3_multiview: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, resolution, width, height
+    cosmos3_multiview: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resolution,
+    ratio,
+    width,
+    height,
+    automatic,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -140,8 +215,18 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
             captured["prompt"] = prompt
             captured["sampling_params"] = sampling_params
             return {
-                "payload": {"video": np.zeros((1, 1, 2, 2, 3), dtype=np.float32)},
-                "metadata": {"multiview": {"cameras": ["front"], "frames_per_view": 1, "fps": 10}},
+                "payload": {"video": np.broadcast_to(np.zeros(3, dtype=np.float32), (1, 1, height, width, 3))},
+                "metadata": {
+                    "multiview": {
+                        "cameras": ["front"],
+                        "frames_per_view": 1,
+                        "fps": 10,
+                        "resolution": resolution,
+                        "aspect_ratio": ratio,
+                        "width": width,
+                        "height": height,
+                    }
+                },
             }
 
     monkeypatch.setattr(cosmos3_multiview, "export_to_video", lambda *args, **kwargs: None)
@@ -149,6 +234,7 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
         "name": "sample",
         "model_mode": "image2video",
         "resolution": resolution,
+        "aspect_ratio": "auto" if automatic else ratio,
         "num_frames": 1,
         "prompt": '{"views": []}',
         "negative_prompt": "bad video",
@@ -179,7 +265,7 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
 
     sampling_params = captured["sampling_params"]
     assert sampling_params.seed == 45
-    assert (sampling_params.width, sampling_params.height) == (width, height)
+    assert (sampling_params.width, sampling_params.height) == ((None, None) if automatic else (width, height))
     assert sampling_params.extra_args["resolution"] == resolution
     assert sampling_params.extra_args["multiview"]["resolution"] == resolution
     assert sampling_params.guidance_scale == 3.0
@@ -193,6 +279,7 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
     assert manifest["seed"] == 45
     assert manifest["model_mode"] == "image2video"
     assert manifest["resolution"] == resolution
+    assert (manifest["aspect_ratio"], manifest["width"], manifest["height"]) == (ratio, width, height)
     assert json.loads((tmp_path / "sample_outputs.json").read_text())["seed"] == 45
 
 
@@ -235,7 +322,7 @@ def test_run_request_splits_rounded_output_without_metadata(
     class FakeOmni:
         def generate(self, prompt, sampling_params):
             # Two cameras, 5 frames each: the pipeline rounded the requested 4 up.
-            return {"payload": {"video": np.zeros((1, 10, 2, 2, 3), dtype=np.float32)}}
+            return {"payload": {"video": np.broadcast_to(np.zeros(3, dtype=np.float32), (1, 10, 736, 544, 3))}}
 
     monkeypatch.setattr(
         cosmos3_multiview, "export_to_video", lambda frames, *args, **kwargs: exported.append(len(frames))
@@ -279,7 +366,7 @@ def test_run_request_cli_overrides_win_over_record_values(
         def generate(self, prompt, sampling_params):
             captured["sampling_params"] = sampling_params
             return {
-                "payload": {"video": np.zeros((1, 1, 2, 2, 3), dtype=np.float32)},
+                "payload": {"video": np.broadcast_to(np.zeros(3, dtype=np.float32), (1, 1, 480, 832, 3))},
                 "metadata": {"multiview": {"cameras": ["front"], "frames_per_view": 1, "fps": 30.0}},
             }
 

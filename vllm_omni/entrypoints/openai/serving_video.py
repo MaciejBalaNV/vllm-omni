@@ -347,6 +347,13 @@ class OmniOpenAIServingVideo:
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height
+        elif self.supports_multiview_reference_inputs:
+            # Automatic multiview sizing validates even a single dimension
+            # constraint after inspecting the first camera's WSM input.
+            if vp.width is not None:
+                gen_params.width = vp.width
+            if vp.height is not None:
+                gen_params.height = vp.height
         if vp.num_frames is not None:
             gen_params.num_frames = vp.num_frames
         gen_params.num_outputs_per_prompt = request.num_outputs_per_prompt

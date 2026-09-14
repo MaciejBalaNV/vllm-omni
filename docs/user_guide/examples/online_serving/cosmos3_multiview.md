@@ -81,32 +81,53 @@ python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
 python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
   request.json --server http://localhost:8091 --sync --output multiview.mp4
 
-# Override the manifest's frame count and resolution:
+# Override the manifest's frame count, resolution, and aspect ratio:
 python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
-  request.json --num-frames 29 --resolution 720 --output multiview.mp4
+  request.json --num-frames 29 --resolution 720 --aspect-ratio 9:16 --output multiview.mp4
 ```
 
-`--num-frames` must be positive. `--resolution` accepts `480` (832×480) and
-`720` (1280×720), per camera. When the flag is omitted, the client uses the
-manifest's resolution, defaulting to `480` if none is supplied.
+`--num-frames` must be positive. `--resolution` selects `480` (default) or `720`.
+`--aspect-ratio` accepts `auto` (default), `1:1`, `4:3`, `3:4`, `16:9`, or `9:16`;
+comma spellings are also accepted. All eleven cameras share the selected size:
 
-Offline manifests may specify top-level `resolution` or `multiview.resolution`;
-API manifests use `extra_params.resolution` or
-`extra_params.multiview.resolution`. Integer and string values are accepted.
-The client rejects conflicting resolution declarations and width/height values
-that disagree with the selected size. A CLI override replaces the resolution
-declarations and sets the matching width/height without editing the input file.
+| Aspect ratio | 480p (width × height) | 720p (width × height) |
+|---|---|---|
+| 1:1 | 640 × 640 | 960 × 960 |
+| 4:3 | 736 × 544 | 1104 × 832 |
+| 3:4 | 544 × 736 | 832 × 1104 |
+| 16:9 | 832 × 480 | 1280 × 720 |
+| 9:16 | 480 × 832 | 720 × 1280 |
 
-Direct HTTP requests can set `extra_params.multiview.resolution` to `"720"`
-and omit width/height, or explicitly supply width `1280` and height `720`.
-The pipeline prefers the nested multiview resolution over
-`extra_params.resolution`, then defaults to `"480"`. Explicit dimensions must
-match the selected bucket. All eleven cameras use the same resolution.
+Automatic mode selects the nearest Cosmos3 bucket from the original dimensions
+of the first camera's WSM input (`camera_front_wide_120fov`), using the first
+frame for video. Detection happens in the pipeline after uploaded references
+have been resolved. Other cameras and optional vision inputs do not determine
+the ratio; all are resized and center-cropped to the same output size. Input
+pixel count does not select the resolution tier. An unreadable first WSM input
+fails generation. Specify `--aspect-ratio 16:9` to retain the previous fixed
+landscape behavior.
 
-720p increases memory and compute requirements. With the current VAE and
-transformer patch defaults it has approximately 2.36 times as many spatial
-tokens as 480p. Measure latency and peak memory for the desired clip length
-and existing execution topology.
+Offline manifests accept top-level `resolution`/`aspect_ratio` or their fields
+inside `multiview`; API manifests also accept them inside `extra_params`.
+Duplicate declarations must agree after normalization. Each CLI override
+replaces declarations for its own setting and clears stale width/height
+constraints. Automatic mode sends no computed width/height; user-supplied
+constraints are retained when there is no geometry override and must match the
+pipeline's resolved size. The client does not decode media or edit the manifest.
+
+For direct HTTP requests, use the existing `aspect_ratio` form field or
+`extra_params.aspect_ratio` / `extra_params.multiview.aspect_ratio`. Nested
+multiview fields take precedence over `extra_params` fields, which take
+precedence over the top-level aspect-ratio field. Defaults are `"480"` and
+`"auto"`. For portrait output at 720p, set
+`extra_params.multiview.resolution` to `"720"` and
+`extra_params.multiview.aspect_ratio` to `"9:16"`, including all eleven camera
+entries as described above. Omit width/height or explicitly supply width `720`
+and height `1280`. Only canonical 480p and 720p buckets are supported.
+Single-dimension constraints are also checked by the pipeline.
+
+720p uses approximately 2.3 times as many spatial tokens as 480p. Measure
+latency and peak memory for the desired clip length and execution topology.
 
 Relative input paths resolve against the manifest's directory. The default
 client submits a background job, polls it, and downloads the existing video

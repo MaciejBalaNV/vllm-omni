@@ -5,6 +5,7 @@
 import argparse
 import copy
 import json
+import math
 import mimetypes
 import os
 import time
@@ -14,11 +15,52 @@ from typing import Any
 
 import httpx
 
-SUPPORTED_RESOLUTIONS = {"480": (832, 480), "720": (1280, 720)}
+# Keep this client usable with only httpx installed. A contract test checks this
+# table against the inference runtime's VIDEO_RES_SIZE_INFO.
+SUPPORTED_RESOLUTIONS = {
+    "480": {
+        "1,1": (640, 640),
+        "4,3": (736, 544),
+        "3,4": (544, 736),
+        "16,9": (832, 480),
+        "9,16": (480, 832),
+    },
+    "720": {
+        "1,1": (960, 960),
+        "4,3": (1104, 832),
+        "3,4": (832, 1104),
+        "16,9": (1280, 720),
+        "9,16": (720, 1280),
+    },
+}
+
+
+def normalize_aspect_ratio(value: Any) -> str:
+    if value is None or value == "auto":
+        return "auto"
+    parts = str(value).strip().replace(":", ",").split(",")
+    if len(parts) == 2:
+        try:
+            width, height = (int(part.strip()) for part in parts)
+        except ValueError:
+            pass
+        else:
+            if width > 0 and height > 0:
+                divisor = math.gcd(width, height)
+                ratio = f"{width // divisor},{height // divisor}"
+                if ratio in SUPPORTED_RESOLUTIONS["480"]:
+                    return ratio
+    raise ValueError(
+        f"Unsupported Cosmos3 multiview aspect_ratio={value!r}; expected auto, 1:1, 4:3, 3:4, 16:9, or 9:16."
+    )
 
 
 def prepare_request(
-    manifest: dict[str, Any], base_dir: Path, *, resolution_override: str | None = None
+    manifest: dict[str, Any],
+    base_dir: Path,
+    *,
+    resolution_override: str | None = None,
+    aspect_ratio_override: str | None = None,
 ) -> tuple[dict[str, str], list[Path]]:
     """Accept an offline manifest or a video API request containing extra_params."""
     extra = copy.deepcopy(manifest.get("extra_params", {}))
@@ -40,14 +82,40 @@ def prepare_request(
         raise ValueError(
             f"Unsupported Cosmos3 multiview resolution {resolution!r}; expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
         )
-    width, height = SUPPORTED_RESOLUTIONS[resolution]
-    for key, expected in (("width", width), ("height", height)):
-        if resolution_override is None and manifest.get(key) is not None and int(manifest[key]) != expected:
-            raise ValueError(
-                f"Cosmos3 multiview resolution={resolution!r} requires {key}={expected}, got {manifest[key]}."
+    if aspect_ratio_override is None:
+        declarations = {
+            normalize_aspect_ratio(value)
+            for value in (
+                manifest.get("aspect_ratio"),
+                extra.get("aspect_ratio"),
+                extra["multiview"].get("aspect_ratio"),
             )
+            if value is not None
+        }
+        if len(declarations) > 1:
+            raise ValueError(f"Conflicting Cosmos3 multiview aspect ratios: {sorted(declarations)}.")
+        aspect_ratio = next(iter(declarations), "auto")
+    else:
+        aspect_ratio = normalize_aspect_ratio(aspect_ratio_override)
+    geometry_override = resolution_override is not None or aspect_ratio_override is not None
+    dimensions = {
+        key: str(manifest[key])
+        for key in ("width", "height")
+        if not geometry_override and manifest.get(key) is not None
+    }
+    if aspect_ratio != "auto":
+        width, height = SUPPORTED_RESOLUTIONS[resolution][aspect_ratio]
+        for key, expected in (("width", width), ("height", height)):
+            if key in dimensions and int(dimensions[key]) != expected:
+                raise ValueError(
+                    f"Cosmos3 multiview resolution={resolution!r} requires {key}={expected}, got {dimensions[key]} "
+                    f"for aspect_ratio={aspect_ratio!r}."
+                )
+            dimensions[key] = str(expected)
     extra["resolution"] = resolution
     extra["multiview"]["resolution"] = resolution
+    extra["aspect_ratio"] = aspect_ratio
+    extra["multiview"]["aspect_ratio"] = aspect_ratio
     paths = []
     for view in extra["multiview"]["views"]:
         for role in ("control", "vision"):
@@ -71,8 +139,7 @@ def prepare_request(
     data = {
         "prompt": str(manifest.get("prompt", "")),
         "extra_params": json.dumps(extra),
-        "width": str(width),
-        "height": str(height),
+        **dimensions,
     }
     for key in (
         "model",
@@ -104,7 +171,12 @@ def main() -> None:
     parser.add_argument(
         "--resolution",
         choices=tuple(SUPPORTED_RESOLUTIONS),
-        help="Video resolution (480 = 832x480, 720 = 1280x720), overriding the manifest value; defaults to 480",
+        help="Video resolution bucket (480 or 720), overriding the manifest value; defaults to 480",
+    )
+    parser.add_argument(
+        "--aspect-ratio",
+        type=normalize_aspect_ratio,
+        help="auto, 1:1, 4:3, 3:4, 16:9, or 9:16; overrides the manifest (default: detect from first WSM input)",
     )
     parser.add_argument("--output", type=Path, default=Path("multiview.mp4"))
     parser.add_argument("--timeout", type=float, default=3600, help="HTTP and job polling timeout in seconds")
@@ -114,7 +186,12 @@ def main() -> None:
         if value is not None and value < 1:
             parser.error(f"--{key.replace('_', '-')} must be positive")
     manifest = json.loads(args.manifest.read_text())
-    data, paths = prepare_request(manifest, args.manifest.resolve().parent, resolution_override=args.resolution)
+    data, paths = prepare_request(
+        manifest,
+        args.manifest.resolve().parent,
+        resolution_override=args.resolution,
+        aspect_ratio_override=args.aspect_ratio,
+    )
     for key in ("num_inference_steps", "num_frames"):
         if getattr(args, key) is not None:
             data[key] = str(getattr(args, key))

@@ -22,8 +22,13 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
-from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS, validate_multiview_request
+from vllm_omni.model_extras.cosmos3 import (
+    COSMOS3_MADS_CAMERAS,
+    normalize_multiview_aspect_ratio,
+    validate_multiview_request,
+)
 
+from .action import find_closest_target_size
 from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MultiviewLayout,
@@ -44,6 +49,7 @@ from .pipeline_cosmos3 import (
 from .transfer import (
     IMAGE_EXTENSIONS,
     as_bool,
+    media_hw,
     media_to_uint8_cthw,
     uint8_cthw_to_normalized_5d,
 )
@@ -160,6 +166,44 @@ def _resolve_multiview_resolution(sp: Any, multiview: Mapping[str, Any]) -> str:
     if resolution not in ("480", "720"):
         raise ValueError(f"Cosmos3 multiview supports resolutions '480' and '720', got {resolution!r}.")
     return resolution
+
+
+def _resolve_multiview_geometry(
+    sp: Any, multiview: Mapping[str, Any], views: Sequence[Mapping[str, Any]]
+) -> tuple[str, str, int, int]:
+    """Select one bucket for every camera from an override or the first WSM."""
+    resolution = _resolve_multiview_resolution(sp, multiview)
+    extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
+    requested_ratio = multiview.get("aspect_ratio")
+    if requested_ratio is None:
+        requested_ratio = extra.get("aspect_ratio")
+    aspect_ratio = normalize_multiview_aspect_ratio(requested_ratio)
+    sizes = VIDEO_RES_SIZE_INFO[resolution]
+    if aspect_ratio == "auto":
+        view = views[0]
+        control = view.get("control_path", view.get("control"))
+        source = str(control) if isinstance(control, str | Path) else "decoded WSM input"
+        try:
+            source_hw = media_hw(control)
+            if source_hw is None or min(source_hw) <= 0:
+                raise ValueError("input has no readable positive spatial dimensions")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot detect Cosmos3 multiview aspect ratio from camera {view['camera_key']!r} "
+                f"WSM input {source!r}: {exc}"
+            ) from exc
+        width, height = find_closest_target_size(*source_hw, resolution)
+        aspect_ratio = next(ratio for ratio, size in sizes.items() if size == (width, height))
+    else:
+        width, height = sizes[aspect_ratio]
+    for key, expected in (("width", width), ("height", height)):
+        requested = getattr(sp, key, None)
+        if requested is not None and int(requested) != expected:
+            raise ValueError(
+                f"Cosmos3 multiview resolution={resolution!r} requires {key}={expected}, got {requested} "
+                f"for aspect_ratio={aspect_ratio!r}."
+            )
+    return resolution, aspect_ratio, width, height
 
 
 def _resolve_temporal_position_period(latent_frames: int, num_views: int, align_across_views: bool) -> int | None:
@@ -544,12 +588,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if requested_num_frames is None:
             requested_num_frames = sp.num_frames
         num_frames = _resolve_multiview_num_frames(requested_num_frames, self.vae_scale_factor_temporal)
-        resolution = _resolve_multiview_resolution(sp, multiview)
-        width, height = VIDEO_RES_SIZE_INFO[resolution]["16,9"]
-        if sp.height is not None and int(sp.height) != height:
-            raise ValueError(f"Cosmos3 multiview resolution={resolution!r} requires height={height}, got {sp.height}.")
-        if sp.width is not None and int(sp.width) != width:
-            raise ValueError(f"Cosmos3 multiview resolution={resolution!r} requires width={width}, got {sp.width}.")
+        resolution, aspect_ratio, width, height = _resolve_multiview_geometry(sp, multiview, views)
         frame_rate_value = self._get_sp_param(sp, "resolved_frame_rate", None)
         if frame_rate_value is None:
             frame_rate_value = self._get_sp_param(sp, "frame_rate", None)
@@ -676,7 +715,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             negative_metadata_mode=str(
                 self._get_sp_param(sp, "negative_metadata_mode", COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE)
             ),
-            aspect_ratio_override="16,9",
+            aspect_ratio_override=aspect_ratio,
         )
 
         guidance_scale = min(
@@ -727,6 +766,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         "cameras": list(self.multiview_cameras),
                         "frames_per_view": num_frames,
                         "fps": frame_rate,
+                        "resolution": resolution,
+                        "aspect_ratio": aspect_ratio,
+                        "width": width,
+                        "height": height,
                     }
                 },
             }

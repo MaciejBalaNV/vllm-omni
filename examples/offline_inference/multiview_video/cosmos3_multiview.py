@@ -40,12 +40,14 @@ import torch
 from diffusers.utils import export_to_video
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras.cosmos3 import normalize_multiview_aspect_ratio
 from vllm_omni.outputs import OmniRequestOutput
 
 SUPPORTED_MODEL_MODES = {"image2video", "text2video"}
-SUPPORTED_RESOLUTIONS = {"480": (832, 480), "720": (1280, 720)}
+SUPPORTED_RESOLUTIONS = {key: VIDEO_RES_SIZE_INFO[key] for key in ("480", "720")}
 
 
 def _safe_camera_name(camera: str) -> str:
@@ -95,9 +97,7 @@ def _resolve_model_mode(request: dict[str, Any], views: list[dict[str, Any]]) ->
     return model_mode
 
 
-def _resolve_resolution(
-    request: dict[str, Any], multiview: dict[str, Any], override: str | None = None
-) -> tuple[str, int, int]:
+def _resolve_resolution(request: dict[str, Any], multiview: dict[str, Any], override: str | None = None) -> str:
     top_level = override if override is not None else request.get("resolution")
     nested = override if override is not None else multiview.get("resolution")
     if top_level is not None and nested is not None and str(top_level) != str(nested):
@@ -110,8 +110,20 @@ def _resolve_resolution(
         raise ValueError(
             f"Unsupported Cosmos3 multiview resolution {resolution!r}; expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
         )
-    width, height = SUPPORTED_RESOLUTIONS[resolution]
-    return resolution, width, height
+    return resolution
+
+
+def _resolve_aspect_ratio(request: dict[str, Any], multiview: dict[str, Any], override: str | None = None) -> str:
+    if override is not None:
+        return normalize_multiview_aspect_ratio(override)
+    declarations = {
+        normalize_multiview_aspect_ratio(value)
+        for value in (request.get("aspect_ratio"), multiview.get("aspect_ratio"))
+        if value is not None
+    }
+    if len(declarations) > 1:
+        raise ValueError(f"Conflicting Cosmos3 multiview aspect ratios: {sorted(declarations)}.")
+    return next(iter(declarations), "auto")
 
 
 def _resolve_seed(request: dict[str, Any], base_seed: int, sample_index: int) -> int:
@@ -206,6 +218,7 @@ def _run_request(
     fps_override: float | None = None,
     num_frames_override: int | None = None,
     resolution_override: str | None = None,
+    aspect_ratio_override: str | None = None,
 ) -> dict[str, Any]:
     multiview_value = request.get("multiview")
     if not isinstance(multiview_value, dict):
@@ -219,10 +232,24 @@ def _run_request(
     views: list[dict[str, Any]] = views_value
 
     model_mode = _resolve_model_mode(request, views)
-    resolution, width, height = _resolve_resolution(request, multiview, resolution_override)
+    resolution = _resolve_resolution(request, multiview, resolution_override)
+    aspect_ratio = _resolve_aspect_ratio(request, multiview, aspect_ratio_override)
+    geometry_override = resolution_override is not None or aspect_ratio_override is not None
+    width = None if geometry_override else request.get("width")
+    height = None if geometry_override else request.get("height")
+    if aspect_ratio != "auto":
+        target_width, target_height = SUPPORTED_RESOLUTIONS[resolution][aspect_ratio]
+        for key, value, expected in (("width", width, target_width), ("height", height, target_height)):
+            if value is not None and int(value) != expected:
+                raise ValueError(
+                    f"Cosmos3 multiview resolution={resolution!r} requires {key}={expected}, got {value} "
+                    f"for aspect_ratio={aspect_ratio!r}."
+                )
+        width, height = target_width, target_height
     # Keep the resolved value with the variant-owned multiview parameters so
     # top-level Imaginaire inputs and native vLLM-Omni inputs behave identically.
     multiview["resolution"] = resolution
+    multiview["aspect_ratio"] = aspect_ratio
 
     # Frame rate and per-camera frame count are pipeline-owned: when neither the
     # CLI nor the record sets them, the pipeline applies its defaults (30 FPS,
@@ -238,6 +265,7 @@ def _run_request(
     extra_args = {
         "multiview": multiview,
         "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
         "wsm": request.get("wsm", {}),
     }
     # Records may also use the field names ``guidance``, ``num_steps``, and
@@ -274,6 +302,23 @@ def _run_request(
     result = omni.generate(prompt, sampling_params)
     video, metadata = _extract_payload(result)
     frames = _frame_list(video)
+    if not frames:
+        raise ValueError("Cosmos3 multiview output contains no video frames.")
+    output_geometry = metadata.get("multiview", {})
+    output_height, output_width = np.asarray(frames[0]).shape[:2]
+    output_resolution = output_geometry.get("resolution", resolution)
+    output_aspect_ratio = output_geometry.get("aspect_ratio")
+    if output_aspect_ratio is None:
+        output_aspect_ratio = next(
+            (
+                ratio
+                for ratio, size in SUPPORTED_RESOLUTIONS[output_resolution].items()
+                if size == (output_width, output_height)
+            ),
+            None,
+        )
+    if output_aspect_ratio is None or output_aspect_ratio == "auto":
+        raise ValueError("Cosmos3 multiview output is missing a resolved aspect ratio and canonical dimensions.")
 
     cameras = metadata.get("multiview", {}).get("cameras") or [view["camera_key"] for view in views]
     frames_per_view = _resolve_frames_per_view(frames, cameras, metadata)
@@ -290,7 +335,10 @@ def _run_request(
     manifest = {
         "name": request.get("name"),
         "model_mode": model_mode,
-        "resolution": resolution,
+        "resolution": output_resolution,
+        "aspect_ratio": output_aspect_ratio,
+        "width": output_width,
+        "height": output_height,
         "seed": seed,
         "prompt": prompt["prompt"],
         "multiview_cameras": cameras,
@@ -352,9 +400,14 @@ def main() -> None:
         "--resolution",
         choices=tuple(SUPPORTED_RESOLUTIONS),
         help=(
-            "Video resolution (480 = 832x480, 720 = 1280x720) for every record, overriding any record value. "
+            "Video resolution bucket (480 or 720) for every record, overriding any record value. "
             "Unset: the record's resolution, else 480."
         ),
+    )
+    parser.add_argument(
+        "--aspect-ratio",
+        type=normalize_multiview_aspect_ratio,
+        help="auto, 1:1, 4:3, 3:4, 16:9, or 9:16; overrides every record (default: detect from first WSM input)",
     )
     parser.add_argument("--cfg-parallel-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--ulysses-degree", type=int, default=1)
@@ -413,6 +466,7 @@ def main() -> None:
             fps_override=args.fps,
             num_frames_override=args.num_frames,
             resolution_override=args.resolution,
+            aspect_ratio_override=args.aspect_ratio,
         )
         manifests.append({**manifest, "output_dir": str(output_dir)})
 

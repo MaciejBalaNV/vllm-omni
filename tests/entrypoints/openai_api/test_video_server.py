@@ -2533,6 +2533,45 @@ def test_multiview_uploads_reach_camera_roles(
     assert not list(multiview_upload_dir.iterdir())
 
 
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("dimension", [None, "width", "height"])
+@pytest.mark.parametrize("location", ["top", "extra", "nested"])
+def test_multiview_aspect_ratio_and_dimension_constraints_reach_pipeline(
+    endpoint,
+    dimension,
+    location,
+    test_client,
+    multiview_upload_dir,
+    mocker,
+):
+    _mock_encode_video_bytes(mocker, b"multiview-output")
+    extra, files = _multiview_upload_request()
+    data = {"prompt": "drive", "aspect_ratio": "auto"}
+    if location == "top":
+        data["aspect_ratio"] = "9:16"
+    elif location == "extra":
+        extra["aspect_ratio"] = "9:16"
+    else:
+        extra["aspect_ratio"] = "1:1"
+        extra["multiview"]["aspect_ratio"] = "9:16"
+    if dimension is not None:
+        data[dimension] = "480" if dimension == "width" else "832"
+    data["extra_params"] = json.dumps(extra)
+    response = test_client.post(endpoint, data=data, files=files)
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        _wait_for_status(test_client, response.json()["id"], "completed")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    sp = engine.captured_sampling_params_list[0]
+    resolved = sp.extra_args["multiview"].get("aspect_ratio", sp.extra_args.get("aspect_ratio"))
+    assert resolved == "9:16"
+    if dimension is not None:
+        assert getattr(sp, dimension) == int(data[dimension])
+    else:
+        assert sp.width is None and sp.height is None
+    assert not list(multiview_upload_dir.iterdir())
+
+
 def test_multiview_uploads_preserve_caller_owned_paths(test_client, multiview_upload_dir, tmp_path, mocker):
     _mock_encode_video_bytes(mocker)
     owned = tmp_path / "owned.mp4"
