@@ -194,6 +194,18 @@ transfer uses the corresponding single-hint sentence. Production unconditional
 captions are empty, and supplied negative prompts are ignored. Unversioned WSM
 artifacts retain their top-level caption and negative-prompt behavior.
 
+The online client also accepts older manifests whose top-level `prompt` is a
+JSON-encoded object with `num_views` and a `views` list containing `view_index`
+and `caption`. It copies each plain-text `caption` into the corresponding
+`multiview.views[view_index].prompt` when that field is absent. Counts must match
+the selected camera list, and indexes must cover `0` through `num_views - 1`
+exactly once. Indexes refer to request camera order; keep that order aligned
+with the aggregate captions. Explicit per-camera prompts take precedence.
+The original top-level prompt is retained for older checkpoints, while camera
+role/type metadata stays out of the extracted captions. Plain-text top-level
+prompts are not automatically copied to every camera. Direct HTTP and offline
+requests should supply `multiview.views[].prompt` explicitly for new checkpoints.
+
 HTTP admission validates supplied per-camera captions but has no checkpoint
 metadata to determine whether they are required. The worker enforces
 `separate_view_text_tokenization`; a request missing a required camera prompt

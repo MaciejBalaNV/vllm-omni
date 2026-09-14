@@ -55,6 +55,46 @@ def normalize_aspect_ratio(value: Any) -> str:
     )
 
 
+def _populate_legacy_view_prompts(prompt: Any, views: list[dict[str, Any]]) -> None:
+    """Expand the older aggregate caption JSON into the copied request views."""
+    if not isinstance(prompt, str) or all("prompt" in view for view in views):
+        return
+    try:
+        payload = json.loads(prompt)
+    except ValueError:
+        return
+    if not isinstance(payload, dict) or not {"num_views", "views"}.issubset(payload):
+        return
+
+    num_views = payload["num_views"]
+    captions = payload["views"]
+    if (
+        type(num_views) is not int
+        or num_views != len(views)
+        or not isinstance(captions, list)
+        or len(captions) != num_views
+    ):
+        raise ValueError(
+            "Legacy multiview prompt.num_views and prompt.views must match multiview.views; "
+            "supply per-camera prompts explicitly when selecting a different camera subset."
+        )
+    by_index = {}
+    for caption in captions:
+        if not isinstance(caption, dict):
+            raise ValueError("Legacy multiview prompt.views entries must be objects with view_index and caption.")
+        index = caption.get("view_index")
+        if type(index) is not int or not 0 <= index < num_views or index in by_index:
+            raise ValueError(
+                "Legacy multiview prompt view_index values must be unique integers from 0 to num_views - 1."
+            )
+        text = caption.get("caption")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"Legacy multiview prompt.views[{index}].caption must be a nonempty string.")
+        by_index[index] = text
+    for index, view in enumerate(views):
+        view.setdefault("prompt", by_index[index])
+
+
 def prepare_request(
     manifest: dict[str, Any],
     base_dir: Path,
@@ -66,6 +106,7 @@ def prepare_request(
     extra = copy.deepcopy(manifest.get("extra_params", {}))
     if "multiview" not in extra:
         extra["multiview"] = copy.deepcopy(manifest["multiview"])
+    _populate_legacy_view_prompts(manifest.get("prompt"), extra["multiview"]["views"])
     for key in (
         "wsm",
         "edge",

@@ -36,6 +36,19 @@ def manifest(vision=False):
     }
 
 
+def legacy_prompt(captions):
+    return json.dumps(
+        {
+            "view_order": "The view captions are listed in the same order as the generated video views.",
+            "num_views": len(captions),
+            "views": [
+                {"view_index": index, "camera_role": "front", "caption": caption}
+                for index, caption in enumerate(captions)
+            ],
+        }
+    )
+
+
 @pytest.mark.parametrize("vision", [False, True])
 @pytest.mark.parametrize("suffix", [".mp4", ".png"])
 def test_resolves_camera_roles_without_mutating_manifest(vision, suffix):
@@ -182,7 +195,8 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
         (tmp_path / filename).write_bytes(f"media-{index}".encode())
         view["control_path"] = filename
     manifest_path = tmp_path / "manifest.json"
-    request_manifest = {"prompt": "drive", **extra}
+    captions = [f"Raw camera caption {index}." for index in range(11)]
+    request_manifest = {"prompt": legacy_prompt(captions), **extra}
     if aspect_ratio is not None:
         request_manifest["aspect_ratio"] = "1:1"
         request_manifest["multiview"]["aspect_ratio"] = "16:9"
@@ -201,6 +215,8 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
             assert body.count(b'name="input_references"') == 11
             assert b"control_reference_index" in body
             assert b"control_path" not in body
+            for caption in captions:
+                assert f'"prompt": {json.dumps(caption)}'.encode() in body
             expected_resolution = resolution
             if expected_resolution is None:
                 assert b'"resolution":' not in body
@@ -258,6 +274,106 @@ def multiview_client():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("envelope", [False, True])
+@pytest.mark.parametrize("shuffled", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_client_expands_legacy_captions_through_upload_validation(
+    tmp_path, multiview_client, envelope, shuffled, explicit
+):
+    (tmp_path / "control.mp4").write_bytes(b"media")
+    captions = [f'Camera {index}: a "STANDARD" truck passes.\nTrees line the road.' for index in range(11)]
+    payload = json.loads(legacy_prompt(captions))
+    if shuffled:
+        payload["views"].reverse()
+    extra = {
+        "wsm": {},
+        "multiview": {
+            "views": [{"camera_key": camera, "control_path": "control.mp4"} for camera in contract.COSMOS3_MADS_CAMERAS]
+        },
+    }
+    expected = captions.copy()
+    if explicit:
+        expected[3] = extra["multiview"]["views"][3]["prompt"] = "An explicit camera caption."
+    request = {"prompt": json.dumps(payload), **({"extra_params": extra} if envelope else extra)}
+    before = copy.deepcopy(request)
+    data, paths = multiview_client.prepare_request(request, tmp_path)
+    resolved = contract.resolve_multiview_uploads(json.loads(data["extra_params"]), [str(path) for path in paths])
+    _, views = contract.validate_multiview_request(resolved, separate_view_text_tokenization=True)
+    assert [view["prompt"] for view in views] == expected
+    # Legacy checkpoints still receive their original aggregate top-level text.
+    contract.validate_multiview_request(resolved, separate_view_text_tokenization=False)
+    assert data["prompt"] == request["prompt"]
+    assert request == before
+
+
+@pytest.mark.parametrize(
+    "failure,match",
+    [
+        ("count", "must match"),
+        ("boolean_count", "must match"),
+        ("missing_view", "must match"),
+        ("non_list", "must match"),
+        ("non_object", "must be objects"),
+        ("duplicate_index", "unique integers"),
+        ("out_of_range", "unique integers"),
+        ("negative_index", "unique integers"),
+        ("boolean_index", "unique integers"),
+        ("missing_index", "unique integers"),
+        ("empty_caption", "nonempty string"),
+        ("object_caption", "nonempty string"),
+    ],
+)
+def test_client_rejects_ambiguous_legacy_captions_before_upload(tmp_path, multiview_client, failure, match):
+    payload = json.loads(legacy_prompt(["First caption.", "Second caption."]))
+    if failure == "count":
+        payload["num_views"] = 3
+    elif failure == "boolean_count":
+        payload["num_views"] = True
+    elif failure == "missing_view":
+        payload["views"].pop()
+    elif failure == "non_list":
+        payload["views"] = {}
+    elif failure == "non_object":
+        payload["views"][0] = "caption"
+    elif failure == "duplicate_index":
+        payload["views"][0]["view_index"] = 1
+    elif failure == "out_of_range":
+        payload["views"][0]["view_index"] = 2
+    elif failure == "negative_index":
+        payload["views"][0]["view_index"] = -1
+    elif failure == "boolean_index":
+        payload["views"][0]["view_index"] = False
+    elif failure == "missing_index":
+        payload["views"][0].pop("view_index")
+    elif failure == "empty_caption":
+        payload["views"][0]["caption"] = " \n"
+    elif failure == "object_caption":
+        payload["views"][0]["caption"] = {"caption": "nested"}
+    request = {
+        "prompt": json.dumps(payload),
+        "multiview": {"views": [{"camera_key": camera, "control_path": "missing.mp4"} for camera in ("front", "rear")]},
+    }
+    with pytest.raises(ValueError, match=match):
+        multiview_client.prepare_request(request, tmp_path)
+
+
+@pytest.mark.parametrize("prompt", ["Drive.", "", '{"caption": "Drive."}', '{"views": []}', "[]"])
+def test_client_does_not_broadcast_unstructured_prompts(tmp_path, multiview_client, prompt):
+    request = {"prompt": prompt, "multiview": {"views": [{"camera_key": contract.COSMOS3_MADS_CAMERAS[0]}]}}
+    data, _ = multiview_client.prepare_request(request, tmp_path)
+    assert data["prompt"] == prompt
+    assert "prompt" not in json.loads(data["extra_params"])["multiview"]["views"][0]
+
+
+def test_client_explicit_prompts_do_not_require_matching_legacy_payload(tmp_path, multiview_client):
+    request = {
+        "prompt": legacy_prompt(["First.", "Second."]),
+        "multiview": {"views": [{"camera_key": contract.COSMOS3_MADS_CAMERAS[1], "prompt": "Explicit."}]},
+    }
+    data, _ = multiview_client.prepare_request(request, tmp_path)
+    assert json.loads(data["extra_params"])["multiview"]["views"][0]["prompt"] == "Explicit."
 
 
 @pytest.mark.parametrize("envelope", [False, True])
