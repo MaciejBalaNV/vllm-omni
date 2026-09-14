@@ -1991,6 +1991,11 @@ class Cosmos3VFMTransformer(nn.Module):
             if hidden_sound is not None:
                 hidden_parts.append(hidden_sound)
             hidden_gen = torch.cat(hidden_parts, dim=1)
+            # Concatenation owns its storage. Release the original embeddings
+            # before the GEN layers to avoid retaining a second full sequence.
+            del hidden_parts, hidden_controls, hidden_video, hidden_action, hidden_sound
+            if has_control:
+                del hidden_control  # The loop variable also retains the last control.
 
             # Run GEN layers.  UND K/V (replicated) is passed to each layer;
             # the Cosmos3CrossAttention forwards them as joint_key/value so the

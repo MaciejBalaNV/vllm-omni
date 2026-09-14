@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -108,6 +109,21 @@ def test_forward_output_matches_full_norm_and_skips_controls(monkeypatch, contro
         extra = {"sound_latents": torch.randn(1, 3, 3)}
 
     hidden = torch.randn(1, 2, 2, 3, 5)
+    embedding_refs = []
+    original_cat = torch.cat
+
+    def record_packed_embeddings(tensors, dim=0, *, out=None):
+        if not embedding_refs and dim == 1 and all(tensor.ndim == 3 for tensor in tensors):
+            embedding_refs.extend(weakref.ref(tensor) for tensor in tensors)
+        return original_cat(tensors, dim=dim, out=out)
+
+    def check_embeddings_released(module, args):
+        # Keep only weak references so this check cannot extend tensor lifetimes.
+        assert len(embedding_refs) == controls + 1 + (modality is not None)
+        assert all(ref() is None for ref in embedding_refs)
+
+    monkeypatch.setattr(torch, "cat", record_packed_embeddings)
+    layer.register_forward_pre_hook(check_embeddings_released)
     norm_inputs = []
     model.norm_moe_gen.register_forward_pre_hook(lambda module, args: norm_inputs.append(args[0].clone()))
     actual = model(
