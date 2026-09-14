@@ -1506,6 +1506,31 @@ class Cosmos3VFMTransformer(nn.Module):
             return nullcontext()
         return self._model_cpu_offload_context(name)
 
+    # At hidden size 4096, each FP32 RMSNorm temporary is at most 128 MiB
+    # for the single-sample video requests served by this pipeline.
+    _output_projection_chunk_size = 8192
+
+    def _project_video_tokens(self, hidden_video: torch.Tensor) -> torch.Tensor:
+        """Normalize/project video tokens without full-sequence FP32 temporaries.
+
+        Keep the existing RMSNorm arithmetic, including its FP32 intermediates.
+        Only the smaller projected latent tokens are retained between chunks;
+        collecting normalized chunks would recreate the large hidden tensor.
+        """
+        batch, sequence_length, _ = hidden_video.shape
+        chunk_size = max(1, self._output_projection_chunk_size // batch)
+        projected = self.proj_out(self.norm_moe_gen(hidden_video[:, :chunk_size]))
+        if sequence_length <= chunk_size:
+            return projected
+
+        # Allocate from the projection result to preserve its dtype under autocast.
+        output = projected.new_empty(batch, sequence_length, projected.shape[-1])
+        output[:, :chunk_size] = projected
+        for start in range(chunk_size, sequence_length, chunk_size):
+            end = min(start + chunk_size, sequence_length)
+            output[:, start:end] = self.proj_out(self.norm_moe_gen(hidden_video[:, start:end]))
+        return output
+
     # -- Patchify / Unpatchify -----------------------------------------------
 
     def _pad_to_patch_size(self, h: int, w: int) -> tuple[int, int, int, int]:
@@ -2009,10 +2034,10 @@ class Cosmos3VFMTransformer(nn.Module):
             if not use_multi_control_attention:
                 hidden_gen = self.gen_sp_gather(hidden_gen)
 
-            # Final norm and project back to latent space
-            hidden_gen = self.norm_moe_gen(hidden_gen)
+            # Final norm and project back to latent space. Split first: control
+            # tokens only condition generation and need no output normalization.
             if not has_action and not has_sound and not has_control:
-                return self.unpatchify(self.proj_out(hidden_gen), t, h, w)
+                return self.unpatchify(self._project_video_tokens(hidden_gen), t, h, w)
 
             split_sizes = []
             if has_control:
@@ -2028,17 +2053,17 @@ class Cosmos3VFMTransformer(nn.Module):
                 split_idx += 1
             hidden_video = split_hidden[split_idx]
             split_idx += 1
-            video_pred = self.unpatchify(self.proj_out(hidden_video), t, h, w)
+            video_pred = self.unpatchify(self._project_video_tokens(hidden_video), t, h, w)
             if has_control:
                 return video_pred
             outputs: list[torch.Tensor] = [video_pred]
             if has_action:
-                hidden_action = split_hidden[split_idx]
+                hidden_action = self.norm_moe_gen(split_hidden[split_idx])
                 split_idx += 1
                 assert action_domain_ids is not None
                 outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
             if has_sound:
-                hidden_sound = split_hidden[split_idx]
+                hidden_sound = self.norm_moe_gen(split_hidden[split_idx])
                 outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
             return tuple(outputs)
 
