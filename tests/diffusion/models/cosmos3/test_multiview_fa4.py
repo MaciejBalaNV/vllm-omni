@@ -115,7 +115,8 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
 
 
 @pytest.mark.parametrize("num_heads,num_kv_heads", HEAD_GEOMETRIES)
-def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int) -> None:
+@pytest.mark.parametrize("patch_hw", [(8, 8), (15, 26), (23, 40)])
+def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int, patch_hw) -> None:
     """Both backends project the same predicate, so their outputs must match."""
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MultiviewAttentionContext,
@@ -131,7 +132,7 @@ def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int) -> Non
     tensors = None
     outputs = {}
     for backend in ("triton", "fa4"):
-        layout = MultiviewLayout(2, 4, 8, 8, backend=backend, max_und_tokens=_MAX_UND)
+        layout = MultiviewLayout(2, 4, *patch_hw, backend=backend, max_und_tokens=_MAX_UND)
         gen = layout.gen_tokens
         if tensors is None:
             tensors = (

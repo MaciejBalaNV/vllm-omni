@@ -168,7 +168,8 @@ def test_client_converts_local_manifest_to_upload_indexes(tmp_path, envelope):
 
 
 @pytest.mark.parametrize("mode", ["async", "sync", "failed"])
-def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("resolution", [None, "480", "720"])
+def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, mode, resolution):
     httpx = pytest.importorskip("httpx")
     spec = importlib.util.spec_from_file_location(
         "multiview_client", _ROOT / "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
@@ -183,7 +184,12 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
         (tmp_path / filename).write_bytes(f"media-{index}".encode())
         view["control_path"] = filename
     manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps({"prompt": "drive", **extra}))
+    request_manifest = {"prompt": "drive", **extra}
+    if resolution is not None:
+        # The CLI must replace conflicting fields and stale dimensions together.
+        request_manifest.update(resolution="480", width=832, height=480)
+        request_manifest["multiview"]["resolution"] = "720"
+    manifest_path.write_text(json.dumps(request_manifest))
     output = tmp_path / "output.mp4"
     requests = []
 
@@ -194,6 +200,11 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
             assert body.count(b'name="input_references"') == 11
             assert b"control_reference_index" in body
             assert b"control_path" not in body
+            expected_resolution = resolution or "480"
+            width, height = (1280, 720) if expected_resolution == "720" else (832, 480)
+            assert f'"resolution": "{expected_resolution}"'.encode() in body
+            assert f'name="width"\r\n\r\n{width}\r\n'.encode() in body
+            assert f'name="height"\r\n\r\n{height}\r\n'.encode() in body
             for index in range(11):
                 assert f"media-{index}".encode() in body
             if mode == "sync":
@@ -211,7 +222,11 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
     )
     monkeypatch.setattr(client.time, "sleep", lambda _: None)
     monkeypatch.setattr(
-        sys, "argv", ["client", str(manifest_path), "--output", str(output)] + (["--sync"] if mode == "sync" else [])
+        sys,
+        "argv",
+        ["client", str(manifest_path), "--output", str(output)]
+        + (["--sync"] if mode == "sync" else [])
+        + (["--resolution", resolution] if resolution is not None else []),
     )
     if mode == "failed":
         with pytest.raises(RuntimeError, match="corrupt input"):
@@ -221,3 +236,59 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
         client.main()
         assert output.read_bytes() == b"generated-video"
         assert requests[-1] == ("/v1/videos/sync" if mode == "sync" else "/v1/videos/video-test/content")
+
+
+@pytest.fixture
+def multiview_client():
+    pytest.importorskip("httpx")
+    spec = importlib.util.spec_from_file_location(
+        "multiview_client", _ROOT / "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("envelope", [False, True])
+@pytest.mark.parametrize("location", ["top", "extra", "nested", "all", "omitted"])
+def test_client_preserves_resolution_and_manifest(tmp_path, multiview_client, envelope, location):
+    (tmp_path / "control.mp4").write_bytes(b"media")
+    extra = {"multiview": {"views": [{"camera_key": "front", "control_path": "control.mp4"}]}, "wsm": {}}
+    request = {"prompt": "drive", **({"extra_params": extra} if envelope else extra)}
+    if location in ("top", "all"):
+        request["resolution"] = 720
+    if location in ("extra", "all"):
+        request.setdefault("extra_params", {})["resolution"] = "720"
+    if location in ("nested", "all"):
+        extra["multiview"]["resolution"] = 720
+    before = copy.deepcopy(request)
+    data, paths = multiview_client.prepare_request(request, tmp_path)
+    resolved = json.loads(data["extra_params"])
+    expected = "480" if location == "omitted" else "720"
+    assert resolved["resolution"] == resolved["multiview"]["resolution"] == expected
+    assert (data["width"], data["height"]) == (("832", "480") if expected == "480" else ("1280", "720"))
+    assert paths == [tmp_path / "control.mp4"]
+    assert request == before
+
+
+@pytest.mark.parametrize("resolution", [256, 704, "1080", "720p", True])
+def test_client_rejects_unsupported_resolution(tmp_path, multiview_client, resolution):
+    request = {"multiview": {"views": [], "resolution": resolution}}
+    with pytest.raises(ValueError, match="Unsupported Cosmos3 multiview resolution"):
+        multiview_client.prepare_request(request, tmp_path)
+
+
+@pytest.mark.parametrize("location", ["top", "extra"])
+def test_client_rejects_resolution_conflicts(tmp_path, multiview_client, location):
+    request = {"multiview": {"views": [], "resolution": "720"}}
+    target = request if location == "top" else request.setdefault("extra_params", {})
+    target["resolution"] = "480"
+    with pytest.raises(ValueError, match="Conflicting Cosmos3 multiview resolutions"):
+        multiview_client.prepare_request(request, tmp_path)
+
+
+@pytest.mark.parametrize("dimensions", [{"width": 832}, {"height": 480}])
+def test_client_rejects_dimensions_that_disagree_with_resolution(tmp_path, multiview_client, dimensions):
+    request = {"multiview": {"views": [], "resolution": "720"}, **dimensions}
+    with pytest.raises(ValueError, match="resolution='720' requires"):
+        multiview_client.prepare_request(request, tmp_path)

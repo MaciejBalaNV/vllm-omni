@@ -438,6 +438,23 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
         )
 
 
+@pytest.mark.parametrize("height,width,patch_hw", [(30, 52, (15, 26)), (45, 80, (23, 40))])
+def test_multiview_resolution_patch_round_trip(height, width, patch_hw) -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.latent_patch_size = 2
+    model.latent_channel_size = 3
+    # Distinct values across cameras, frames, rows and columns expose ordering
+    # mistakes and loss of the last real row when the 720p latent is padded.
+    latents = torch.arange(3 * 4 * height * width, dtype=torch.float32).reshape(1, 3, 4, height, width)
+    tokens = model.patchify(latents, t=4, h=height, w=width)
+    assert tokens.shape == (1, 4 * patch_hw[0] * patch_hw[1], 12)
+    restored = model.unpatchify(tokens, t=4, h=height, w=width)
+    torch.testing.assert_close(restored, latents, rtol=0, atol=0)
+
+
 def test_gen_sp_plan_auto_pads_hidden_states_and_rope_together() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 

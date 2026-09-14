@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -59,8 +61,77 @@ def test_model_mode_must_match_per_view_vision_inputs(cosmos3_multiview: ModuleT
         cosmos3_multiview._resolve_model_mode({"model_mode": "image2video"}, t2v_view)
 
 
+@pytest.mark.parametrize(
+    "resolution,width,height", [(480, 832, 480), ("480", 832, 480), (720, 1280, 720), ("720", 1280, 720)]
+)
+def test_resolution_manifest_fields(cosmos3_multiview, resolution, width, height):
+    resolve = cosmos3_multiview._resolve_resolution
+    assert resolve({"resolution": resolution}, {}) == (str(resolution), width, height)
+    assert resolve({}, {"resolution": resolution}) == (str(resolution), width, height)
+    assert resolve({"resolution": str(resolution)}, {"resolution": resolution}) == (str(resolution), width, height)
+    assert resolve({}, {}) == ("480", 832, 480)
+
+
+def test_resolution_conflicts_and_invalid_buckets(cosmos3_multiview):
+    resolve = cosmos3_multiview._resolve_resolution
+    with pytest.raises(ValueError, match="Conflicting"):
+        resolve({"resolution": "480"}, {"resolution": "720"})
+    assert resolve({"resolution": "480"}, {"resolution": "720"}, "720") == ("720", 1280, 720)
+    for resolution in (256, 704, "1080", "720p", True):
+        with pytest.raises(ValueError, match="Unsupported"):
+            resolve({"resolution": resolution}, {})
+
+
+def test_cli_resolution_overrides_every_jsonl_record(cosmos3_multiview, monkeypatch, tmp_path):
+    records = [
+        {"name": "a", "resolution": "480", "multiview": {"resolution": "720", "views": [{"camera_key": "front"}]}},
+        {"name": "b", "multiview": {"views": [{"camera_key": "rear"}]}},
+    ]
+    before = copy.deepcopy(records)
+    input_path = tmp_path / "requests.jsonl"
+    input_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    captured = []
+
+    class FakeOmni:
+        def generate(self, prompt, sampling_params):
+            captured.append(sampling_params)
+            # Actual-sized frames ensure export never receives a 480p canvas.
+            return {"payload": {"video": np.zeros((1, 1, 720, 1280, 3), dtype=np.float32)}}
+
+    exported_shapes = []
+    monkeypatch.setattr(cosmos3_multiview, "Omni", lambda **kwargs: FakeOmni())
+    monkeypatch.setattr(
+        cosmos3_multiview, "export_to_video", lambda frames, *args, **kwargs: exported_shapes.append(frames[0].shape)
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "example",
+            "--model",
+            "test",
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(tmp_path),
+            "--resolution",
+            "720",
+        ],
+    )
+    cosmos3_multiview.main()
+    assert len(captured) == 2
+    for sp in captured:
+        assert (sp.width, sp.height) == (1280, 720)
+        assert sp.extra_args["resolution"] == sp.extra_args["multiview"]["resolution"] == "720"
+    assert exported_shapes == [(720, 1280, 3)] * 2
+    manifests = [json.loads(line) for line in (tmp_path / "sample_outputs.jsonl").read_text().splitlines()]
+    assert [manifest["resolution"] for manifest in manifests] == ["720", "720"]
+    assert cosmos3_multiview._load_requests(input_path) == before
+
+
+@pytest.mark.parametrize("resolution,width,height", [("480", 832, 480), ("720", 1280, 720)])
 def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
-    cosmos3_multiview: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    cosmos3_multiview: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, resolution, width, height
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -77,7 +148,7 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
     request = {
         "name": "sample",
         "model_mode": "image2video",
-        "resolution": "480",
+        "resolution": resolution,
         "num_frames": 1,
         "prompt": '{"views": []}',
         "negative_prompt": "bad video",
@@ -108,9 +179,9 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
 
     sampling_params = captured["sampling_params"]
     assert sampling_params.seed == 45
-    assert (sampling_params.width, sampling_params.height) == (832, 480)
-    assert sampling_params.extra_args["resolution"] == "480"
-    assert sampling_params.extra_args["multiview"]["resolution"] == "480"
+    assert (sampling_params.width, sampling_params.height) == (width, height)
+    assert sampling_params.extra_args["resolution"] == resolution
+    assert sampling_params.extra_args["multiview"]["resolution"] == resolution
     assert sampling_params.guidance_scale == 3.0
     assert sampling_params.num_inference_steps == 20
     assert sampling_params.extra_args["flow_shift"] == 5.0
@@ -121,7 +192,7 @@ def test_run_request_forwards_imaginaire_fields_and_writes_manifest(
     assert captured["prompt"]["negative_prompt"] == "bad video"
     assert manifest["seed"] == 45
     assert manifest["model_mode"] == "image2video"
-    assert manifest["resolution"] == "480"
+    assert manifest["resolution"] == resolution
     assert json.loads((tmp_path / "sample_outputs.json").read_text())["seed"] == 45
 
 

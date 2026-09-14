@@ -156,7 +156,10 @@ def _resolve_multiview_resolution(sp: Any, multiview: Mapping[str, Any]) -> str:
     if resolution is None:
         extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
         resolution = extra.get("resolution", "480")
-    return str(resolution)
+    resolution = str(resolution)
+    if resolution not in ("480", "720"):
+        raise ValueError(f"Cosmos3 multiview supports resolutions '480' and '720', got {resolution!r}.")
+    return resolution
 
 
 def _resolve_temporal_position_period(latent_frames: int, num_views: int, align_across_views: bool) -> int | None:
@@ -542,13 +545,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             requested_num_frames = sp.num_frames
         num_frames = _resolve_multiview_num_frames(requested_num_frames, self.vae_scale_factor_temporal)
         resolution = _resolve_multiview_resolution(sp, multiview)
-        if resolution != "480":
-            raise ValueError(f"Cosmos3 multiview v1 supports only resolution='480', got {resolution!r}.")
-        width, height = VIDEO_RES_SIZE_INFO["480"]["16,9"]
+        width, height = VIDEO_RES_SIZE_INFO[resolution]["16,9"]
         if sp.height is not None and int(sp.height) != height:
-            raise ValueError(f"Cosmos3 multiview height is fixed at {height}, got {sp.height}.")
+            raise ValueError(f"Cosmos3 multiview resolution={resolution!r} requires height={height}, got {sp.height}.")
         if sp.width is not None and int(sp.width) != width:
-            raise ValueError(f"Cosmos3 multiview width is fixed at {width}, got {sp.width}.")
+            raise ValueError(f"Cosmos3 multiview resolution={resolution!r} requires width={width}, got {sp.width}.")
         frame_rate_value = self._get_sp_param(sp, "resolved_frame_rate", None)
         if frame_rate_value is None:
             frame_rate_value = self._get_sp_param(sp, "frame_rate", None)

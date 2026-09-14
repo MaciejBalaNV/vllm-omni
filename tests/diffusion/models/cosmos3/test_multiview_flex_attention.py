@@ -701,6 +701,29 @@ def test_flex_attention_matches_dense_masked_gqa_oracle() -> None:
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
 
+@pytest.mark.parametrize("backend", ["triton", "fa4"])
+def test_attention_plans_distinguish_resolutions(backend) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MultiviewAttentionContext,
+        MultiviewLayout,
+        get_multiview_attention_plan,
+    )
+
+    cache = {}
+    plans = []
+    for height, width in ((15, 26), (23, 40), (15, 26)):
+        layout = MultiviewLayout(2, 2, height, width, backend=backend, max_und_tokens=128)
+        context = MultiviewAttentionContext(layout, cache)
+        plan, geometry = get_multiview_attention_plan(
+            context, real_und_len=7, real_q_len=layout.gen_tokens, device=torch.device("cpu")
+        )
+        assert geometry.real_q_len == 4 * height * width
+        plans.append(plan)
+    assert len(cache) == 2
+    assert plans[0] is plans[2]
+    assert plans[0] is not plans[1]
+
+
 def test_packing_buffers_are_reused_and_never_leak_stale_rows() -> None:
     """Layers re-pack identical shapes, so the padded q/k/v buffers are reused.
 
