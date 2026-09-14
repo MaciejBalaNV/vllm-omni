@@ -164,7 +164,9 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description=(
             "MiniMax H3 output ratio. T2VA requires 21:9, 16:9, 4:3, 1:1, 3:4, or 9:16; "
-            "FL2VA follows the input image; Ref2VA defaults to 16:9."
+            "FL2VA follows the input image; Ref2VA defaults to 16:9. "
+            "Cosmos3 Multiview accepts auto (default, detected from the first camera's WSM input), "
+            "1:1, 4:3, 3:4, 16:9, or 9:16 at the selected 480p or 720p resolution."
         ),
     )
     short_edge: int | None = Field(

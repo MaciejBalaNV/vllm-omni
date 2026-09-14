@@ -92,11 +92,13 @@ def _denoise(pipeline, backend, request_index):
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 
-    # 66/110 GEN tokens cut across all eleven cameras and require padding at CP4/8.
+    # Square then portrait layouts cut across all cameras; 330 portrait GEN
+    # tokens require padding at CP4/8 while exercising a second spatial shape.
     frames_per_view = 3 + 2 * request_index
     frames = 11 * frames_per_view
     rng = torch.Generator().manual_seed(42 + request_index)
-    latents = torch.randn(1, 2, frames, 1, 1, generator=rng).to(pipeline.device, pipeline.dtype)
+    spatial_h, spatial_w = (1, 1) if request_index == 0 else (3, 1)
+    latents = torch.randn(1, 2, frames, spatial_h, spatial_w, generator=rng).to(pipeline.device, pipeline.dtype)
     control = torch.randn(latents.shape, generator=rng).to(pipeline.device, pipeline.dtype)
     condition = torch.randn(latents.shape, generator=rng).to(pipeline.device, pipeline.dtype)
     mask = torch.ones(1, 1, frames, 1, 1, device=pipeline.device, dtype=pipeline.dtype)
@@ -123,7 +125,7 @@ def _denoise(pipeline, backend, request_index):
         velocity_mask=mask,
         condition_latents=condition,
         shared_kwargs={
-            "video_shape": (frames, 1, 1),
+            "video_shape": (frames, spatial_h, spatial_w),
             "fps": 30.0,
             "noisy_frame_mask": mask,
             "control_latents": [control],
@@ -131,8 +133,8 @@ def _denoise(pipeline, backend, request_index):
             "multiview_layout": MultiviewLayout(
                 11,
                 frames,
-                1,
-                1,
+                spatial_h,
+                spatial_w,
                 backend=backend,
                 max_und_tokens=64,
                 decomposed_temporal_window_seconds=0.5,

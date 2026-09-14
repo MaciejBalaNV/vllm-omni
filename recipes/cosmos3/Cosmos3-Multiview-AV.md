@@ -50,7 +50,7 @@ Cosmos3 Nano fields):
 ```
 
 The scheduler directory must describe the regular FlowUniPC scheduler. The
-request defaults to 35 steps, guidance 6.0, flow shift 10, and 480p (832×480).
+request defaults to 35 steps, guidance 6.0, flow shift 10, and the 480p resolution bucket.
 Resolution, frame rate, and per-camera frame count are request-driven. When
 omitted, fps defaults to 30 and num_frames to 201.
 
@@ -61,39 +61,63 @@ there. Other rates are accepted with a warning outside [10, 30], and frame
 counts are rounded up to the VAE's `4k+1` grid (200 becomes 201) instead of
 being rejected.
 
-## Resolution
+## Resolution and aspect ratio
 
-Every camera uses the same selected landscape size:
+All eleven cameras share one output size. `resolution` selects the `"480"`
+(default) or `"720"` bucket; it is independent of the input's pixel count.
+`aspect_ratio` defaults to `"auto"`, which uses the original dimensions of the
+first camera's WSM input (`camera_front_wide_120fov`). Images use their spatial
+size and videos use their first frame. The nearest bucket is selected using
+Cosmos3's existing target-size matching. Other cameras and vision inputs do
+not affect the selection; all inputs are resized and center-cropped to it.
+An unreadable first WSM input fails generation rather than selecting a fallback.
 
-| `resolution` | Per-camera output (width × height) |
-|---|---|
-| `"480"` (default) | 832 × 480 |
-| `"720"` | 1280 × 720 |
+| `aspect_ratio` | 480p output (width × height) | 720p output (width × height) |
+|---|---|---|
+| `1:1` | 640 × 640 | 960 × 960 |
+| `4:3` | 736 × 544 | 1104 × 832 |
+| `3:4` | 544 × 736 | 832 × 1104 |
+| `16:9` | 832 × 480 | 1280 × 720 |
+| `9:16` | 480 × 832 | 720 × 1280 |
 
-For offline JSON/JSONL input, set `resolution` at the top level or inside
-`multiview`. Integer values `480` and `720` are also accepted. If both fields
-are present, their values must agree. `--resolution` overrides both fields for
-every record:
+These are canonical buckets, so their dimensions need not form the exact
+mathematical ratio. 256p, 704p, and arbitrary dimensions are unsupported.
+Explicit ratios override detection; comma spellings such as `"9,16"` are also
+accepted. To retain the previous fixed landscape behavior, specify `"16:9"`.
+
+Offline JSON/JSONL records accept `resolution` and `aspect_ratio` at the top
+level or inside `multiview`. Integer resolutions `480` and `720` are accepted.
+Duplicate declarations must agree after normalization. Each CLI flag overrides
+its own setting for every record; a geometry override clears stale width/height
+constraints without editing the input file:
 
 ```bash
+# Automatically select an aspect ratio from the first WSM input at 720p.
 python examples/offline_inference/multiview_video/cosmos3_multiview.py \
   --model /models/cosmos3-multiview-av --input /data/mv_i2v_wsm.json \
-  --resolution 720 --num-frames 29 --output-dir outputs/mv_720
+  --resolution 720 --aspect-ratio auto --num-frames 29 --output-dir outputs/mv_auto
+
+# Explicitly generate portrait views.
+python examples/offline_inference/multiview_video/cosmos3_multiview.py \
+  --model /models/cosmos3-multiview-av --input /data/mv_i2v_wsm.json \
+  --resolution 720 --aspect-ratio 9:16 --num-frames 29 --output-dir outputs/mv_portrait
 ```
 
-Direct pipeline requests resolve `extra_args.multiview.resolution` first,
-then `extra_args.resolution`, and otherwise use `"480"`. The generic image
-resolution field is not used. Explicit sampling width/height must match the
-selected bucket; arbitrary dimensions and other resolution buckets are rejected.
-The [online client](../../docs/user_guide/examples/online_serving/cosmos3_multiview.md)
-also supports `--resolution 720`.
+Direct pipeline requests prefer `extra_args.multiview.resolution` and
+`extra_args.multiview.aspect_ratio` over their top-level `extra_args` equivalents,
+then default to `"480"` and `"auto"`. The generic image resolution field is not
+used. Explicit sampling width/height must match the resolved bucket, including
+in automatic mode. Output dimensions and prompt metadata use that same bucket.
 
-Vision and WSM inputs are resized and center-cropped to the selected output
-size. With spatial compression 16 and transformer patch size 2, 720p uses
-45×80 latents and 23×40 patches. Transformer padding is cropped back before
-VAE decode, preserving the exact 1280×720 output. This produces approximately
-2.36 times as many spatial tokens as 480p; memory and latency depend on clip
-length, attention backend, and execution topology.
+Detection runs in the pipeline for both offline and online requests; clients do
+not decode media or inject landscape dimensions in automatic mode. See the
+[online client guide](../../docs/user_guide/examples/online_serving/cosmos3_multiview.md).
+
+The existing transformer pads either spatial axis and crops back before VAE
+decode, preserving exact output dimensions. With spatial compression 16 and
+patch size 2, the buckets use 390–400 spatial tokens at 480p and 900–920 at 720p,
+per latent frame and item. Memory and latency also depend on clip length,
+attention backend, and execution topology.
 
 ## Sparse attention backend
 
@@ -170,7 +194,7 @@ sentences as the positive prompt; set `negative_metadata_mode` in the request's
 extra args to change it.
 
 The example writes `vision_viewNN_<camera>.mp4` for all eleven cameras plus
-`sample_outputs.json`, including the selected resolution. Strict Ulysses CP,
+`sample_outputs.json`, including the resolved resolution, aspect ratio, width, and height. Strict Ulysses CP,
 CFG parallelism, TP, and HSDP use the existing engine flags; HSDP and TP cannot
 be combined. See the offline script's usage examples. Cache-DiT, session state,
 LiDAR, camera subsets, and reordered cameras are rejected in v1.
@@ -191,13 +215,14 @@ pytest -q \
 ```
 
 On CUDA, run `test_multiview_recompile.py` and, on supported Blackwell hardware,
-`test_multiview_fa4.py` from the same model test directory. These cover warmed
-480p/720p attention geometries and backend parity. Run the existing distributed
+`test_multiview_fa4.py` from the same model test directory. These cover all ten warmed
+aspect-ratio/resolution geometries and backend parity. Run the existing distributed
 multiview tests for the deployment's parallel configuration.
 
 For checkpoint validation, generate 29-frame clips in WSM-only and
-vision-conditioned modes at both resolutions with the same seed and settings.
+vision-conditioned modes for all five ratios at both resolutions with the same
+seed and settings. Include explicit overrides as well as automatic detection.
 Check all eleven exported videos for camera order, frame count, and exact
-dimensions. Follow with a representative 201-frame 720p generation on sufficient
+dimensions. Follow with a 201-frame 720p portrait generation on sufficient
 hardware. Record the backend, GPU topology, steps, cold/warm latency, and peak
 memory; no fixed memory or latency target is implied by resolution support.

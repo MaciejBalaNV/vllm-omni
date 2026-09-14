@@ -82,7 +82,7 @@ def test_varying_prompt_lengths_do_not_recompile_the_flex_kernel(monkeypatch: py
     )
 
 
-def test_switching_resolutions_reuses_warmed_flex_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_switching_resolutions_and_ratios_reuses_warmed_flex_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
     import torch._dynamo
     from torch._dynamo.testing import CompileCounterWithBackend
 
@@ -96,15 +96,33 @@ def test_switching_resolutions_reuses_warmed_flex_kernels(monkeypatch: pytest.Mo
     )
     torch._dynamo.reset()
     counter.clear()
-    layouts = [module.MultiviewLayout(2, 2, h, w, max_und_tokens=_MAX_UND) for h, w in ((15, 26), (23, 40))]
+    geometries = (
+        (15, 26),
+        (26, 15),
+        (20, 20),
+        (17, 23),
+        (23, 17),
+        (23, 40),
+        (40, 23),
+        (30, 30),
+        (26, 35),
+        (35, 26),
+    )
+    layouts = [module.MultiviewLayout(2, 2, h, w, max_und_tokens=_MAX_UND) for h, w in geometries]
     tensors = []
     for layout in layouts:
         q = torch.randn(1, layout.gen_tokens, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(1, layout.gen_tokens, _KV_HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
         tensors.append((q, k, torch.randn_like(k)))
 
-    # Same spatial geometry as 480p/720p, shortened to one latent frame per
-    # camera. New requests clear their caches and vary the text length.
-    for index, und_len in ((0, 100), (1, 200), (0, 300), (1, 400), (0, 500)):
-        _run_generation(module, layouts[index], *tensors[index], und_len)
-    assert counter.frame_count == 2, f"expected one graph per resolution, got {counter.frame_count}"
+    # All ten spatial geometries, shortened to one latent frame per camera.
+    # Transposed buckets may share compiled kernels but must use fresh masks.
+    with torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
+        for index, layout in enumerate(layouts):
+            _run_generation(module, layout, *tensors[index], 100)
+        warmed_graphs = counter.frame_count
+        assert warmed_graphs > 0
+        for und_len in (200, 400):
+            for index in reversed(range(len(layouts))):
+                _run_generation(module, layouts[index], *tensors[index], und_len)
+        assert counter.frame_count == warmed_graphs, "Revisiting a warmed geometry caused recompilation"

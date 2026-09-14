@@ -115,7 +115,22 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
 
 
 @pytest.mark.parametrize("num_heads,num_kv_heads", HEAD_GEOMETRIES)
-@pytest.mark.parametrize("patch_hw", [(8, 8), (15, 26), (23, 40)])
+@pytest.mark.parametrize(
+    "patch_hw",
+    [
+        (8, 8),
+        (20, 20),
+        (17, 23),
+        (23, 17),
+        (15, 26),
+        (26, 15),
+        (30, 30),
+        (26, 35),
+        (35, 26),
+        (23, 40),
+        (40, 23),
+    ],
+)
 def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int, patch_hw) -> None:
     """Both backends project the same predicate, so their outputs must match."""
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (

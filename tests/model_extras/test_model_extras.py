@@ -207,6 +207,7 @@ def test_cosmos3_multiview_extra_registry() -> None:
             "max_sequence_length",
             "negative_prompt",
             "resolution",
+            "aspect_ratio",
             "fps",
             "frame_rate",
             "resolved_frame_rate",
