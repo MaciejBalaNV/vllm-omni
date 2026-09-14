@@ -66,7 +66,22 @@ def prepare_request(
     extra = copy.deepcopy(manifest.get("extra_params", {}))
     if "multiview" not in extra:
         extra["multiview"] = copy.deepcopy(manifest["multiview"])
-    extra.setdefault("wsm", manifest.get("wsm", True))
+    for key in (
+        "wsm",
+        "edge",
+        "blur",
+        "depth",
+        "seg",
+        "lidar",
+        "emphasize_control_in_prompt",
+        "guidance_interval",
+        "control_guidance",
+        "control_guidance_interval",
+        "sigma_max",
+        "normalize_cfg",
+    ):
+        if key in manifest:
+            extra.setdefault(key, copy.deepcopy(manifest[key]))
     if resolution_override is None:
         declarations = {
             str(value)
@@ -75,10 +90,10 @@ def prepare_request(
         }
         if len(declarations) > 1:
             raise ValueError(f"Conflicting Cosmos3 multiview resolutions: {sorted(declarations)}.")
-        resolution = next(iter(declarations), "480")
+        resolution = next(iter(declarations), None)
     else:
         resolution = str(resolution_override)
-    if resolution not in SUPPORTED_RESOLUTIONS:
+    if resolution is not None and resolution not in SUPPORTED_RESOLUTIONS:
         raise ValueError(
             f"Unsupported Cosmos3 multiview resolution {resolution!r}; expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
         )
@@ -103,7 +118,7 @@ def prepare_request(
         for key in ("width", "height")
         if not geometry_override and manifest.get(key) is not None
     }
-    if aspect_ratio != "auto":
+    if aspect_ratio != "auto" and resolution is not None:
         width, height = SUPPORTED_RESOLUTIONS[resolution][aspect_ratio]
         for key, expected in (("width", width), ("height", height)):
             if key in dimensions and int(dimensions[key]) != expected:
@@ -112,8 +127,9 @@ def prepare_request(
                     f"for aspect_ratio={aspect_ratio!r}."
                 )
             dimensions[key] = str(expected)
-    extra["resolution"] = resolution
-    extra["multiview"]["resolution"] = resolution
+    if resolution is not None:
+        extra["resolution"] = resolution
+        extra["multiview"]["resolution"] = resolution
     extra["aspect_ratio"] = aspect_ratio
     extra["multiview"]["aspect_ratio"] = aspect_ratio
     paths = []
@@ -136,6 +152,19 @@ def prepare_request(
                 raise FileNotFoundError(path)
             view[f"{role}_reference_index"] = len(paths)
             paths.append(path)
+    if extra.get("lidar") is not None:
+        lidar = extra["lidar"]
+        if set(lidar) != {"control_path"}:
+            raise ValueError("The client expects lidar.control_path pointing to one local .safetensors file.")
+        path = Path(lidar.pop("control_path")).expanduser()
+        if not path.is_absolute():
+            path = base_dir / path
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if path.suffix.lower() != ".safetensors":
+            raise ValueError("LiDAR controls must use the numeric .safetensors format.")
+        lidar["control_reference_index"] = len(paths)
+        paths.append(path)
     data = {
         "prompt": str(manifest.get("prompt", "")),
         "extra_params": json.dumps(extra),
@@ -171,7 +200,7 @@ def main() -> None:
     parser.add_argument(
         "--resolution",
         choices=tuple(SUPPORTED_RESOLUTIONS),
-        help="Video resolution bucket (480 or 720), overriding the manifest value; defaults to 480",
+        help="Video resolution bucket (480 or 720), overriding the manifest value; otherwise use the checkpoint default",
     )
     parser.add_argument(
         "--aspect-ratio",

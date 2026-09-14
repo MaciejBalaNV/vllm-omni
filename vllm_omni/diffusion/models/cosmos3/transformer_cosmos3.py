@@ -1742,6 +1742,57 @@ class Cosmos3VFMTransformer(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
+    def _embed_timestep(self, timestep: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Compute the shared diffusion timestep in FP32 before the model-dtype cast."""
+        with torch.autocast(timestep.device.type, enabled=False):
+            embedding = self.time_embedder((timestep * self.timestep_scale).float())
+        return embedding.to(dtype)
+
+    def _run_gen_layers(
+        self,
+        hidden_gen: torch.Tensor,
+        *,
+        use_sequence_parallel: bool = True,
+        control_token_sizes: tuple[int, ...] | None = None,
+        control_weights: tuple[float, ...] | None = None,
+        multiview_layout: Any | None = None,
+    ) -> torch.Tensor:
+        """Run the shared GEN stack, including sequence parallelism and cache-dit wrappers."""
+        # UND K/V stay replicated; Cosmos3CrossAttention supplies them as
+        # joint_key/value for Ulysses head-slicing in the attention backend.
+        if self.cached_kv is None or self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        freqs_cos, freqs_sin = self.cached_freqs_gen
+        if use_sequence_parallel:
+            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        layer_kwargs = {
+            "control_token_sizes": control_token_sizes,
+            "control_weights": control_weights,
+            "multiview_layout": multiview_layout,
+        }
+        if len(self.gen_layers) == len(self.cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+                hidden_gen = layer(
+                    hidden_gen,
+                    k_und=k_und,
+                    v_und=v_und,
+                    freqs_cos=freqs_cos,
+                    freqs_sin=freqs_sin,
+                    **layer_kwargs,
+                )
+                # Cache-dit's block wrapper may return a tuple; unwrap it.
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+        else:
+            # Cache-dit patches gen_layers to a grouped wrapper.
+            for layer in self.gen_layers:
+                hidden_gen = layer(
+                    hidden_gen, cached_kv=self.cached_kv, freqs_gen=(freqs_cos, freqs_sin), **layer_kwargs
+                )
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+        return self.gen_sp_gather(hidden_gen) if use_sequence_parallel else hidden_gen
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1956,9 +2007,7 @@ class Cosmos3VFMTransformer(nn.Module):
             # For I2V: only add to noisy tokens, not conditioned ones.
             # Conditioned frames are clean context and should not receive
             # the diffusion timestep signal.
-            with torch.autocast(current_omni_platform.device_type, enabled=False):
-                time_embed = self.time_embedder((timestep * self.timestep_scale).float())
-            time_embed = time_embed.to(hidden_states.dtype)
+            time_embed = self._embed_timestep(timestep, hidden_states.dtype)
 
             if noisy_frame_mask is not None:
                 # Build per-token mask from per-frame mask.
@@ -1999,47 +2048,13 @@ class Cosmos3VFMTransformer(nn.Module):
             if has_control:
                 del hidden_control  # The loop variable also retains the last control.
 
-            # Run GEN layers.  UND K/V (replicated) is passed to each layer;
-            # the Cosmos3CrossAttention forwards them as joint_key/value so the
-            # framework Attention handles the Ulysses head-slicing internally.
-            if self.cached_kv is None or self.cached_freqs_gen is None:
-                raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            freqs_cos, freqs_sin = self.cached_freqs_gen
-            if not use_multi_control_attention:
-                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-            freqs_gen = (freqs_cos, freqs_sin)
-
-            if len(self.gen_layers) == len(self.cached_kv):
-                for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
-                    hidden_gen = layer(
-                        hidden_gen,
-                        k_und=k_und,
-                        v_und=v_und,
-                        freqs_cos=freqs_cos,
-                        freqs_sin=freqs_sin,
-                        control_token_sizes=multi_control_token_sizes,
-                        control_weights=multi_control_weights,
-                        multiview_layout=multiview_layout,
-                    )
-                    # Cache-dit's block wrapper may return a tuple; unwrap it.
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
-            else:
-                # Cache-dit patches gen_layers to a grouped wrapper.
-                for layer in self.gen_layers:
-                    hidden_gen = layer(
-                        hidden_gen,
-                        cached_kv=self.cached_kv,
-                        freqs_gen=freqs_gen,
-                        control_token_sizes=multi_control_token_sizes,
-                        control_weights=multi_control_weights,
-                        multiview_layout=multiview_layout,
-                    )
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
-
-            if not use_multi_control_attention:
-                hidden_gen = self.gen_sp_gather(hidden_gen)
+            hidden_gen = self._run_gen_layers(
+                hidden_gen,
+                use_sequence_parallel=not use_multi_control_attention,
+                control_token_sizes=multi_control_token_sizes,
+                control_weights=multi_control_weights,
+                multiview_layout=multiview_layout,
+            )
 
             # Final norm and project back to latent space. Split first: control
             # tokens only condition generation and need no output normalization.

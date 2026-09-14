@@ -265,7 +265,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     if isinstance(exc, OmniClientError):
         return VideoError(code=exc.status_code, message=exc.message)
 
-    if isinstance(exc, (EngineGenerateError, EngineDeadError)):
+    if isinstance(exc, EngineGenerateError | EngineDeadError):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
 
@@ -448,9 +448,10 @@ async def _persist_uploaded_control_reference(
     upload: UploadFile,
     *,
     max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
+    numeric_lidar: bool = False,
 ) -> str:
     """Stream one model control upload to request-scoped local storage."""
-    suffix = _control_upload_suffix(upload)
+    suffix = _control_upload_suffix(upload, numeric_lidar=numeric_lidar)
 
     declared_size = getattr(upload, "size", None)
     if isinstance(declared_size, Integral) and int(declared_size) > max_bytes:
@@ -485,10 +486,14 @@ async def _persist_uploaded_control_reference(
                 os.unlink(path)
 
 
-def _control_upload_suffix(upload: UploadFile) -> str:
+def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -> str:
     """Use the same media classification before and during persistence."""
-    kind = _uploaded_media_kind(upload)
     suffix = Path(upload.filename or "").suffix.lower()
+    if numeric_lidar:
+        if suffix != ".safetensors":
+            raise HTTPException(400, detail="lidar.control_reference_index must reference a .safetensors file.")
+        return suffix
+    kind = _uploaded_media_kind(upload)
     supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
     if kind == "audio" or (suffix and suffix not in supported_suffixes):
         raise HTTPException(
@@ -883,16 +888,27 @@ async def _parse_video_form(
             raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
         try:
             # Validate all camera/role mappings and media kinds before creating files.
+            lidar_manifest = (request.extra_params or {}).get("lidar")
+            lidar_index = lidar_manifest.get("control_reference_index") if isinstance(lidar_manifest, dict) else None
             resolve_multiview_uploads(
                 request.extra_params or {},
-                ["reference" + _control_upload_suffix(upload) for upload in input_references],
+                [
+                    "reference" + _control_upload_suffix(upload, numeric_lidar=index == lidar_index)
+                    for index, upload in enumerate(input_references)
+                ],
             )
             for index, upload in enumerate(input_references):
                 try:
-                    path = await _persist_uploaded_control_reference(upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES)
+                    path = await _persist_uploaded_control_reference(
+                        upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=index == lidar_index
+                    )
                 except HTTPException as exc:
                     raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
                 upload_resources.paths.append(path)
+                if index == lidar_index:
+                    from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
+
+                    validate_lidar_header(path)
             request.extra_params = resolve_multiview_uploads(request.extra_params or {}, upload_resources.paths)
             return request, handler, effective_model_name, None, None, None, None, upload_resources
         except (TypeError, ValueError) as exc:

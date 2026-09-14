@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
+from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from .multiview_flex_attention import (
@@ -14,6 +16,7 @@ from .multiview_flex_attention import (
     MultiviewLayout,
     padded_multiview_flex_attention,
 )
+from .multiview_packing import pack_state, packed_position_ids, patchify_sensor, unpack_state, unpatchify_sensor
 from .multiview_parallel import multiview_ulysses_attention
 from .transformer_cosmos3 import (
     COSMOS3_MULTIVIEW_BACKBONE_TYPE,
@@ -118,6 +121,17 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        od_config = kwargs.get("od_config", args[0] if args else None)
+        deployment = _tf_config_get(od_config.tf_model_config, "multiview", {})
+        self.lidar_config = _tf_config_get(deployment, "lidar", None)
+        if self.lidar_config is not None:
+            from .lidar import validate_lidar_config
+
+            self.lidar_config = dict(self.lidar_config)
+            validate_lidar_config(self.lidar_config)
+            width = self.latent_patch_size**2 * self.lidar_config["latent_channels"]
+            self.lidar_proj_in = nn.Linear(width, self.hidden_size)
+            self.lidar_proj_out = nn.Linear(self.hidden_size, width)
         self._multiview_mask_cache: dict[tuple[Any, ...], Any] = {}
         # Padded q/k/v packing buffers, keyed by shape/dtype/device. Held on the
         # transformer rather than the per-forward context so the ~2.5 GiB of
@@ -129,6 +143,128 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         self._multiview_mask_cache.clear()
         self._multiview_buffer_cache.clear()
 
+    def validate_loaded_weights(self, loaded: set[str]) -> None:
+        super().validate_loaded_weights(loaded)
+        if self.lidar_config is not None:
+            required = {
+                f"lidar_proj_{direction}.{parameter}" for direction in ("in", "out") for parameter in ("weight", "bias")
+            }
+            missing = [name for name in sorted(required) if not any(key.endswith(name) for key in loaded)]
+            if missing:
+                raise ValueError(f"Incomplete joint checkpoint: missing LiDAR projection weights {missing}.")
+
+    def _forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        multiview_layout: MultiviewLayout,
+        packed_shapes: tuple[tuple[int, ...], ...],
+        caption_lengths: tuple[int, ...],
+        control_latents=None,
+        lidar_control_latents: torch.Tensor | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Pack sensor-specific embeddings around the base transformer's shared GEN execution.
+
+        Captions arrive compacted from the pipeline with host-side lengths;
+        no text-mask reduction or device-to-host synchronization is needed here.
+        """
+        if kwargs.get("action_latents") is not None or kwargs.get("sound_latents") is not None:
+            raise ValueError("Multiview generation cannot be combined with action or sound.")
+        targets = unpack_state(hidden_states, packed_shapes)
+        camera = targets[0]
+        has_control = control_latents is not None and len(control_latents) > 0
+        items = tuple(item for item in multiview_layout.items if has_control or not item.is_control)
+        lengths = caption_lengths
+        if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != text_ids.shape[1]:
+            raise ValueError("Packed caption lengths must cover the compacted text tokens with nonempty segments.")
+        layout = replace(multiview_layout, items=items, caption_lengths=lengths if len(lengths) > 1 else ())
+        context = MultiviewAttentionContext(layout, self._multiview_mask_cache, self._multiview_buffer_cache)
+        if self.cached_kv is None or self.cached_freqs_gen is None:
+            dummy = camera.new_empty(0)
+            rotary = self.language_model.rotary_emb
+            if self.cached_kv is None:
+                caption_caches = []
+                with self._offload_context("reasoner"):
+                    for ids, length in zip(text_ids.split(lengths, dim=1), lengths, strict=True):
+                        # A separate causal UND call per camera prevents text
+                        # leakage and resets all three text position origins.
+                        pos = torch.arange(length, device=ids.device).reshape(1, 1, length).expand(3, 1, -1)
+                        cos, sin = rotary(dummy, position_ids=pos)
+                        caption_caches.append(self.language_model(ids, (cos.unsqueeze(2), sin.unsqueeze(2))))
+                self.cached_kv = [
+                    (
+                        torch.cat([cache[layer][0] for cache in caption_caches], dim=1),
+                        torch.cat([cache[layer][1] for cache in caption_caches], dim=1),
+                    )
+                    for layer in range(len(caption_caches[0]))
+                ]
+            # No subsequent sample/modality follows this request, so the
+            # reference-compatible endpoint cursor is intentionally unused.
+            positions, _ = packed_position_ids(
+                items,
+                text_origin=max(lengths) + self.temporal_modality_margin,
+                base_fps=self.base_fps,
+                camera_compression=self.temporal_compression_factor,
+                lidar_compression=1 if self.lidar_config is None else self.lidar_config["temporal_compression_factor"],
+                enable_fps_modulation=self.enable_fps_modulation,
+                align_views=kwargs.get("temporal_position_period") is not None,
+            )
+            cos, sin = rotary(dummy, position_ids=positions.unsqueeze(1).to(camera.device))
+            self.cached_freqs_gen = (cos.unsqueeze(2), sin.unsqueeze(2))
+
+        with self._offload_context("generator"):
+            # Both targets get exactly the same diffusion timestep. Controls
+            # never receive it; camera condition frames receive zero.
+            time = self._embed_timestep(timestep, camera.dtype).unsqueeze(1)
+            streams = []
+            if has_control:
+                streams.append(control_latents[0])
+            streams.append(camera)
+            if len(targets) == 2:
+                if self.lidar_config is None:
+                    raise ValueError("Joint requests require a checkpoint with LiDAR projections.")
+                if has_control:
+                    if lidar_control_latents is None:
+                        raise ValueError("Joint transfer requires LiDAR control latents.")
+                    streams.append(lidar_control_latents)
+                streams.append(targets[1])
+            if len(streams) != len(items):
+                raise ValueError("Packed stream boundaries do not match the camera/LiDAR inputs.")
+            embeddings = []
+            for item, latent in zip(items, streams, strict=True):
+                project = self.lidar_proj_in if item.is_lidar else self.proj_in
+                hidden = project(patchify_sensor(latent.to(camera), self.latent_patch_size))
+                if not item.is_control:
+                    if not item.is_lidar and noisy_frame_mask is not None:
+                        mask = (
+                            noisy_frame_mask[:, 0, :, 0, 0]
+                            .repeat_interleave(item.token_shape[1] * item.token_shape[2], dim=1)
+                            .unsqueeze(-1)
+                        )
+                        hidden = hidden + time * mask
+                    else:
+                        hidden = hidden + time
+                embeddings.append(hidden)
+            hidden = torch.cat(embeddings, dim=1)
+            del embeddings
+            hidden = self._run_gen_layers(hidden, multiview_layout=context)
+            outputs = []
+            for item, latent, part in zip(
+                items, streams, hidden.split([item.num_tokens for item in items], dim=1), strict=True
+            ):
+                if item.is_control:
+                    continue
+                if item.is_lidar:
+                    projected = self.lidar_proj_out(self.norm_moe_gen(part))
+                else:
+                    projected = self._project_video_tokens(part)
+                outputs.append(unpatchify_sensor(projected, tuple(latent.shape[1:]), self.latent_patch_size))
+            return pack_state(outputs)
+
     def forward(
         self,
         *args,
@@ -137,20 +273,4 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if multiview_layout is None:
             return super().forward(*args, **kwargs)
-        control_latents = kwargs.get("control_latents")
-        if isinstance(control_latents, torch.Tensor):
-            control_count = 1
-        elif control_latents is None:
-            control_count = 0
-        else:
-            control_count = len(control_latents)
-        if control_count != 1:
-            raise ValueError(f"Cosmos3 multiview v1 requires exactly one packed WSM control item, got {control_count}.")
-        if kwargs.get("action_latents") is not None or kwargs.get("sound_latents") is not None:
-            raise ValueError("Cosmos3 multiview v1 cannot be combined with action or sound streams.")
-        context = MultiviewAttentionContext(
-            multiview_layout,
-            self._multiview_mask_cache,
-            self._multiview_buffer_cache,
-        )
-        return super().forward(*args, multiview_layout=context, **kwargs)
+        return self._forward_packed(*args, multiview_layout=multiview_layout, **kwargs)

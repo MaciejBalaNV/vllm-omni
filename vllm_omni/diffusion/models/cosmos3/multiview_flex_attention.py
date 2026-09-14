@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask
@@ -118,6 +118,7 @@ class MaskItem:
     view_offset: int = 0
     is_control: bool = False
     seconds_per_frame: float = 1.0
+    is_lidar: bool = False
 
     def __post_init__(self) -> None:
         latent_t, patch_h, patch_w = self.token_shape
@@ -145,7 +146,12 @@ class MaskItem:
 
 @dataclass(frozen=True)
 class MultiviewLayout:
-    """Request-invariant geometry passed from the pipeline to the transformer."""
+    """Explicit packed camera/LiDAR streams and request-invariant attention geometry.
+
+    Items may have different shapes and optional controls. For camera-only
+    geometry callers, omitting items constructs a camera control/target pair
+    once at initialization; attention always consumes the resulting items.
+    """
 
     num_views: int
     latent_frames: int
@@ -160,9 +166,8 @@ class MultiviewLayout:
     #: length, so the compiled attention sees a single shape.  See
     #: ``DEFAULT_MAX_UND_TOKENS``.
     max_und_tokens: int = DEFAULT_MAX_UND_TOKENS
-
-    #: v1 always packs one fully-clean WSM control item then one RGB target.
-    NUM_ITEMS: ClassVar[int] = 2
+    items: tuple[MaskItem, ...] = ()
+    caption_lengths: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_attention_scope(self.attention_scope)
@@ -211,33 +216,25 @@ class MultiviewLayout:
                 f"Cosmos3 multiview seconds_per_frame must be finite and positive, got {self.seconds_per_frame!r}."
             )
 
-    @property
-    def item_tokens(self) -> int:
-        return self.latent_frames * self.patch_height * self.patch_width
+        if not self.items:
+            shape = (self.latent_frames, self.patch_height, self.patch_width)
+            object.__setattr__(
+                self,
+                "items",
+                (
+                    MaskItem(shape, self.num_views, is_control=True, seconds_per_frame=self.seconds_per_frame),
+                    MaskItem(shape, self.num_views, seconds_per_frame=self.seconds_per_frame),
+                ),
+            )
 
     @property
     def gen_tokens(self) -> int:
-        return self.item_tokens * self.NUM_ITEMS
+        return sum(item.num_tokens for item in self.items)
 
     @property
     def block_sizes(self) -> tuple[int, int]:
         """The ``(q, kv)`` sparse block granularity this backend demands."""
         return _BACKEND_BLOCK_SIZES[self.backend]
-
-    def mask_items(self, device: torch.device) -> tuple[MaskItem, ...]:
-        """Build the packed control and target items.
-
-        Attention visibility is independent of target conditioning state, so
-        mask items contain only the semantic fields read by the predicate.
-        Both streams use the same rate, making timestamp a function of
-        ``(view_id, frame_id)`` within every discrete semantic run.
-        """
-        del device
-        shape = (self.latent_frames, self.patch_height, self.patch_width)
-        return (
-            MaskItem(shape, self.num_views, is_control=True, seconds_per_frame=self.seconds_per_frame),
-            MaskItem(shape, self.num_views, is_control=False, seconds_per_frame=self.seconds_per_frame),
-        )
 
     def cache_key(self) -> tuple[Any, ...]:
         return (
@@ -251,6 +248,8 @@ class MultiviewLayout:
             self.seconds_per_frame,
             self.backend,
             self.max_und_tokens,
+            self.items,
+            self.caption_lengths,
         )
 
 
@@ -360,6 +359,7 @@ def build_multiview_flex_metadata(
     attention_scope: AttentionScope = "decomposed",
     decomposed_temporal_window_seconds: float | None = None,
     control_attends_sensor: bool = False,
+    caption_lengths: Sequence[int] = (),
 ) -> MultiviewFlexMetadata:
     """Build metadata without ever materializing a token-by-token dense mask.
 
@@ -409,6 +409,13 @@ def build_multiview_flex_metadata(
     timestamp = torch.full((seq_len,), -1.0, dtype=torch.float32, device=device)
     sample_id[:num_und] = 0
     is_und[:num_und] = True
+    if caption_lengths:
+        if sum(caption_lengths) != num_und or any(length <= 0 for length in caption_lengths):
+            raise ValueError("Caption boundaries must partition the real text tokens.")
+        start = 0
+        for view, length in enumerate(caption_lengths):
+            view_id[start : start + length] = view
+            start += length
 
     view_offsets = {item.view_offset for item in items}
     if attention_scope == "decomposed" and len(view_offsets) > 1 and decomposed_temporal_window_seconds is None:
@@ -442,7 +449,9 @@ def build_multiview_flex_metadata(
         item_timestamps = item_frames.to(torch.float32) * item.seconds_per_frame
         sample_id[start:end] = 0
         frame_id[start:end] = item_frames
-        view_id[start:end] = item_views
+        # Negative sensor IDs distinguish LiDAR from every camera while
+        # retaining the six-vector ABI consumed by both sparse backends.
+        view_id[start:end] = -2 if item.is_lidar else item_views
         is_control[start:end] = item.is_control
         timestamp[start:end] = item_timestamps
 
@@ -515,7 +524,10 @@ def _make_pair_allowed(
         sensor_to_control = (~q_control) & k_control & same_view
         control_to_control = q_control & k_control & same_view
         control_to_sensor = control_reaches_sensor & q_control & (~k_control) & same_view
-        return same_sample & (k_und | sensor_to_sensor | sensor_to_control | control_to_control | control_to_sensor)
+        reads_caption = k_und & ((k_view == -1) | (q_view == -2) | same_view)
+        return same_sample & (
+            reads_caption | (~k_und & (sensor_to_sensor | sensor_to_control | control_to_control | control_to_sensor))
+        )
 
     return pair_allowed
 
@@ -780,9 +792,10 @@ def get_multiview_attention_plan(
     if cached is not None:
         return cached, geometry
 
-    items = layout.mask_items(device)
-    item_tokens = layout.item_tokens
-    item_offsets = tuple(padded_und_len + index * item_tokens for index in range(len(items) + 1))
+    items = layout.items
+    item_offsets = [padded_und_len]
+    for item in items:
+        item_offsets.append(item_offsets[-1] + item.num_tokens)
     metadata = build_multiview_flex_metadata(
         seq_len=padded_und_len + padded_q_len,
         full_q_offsets=item_offsets,
@@ -792,6 +805,7 @@ def get_multiview_attention_plan(
         attention_scope=layout.attention_scope,
         decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
         control_attends_sensor=layout.control_attends_sensor,
+        caption_lengths=layout.caption_lengths,
     )
     sparsity = build_multiview_block_sparsity(
         metadata,

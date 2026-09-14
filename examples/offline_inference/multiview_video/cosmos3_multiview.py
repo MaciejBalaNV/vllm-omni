@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,21 @@ def _safe_sample_name(name: str, sample_index: int) -> str:
     return safe_name
 
 
+def _resolve_input_paths(request: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+    # Match the HTTP client's path base for both direct and extra_params manifests.
+    for container in (request, request.get("extra_params", {})):
+        media = list(container.get("multiview", {}).get("views", []))
+        if container.get("lidar") is not None:
+            media.append(container["lidar"])
+        for item in media:
+            for field in ("vision_path", "control_path", "vision", "control"):
+                value = item.get(field)
+                if isinstance(value, str) and "://" not in value:
+                    path = Path(value).expanduser()
+                    item[field] = str((base_dir / path).resolve())
+    return request
+
+
 def _load_requests(input_path: Path) -> list[dict[str, Any]]:
     if input_path.suffix.lower() == ".jsonl":
         requests = []
@@ -73,7 +89,7 @@ def _load_requests(input_path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"Invalid JSON on {input_path} line {line_number}: {exc}") from exc
             if not isinstance(request, dict):
                 raise TypeError(f"{input_path} line {line_number} must contain a JSON object.")
-            requests.append(request)
+            requests.append(_resolve_input_paths(request, input_path.resolve().parent))
         if not requests:
             raise ValueError(f"Input JSONL file is empty: {input_path}")
         return requests
@@ -81,7 +97,7 @@ def _load_requests(input_path: Path) -> list[dict[str, Any]]:
     request = json.loads(input_path.read_text())
     if not isinstance(request, dict):
         raise TypeError(f"Input JSON must contain one object, got {type(request).__name__}.")
-    return [request]
+    return [_resolve_input_paths(request, input_path.resolve().parent)]
 
 
 def _resolve_model_mode(request: dict[str, Any], views: list[dict[str, Any]]) -> str:
@@ -90,14 +106,14 @@ def _resolve_model_mode(request: dict[str, Any], views: list[dict[str, Any]]) ->
     model_mode = str(request.get("model_mode", inferred_mode)).strip().lower()
     if model_mode not in SUPPORTED_MODEL_MODES:
         raise ValueError(f"Unsupported model_mode {model_mode!r}; expected one of {sorted(SUPPORTED_MODEL_MODES)}.")
-    if model_mode == "image2video" and not all(vision_present):
-        raise ValueError("model_mode='image2video' requires vision input for every camera view.")
+    if model_mode == "image2video" and not any(vision_present):
+        raise ValueError("model_mode='image2video' requires at least one camera vision input.")
     if model_mode == "text2video" and any(vision_present):
         raise ValueError("model_mode='text2video' must not include per-camera vision inputs.")
     return model_mode
 
 
-def _resolve_resolution(request: dict[str, Any], multiview: dict[str, Any], override: str | None = None) -> str:
+def _resolve_resolution(request: dict[str, Any], multiview: dict[str, Any], override: str | None = None) -> str | None:
     top_level = override if override is not None else request.get("resolution")
     nested = override if override is not None else multiview.get("resolution")
     if top_level is not None and nested is not None and str(top_level) != str(nested):
@@ -105,7 +121,9 @@ def _resolve_resolution(request: dict[str, Any], multiview: dict[str, Any], over
             "Conflicting Cosmos3 multiview resolutions: "
             f"top-level resolution={top_level!r}, multiview.resolution={nested!r}."
         )
-    resolution = str(nested if nested is not None else top_level if top_level is not None else "480")
+    if top_level is None and nested is None:
+        return None
+    resolution = str(nested if nested is not None else top_level)
     if resolution not in SUPPORTED_RESOLUTIONS:
         raise ValueError(
             f"Unsupported Cosmos3 multiview resolution {resolution!r}; expected one of {sorted(SUPPORTED_RESOLUTIONS)}."
@@ -220,6 +238,7 @@ def _run_request(
     resolution_override: str | None = None,
     aspect_ratio_override: str | None = None,
 ) -> dict[str, Any]:
+    request = {**request.get("extra_params", {}), **request}
     multiview_value = request.get("multiview")
     if not isinstance(multiview_value, dict):
         raise ValueError("Input JSON must contain a multiview object.")
@@ -237,7 +256,7 @@ def _run_request(
     geometry_override = resolution_override is not None or aspect_ratio_override is not None
     width = None if geometry_override else request.get("width")
     height = None if geometry_override else request.get("height")
-    if aspect_ratio != "auto":
+    if aspect_ratio != "auto" and resolution is not None:
         target_width, target_height = SUPPORTED_RESOLUTIONS[resolution][aspect_ratio]
         for key, value, expected in (("width", width, target_width), ("height", height, target_height)):
             if value is not None and int(value) != expected:
@@ -248,11 +267,12 @@ def _run_request(
         width, height = target_width, target_height
     # Keep the resolved value with the variant-owned multiview parameters so
     # top-level Imaginaire inputs and native vLLM-Omni inputs behave identically.
-    multiview["resolution"] = resolution
+    if resolution is not None:
+        multiview["resolution"] = resolution
     multiview["aspect_ratio"] = aspect_ratio
 
     # Frame rate and per-camera frame count are pipeline-owned: when neither the
-    # CLI nor the record sets them, the pipeline applies its defaults (30 FPS,
+    # CLI nor the record sets them, the pipeline applies its defaults (checkpoint FPS,
     # 201 frames) and rounds frame counts up to the VAE's 4k+1 grid. CLI
     # overrides win over record values.
     num_frames = num_frames_override
@@ -264,10 +284,26 @@ def _run_request(
 
     extra_args = {
         "multiview": multiview,
-        "resolution": resolution,
         "aspect_ratio": aspect_ratio,
-        "wsm": request.get("wsm", {}),
     }
+    if resolution is not None:
+        extra_args["resolution"] = resolution
+    for key in (
+        "wsm",
+        "edge",
+        "blur",
+        "depth",
+        "seg",
+        "lidar",
+        "emphasize_control_in_prompt",
+        "guidance_interval",
+        "control_guidance",
+        "control_guidance_interval",
+        "sigma_max",
+        "normalize_cfg",
+    ):
+        if key in request:
+            extra_args[key] = request[key]
     # Records may also use the field names ``guidance``, ``num_steps``, and
     # ``shift``; the vLLM-Omni names win when both are present.
     flow_shift = _first_present(request, "flow_shift", "shift")
@@ -299,14 +335,16 @@ def _run_request(
     elif fallback_negative_prompt is not None:
         prompt["negative_prompt"] = fallback_negative_prompt
 
+    started = time.perf_counter()
     result = omni.generate(prompt, sampling_params)
+    generation_seconds = time.perf_counter() - started
     video, metadata = _extract_payload(result)
     frames = _frame_list(video)
     if not frames:
         raise ValueError("Cosmos3 multiview output contains no video frames.")
     output_geometry = metadata.get("multiview", {})
     output_height, output_width = np.asarray(frames[0]).shape[:2]
-    output_resolution = output_geometry.get("resolution", resolution)
+    output_resolution = output_geometry.get("resolution", resolution or "480")
     output_aspect_ratio = output_geometry.get("aspect_ratio")
     if output_aspect_ratio is None:
         output_aspect_ratio = next(
@@ -345,6 +383,7 @@ def _run_request(
         "frames_per_view": frames_per_view,
         "fps": output_fps,
         "files_by_camera": files_by_camera,
+        "generation_seconds": generation_seconds,
     }
     (output_dir / "sample_outputs.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
@@ -384,7 +423,7 @@ def main() -> None:
         default=None,
         help=(
             "Frame rate for every record, overriding any record value. "
-            "Unset: the record's fps, else the pipeline default of 30 FPS."
+            "Unset: the record's fps, else the checkpoint default (30 FPS for unversioned artifacts)."
         ),
     )
     parser.add_argument(
@@ -401,7 +440,7 @@ def main() -> None:
         choices=tuple(SUPPORTED_RESOLUTIONS),
         help=(
             "Video resolution bucket (480 or 720) for every record, overriding any record value. "
-            "Unset: the record's resolution, else 480."
+            "Unset: the record's resolution, else the checkpoint default (480 for unversioned artifacts)."
         ),
     )
     parser.add_argument(
