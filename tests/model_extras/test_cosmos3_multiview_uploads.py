@@ -76,13 +76,12 @@ def test_rejects_invalid_indexes(index):
     [
         ("duplicate", "more than once"),
         ("unused", "exactly once"),
-        ("too_many", "at most 22"),
+        ("too_many", "at most 23"),
         ("conflict", "cannot be combined"),
         ("missing_control", "control input for every camera"),
-        ("partial_vision", "every camera or none"),
-        ("camera_order", "camera order"),
+        ("partial_vision", "complete RGB videos"),
         ("duplicate_camera", "unique"),
-        ("missing_camera", "camera order"),
+        ("unknown_camera", "subset"),
         ("mixed_media", "all images or all videos"),
         ("no_wsm", "exactly one"),
         ("top_level_control", "supplied per view"),
@@ -106,14 +105,11 @@ def test_rejects_invalid_manifests(case, match):
         paths.pop()
     elif case == "partial_vision":
         views[0]["vision_reference_index"] = len(paths)
-        paths.append("vision.mp4")
-    elif case == "camera_order":
-        views.reverse()
+        paths.append("vision.png")
     elif case == "duplicate_camera":
         views[1]["camera_key"] = views[0]["camera_key"]
-    elif case == "missing_camera":
-        views.pop()
-        paths.pop()
+    elif case == "unknown_camera":
+        views[0]["camera_key"] = "unknown"
     elif case == "mixed_media":
         paths[0] = "image.png"
     elif case == "no_wsm":
@@ -205,11 +201,14 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
             assert body.count(b'name="input_references"') == 11
             assert b"control_reference_index" in body
             assert b"control_path" not in body
-            expected_resolution = resolution or "480"
-            assert f'"resolution": "{expected_resolution}"'.encode() in body
+            expected_resolution = resolution
+            if expected_resolution is None:
+                assert b'"resolution":' not in body
+            else:
+                assert f'"resolution": "{expected_resolution}"'.encode() in body
             expected_ratio = (aspect_ratio or "auto").replace(":", ",")
             assert f'"aspect_ratio": "{expected_ratio}"'.encode() in body
-            if expected_ratio == "auto":
+            if expected_ratio == "auto" or expected_resolution is None:
                 assert b'name="width"' not in body
                 assert b'name="height"' not in body
             else:
@@ -276,8 +275,10 @@ def test_client_preserves_resolution_and_manifest(tmp_path, multiview_client, en
     before = copy.deepcopy(request)
     data, paths = multiview_client.prepare_request(request, tmp_path)
     resolved = json.loads(data["extra_params"])
-    expected = "480" if location == "omitted" else "720"
-    assert resolved["resolution"] == resolved["multiview"]["resolution"] == expected
+    if location == "omitted":
+        assert "resolution" not in resolved and "resolution" not in resolved["multiview"]
+    else:
+        assert resolved["resolution"] == resolved["multiview"]["resolution"] == "720"
     assert "width" not in data and "height" not in data
     assert resolved["multiview"]["aspect_ratio"] == "auto"
     assert paths == [tmp_path / "control.mp4"]
@@ -394,3 +395,109 @@ def test_client_auto_preserves_only_explicit_dimension_constraints(tmp_path, mul
     assert {key: int(data[key]) for key in ("width", "height") if key in data} == dimensions
     overridden, _ = multiview_client.prepare_request(request, tmp_path, resolution_override="720")
     assert "width" not in overridden and "height" not in overridden
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "transfer", "completion", "joint"])
+@pytest.mark.parametrize("vision", ["none", "images", "prefix"])
+def test_request_mode_matrix_preserves_subset_order(mode, vision):
+    keys = contract.COSMOS3_MADS_CAMERAS[2::-1]
+    views = [{"camera_key": key, "prompt": f"Raw caption {i}."} for i, key in enumerate(keys)]
+    extra = {"multiview": {"views": views}}
+    if mode != "ordinary":
+        extra["wsm"] = {}
+        for view in views:
+            view["control_path"] = "control.mp4"
+    if mode == "joint":
+        extra["lidar"] = {"control_path": "map.safetensors"}
+    if mode == "completion":
+        views[0]["vision_path"] = "complete.mp4"
+    elif vision != "none":
+        for view in views:
+            view["vision_path"] = "image.png" if vision == "images" else "prefix.mp4"
+    _, resolved = contract.validate_multiview_request(
+        extra, separate_view_text_tokenization=True, variable_view_count=True
+    )
+    assert [view["camera_key"] for view in resolved] == list(keys)
+
+
+@pytest.mark.parametrize(
+    "failure", ["partial_joint", "extra_hint", "missing_control", "numeric_camera", "missing_caption"]
+)
+def test_joint_request_mode_rejections(failure):
+    extra = contract.resolve_multiview_uploads(manifest(), ["control.mp4"] * 11)
+    extra["lidar"] = {"control_path": "map.safetensors"}
+    for view in extra["multiview"]["views"]:
+        view["prompt"] = "Raw caption."
+    view = extra["multiview"]["views"][0]
+    if failure == "partial_joint":
+        view["vision_path"] = "prefix.mp4"
+    elif failure == "extra_hint":
+        extra["depth"] = {}
+    elif failure == "missing_control":
+        view.pop("control_path")
+    elif failure == "numeric_camera":
+        view["control_path"] = "map.safetensors"
+    else:
+        view.pop("prompt")
+    with pytest.raises(ValueError):
+        contract.validate_multiview_request(extra, separate_view_text_tokenization=True)
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        '{"camera_view": "front", "caption": "drive"}',
+        "The video is captured from a camera mounted on a car. Drive.",
+        "This video is of 480x832 resolution.",
+        "Follow the depth control video precisely: drive",
+        "The video is 6.7 seconds long and is of 30 FPS.",
+    ],
+)
+def test_caption_rejects_runtime_framing(caption):
+    with pytest.raises(ValueError, match="runtime"):
+        contract.validate_camera_caption(caption)
+
+
+@pytest.mark.parametrize("caption", ['{"caption": "Driving."}', ' {"weather": "rain", "objects": []} ', "{}"])
+def test_per_camera_json_objects_are_rejected_before_prompt_formatting(caption):
+    extra = {"multiview": {"views": [{"camera_key": contract.COSMOS3_MADS_CAMERAS[0], "prompt": caption}]}}
+    with pytest.raises(ValueError, match="JSON-object camera prompts"):
+        contract.validate_multiview_request(extra, separate_view_text_tokenization=True, variable_view_count=True)
+
+
+@pytest.mark.parametrize("aspect_ratio", ["auto", "16:9"])
+def test_http_client_leaves_omitted_defaults_for_checkpoint(tmp_path, multiview_client, aspect_ratio):
+    data, _ = multiview_client.prepare_request({"multiview": {"views": [], "aspect_ratio": aspect_ratio}}, tmp_path)
+    extra = json.loads(data["extra_params"])
+    assert "resolution" not in extra and "resolution" not in extra["multiview"]
+    assert "width" not in data and "height" not in data and "fps" not in data
+    assert "emphasize_control_in_prompt" not in extra
+
+
+@pytest.mark.parametrize("index", [True, -1, "11", 0, 12])
+def test_numeric_upload_rejects_invalid_or_reused_index(index):
+    extra = manifest()
+    extra["lidar"] = {"control_reference_index": index}
+    with pytest.raises(ValueError):
+        contract.resolve_multiview_uploads(extra, ["camera.mp4"] * 11 + ["map.safetensors"])
+
+
+def test_joint_client_keeps_captions_and_resolves_numeric_upload(tmp_path, multiview_client):
+    camera = contract.COSMOS3_MADS_CAMERAS[3]
+    for name in ("camera.mp4", "map.safetensors"):
+        (tmp_path / name).write_bytes(b"input")
+    request = {
+        "wsm": {},
+        "num_frames": 201,
+        "fps": 30,
+        "emphasize_control_in_prompt": False,
+        "lidar": {"control_path": "map.safetensors"},
+        "multiview": {"views": [{"camera_key": camera, "control_path": "camera.mp4", "prompt": "Raw."}]},
+    }
+    data, paths = multiview_client.prepare_request(request, tmp_path)
+    extra = json.loads(data["extra_params"])
+    resolved = contract.resolve_multiview_uploads(extra, [str(path) for path in paths])
+    assert resolved["lidar"] == {"control_path": str(tmp_path / "map.safetensors")}
+    assert resolved["multiview"]["views"][0]["prompt"] == "Raw."
+    assert resolved["emphasize_control_in_prompt"] is False
+    assert data["num_frames"] == "201"

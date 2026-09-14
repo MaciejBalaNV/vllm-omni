@@ -103,8 +103,8 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
 
     metadata = build_multiview_flex_metadata(
         seq_len=real_und_len + gen,
-        full_q_offsets=(real_und_len, real_und_len + layout.item_tokens, real_und_len + gen),
-        items_per_sample=layout.mask_items(device),
+        full_q_offsets=(real_und_len, real_und_len + layout.items[0].num_tokens, real_und_len + gen),
+        items_per_sample=layout.items,
         device=device,
         num_und=real_und_len,
         attention_scope=layout.attention_scope,

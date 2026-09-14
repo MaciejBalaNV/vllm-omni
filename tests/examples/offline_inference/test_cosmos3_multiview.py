@@ -57,7 +57,7 @@ def test_model_mode_must_match_per_view_vision_inputs(cosmos3_multiview: ModuleT
 
     with pytest.raises(ValueError, match="must not include"):
         cosmos3_multiview._resolve_model_mode({"model_mode": "text2video"}, i2v_view)
-    with pytest.raises(ValueError, match="requires vision"):
+    with pytest.raises(ValueError, match="requires at least one camera vision"):
         cosmos3_multiview._resolve_model_mode({"model_mode": "image2video"}, t2v_view)
 
 
@@ -69,7 +69,7 @@ def test_resolution_manifest_fields(cosmos3_multiview, resolution, width, height
     assert resolve({"resolution": resolution}, {}) == str(resolution)
     assert resolve({}, {"resolution": resolution}) == str(resolution)
     assert resolve({"resolution": str(resolution)}, {"resolution": resolution}) == str(resolution)
-    assert resolve({}, {}) == "480"
+    assert resolve({}, {}) is None
 
 
 def test_resolution_conflicts_and_invalid_buckets(cosmos3_multiview):
@@ -105,7 +105,11 @@ def test_dimensions_are_constraints_until_geometry_override(cosmos3_multiview, t
             assert (sp.width, sp.height) == expected
             raise StopBeforeGenerationError
 
-    request = {"width": 640, "multiview": {"views": [{"camera_key": "front", "control_path": "wsm.mp4"}]}}
+    request = {
+        "width": 640,
+        "resolution": "480",
+        "multiview": {"views": [{"camera_key": "front", "control_path": "wsm.mp4"}]},
+    }
     with pytest.raises(StopBeforeGenerationError):
         cosmos3_multiview._run_request(
             FakeOmni(),
@@ -403,3 +407,48 @@ def test_run_request_cli_overrides_win_over_record_values(
     assert sampling_params.num_frames == 200
     assert sampling_params.extra_args["multiview"]["num_frames"] == 200
     assert manifest["fps"] == 30.0
+
+
+def test_joint_manifest_paths_resolve_like_http_client(cosmos3_multiview: ModuleType, tmp_path: Path) -> None:
+    request = {
+        "extra_params": {
+            "wsm": {},
+            "lidar": {"control_path": "map.safetensors"},
+            "multiview": {"views": [{"camera_key": "front", "prompt": "Raw.", "control_path": "camera.mp4"}]},
+        }
+    }
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(request))
+    loaded = cosmos3_multiview._load_requests(path)[0]["extra_params"]
+    assert loaded["lidar"]["control_path"] == str(tmp_path / "map.safetensors")
+    assert loaded["multiview"]["views"][0]["control_path"] == str(tmp_path / "camera.mp4")
+    assert loaded["multiview"]["views"][0]["prompt"] == "Raw."
+
+
+@pytest.mark.parametrize("aspect_ratio", ["auto", "16:9"])
+def test_omitted_geometry_uses_checkpoint_defaults(cosmos3_multiview, monkeypatch, tmp_path, aspect_ratio):
+    class FakeOmni:
+        def generate(self, prompt, sp):
+            assert "resolution" not in sp.extra_args
+            assert "resolution" not in sp.extra_args["multiview"]
+            assert sp.width is None and sp.height is None and sp.fps is None
+            return {
+                "payload": {"video": np.broadcast_to(np.zeros(3, dtype=np.float32), (1, 1, 720, 1280, 3))},
+                "metadata": {
+                    "multiview": {
+                        "cameras": ["front"],
+                        "frames_per_view": 1,
+                        "fps": 10,
+                        "resolution": "720",
+                        "aspect_ratio": "16,9",
+                    }
+                },
+            }
+
+    monkeypatch.setattr(cosmos3_multiview, "export_to_video", lambda *args, **kwargs: None)
+    request = {"multiview": {"aspect_ratio": aspect_ratio, "views": [{"camera_key": "front"}]}}
+    manifest = cosmos3_multiview._run_request(
+        FakeOmni(), request, output_dir=tmp_path, seed=42, fallback_negative_prompt=None
+    )
+    assert manifest["resolution"] == "720" and manifest["fps"] == 10
+    assert (manifest["width"], manifest["height"]) == (1280, 720)

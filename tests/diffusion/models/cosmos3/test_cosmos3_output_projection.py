@@ -72,6 +72,58 @@ class _RecordingGenLayer(nn.Module):
         return self.output
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_shared_gen_runner_preserves_wrapped_layers_and_sp_routing(grouped, sequence_parallel):
+    model = _output_model()
+    model.cached_kv = [(torch.tensor([i]), torch.tensor([i + 10])) for i in range(2)]
+    model.cached_freqs_gen = (torch.zeros(1), torch.ones(1))
+    calls = []
+
+    def prepare(hidden, cos, sin):
+        calls.append("prepare")
+        return hidden + 2, cos + 3, sin + 4
+
+    def gather(hidden):
+        calls.append("gather")
+        return hidden - 1
+
+    model.gen_sp_prepare, model.gen_sp_gather = prepare, gather
+    context = object()
+
+    class Layer(nn.Module):
+        def forward(self, hidden, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["multiview_layout"] is context
+            assert kwargs["control_token_sizes"] == (2, 3)
+            assert kwargs["control_weights"] == (0.25, 0.75)
+            if grouped:
+                assert kwargs["cached_kv"] is model.cached_kv
+                cos, sin = kwargs["freqs_gen"]
+            else:
+                cos, sin = kwargs["freqs_cos"], kwargs["freqs_sin"]
+            torch.testing.assert_close(cos, model.cached_freqs_gen[0] + (3 if sequence_parallel else 0))
+            torch.testing.assert_close(sin, model.cached_freqs_gen[1] + (4 if sequence_parallel else 0))
+            return (hidden + (2 if grouped else 1),)
+
+    model.gen_layers = nn.ModuleList([Layer()] if grouped else [Layer(), Layer()])
+    hidden = torch.zeros(1, 5, 8)
+    actual = model._run_gen_layers(
+        hidden,
+        use_sequence_parallel=sequence_parallel,
+        control_token_sizes=(2, 3),
+        control_weights=(0.25, 0.75),
+        multiview_layout=context,
+    )
+    torch.testing.assert_close(actual, hidden + (3 if sequence_parallel else 2))
+    markers = [call for call in calls if isinstance(call, str)]
+    assert markers == (["prepare", "gather"] if sequence_parallel else [])
+    if not grouped:
+        layers = [call for call in calls if isinstance(call, dict)]
+        assert [call["k_und"].item() for call in layers] == [0, 1]
+        assert [call["v_und"].item() for call in layers] == [10, 11]
+
+
 @pytest.mark.parametrize("controls,modality", [(0, None), (1, None), (2, None), (0, "action"), (0, "sound")])
 @torch.inference_mode()
 def test_forward_output_matches_full_norm_and_skips_controls(monkeypatch, controls, modality) -> None:

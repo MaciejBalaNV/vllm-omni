@@ -624,10 +624,10 @@ def test_compressed_block_mask_matches_dense_token_projection(
         seq_len=geometry.padded_und_len + geometry.padded_q_len,
         full_q_offsets=(
             geometry.padded_und_len,
-            geometry.padded_und_len + layout.item_tokens,
-            geometry.padded_und_len + 2 * layout.item_tokens,
+            geometry.padded_und_len + layout.items[0].num_tokens,
+            geometry.padded_und_len + layout.gen_tokens,
         ),
-        items_per_sample=layout.mask_items(torch.device("cpu")),
+        items_per_sample=layout.items,
         device="cpu",
         num_und=3,
         attention_scope=layout.attention_scope,
@@ -683,7 +683,7 @@ def test_flex_attention_matches_dense_masked_gqa_oracle() -> None:
     metadata = build_multiview_flex_metadata(
         seq_len=11,
         full_q_offsets=(3, 7, 11),
-        items_per_sample=layout.mask_items(torch.device("cpu")),
+        items_per_sample=layout.items,
         device="cpu",
         num_und=3,
         attention_scope=layout.attention_scope,
