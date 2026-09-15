@@ -84,8 +84,11 @@ def _build_mask_mod(cutlass, cute, fa_utils):
         result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
         for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
             group_k = k_group_ids[n_idx[j]]
-            word = allowed_words[base + group_k // cutlass.Int32(32)]
-            shift = cutlass.Uint32(group_k % cutlass.Int32(32))
+            # Run ids are non-negative, so the unsigned read is lossless and lets
+            # the divide and modulo reduce to one shift each.
+            group_u = cutlass.Uint32(group_k)
+            word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
+            shift = group_u % cutlass.Uint32(32)
             result[j] = cutlass.Boolean(fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1))
         return result.load()
 
