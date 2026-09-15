@@ -100,7 +100,7 @@ class VideoRopePosition3DEmb(nn.Module):
         self.register_buffer("seq_w", torch.arange(len_w, dtype=torch.float32), persistent=False)
         self.register_buffer("seq_t", torch.arange(len_t, dtype=torch.float32), persistent=False)
 
-    def forward(self, T: int, H: int, W: int) -> torch.Tensor:  # returns [THW,D]
+    def forward(self, T: int, H: int, W: int) -> torch.Tensor:  # returns [T*H*W,D]
         """Returns rope angles of shape ``(T*H*W, head_dim)``.
 
         Each half of the last dim duplicates the per-axis angles
@@ -119,7 +119,7 @@ class VideoRopePosition3DEmb(nn.Module):
         ang_w_b = ang_w.view(1, 1, W, -1).expand(T, H, W, -1)  # [T,H,W,Dw/2]
         half = torch.cat([ang_t_b, ang_h_b, ang_w_b], dim=-1)  # [T,H,W,D/2]
         full = torch.cat([half, half], dim=-1)  # [T,H,W,D]
-        return full.reshape(T * H * W, -1)  # [THW,D]
+        return full.reshape(T * H * W, -1)  # [T*H*W,D]
 
 
 def apply_rotary_emb(
