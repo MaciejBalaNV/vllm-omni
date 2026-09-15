@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803
 """Bit-exact data-movement kernels for the diffusers Wan causal VAE decoder.
 
@@ -22,6 +22,8 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from ._utils import _pick_block_width
+
 _MAX_INT32 = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BLOCK_SIZE = 512
@@ -37,8 +39,6 @@ _ROWS_NUM_WARPS = 8
 # Plane copies: 4096 elements per program on 8 warps = 16 elements (two
 # 16-byte vectors) per thread.
 _PLANE_BLOCK = 4096
-# Column blocks for the row-tiled shortcut add (720p stage rows are 320/640/1280 wide).
-_ROW_BLOCK_WIDTHS = (64, 128, 256)
 # Square tile edge for assembling channels-first input into channels-last output.
 _TRANSPOSE_BLOCK = 64
 _HAS_INTERLEAVE = HAS_TRITON and hasattr(tl, "interleave")
@@ -52,6 +52,7 @@ if HAS_TRITON:
         out_ptr,
         keep_ptr,
         plane_size,
+        blocks_per_plane,
         channels_outer,
         out_frames,
         cache_frames,
@@ -76,8 +77,9 @@ if HAS_TRITON:
         padding is written here; the consumer lets cuDNN pad inside the
         convolution.
         """
-        plane = tl.program_id(0).to(tl.int64)
-        offsets = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        pid = tl.program_id(0).to(tl.int64)
+        plane = pid // blocks_per_plane
+        offsets = (pid % blocks_per_plane) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < plane_size
         frame = plane % out_frames
         rest = plane // out_frames
@@ -533,16 +535,6 @@ def _next_power_of_2(value: int) -> int:
     return 1 << max(0, value - 1).bit_length()
 
 
-def _pick_block_width(width: int) -> int:
-    """The column block (64/128/256) that pads ``width`` the least; ties go to the wider block."""
-    best, best_padded = _ROW_BLOCK_WIDTHS[0], None
-    for block in _ROW_BLOCK_WIDTHS:
-        padded = -(-width // block) * block
-        if best_padded is None or padded <= best_padded:
-            best, best_padded = block, padded
-    return best
-
-
 def cat_pad_5d(
     x: torch.Tensor,
     cache_x: torch.Tensor | None,
@@ -774,7 +766,10 @@ def cat_time_5d(
     else:
         keep_arg = out
 
-    grid = (batch * channels_outer * out_frames, triton.cdiv(plane_size, _PLANE_BLOCK))
+    # Flatten the plane/block grid: large channels-last planes exceed CUDA's
+    # 65,535-block limit on grid-y.
+    blocks_per_plane = triton.cdiv(plane_size, _PLANE_BLOCK)
+    grid = (batch * channels_outer * out_frames * blocks_per_plane,)
     with torch.get_device_module().device(x.device):
         _cat_time_planes_kernel[grid](
             x,
@@ -782,6 +777,7 @@ def cat_time_5d(
             out,
             keep_arg,
             plane_size,
+            blocks_per_plane,
             channels_outer,
             out_frames,
             cache_frames,
