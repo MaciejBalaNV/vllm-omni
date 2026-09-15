@@ -171,14 +171,27 @@ cross-host file transport.
 ## Joint input and caption contract
 
 New exports have `transformer/config.json` → `multiview.schema_version=2`.
-The joint artifact includes `lidar_encoder/config.json` and
-`lidar_encoder/model.safetensors`, containing only the V1.2 encoder and latent
-statistics. Install the optional runtime dependencies with `pip install -e
+The joint artifact includes `lidar_vae/config.json` and
+`lidar_vae/diffusion_pytorch_model.safetensors`, containing the complete V1.2
+encoder, decoder, coordinates, and latent statistics. vLLM-Omni loads only
+the encoder, quantization convolution, and shared buffers in FP32; decoder
+tensors are not materialized. Joint inference returns RGB only.
+
+The VAE config stores resolved network constructor defaults in addition to the
+explicit settings in `transformer/config.json` → `multiview.lidar`. The runtime
+constructs the encoder from the VAE config and requires every explicit
+transformer setting and shared metadata field to agree. The component specifies
+`dtype="float32"` and `sample_posterior=false`. `apply_validity_mask` describes
+decoder behavior and does not change encoder input masking.
+
+Install the optional runtime dependencies with `pip install -e
 '.[cosmos3-lidar]'` in the supported CUDA environment. NATTEN must match the
 installed PyTorch/CUDA build; the reference uses `0.21.6.dev6` builds for
 PyTorch 2.10. No imaginaire4 training packages are needed by the runtime.
-Missing encoder files, incompatible metadata, missing projection weights,
-and invalid latent statistics fail loading.
+Missing VAE files, incompatible metadata, missing projection weights, malformed
+encoder tensors, and invalid latent statistics fail loading. Decoder validation
+belongs to the exporter. The component is loaded directly and does not require
+a LiDAR entry in the Diffusers pipeline indexes.
 
 Each production camera entry must include a nonempty plain-text `prompt`.
 JSON-object per-camera captions are rejected, including objects without metadata

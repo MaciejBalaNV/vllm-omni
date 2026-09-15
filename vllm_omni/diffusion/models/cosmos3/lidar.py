@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""V1.2 LiDAR deployment encoder. Deliberately has no decode method."""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""V1.2 LiDAR encoder loaded from the unified VAE. Deliberately has no decode method."""
 
 from __future__ import annotations
 
@@ -13,10 +13,18 @@ from typing import Any
 import torch
 from torch import nn
 
+_LIDAR_VAE_SUBFOLDER = "lidar_vae"
+_LIDAR_VAE_WEIGHTS = "diffusion_pytorch_model.safetensors"
+
 
 def validate_lidar_config(config: dict[str, Any]) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("LiDAR metadata must be a JSON object.")
     required = {
         "version",
+        "dtype",
+        "sample_posterior",
+        "apply_validity_mask",
         "fps",
         "latent_channels",
         "temporal_compression_factor",
@@ -30,7 +38,13 @@ def validate_lidar_config(config: dict[str, Any]) -> None:
         raise ValueError(f"Incomplete joint artifact: missing LiDAR metadata {sorted(missing)}.")
     if config["version"] != "1.2":
         raise ValueError("Only the V1.2 LiDAR tokenizer is supported.")
+    if config["dtype"] != "float32" or config["sample_posterior"] is not False:
+        raise ValueError("LiDAR requires FP32 execution and posterior-mean encoding.")
+    if not isinstance(config["apply_validity_mask"], bool):
+        raise ValueError("LiDAR apply_validity_mask must be boolean.")
     projection = config["range_projection"]
+    if not isinstance(projection, dict) or not isinstance(config["network_config"], dict):
+        raise ValueError("LiDAR range_projection and network_config must be JSON objects.")
     expected = {
         "semantic_width": 1800,
         "model_width": 1808,
@@ -60,6 +74,18 @@ def validate_lidar_config(config: dict[str, Any]) -> None:
     chunk, context = config["streaming_chunk_frames"], config["streaming_context_frames"]
     if type(chunk) is not int or chunk < 1 or (context is not None and (type(context) is not int or context < chunk)):
         raise ValueError("LiDAR streaming context must be at least the positive chunk length.")
+
+
+def _validate_lidar_vae_config(component: dict[str, Any], deployment: dict[str, Any]) -> None:
+    validate_lidar_config(deployment)
+    validate_lidar_config(component)
+    for key, expected in deployment.items():
+        if key == "network_config":
+            # The VAE resolves constructor defaults that transformer metadata may omit.
+            if any(name not in component[key] or component[key][name] != value for name, value in expected.items()):
+                raise ValueError("LiDAR VAE network_config metadata disagrees with transformer deployment metadata.")
+        elif key not in component or component[key] != expected:
+            raise ValueError(f"LiDAR VAE {key} metadata disagrees with transformer deployment metadata.")
 
 
 def prepare_lidar_encoder_input(frames: torch.Tensor, projection: dict[str, Any]) -> torch.Tensor:
@@ -98,21 +124,43 @@ class Cosmos3LidarEncoder(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_path: str, config: dict[str, Any], device: torch.device) -> Cosmos3LidarEncoder:
-        from safetensors.torch import load_file
+        from safetensors import safe_open
 
-        folder = Path(model_path) / "lidar_encoder"
-        if not Path(model_path).exists():
+        checkpoint_path = Path(model_path)
+        if not checkpoint_path.exists():
             from huggingface_hub import snapshot_download
 
-            folder = Path(snapshot_download(model_path, allow_patterns=["lidar_encoder/*"])) / "lidar_encoder"
-        if not (folder / "config.json").is_file() or not (folder / "model.safetensors").is_file():
-            raise ValueError("Incomplete joint artifact: lidar_encoder/config.json and model.safetensors are required.")
-        if json.loads((folder / "config.json").read_text()) != config:
-            raise ValueError("LiDAR encoder metadata disagrees with transformer deployment metadata.")
+            checkpoint_path = Path(
+                snapshot_download(
+                    model_path,
+                    allow_patterns=[
+                        f"{_LIDAR_VAE_SUBFOLDER}/config.json",
+                        f"{_LIDAR_VAE_SUBFOLDER}/{_LIDAR_VAE_WEIGHTS}",
+                    ],
+                )
+            )
+        folder = checkpoint_path / _LIDAR_VAE_SUBFOLDER
+        if not (folder / "config.json").is_file() or not (folder / _LIDAR_VAE_WEIGHTS).is_file():
+            raise ValueError(
+                f"Incomplete joint artifact: {_LIDAR_VAE_SUBFOLDER}/config.json and {_LIDAR_VAE_WEIGHTS} are required."
+            )
+        component_config = json.loads((folder / "config.json").read_text())
+        _validate_lidar_vae_config(component_config, config)
         # Pipeline construction may set the default parameter dtype to BF16.
         # Convert before loading so FP32 checkpoint values are never rounded.
-        model = cls(config).float()
-        model.load_state_dict(load_file(folder / "model.safetensors"), strict=True)
+        model = cls(component_config).float()
+        expected = model.state_dict()
+        with safe_open(folder / _LIDAR_VAE_WEIGHTS, framework="pt", device="cpu") as weights:
+            # Leave the unused decoder in the file; only the exporter validates its state.
+            encoder_keys = [name for name in weights.keys() if not name.startswith(("decoder.", "post_quant_conv."))]
+            if unexpected := set(encoder_keys) - expected.keys():
+                raise ValueError(f"Unexpected LiDAR encoder tensors: {sorted(unexpected)}.")
+            state = {}
+            for name in encoder_keys:
+                if expected[name].is_floating_point() and weights.get_slice(name).get_dtype() != "F32":
+                    raise ValueError(f"LiDAR encoder tensor {name} must be FP32.")
+                state[name] = weights.get_tensor(name)
+            model.load_state_dict(state, strict=True)
         if (
             not torch.isfinite(model.latent_mean).all()
             or not torch.isfinite(model.latent_std).all()
