@@ -124,9 +124,8 @@ def encoder_forward(
     for block in self.down_blocks:
         x = block(x, feat_cache=feat_cache, feat_idx=feat_idx)
     x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
-    x = fp._norm_act(self.norm_out, self.nonlinearity, x)
     if feat_cache is None:
-        return self.conv_out(x)
-    x = fp._run_cached_causal_conv(self.conv_out, x, feat_cache, feat_idx[0])
+        return self.conv_out(fp._norm_act(self.norm_out, self.nonlinearity, x))
+    x = fp._run_norm_act_cached_conv(self.norm_out, self.nonlinearity, self.conv_out, x, feat_cache, feat_idx[0])
     feat_idx[0] += 1
     return x

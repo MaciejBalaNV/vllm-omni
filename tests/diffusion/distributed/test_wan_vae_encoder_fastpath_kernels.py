@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -17,6 +19,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import encoder_forwards as ef
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_downsample as down
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_norm_cache as nc
 
 pytestmark = [
     pytest.mark.core_model,
@@ -194,3 +197,153 @@ def test_production_width_normalization(channels, dtype):
     expected = F.silu(norm(cl))
     tol = 0.04 if dtype == torch.bfloat16 else 0.004 if dtype == torch.float16 else 1e-5
     torch.testing.assert_close(actual, expected, atol=tol, rtol=tol)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("layout", ["contiguous", "frame_major", "channels_last"])
+@pytest.mark.parametrize("channels", [160, 320, 640])
+@pytest.mark.parametrize("frames,history", [(1, 0), (1, 1), (1, 2), (2, 2), (4, 2)])
+@pytest.mark.parametrize("silu", [False, True])
+def test_fused_norm_cache_matches_existing_kernels(dtype, layout, channels, frames, history, silu):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+
+    channels_last = layout == "channels_last"
+    fmt = torch.channels_last_3d if channels_last else torch.contiguous_format
+    # Odd spatial size exercises masked tiles; batch > 1 and sliced history
+    # exercise storage offsets and noncanonical cache batch/channel strides.
+    x = torch.randn(2, channels, frames, 3, 11, device="cuda", dtype=dtype)
+    if channels_last:
+        x = x.contiguous(memory_format=fmt)
+    elif layout == "frame_major":
+        x = x.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4)
+    norm = WanRMS_norm(channels, images=False).to(device="cuda", dtype=dtype)
+    norm.gamma.uniform_(-2, 2)
+    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last))
+    bias = torch.randn(channels, device="cuda", dtype=dtype) if channels_last else None
+    cache = None
+    if history:
+        cache = torch.randn(2, channels, history + 2, 3, 11, device="cuda", dtype=dtype).contiguous(memory_format=fmt)
+        cache[:, ::3] = -0.0
+        cache = cache[:, :, 1 : history + 1]
+    previous = None if cache is None else cache.clone()
+    normalized = fp.rms_norm_fastpath(norm, x, silu=silu, bias=bias)
+    expected, expected_cache = fp.dm.cat_time_5d(normalized, cache, 2, keep_cache_frames=2)
+    actual, actual_cache = nc.norm_act_cat_time(
+        x, norm.gamma, norm.scale, cache, 2, channels_last=channels_last, silu=silu, bias=bias
+    )
+    bits_equal(actual, expected)
+    bits_equal(actual_cache, expected_cache)
+    if cache is not None:
+        bits_equal(cache, previous)
+    assert actual.is_contiguous(memory_format=fmt) and actual_cache.is_contiguous(memory_format=fmt)
+    assert actual.untyped_storage().data_ptr() != actual_cache.untyped_storage().data_ptr()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("channels_last", [False, True])
+@pytest.mark.parametrize("pad", [0, 2])
+def test_fused_norm_cache_edge_values(dtype, channels_last, pad):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+
+    x = torch.zeros(1, 160, 1, 1, 2051, device="cuda", dtype=dtype)
+    x[..., 1::4] = -0.0
+    x[:, ::2, :, :, 2::4] = torch.finfo(dtype).tiny
+    x[:, ::2, :, :, 3::4] = 1
+    x[:, 1::2, :, :, 3::4] = -1
+    if channels_last:
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    norm = WanRMS_norm(160, images=False).to(device="cuda", dtype=dtype)
+    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last))
+    expected = fp.rms_norm_fastpath(norm, x, silu=True)
+    expected, history = fp.dm.cat_time_5d(expected, None, pad, keep_cache_frames=2)
+    actual, cache = nc.norm_act_cat_time(x, norm.gamma, norm.scale, None, pad, channels_last=channels_last, silu=True)
+    bits_equal(actual, expected)
+    bits_equal(cache, history)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("channels_last", [False, True])
+@pytest.mark.parametrize(
+    "invalid", ["gamma_dtype", "gamma_shape", "layout", "cache_dtype", "cache_length", "grad", "compile"]
+)
+def test_fused_norm_cache_declines_unsupported_inputs(monkeypatch, channels_last, invalid):
+    fmt = torch.channels_last_3d if channels_last else torch.contiguous_format
+    x = torch.randn(1, 160, 1, 4, 8, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=fmt)
+    gamma = torch.ones(160, device="cuda", dtype=x.dtype)
+    cache = torch.randn(1, 160, 2, 4, 8, device="cuda", dtype=x.dtype).contiguous(memory_format=fmt)
+    if invalid == "gamma_dtype":
+        gamma = gamma.float()
+    elif invalid == "gamma_shape":
+        gamma = gamma[:80]
+    elif invalid == "layout":
+        x = x[..., ::2]
+    elif invalid == "cache_dtype":
+        cache = cache.float()
+    elif invalid == "cache_length":
+        cache = torch.cat((cache, cache), dim=2)
+    elif invalid == "compile":
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    previous = cache.clone()
+    with torch.set_grad_enabled(invalid == "grad"):
+        assert nc.norm_act_cat_time(x, gamma, 160**0.5, cache, 2, channels_last=channels_last, silu=True) is None
+    bits_equal(cache, previous)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("level", ["lossless", "channels_last"])
+@pytest.mark.parametrize("frames", [1, 9])
+def test_encoder_norm_cache_fusion_adds_no_posterior_drift(monkeypatch, dtype, level, frames):
+    torch.manual_seed(42)
+    vae = AutoencoderKLWan(**CONFIG).eval().to(device="cuda", dtype=dtype)
+    assert install_wan_vae_encoder_fastpath(vae, level=level).installed
+    configs = [(m, getattr(m, fp.CFG_ATTR)) for m in vae.encoder.modules() if hasattr(m, fp.CFG_ATTR)]
+    x = torch.rand(1, 3, frames, 64, 96, device="cuda", dtype=dtype) * 2 - 1
+    for module, cfg in configs:
+        setattr(module, fp.CFG_ATTR, replace(cfg, fuse_norm_cache=False))
+    expected = encode_frames(vae, x)
+    for module, cfg in configs:
+        setattr(module, fp.CFG_ATTR, cfg)
+    fused = nc.norm_act_cat_time
+    hits = []
+
+    def record(*args, **kwargs):
+        pair = fused(*args, **kwargs)
+        if pair is not None:
+            hits.append(args[0].shape)
+        return pair
+
+    monkeypatch.setattr(nc, "norm_act_cat_time", record)
+    actual = encode_frames(vae, x)
+    bits_equal(actual, expected)
+    if level == "channels_last" or dtype in configs[0][1].fused_silu_dtypes:
+        assert hits, "parity must exercise the fused kernel, not only its fallback"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_norm_cache_history_across_fusion_and_fallback(monkeypatch, dtype, channels_last):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanRMS_norm
+
+    norm = WanRMS_norm(160, images=False).to(device="cuda", dtype=dtype)
+    conv = WanCausalConv3d(160, 160, 3, padding=1).eval().to(device="cuda", dtype=dtype)
+    if channels_last:
+        conv.to(memory_format=torch.channels_last_3d)
+    cfg = fp.FastPathConfig(fused_silu_dtypes=frozenset({dtype}), channels_last=channels_last, fuse_norm_cache=True)
+    setattr(norm, fp.CFG_ATTR, cfg)
+    cache, reference_cache = [None], [None]
+    fused = nc.norm_act_cat_time
+    for i, frames in enumerate((1, 1, 4, 1, 2)):
+        x = torch.randn(1, 160, frames, 6, 10, device="cuda", dtype=dtype)
+        if channels_last:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
+        bias = torch.randn(160, device="cuda", dtype=dtype) if channels_last else None
+        normalized = fp._norm_act(norm, torch.nn.SiLU(), x, pending_bias=bias)
+        expected = fp._run_cached_causal_conv(conv, normalized, reference_cache, 0)
+        monkeypatch.setattr(nc, "norm_act_cat_time", (lambda *a, **kw: None) if i == 2 else fused)
+        actual = fp._run_norm_act_cached_conv(norm, torch.nn.SiLU(), conv, x, cache, 0, pending_bias=bias)
+        bits_equal(actual, expected)
+        bits_equal(cache[0], reference_cache[0])

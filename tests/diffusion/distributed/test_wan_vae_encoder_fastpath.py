@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResample, WanRMS_norm
 from torch import nn
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
@@ -204,6 +204,8 @@ def test_encoder_decoder_installation_is_independent(encode_first):
     for install in installers:
         assert install(vae, level="channels_last").installed
     assert is_encoder_installed(vae) and is_installed(vae)
+    assert getattr(vae.encoder, fp.CFG_ATTR).fuse_norm_cache
+    assert not getattr(vae.decoder, fp.CFG_ATTR).fuse_norm_cache
     decoder_stride = vae.decoder.conv_in.weight.stride()
     vae.encoder.conv_in.weight.add_(1)
     updated = vae.encoder.conv_in.weight.clone()
@@ -435,3 +437,131 @@ def test_convolution_probes_are_scoped_to_backend_settings():
         assert fp._conv_verdict_key(conv, x, 1) != original
     assert fp._conv_verdict_key(conv, x, 2) != original
     assert fp._conv_verdict_key(conv, x, 1) == original
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("channels_last", [False, True])
+@pytest.mark.parametrize("return_bias", [False, True])
+@pytest.mark.parametrize("history", [None, "Rep", 1, 2])
+def test_norm_cache_fusion_dispatch(monkeypatch, channels_last, return_bias, history):
+    norm = WanRMS_norm(8, images=False).eval()
+    conv = WanCausalConv3d(8, 8, 3, padding=1).eval()
+    cfg = fp.FastPathConfig(
+        fused_silu_dtypes=frozenset({torch.float32}), channels_last=channels_last, fuse_norm_cache=True
+    )
+    setattr(norm, fp.CFG_ATTR, cfg)
+    x = torch.randn(2, 8, 1, 3, 5)
+    bias = torch.randn(8) if channels_last else None
+    payload = torch.randn(2, 8, history, 3, 5) if isinstance(history, int) else None
+    cache = [payload if payload is not None else history]
+    normalized = F.silu(norm(x if bias is None else fp._add_channel_bias(x, bias)))
+    assembled = F.pad(
+        normalized if payload is None else torch.cat((payload, normalized), dim=2),
+        (0, 0, 0, 0, 2 if payload is None else 2 - payload.shape[2], 0),
+    )
+    next_cache = assembled[:, :, -2:].clone()
+    expected = F.conv3d(F.pad(assembled, (1, 1, 1, 1)), conv.weight, None if return_bias else conv.bias)
+    seen = []
+
+    def fused(source, gamma, scale, previous, pad, **kwargs):
+        assert source is x and gamma is norm.gamma and scale == norm.scale
+        assert previous is payload and pad == 2
+        assert kwargs == dict(channels_last=channels_last, silu=True, bias=bias)
+        seen.append(True)
+        return assembled, next_cache
+
+    monkeypatch.setattr(fp, "_kernels_allowed", lambda _x: True)
+    monkeypatch.setattr(fp.nc, "norm_act_cat_time", fused)
+    monkeypatch.setattr(fp, "_norm_act", lambda *a, **kw: pytest.fail("normalized temporary must not be made"))
+    monkeypatch.setattr(fp.dm, "cat_time_5d", lambda *a, **kw: pytest.fail("separate assembly must not run"))
+    result = fp._run_norm_act_cached_conv(
+        norm, nn.SiLU(), conv, x, cache, 0, pending_bias=bias, return_bias=return_bias, after_norm=nn.Dropout().eval()
+    )
+    actual, deferred = result if return_bias else (result, None)
+    bits_equal(actual, expected)
+    assert deferred is (conv.bias if return_bias else None)
+    assert seen == [True] and cache[0] is next_cache
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "reason",
+    ["disabled", "silu", "norm", "dropout_active", "dropout_hook", "dropout_custom", "padding", "kernel"],
+)
+def test_norm_cache_fusion_falls_back_in_order(monkeypatch, reason):
+    norm = WanRMS_norm(8, images=False).eval()
+    conv = WanCausalConv3d(8, 8, 3, padding=1).eval()
+    setattr(
+        norm,
+        fp.CFG_ATTR,
+        fp.FastPathConfig(
+            fused_silu_dtypes=frozenset() if reason == "silu" else frozenset({torch.float32}),
+            fuse_norm_cache=reason != "disabled",
+        ),
+    )
+    if reason == "norm":
+        norm = nn.Identity()
+    dropout = nn.Dropout(0.0).eval()
+    events = []
+    if reason == "dropout_active":
+        dropout.train().p = 0.5
+    elif reason == "dropout_hook":
+        dropout.register_forward_hook(lambda *_: events.append("hook"))
+    elif reason == "dropout_custom":
+        dropout.forward = lambda x: events.append("custom") or x
+    x = torch.randn(1, 8, 1, 3, 5)
+    cache = [torch.randn(1, 8, 2, 3, 5)]
+    previous = cache[0]
+    bias = torch.randn(8)
+    if reason == "padding":
+        fp._SPATIAL_PAD_VERDICTS[conv] = {fp._conv_verdict_key(conv, x, 2): False}
+
+    def declined(*a, **kw):
+        assert reason == "kernel", "ineligible fusion must decline before allocating or reducing"
+        assert cache[0] is previous
+        events.append("decline")
+        return None
+
+    def normalized(n, act, source, *, pending_bias):
+        assert n is norm and source is x and pending_bias is bias
+        events.append("norm")
+        return source + 1
+
+    def cached(c, source, slots, index, *, return_bias):
+        assert c is conv and slots is cache and index == 0 and return_bias
+        assert slots[0] is previous
+        events.append("conv")
+        return source, None
+
+    monkeypatch.setattr(fp, "_kernels_allowed", lambda _x: True)
+    monkeypatch.setattr(fp.nc, "norm_act_cat_time", declined)
+    monkeypatch.setattr(fp, "_norm_act", normalized)
+    monkeypatch.setattr(fp, "_run_cached_causal_conv", cached)
+    fp._run_norm_act_cached_conv(
+        norm, nn.SiLU(), conv, x, cache, 0, pending_bias=bias, after_norm=dropout, return_bias=True
+    )
+    assert events == (
+        (["decline"] if reason == "kernel" else [])
+        + ["norm"]
+        + (["hook"] if reason == "dropout_hook" else ["custom"] if reason == "dropout_custom" else [])
+        + ["conv"]
+    )
+
+
+def test_norm_cache_does_not_skip_global_dropout_hooks():
+    dropout = nn.Dropout().eval()
+    assert fp._can_bypass_dropout(dropout)
+    handle = nn.modules.module.register_module_forward_hook(lambda *_: None)
+    try:
+        assert not fp._can_bypass_dropout(dropout)
+    finally:
+        handle.remove()
+
+
+@torch.no_grad()
+def test_norm_cache_kernel_declines_cpu_without_mutation():
+    x = torch.randn(1, 8, 1, 3, 5)
+    cache = torch.randn(1, 8, 2, 3, 5)
+    previous = cache.clone()
+    assert fp.nc.norm_act_cat_time(x, torch.ones(8), 8**0.5, cache, 2, channels_last=False, silu=True) is None
+    bits_equal(cache, previous)

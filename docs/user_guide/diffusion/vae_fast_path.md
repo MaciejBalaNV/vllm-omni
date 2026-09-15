@@ -82,6 +82,16 @@ Other Wan architectures retain their reference encoding path.
 | `channels_last` | no | Also converts encoder convolution weights to channels-last, uses single-pass normalization and fuses shortcut averaging with residual addition. Outputs can differ in the last bits. |
 | `off` | no | Reference encoding. |
 
+For eligible cached encoder convolutions, normalization/SiLU writes directly
+into the temporally assembled convolution input and the next two-frame cache.
+Already-normalized history is copied unchanged; missing history stays zero.
+`lossless` retains ATen's reduction and the existing intermediate rounding,
+and only folds SiLU for dtypes that pass the installation-time exactness probe.
+`channels_last` retains its existing single-pass normalization math; this fusion
+does not change its quality gates. Unsupported layouts, non-identity or hooked
+dropout, and rejected spatial-padding probes use the existing separate path.
+This fusion is encoder-only; decoder dispatch is unchanged.
+
 Untiled encoding patchifies one temporal chunk at a time and writes encoder
 features into a preallocated buffer. The schedule remains one initial frame,
 then four frames per chunk. `quant_conv` runs once after assembly. Tiled

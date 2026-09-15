@@ -221,6 +221,7 @@ def _install_bindings(
         fused_silu_dtypes=fused_silu_dtypes,
         channels_last=level == "channels_last",
         clone_encoder_shortcuts=clone_encoder_shortcuts,
+        fuse_norm_cache=encoder,
     )
 
     with ExitStack() as rollback:
