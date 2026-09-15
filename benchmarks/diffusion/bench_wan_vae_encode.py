@@ -13,6 +13,8 @@ Examples::
 RGB tensor [B, 3, T, H, W] in [-1, 1]. Input loading/transfers, JIT compilation,
 quality checks and optional reference-decoder reconstruction are outside timing.
 The default input is seeded uniform noise. The reference always runs first.
+Console output uses timing and quality tables; ``--json`` saves full metrics
+and per-level failure reasons.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
 )
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+MAX_NORMALIZED_RMSE = 0.01
+MIN_RECONSTRUCTION_PSNR_DB = 50.0
 TINY_CONFIG = dict(
     base_dim=20,
     decoder_base_dim=32,
@@ -174,96 +178,248 @@ def differences(actual, reference):
     return {"bitwise_equal": equal, "max_abs_diff": error.abs().max().item(), "normalized_rmse": rmse / scale}
 
 
+def validate_result(result, reference):
+    """Attach quality metrics and explicit failure reasons to one timed result."""
+    stats, moments, mean, logvar, reconstruction = result
+    level = stats["level"]
+    errors = stats["errors"] = []
+    if reference is None:
+        stats["status"] = "unvalidated"
+        errors.append(f"[{level}] reference level 'off' is unavailable; cannot compute speedup or validate outputs.")
+        return
+
+    stats["speedup"] = reference[0]["median_s"] / stats["median_s"]
+    for name, actual, expected in (
+        ("moments", moments, reference[1]),
+        ("mean", mean, reference[2]),
+        ("logvar", logvar, reference[3]),
+    ):
+        metrics = stats[name] = differences(actual, expected)
+        nrmse = metrics["normalized_rmse"]
+        max_abs = metrics["max_abs_diff"]
+        if not math.isfinite(nrmse) or not math.isfinite(max_abs):
+            errors.append(
+                f"[{level}] {name}: nonfinite comparison metrics "
+                f"(normalized_rmse={nrmse!r}, max_abs_diff={max_abs!r}); "
+                "check candidate/reference tensors for NaN, Inf or numerical overflow."
+            )
+        if level == "lossless" and not metrics["bitwise_equal"]:
+            errors.append(
+                f"[{level}] {name}: bitwise_equal=False, required True "
+                f"(max_abs_diff={max_abs:.6g}, normalized_rmse={nrmse!r})."
+            )
+        if level == "channels_last" and math.isfinite(nrmse) and nrmse > MAX_NORMALIZED_RMSE:
+            errors.append(
+                f"[{level}] {name}: normalized_rmse={nrmse!r} exceeds "
+                f"{MAX_NORMALIZED_RMSE:g} ({MAX_NORMALIZED_RMSE:.0%}); max_abs_diff={max_abs:.6g}."
+            )
+    if reconstruction is not None:
+        mse = (reconstruction.float() - reference[4].float()).square().mean().item()
+        if not math.isfinite(mse):
+            psnr = math.nan if math.isnan(mse) else -math.inf
+        else:
+            psnr = math.inf if mse == 0 else 10 * math.log10(4 / mse)
+        stats["reconstruction_psnr_db"] = "inf" if psnr == math.inf else psnr
+        if math.isnan(psnr) or psnr < MIN_RECONSTRUCTION_PSNR_DB:
+            errors.append(
+                f"[{level}] reconstruction: PSNR={psnr!r} dB, "
+                f"required >= {MIN_RECONSTRUCTION_PSNR_DB:g} dB (MSE={mse!r})."
+            )
+    stats["status"] = "validation_failed" if errors else "ok"
+
+
+def _print_table(headers, rows, text_columns=2):
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+    for index, row in enumerate([headers, *rows]):
+        print(
+            "  ".join(
+                value.ljust(width) if i < text_columns else value.rjust(width)
+                for i, (value, width) in enumerate(zip(row, widths))
+            )
+        )
+        if index == 0:
+            print("  ".join("-" * width for width in widths))
+
+
+def print_results(results, environment):
+    """Human-readable report; retain the full machine-readable data in --json."""
+    shape = "x".join(map(str, environment["input_shape"]))
+    print(f"\nWan VAE encoder | {environment['gpu']} | {environment['dtype']} | RGB {shape} (B,C,T,H,W)")
+    print(f"Model: {environment['model']} | GPUs: {environment['world_size']} | tiling: {environment['tiling']}")
+    print("\nTiming (validation status is separate from speedup)")
+    labels = {"ok": "PASS", "validation_failed": "FAIL", "oom": "OOM", "unvalidated": "NO REF"}
+    rows = []
+    for stats in results:
+        rows.append(
+            [
+                stats["level"],
+                labels[stats["status"]],
+                f"{stats['median_s']:.4f}" if "median_s" in stats else "-",
+                f"{stats['speedup']:.2f}x" if "speedup" in stats else "-",
+                f"{stats['frames_per_s']:.2f}" if "frames_per_s" in stats else "-",
+                f"{stats['peak_gib']:.2f}" if "peak_gib" in stats else "-",
+                f"{stats['install_s']:.4f}" if "install_s" in stats else "-",
+                f"{stats['first_call_s']:.4f}" if "first_call_s" in stats else "-",
+            ]
+        )
+    _print_table(
+        ["Level", "Status", "Median (s)", "Speedup", "Frames/s", "Peak (GiB)", "Install (s)", "First (s)"], rows
+    )
+
+    rows = []
+    for stats in results:
+        for name in ("moments", "mean", "logvar"):
+            if name in stats:
+                metrics = stats[name]
+                rows.append(
+                    [
+                        stats["level"],
+                        name,
+                        "yes" if metrics["bitwise_equal"] else "no",
+                        f"{metrics['max_abs_diff']:.6g}",
+                        f"{metrics['normalized_rmse']:.4%}",
+                    ]
+                )
+    if rows:
+        print("\nPosterior quality vs. off (NRMSE is normalized RMSE; bitwise 'no' is allowed for channels_last)")
+        _print_table(["Level", "Tensor", "Bitwise", "Max abs diff", "NRMSE"], rows)
+    rows = [
+        [stats["level"], f"{float(stats['reconstruction_psnr_db']):.2f}"]
+        for stats in results
+        if "reconstruction_psnr_db" in stats
+    ]
+    if rows:
+        print("\nReference-decoder reconstruction quality")
+        _print_table(["Level", "PSNR (dB)"], rows, text_columns=1)
+    print(
+        f"\nGates: lossless must be bitwise equal; channels_last NRMSE <= {MAX_NORMALIZED_RMSE:.0%}; "
+        "posterior comparison metrics must be finite."
+    )
+    if rows:
+        print(f"Reconstruction gate: PSNR >= {MIN_RECONSTRUCTION_PSNR_DB:g} dB.")
+    print(flush=True)
+
+
+def failure_summary(results):
+    failed = [stats for stats in results if stats["status"] != "ok"]
+    lines = [f"Encoder benchmark failed for {len(failed)} level(s):"]
+    lines.extend(f"  - {error}" for stats in failed for error in stats["errors"])
+    return "\n".join(lines)
+
+
 @torch.inference_mode()
 def run_level(args, level, pixels, rank):
-    vae = load_vae(args)
-    inputs = pixels.to(device="cuda", dtype=DTYPES[args.dtype])
-    sync()
-    start = time.perf_counter()
-    report = install_wan_vae_encoder_fastpath(vae, level=level)
-    sync()
-    install_time = max_across_ranks(time.perf_counter() - start)
-    if level != "off" and not report.installed:
-        raise RuntimeError(f"requested encoder fast path was not installed: {report.reason}")
-    sync()
-    start = time.perf_counter()
-    vae.encode(inputs)
-    sync()
-    first_call = max_across_ranks(time.perf_counter() - start)
-    for _ in range(args.warmup):
-        vae.encode(inputs)
-    sync()
-    torch.accelerator.reset_peak_memory_stats()
-    times = []
-    posterior = None
-    for _ in range(args.iters):
-        posterior = None
+    phase = "model loading"
+    try:
+        vae = load_vae(args)
+        phase = "input transfer"
+        inputs = pixels.to(device="cuda", dtype=DTYPES[args.dtype])
         sync()
         start = time.perf_counter()
-        posterior = vae.encode(inputs).latent_dist
-        torch.accelerator.synchronize()
-        times.append(max_across_ranks(time.perf_counter() - start))
-    peak = max_across_ranks(torch.accelerator.max_memory_allocated()) / 2**30
-    median = statistics.median(times)
-    stats = dict(
-        status="ok",
-        level=level,
-        install_s=install_time,
-        first_call_s=first_call,
-        median_s=median,
-        min_s=min(times),
-        times_s=times,
-        peak_gib=peak,
-        frames_per_s=inputs.shape[0] * inputs.shape[2] / median,
-        patched=dict(report.patched),
-        fused_silu=report.fused_silu_dtypes,
-        checkpoint_revision=getattr(vae.config, "_commit_hash", None),
-    )
-    moments = posterior.parameters.detach().cpu()
-    logvar = posterior.logvar.detach().cpu()
-    mean = posterior.mode().detach().cpu()
-    del posterior
-    reconstruction = None
-    if args.check_reconstruction:
-        # No decoder fast path is installed in this benchmark. Every candidate
-        # is reconstructed by the same reference decoder weights and settings.
-        decoded = vae.decode(mean.to(device="cuda", dtype=DTYPES[args.dtype])).sample
-        if rank == 0:
-            reconstruction = decoded.cpu()
-        del decoded
-    if args.profile:
-        from torch.profiler import ProfilerActivity, profile
-
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        phase = "fast-path installation"
+        report = install_wan_vae_encoder_fastpath(vae, level=level)
+        sync()
+        install_time = max_across_ranks(time.perf_counter() - start)
+        if level != "off" and not report.installed:
+            raise RuntimeError(f"[{level}] requested encoder fast path was not installed: {report.reason}")
+        sync()
+        start = time.perf_counter()
+        phase = "first encode"
+        vae.encode(inputs)
+        sync()
+        first_call = max_across_ranks(time.perf_counter() - start)
+        phase = "encode warmup"
+        for _ in range(args.warmup):
             vae.encode(inputs)
+        sync()
+        torch.accelerator.reset_peak_memory_stats()
+        times = []
+        posterior = None
+        phase = "timed encoding"
+        for _ in range(args.iters):
+            posterior = None
             sync()
-        if rank == 0:
-            kernels = {}
-            for event in prof.events():
-                if event.device_type.name == "CUDA":
-                    entry = kernels.setdefault(event.name, {"name": event.name, "ms": 0.0, "calls": 0})
-                    entry["ms"] += event.device_time_total / 1000
-                    entry["calls"] += 1
-            ordered = sorted(kernels.values(), key=lambda item: item["ms"], reverse=True)
-            total = sum(item["ms"] for item in ordered)
-            conv = sum(
-                item["ms"]
-                for item in ordered
-                if any(tag in item["name"].lower() for tag in ("conv", "cudnn", "gemm", "cutlass", "xmma"))
-            )
-            stats["profile"] = {
-                "kernel_time_ms": total,
-                "conv_like_percent": 100 * conv / total if total else 0,
-                "kernels": ordered[: args.profile_rows],
-            }
-            print(f"[{level}] CUDA operator profile")
-            print(prof.key_averages().table(sort_by="self_device_time_total", row_limit=args.profile_rows))
-    del vae, inputs
-    # Instance-bound forwards form cycles; collect them before the next level
-    # so its peak memory excludes the previous model's parameters.
-    gc.collect()
-    torch.accelerator.empty_cache()
-    return stats, moments, mean, logvar, reconstruction
+            start = time.perf_counter()
+            posterior = vae.encode(inputs).latent_dist
+            torch.accelerator.synchronize()
+            times.append(max_across_ranks(time.perf_counter() - start))
+        peak = max_across_ranks(torch.accelerator.max_memory_allocated()) / 2**30
+        median = statistics.median(times)
+        stats = dict(
+            status="ok",
+            level=level,
+            install_s=install_time,
+            first_call_s=first_call,
+            median_s=median,
+            min_s=min(times),
+            times_s=times,
+            peak_gib=peak,
+            frames_per_s=inputs.shape[0] * inputs.shape[2] / median,
+            patched=dict(report.patched),
+            fused_silu=report.fused_silu_dtypes,
+            checkpoint_revision=getattr(vae.config, "_commit_hash", None),
+        )
+        phase = "posterior transfer"
+        moments = posterior.parameters.detach().cpu()
+        logvar = posterior.logvar.detach().cpu()
+        mean = posterior.mode().detach().cpu()
+        del posterior
+        reconstruction = None
+        if args.check_reconstruction:
+            phase = "reference-decoder reconstruction"
+            # No decoder fast path is installed in this benchmark. Every candidate
+            # is reconstructed by the same reference decoder weights and settings.
+            decoded = vae.decode(mean.to(device="cuda", dtype=DTYPES[args.dtype])).sample
+            if rank == 0:
+                reconstruction = decoded.cpu()
+            del decoded
+        if args.profile:
+            phase = "profiling"
+            from torch.profiler import ProfilerActivity, profile
+
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                vae.encode(inputs)
+                sync()
+            if rank == 0:
+                kernels = {}
+                for event in prof.events():
+                    if event.device_type.name == "CUDA":
+                        entry = kernels.setdefault(event.name, {"name": event.name, "ms": 0.0, "calls": 0})
+                        entry["ms"] += event.device_time_total / 1000
+                        entry["calls"] += 1
+                ordered = sorted(kernels.values(), key=lambda item: item["ms"], reverse=True)
+                total = sum(item["ms"] for item in ordered)
+                conv = sum(
+                    item["ms"]
+                    for item in ordered
+                    if any(tag in item["name"].lower() for tag in ("conv", "cudnn", "gemm", "cutlass", "xmma"))
+                )
+                stats["profile"] = {
+                    "kernel_time_ms": total,
+                    "conv_like_percent": 100 * conv / total if total else 0,
+                    "kernels": ordered[: args.profile_rows],
+                }
+                print(f"[{level}] CUDA operator profile")
+                print(prof.key_averages().table(sort_by="self_device_time_total", row_limit=args.profile_rows))
+        phase = "cleanup"
+        del vae, inputs
+        # Instance-bound forwards form cycles; collect them before the next level
+        # so its peak memory excludes the previous model's parameters.
+        gc.collect()
+        torch.accelerator.empty_cache()
+        return stats, moments, mean, logvar, reconstruction
+    except torch.OutOfMemoryError as exc:
+        if phase == "model loading":
+            hint = "Free GPU memory before loading the VAE, or use --tiny for a development-only run."
+        elif phase == "reference-decoder reconstruction":
+            hint = "Try a smaller input or omit --check-reconstruction to benchmark encoding alone."
+        else:
+            hint = "Try a smaller --size/--frames workload or enable --tiling."
+        raise torch.OutOfMemoryError(
+            f"[{level}] out of memory during {phase} "
+            f"(input={list(pixels.shape)}, dtype={args.dtype}). {hint}\n"
+            f"    Original error: {exc}"
+        ) from exc
 
 
 def package_version(name):
@@ -282,7 +438,6 @@ def main():
     pixels = make_pixels(args)
     results = []
     reference = None
-    failed = False
     environment = dict(
         gpu=torch.cuda.get_device_name(),
         capability=torch.cuda.get_device_capability(),
@@ -311,50 +466,39 @@ def main():
     )
     try:
         for level in args.levels:
+            if rank == 0:
+                print(f"Running {level}...", flush=True)
             try:
                 result = run_level(args, level, pixels, rank)
-            except torch.OutOfMemoryError:
+            except torch.OutOfMemoryError as exc:
                 if dist.is_initialized():
                     raise  # A failed collective cannot be safely retried by one rank.
-                results.append(dict(level=level, status="oom"))
+                results.append(dict(level=level, status="oom", errors=[str(exc)]))
+                result = None
+            if result is None:
+                # Release the exception traceback before collecting failed models.
                 gc.collect()
                 torch.accelerator.empty_cache()
-                failed = True
                 continue
-            stats, moments, mean, logvar, reconstruction = result
+            stats = result[0]
             if level == "off":
                 reference = result
-            if reference is not None and rank == 0:
-                stats["speedup"] = reference[0]["median_s"] / stats["median_s"]
-                for name, actual, expected in (
-                    ("moments", moments, reference[1]),
-                    ("mean", mean, reference[2]),
-                    ("logvar", logvar, reference[3]),
-                ):
-                    metrics = differences(actual, expected)
-                    stats[name] = metrics
-                    finite = math.isfinite(metrics["normalized_rmse"])
-                    if level == "lossless":
-                        failed |= not metrics["bitwise_equal"]
-                    failed |= not finite or (level == "channels_last" and metrics["normalized_rmse"] > 0.01)
-                if reconstruction is not None:
-                    mse = (reconstruction.float() - reference[4].float()).square().mean().item()
-                    psnr = math.inf if mse == 0 else 10 * math.log10(4 / mse)
-                    stats["reconstruction_psnr_db"] = "inf" if psnr == math.inf else psnr
-                    failed |= math.isnan(psnr) or psnr < 50
-            results.append(stats)
             if rank == 0:
-                print(json.dumps(stats, indent=2))
-        if reference is None:
-            failed = True
-        if rank == 0 and args.json:
-            args.json.write_text(json.dumps(dict(environment=environment, results=results), indent=2) + "\n")
-        failed = bool(max_across_ranks(int(failed)))
+                validate_result(result, reference)
+            results.append(stats)
+        if rank == 0:
+            print_results(results, environment)
+            if args.json:
+                args.json.write_text(json.dumps(dict(environment=environment, results=results), indent=2) + "\n")
+                print(f"Detailed results saved to {args.json}", flush=True)
+        failed = bool(max_across_ranks(int(any(stats["status"] != "ok" for stats in results))))
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
     if failed:
-        raise SystemExit("Encoder validation failed or a workload ran out of memory; inspect the reported results")
+        raise SystemExit(failure_summary(results) if rank == 0 else "Encoder benchmark failed; see rank 0's report.")
+    if rank == 0:
+        print("All requested validation checks passed.")
 
 
 if __name__ == "__main__":

@@ -124,7 +124,10 @@ original forwards and tensor layouts while retaining current weight values.
 encoder levels with the same weights, inputs and backend settings, always
 running `off` first. It reports startup/first-call time separately from warmed
 median latency, throughput and peak allocated memory. Reference tensors are
-kept on CPU during candidate timing.
+kept on CPU during candidate timing. Console output includes timing and
+per-tensor quality tables with explicit PASS/FAIL/OOM/NO REF statuses; speedups
+are still shown when numerical validation fails. `--json` saves the full
+metrics and per-level `errors` lists.
 
 ```bash
 # Image conditioning
@@ -157,6 +160,11 @@ between reconstructions of the reference and candidate mean, using the same
 reference decoder. These are validation gates, not measured encoder results.
 Single-GPU OOM cases are recorded explicitly; distributed failures terminate
 the run because a failed collective cannot be retried safely on one rank.
+Failure messages identify the level, tensor, measured metric and required
+threshold. OOM messages identify the failing phase (such as timed encoding or
+reference-decoder reconstruction), input shape and dtype, and retain the
+original allocation error. If the reference fails, remaining timings are
+marked NO REF rather than presented as validated results.
 
 Validate on both H100 and GB200, using 256x256, 640x384 and 1280x720 inputs with
 1, 5, 33, 93 and 189 frames. Record repeatable gains separately for images and
