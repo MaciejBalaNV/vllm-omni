@@ -256,7 +256,7 @@ per record. No LiDAR outputs are needed for this review.
 
 The offline client records `generation_seconds` before video export in each
 `sample_outputs.json`. Keep cold and warm measurements separate. Record GPU
-model/count, CUDA/PyTorch/NATTEN/attention versions, topology, request dimensions,
+model/count, CUDA/PyTorch/attention versions, topology, request dimensions,
 steps, and compiled/eager mode. Capture device-memory samples during both runs,
 for example in a separate terminal:
 
@@ -302,7 +302,7 @@ existing unified artifact without changing the exporter.
 Local CPU validation uses the existing isolated environment and source adapters
 for unavailable vLLM imports. The checked tensor operations, decoder, pipeline,
 postprocessor, storage, and job lifecycle functions execute repository source.
-These results do **not** establish CUDA NATTEN parity or full engine/HTTP serving:
+These results do **not** establish CUDA attention parity or full engine/HTTP serving:
 
 - Across the selected CPU-adapter runs, 579 decoder, encoder, pipeline,
   offline, and upload/client checks passed, along with 11 serving-handler and
@@ -336,12 +336,38 @@ Normal pytest collection on this host fails because vLLM is unavailable. CUDA,
 production-checkpoint decoder parity, full HTTP smoke tests, and distributed/
 offload execution remain pending. No GPU performance results are claimed.
 
+### FlexAttention replacement checks (2026-09-15)
+
+Local validation ran on macOS arm64 with PyTorch 2.14.0 and no NATTEN installed,
+using the CPU source adapters described above:
+
+- 783 selected operator, encoder, decoder, multiview, numeric output,
+  offline, and upload checks passed. All 29 serving/storage checks passed.
+- Tests now execute local attention with nonzero projections, symmetric and
+  asymmetric decoder layouts, alternating dilation, and both factorized and
+  joint 3D bottlenecks. Streaming checks cover partial chunks, bounded/unbounded
+  context, batch sizes 1/2, repeated requests, and RNG preservation.
+- Operator results match independently enumerated FP64 neighborhoods at
+  `rtol=1e-4, atol=1e-4`. CPU allocation inspection covers a 58,112-token spatial
+  mask without a token-level square allocation. Cache eviction/reuse and real
+  Dynamo graph isolation are checked separately.
+- Twelve CUDA cases skipped. Three multiview runtime import/registration/warmup
+  checks were excluded after failing on unavailable runtime dependencies.
+  Full native pytest/HTTP execution remains unavailable on this host.
+- Ruff lint/formatting, Python compilation, and `git diff --check` passed.
+
+CUDA numerical parity, real-checkpoint output quality, GPU allocator peaks,
+offload/reload execution, cold-start time, and warmed encoder/decoder latency
+remain **unqualified**. The following utility and commands prepare those checks;
+CPU results do not satisfy the GPU acceptance criteria.
+
 ### Run on the CUDA validation host
 
 Install the supported vLLM-Omni runtime with `.[cosmos3-lidar]`. Run:
 
 ```bash
 pytest tests/diffusion/models/cosmos3/test_cosmos3_lidar_decoder.py \
+  tests/diffusion/models/cosmos3/test_lidar_neighborhood_attention.py \
   tests/diffusion/models/cosmos3/test_cosmos3_lidar.py \
   tests/diffusion/models/cosmos3/test_cosmos3_multiview_pipeline.py \
   tests/diffusion/test_diffusion_output_formatter.py \
@@ -351,8 +377,15 @@ pytest tests/diffusion/models/cosmos3/test_cosmos3_lidar_decoder.py \
   tests/entrypoints/openai_api/test_video_server.py
 ```
 
-Use the reference checkout and tokenizer dependencies on that host to compare
-identical latents against imaginaire4:
+Run the runtime regression suites without NATTEN installed. The encoder and
+decoder now share PyTorch FlexAttention, including the decoder's local blocks
+at each upsampling level. The CPU operator tests use an independent FP64
+neighborhood oracle. CUDA cases exercise the compiled operator and multiple
+devices when available.
+
+For reference qualification, use the imaginaire4 checkout and its tokenizer
+dependencies, including its original NATTEN build, in a separate validation
+environment. Compare identical inputs using a real exported checkpoint:
 
 ```bash
 python tools/validate_cosmos3_lidar_decoder.py \
@@ -362,7 +395,11 @@ python tools/validate_cosmos3_lidar_decoder.py \
 ```
 
 The default synthetic case crosses the production 9-sweep chunk boundary and
-ends with a partial chunk. Repeat with `--frames 1` for single-sweep decoding.
+ends with a partial chunk. For chunk length 9, run positive lengths
+`--frames 1`, `8`, `9`, `10`, and `19`, and repeat with `--batch-size 2`.
+Use artifacts with bounded and unbounded context and symmetric/asymmetric
+decoder topology. Synthetic tensors establish execution and streaming behavior;
+they do not qualify production output quality.
 For production parity, save the generated normalized LiDAR target from the
 multiview pipeline's `final_targets[1]` to safetensors under `latents`, then run:
 
@@ -371,15 +408,32 @@ python tools/validate_cosmos3_lidar_decoder.py \
   --model /models/cosmos3-multiview \
   --reference-root /workspace/imaginaire4 \
   --latents outputs/generated_lidar_latents.safetensors \
+  --encoder-input outputs/prepared_lidar_control.safetensors \
   --report outputs/lidar_decoder_generated_parity.json
 ```
 
-The utility checks normalized range/intensity and validity probabilities at
+The encoder input must contain metric FP32 `frames` shaped `[3,T,128,1800]`.
+The utility checks raw range/intensity and validity probabilities at
 `rtol=1e-4, atol=1e-4`, then metric output after reference width cropping. Binary
-validity must match exactly. Compare against the reference decoder output,
-before optional smoothing in its artifact writer. Timing includes raw-output
-capture; peak memory includes both decoder implementations. Treat these as
-validation measurements, not isolated decoder benchmarks.
+validity must match exactly. It also checks the encoder's normalized latents
+against reference encoding at the same tolerances. Decoder comparison precedes
+optional smoothing in the reference artifact writer.
+
+Each implementation's first call is measured separately from three warm-ups
+and ten timed runs. Timed runs have no capture hooks. Only one implementation's
+encoder or decoder resides on CUDA during each measurement; the report records
+resident inputs/cache memory and peak allocation separately. Persistent compiler
+disk caches are not cleared, and the report identifies this limit on cold-start
+measurements. Repeated requests must reuse cached attention geometry/code,
+preserve RNG state, and produce identical output. On production spatial grids,
+the warmed memory increment must remain below one dense FP32 spatial score
+matrix. Cache sizes, actual local shapes, numeric errors, configuration, and
+per-run latency are recorded even when a later parity check fails.
+
+`passed: true` records numerical and memory checks for the supplied inputs;
+production qualification additionally requires `production_inputs: true` and
+review of results on the real checkpoint. Performance regressions are reported
+and can be tuned separately.
 
 Finally, add `return_output: true` to the prepared iteration-4200 examples' LiDAR
 entries and run the offline and asynchronous HTTP clients documented in

@@ -184,10 +184,26 @@ transformer setting and shared metadata field to agree. The component specifies
 `dtype="float32"` and `sample_posterior=false`. `apply_validity_mask` describes
 decoder behavior and does not change encoder input masking.
 
-Install the optional runtime dependencies with `pip install -e
-'.[cosmos3-lidar]'` in the supported CUDA environment. NATTEN must match the
-installed PyTorch/CUDA build; the reference uses `0.21.6.dev6` builds for
-PyTorch 2.10. No imaginaire4 training packages are needed by the runtime.
+Install the optional runtime dependencies in the supported CUDA environment:
+
+```bash
+uv pip install -e '.[cosmos3-lidar]'
+```
+
+The encoder and decoder use PyTorch FlexAttention for spatial neighborhood
+attention; Cosmos3 does not require NATTEN or a separate CUDA extension build.
+Use a supported PyTorch/CUDA runtime with FlexAttention. Each local attention
+shape compiles on first use, including partial streaming chunks; the rest of
+the VAE executes eagerly. Even with `--enforce-eager`, local LiDAR attention
+compiles to keep memory bounded. Compilation/kernel failures raise an error.
+
+LiDAR attention stays in FP32 with IEEE multiplication independently of the
+camera model's precision settings. Its spatial masks and compiled operators
+use bounded caches; temporal state remains local to each request. Mask geometry
+comes from each encoder/decoder level, including asymmetric decoder artifacts.
+CPU execution is available only for small correctness fixtures (at most 4,096
+spatial tokens); production LiDAR grids require CUDA.
+
 Missing VAE files, incompatible metadata, missing projection weights, malformed
 encoder/decoder tensors, unsupported streaming architectures, and invalid latent
 statistics fail loading. The component is loaded directly and does not require

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 # =============================================================================
 # Transformer VAE with hierarchical hourglass architecture,
-# neighborhood attention (natten) for spatial processing, and
+# neighborhood attention (FlexAttention) for spatial processing, and
 # causal temporal attention for video.
 #
 # Architecture:
@@ -30,14 +30,12 @@ from __future__ import annotations
 #
 # Based on: https://github.com/crowsonkb/k-diffusion/blob/master/
 #           k_diffusion/models/image_transformer_v2.py
-# Call `natten.use_fused_na(True)` for acceleration on GPUs.
 # =============================================================================
 import functools
 import math
 from typing import Literal
 
 import einops
-import natten
 import torch
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
@@ -45,6 +43,7 @@ from torch import nn
 from torch.nn.modules.utils import _pair
 
 from vllm_omni.diffusion.models.cosmos3.lidar_encoder import ops
+from vllm_omni.diffusion.models.cosmos3.lidar_encoder.neighborhood_attention import neighborhood_attention_2d
 from vllm_omni.diffusion.models.cosmos3.lidar_encoder.rope3d import (
     VideoRopePosition3DEmb,
     apply_rotary_emb,
@@ -183,7 +182,7 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
         # When True (default), the W (last spatial) axis is treated as
         # periodic: it is circularly padded before the neighborhood attention
         # so the seam wraps (range-image azimuth, column 0 ~ column W-1). When
-        # False, no wrap -- ``natten`` clamps the neighborhood at the W edges
+        # False, no wrap -- the neighborhood shifts inward at the W edges
         # (the same boundary handling it already uses for H). Set False for a
         # Cartesian grid (e.g. BEV x-axis) where the two W edges are unrelated.
         circular: bool = True,
@@ -202,6 +201,8 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
         if not self.circular:
             return q, k, v
         padding = self.kernel_size[1] // 2
+        if padding == 0:
+            return q, k, v
         q = F.pad(q, (0, 0, 0, 0, padding, padding), mode="circular")
         k = F.pad(k, (0, 0, 0, 0, padding, padding), mode="circular")
         v = F.pad(v, (0, 0, 0, 0, padding, padding), mode="circular")
@@ -211,6 +212,8 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
         if not self.circular:
             return x
         padding = self.kernel_size[1] // 2
+        if padding == 0:
+            return x
         x = x[:, :, padding:-padding]
         return x
 
@@ -221,7 +224,7 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
         q, k = self.scale_qk(q, k)
         q, k = self.apply_rope_qk(q, k, coords)
         q, k, v = self.before_attn(q, k, v)
-        h = natten.functional.na2d(
+        h = neighborhood_attention_2d(
             query=q,
             key=k,
             value=v,
@@ -1410,7 +1413,7 @@ class Encoder(nn.Module):
         return h, new_cache
 
 
-# Decoder ported from imaginaire4 9ca7bd6adfe. Shared blocks above are unchanged.
+# Decoder ported from imaginaire4 9ca7bd6adfe; shared spatial attention uses FlexAttention.
 class Decoder(nn.Module):
     def __init__(
         self,

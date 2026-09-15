@@ -5,12 +5,9 @@
 from __future__ import annotations
 
 import copy
-import importlib.util
 import json
-import sys
 from contextlib import contextmanager
-from importlib.machinery import ModuleSpec
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,17 +22,6 @@ from vllm_omni.diffusion.models.cosmos3.lidar import (
 from vllm_omni.model_extras.cosmos3_lidar import serialize_lidar_output
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
-
-
-@pytest.fixture(autouse=True)
-def optional_natten(monkeypatch):
-    # These small CPU networks have no local attention blocks. Importing the
-    # dependency is sufficient; invoking a substituted kernel must fail.
-    if importlib.util.find_spec("natten") is None:
-        module = ModuleType("natten")
-        module.__spec__ = ModuleSpec("natten", loader=None)
-        module.functional = SimpleNamespace(na2d=lambda *a, **kw: pytest.fail("Unexpected NATTEN execution"))
-        monkeypatch.setitem(sys.modules, "natten", module)
 
 
 @pytest.fixture
@@ -265,6 +251,123 @@ def test_decoder_real_streaming_matches_full_causal_network(config):
         full = postprocess_lidar_decoder_output(model.decoder(z, model.coords), config)
         chunked = model.decode(latents)
     torch.testing.assert_close(chunked, full, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("asymmetric", [False, True])
+@pytest.mark.parametrize("context", [None, 3, 4])
+@pytest.mark.parametrize("frames", [1, 2, 3, 4, 7])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_real_local_attention_decoder_streaming(
+    config, asymmetric, context, frames, batch, monkeypatch, bottleneck_3d=False
+):
+    from vllm_omni.diffusion.models.cosmos3.lidar_encoder import neighborhood_attention as attention
+    from vllm_omni.diffusion.models.cosmos3.lidar_encoder import transformer_vae
+    from vllm_omni.diffusion.models.cosmos3.lidar_encoder.encoding import generate_polar_coords
+
+    # Execute all real upsampling/temporal/spatial blocks on a small grid that
+    # permits eager CPU FlexAttention. Topology still uses the artifact resolver.
+    network = copy.deepcopy(config["network_config"])
+    network.update(
+        resolution=[32, 48],
+        base_channels=8,
+        depths=[2, 2, 1, 1],
+        num_heads=[1, 1, 2, 2],
+        dilation=[2, 2, 1, 1],
+        window_size=[3, 3],
+        bottleneck_3d=bottleneck_3d,
+        bottleneck_3d_causal_time=bottleneck_3d,
+        bottleneck_3d_rope=bottleneck_3d,
+    )
+    if asymmetric:
+        network.update(
+            decoder_depths=[2, 1, 1],
+            decoder_num_heads=[1, 1, 2],
+            decoder_dilation=[2, 1, 1],
+            decoder_temporal_upsample=[False, False],
+            out_patch_size=[4, 4],
+        )
+    with torch.random.fork_rng():
+        torch.manual_seed(721)
+        model = transformer_vae.Decoder(**lidar_decoder_args(network)).float().eval()
+        # Zero-initialized residual projections otherwise hide attention errors.
+        for name, parameter in model.named_parameters():
+            if name.endswith("out_proj.weight"):
+                torch.nn.init.normal_(parameter, std=0.1)
+        z = torch.randn(batch, 2, frames, 2, 3)
+    coords = generate_polar_coords(32, 48)
+    keys_before = set(model.state_dict())
+    seen = set()
+    real_attention = transformer_vae.neighborhood_attention_2d
+
+    def track(query, key, value, **kwargs):
+        seen.add((query.shape[0], tuple(query.shape[1:3]), tuple(kwargs["dilation"])))
+        return real_attention(query, key, value, **kwargs)
+
+    monkeypatch.setattr(transformer_vae, "neighborhood_attention_2d", track)
+    attention._get_block_mask.cache_clear()
+
+    def stream():
+        cache, chunks = None, []
+        for start in range(0, frames, 3):
+            chunk = z[:, :, start : start + 3]
+            if cache is not None and context is not None:
+                keep = context - chunk.shape[2]
+                cache = {key: (k[:, :, -keep:], v[:, :, -keep:]) for key, (k, v) in cache.items()} if keep else None
+            output, cache = model(chunk, coords, temporal_kv_cache=cache, return_temporal_kv_cache=True)
+            assert cache and all(key.startswith(("mid_temporal.", "mid_3d.", "up_levels.temporal_")) for key in cache)
+            if context is not None:
+                assert all(k.shape[2] <= context for k, _ in cache.values())
+            chunks.append(output)
+        return torch.cat(chunks, 2)
+
+    rng = torch.random.get_rng_state()
+    with torch.inference_mode():
+        actual = stream()
+        misses = attention._get_block_mask.cache_info().misses
+        repeated = stream()
+        assert attention._get_block_mask.cache_info().misses == misses
+        torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
+        if context is None:
+            torch.testing.assert_close(actual, model(z, coords), rtol=1e-4, atol=1e-4)
+    assert torch.equal(torch.random.get_rng_state(), rng)
+    assert actual.shape == (batch, 3, frames, 32, 48) and actual.dtype == torch.float32
+    assert set(model.state_dict()) == keys_before
+    assert any(dilation == (2, 2) for _, _, dilation in seen)
+    assert len({hw for _, hw, _ in seen}) == (2 if asymmetric else 3)
+    if frames > 3 and frames % 3:
+        assert {folded for folded, _, _ in seen} >= {batch * 3, batch * (frames % 3)}
+
+
+@pytest.mark.parametrize("asymmetric", [False, True])
+def test_local_attention_preserves_joint_3d_bottleneck_streaming(config, asymmetric, monkeypatch):
+    test_real_local_attention_decoder_streaming(config, asymmetric, None, 4, 1, monkeypatch, bottleneck_3d=True)
+
+
+def test_real_decoder_wrapper_with_local_attention(config):
+    from vllm_omni.diffusion.models.cosmos3.lidar_encoder.transformer_vae import CircularNeighborhoodSelfAttentionBlock
+
+    # Lowest upsampling level is small enough for eager CPU attention while
+    # the wrapper still exercises the physical 128x1808 -> 128x1800 contract.
+    config["network_config"].update(depths=[0, 0, 1, 1], window_size=[3, 3])
+    config["streaming_context_frames"] = None
+    with torch.random.fork_rng():
+        torch.manual_seed(721)
+        model = Cosmos3LidarDecoder(config).float().eval()
+        for block in model.modules():
+            if isinstance(block, CircularNeighborhoodSelfAttentionBlock):
+                torch.nn.init.normal_(block.out_proj.weight, std=0.1)
+        latents = torch.randn(1, 2, 1, 8, 113)
+    model.latent_mean.fill_(0.125)
+    model.latent_std.fill_(1.25)
+    rng = torch.random.get_rng_state()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = model.decode(latents)
+    with torch.inference_mode():
+        z = model.post_quant_conv((latents * 1.25 + 0.125)[:, :, 0]).unsqueeze(2)
+        expected = postprocess_lidar_decoder_output(model.decoder(z, model.coords), config)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    assert actual.shape == (1, 3, 1, 128, 1800) and actual.dtype == torch.float32
+    assert torch.equal(torch.random.get_rng_state(), rng)
 
 
 def test_serialized_frames_roundtrip_preserves_values_and_sample_shape():

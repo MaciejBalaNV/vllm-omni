@@ -539,8 +539,15 @@ def test_pipeline_shares_schedule_preserves_conditions_and_optional_lidar(
     lidar_decoded = []
 
     def decode_lidar(latents):
+        from vllm_omni.diffusion.models.cosmos3.lidar_encoder.neighborhood_attention import neighborhood_attention_2d
+
         lidar_decoded.append(latents.clone())
-        return torch.ones(1, 3, 2, 128, 1800)
+        # Execute small real FlexAttention when output is requested. It must
+        # leave the camera tensors and both RNG streams unchanged.
+        q = latents.permute(0, 2, 3, 4, 1).reshape(2, 1, 3, 1, 2).contiguous()
+        with torch.inference_mode():
+            spatial = neighborhood_attention_2d(q, q, q, kernel_size=(1, 3), dilation=1, scale=1.0)
+        return spatial.mean((1, 2, 3, 4)).reshape(1, 1, 2, 1, 1).expand(1, 3, 2, 128, 1800).contiguous()
 
     decode_lidar.config = lidar_config()
     pipeline.lidar_decoder = decode_lidar
@@ -585,9 +592,11 @@ def test_pipeline_shares_schedule_preserves_conditions_and_optional_lidar(
         expected_camera[:, :, :2] = 0.5
     else:
         expected_camera[:, :, ::2] = 0.5
+    rng_before = torch.random.get_rng_state()
     result = pipeline.forward(
         SimpleNamespace(prompts=[{"prompt": "ignored", "negative_prompt": "ignored too"}], sampling_params=sp)
     )
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
     assert scheduler_calls == [1000, 500]
     assert len(calls) == 2 and len(decoded) == 2
     initial_targets = unpack_state(calls[0]["hidden_states"], calls[0]["packed_shapes"])
@@ -798,17 +807,9 @@ def test_encoder_requires_vae_policy_metadata(lidar_vae_artifact, field):
         TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
 
 
-def test_encoder_loads_real_architecture_with_saved_constructor_defaults(tmp_path, monkeypatch):
-    import importlib.util
+def test_encoder_loads_real_architecture_with_saved_constructor_defaults(tmp_path):
     import inspect
-    import sys
-    from types import ModuleType
 
-    # Construct the real encoder on CPU; this test must never execute attention kernels.
-    if importlib.util.find_spec("natten") is None:
-        natten = ModuleType("natten")
-        natten.functional = SimpleNamespace(na2d=lambda *args, **kwargs: pytest.fail("Unexpected attention execution"))
-        monkeypatch.setitem(sys.modules, "natten", natten)
     from vllm_omni.diffusion.models.cosmos3.lidar_encoder.transformer_vae import Encoder
 
     config = lidar_config()

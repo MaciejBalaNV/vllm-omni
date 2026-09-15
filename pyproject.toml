@@ -35,8 +35,8 @@ classifiers = [
 
 [project.optional-dependencies]
 
-# V1.2 LiDAR encoder neighborhood attention; camera-only deployments do not import it.
-cosmos3-lidar = ["natten>=0.21.0", "einops>=0.8.0", "safetensors>=0.4.0"]
+# V1.2 LiDAR encoder/decoder; neighborhood attention uses PyTorch FlexAttention.
+cosmos3-lidar = ["einops>=0.8.0", "safetensors>=0.4.0"]
 
 dev = [
     "pytest==9.1.1",
