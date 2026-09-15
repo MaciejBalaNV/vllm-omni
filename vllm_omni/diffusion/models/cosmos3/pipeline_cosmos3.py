@@ -682,6 +682,58 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             fps_value = 24.0
         return int(fps_value) if fps_value.is_integer() else fps_value
 
+    def _postprocess_multiview_video(
+        video: torch.Tensor,
+        multiview: Mapping[str, Any],
+        *,
+        output_type: str,
+        guardrails_enabled: bool,
+    ) -> np.ndarray | torch.Tensor | list[list[PIL.Image.Image]]:
+        """Process one camera at a time into the final CPU presentation buffer."""
+        cameras = multiview.get("cameras")
+        frames_per_view = multiview.get("frames_per_view")
+        if (
+            not isinstance(cameras, list | tuple)
+            or not cameras
+            or not isinstance(frames_per_view, int)
+            or isinstance(frames_per_view, bool)
+            or frames_per_view <= 0
+        ):
+            raise ValueError("Cosmos3 multiview output requires cameras and a positive integer frames_per_view.")
+        if video.ndim != 5 or video.shape[:2] != (1, 3) or video.shape[2] != len(cameras) * frames_per_view:
+            raise ValueError("Cosmos3 multiview output must have shape [1, 3, V*F, H, W] matching its metadata.")
+        if output_type not in ("np", "pt", "pil"):
+            raise ValueError(f"{output_type} does not exist. Please choose one of ['np', 'pt', 'pil']")
+
+        processed_video = None
+        for view_index in range(len(cameras)):
+            frame_start = view_index * frames_per_view
+            # Move only this camera to the host, even if an in-process caller
+            # supplies a CUDA tensor. Guardrail conversions then stay on CPU.
+            view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
+            if guardrails_enabled:
+                view = check_video_safety(view)
+            processed_view = video_processor.postprocess_video(view, output_type=output_type)
+            if processed_video is None:
+                if output_type == "pil":
+                    processed_video = [[]]
+                else:
+                    output_shape = (1, video.shape[2], *processed_view.shape[2:])
+                    if output_type == "np":
+                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
+                    else:
+                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
+            if output_type == "pil":
+                processed_video[0].extend(processed_view[0])
+            else:
+                processed_video[:, frame_start : frame_start + frames_per_view] = processed_view
+            # Do not retain converted camera clips and concatenate them later:
+            # that would duplicate the complete processed multiview output.
+            del view, processed_view
+
+        assert processed_video is not None
+        return processed_video
+
     def post_process_func(
         output: torch.Tensor | dict[str, torch.Tensor] | tuple,
         output_type: str = "np",
@@ -772,9 +824,15 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                 }
             return processed_image
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
-        if guardrails_enabled:
-            video = check_video_safety(video)
-        processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        multiview = envelope_public_metadata.get("multiview")
+        if isinstance(multiview, Mapping):
+            processed_video = _postprocess_multiview_video(
+                video, multiview, output_type=output_type, guardrails_enabled=guardrails_enabled
+            )
+        else:
+            if guardrails_enabled:
+                video = check_video_safety(video)
+            processed_video = video_processor.postprocess_video(video, output_type=output_type)
         auxiliary_payload = {}
         if pending_action is not None:
             auxiliary_payload["actions"] = pending_action
