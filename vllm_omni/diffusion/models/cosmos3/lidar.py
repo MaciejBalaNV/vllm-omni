@@ -116,10 +116,10 @@ class _LidarComponent(nn.Module):
 
         checkpoint_path = Path(model_path)
         if not checkpoint_path.exists():
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
             checkpoint_path = Path(
-                snapshot_download(
+                hf_api().snapshot_download(
                     model_path,
                     allow_patterns=[
                         f"{_LIDAR_VAE_SUBFOLDER}/config.json",
