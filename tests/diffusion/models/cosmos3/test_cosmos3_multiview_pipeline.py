@@ -351,8 +351,9 @@ def test_multiview_forward_propagates_resolution(
 
         shapes = shared_kwargs["packed_shapes"]
         latents = unpack_state(latents, shapes)[0]
-        condition_latents = unpack_state(condition_latents, shapes)[0]
         assert latents.shape == (1, 3, 4, height // 16, width // 16)
+        assert velocity_mask.shape == (1, 1, 4, 1, 1)
+        assert condition_latents.shape == latents.shape
         control = control_latents[0]
         assert control.shape == latents.shape
         assert shared_kwargs["video_shape"] == tuple(latents.shape[2:])

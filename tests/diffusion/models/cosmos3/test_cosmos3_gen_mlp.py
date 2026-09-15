@@ -156,6 +156,50 @@ def test_multiview_gen_mlp_reduces_once_before_residual(monkeypatch, parallel_st
     assert layer.mlp.down_proj.reduce_results is False
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_multiview_residuals_reuse_projection_outputs_without_mutating_input(dtype):
+    torch.manual_seed(42)
+    layer = _gen_layer(dtype)
+    hidden = torch.randn(1, 19, 8, dtype=dtype)
+    original = hidden.clone()
+    residual = hidden + layer.input_layernorm(hidden) * 0.125
+    expected = residual + layer._forward_mlp(residual)
+    attention_pointers, mlp_pointers = [], []
+    layer.cross_attention.register_forward_hook(
+        lambda module, args, output: attention_pointers.append(output.data_ptr())
+    )
+    forward_mlp = layer._forward_mlp
+
+    def record_mlp(hidden):
+        assert hidden.data_ptr() == attention_pointers[-1]
+        output = forward_mlp(hidden)
+        mlp_pointers.append(output.data_ptr())
+        return output
+
+    layer._forward_mlp = record_mlp
+    actual = layer(hidden, cached_kv=[(torch.zeros(1), torch.zeros(1))], freqs_gen=(torch.zeros(1), torch.zeros(1)))
+    assert actual.data_ptr() == mlp_pointers[-1]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(hidden, original, rtol=0, atol=0)
+
+
+def test_multiview_residuals_preserve_autograd_and_dtype_promotion():
+    layer = _gen_layer()
+    residual = torch.randn(1, 3, 8, requires_grad=True)
+    projected = residual.sigmoid()  # Its original output is needed by backward.
+    original = projected.detach().clone()
+    output = layer._add_residual(projected, residual)
+    output.sum().backward()
+    torch.testing.assert_close(projected, original, rtol=0, atol=0)
+    torch.testing.assert_close(residual.grad, 1 + original * (1 - original))
+    with torch.inference_mode():
+        projected = original.bfloat16()
+        promoted = layer._add_residual(projected, residual.detach())
+        assert promoted.dtype == torch.float32
+        torch.testing.assert_close(promoted, residual.detach() + projected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("transformer_cls", [cosmos3.Cosmos3VFMTransformer, Cosmos3EdgeVFMTransformer])
 @pytest.mark.parametrize("tp_size", [1, 4])
 @torch.inference_mode()

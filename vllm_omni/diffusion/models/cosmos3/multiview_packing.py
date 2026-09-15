@@ -10,6 +10,10 @@ import torch.nn.functional as F
 
 
 def pack_state(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    # Camera-only state needs no concatenation. The result may share storage
+    # with its input, just like the views returned by unpack_state.
+    if len(tensors) == 1:
+        return tensors[0].flatten(1)
     return torch.cat([tensor.flatten(1) for tensor in tensors], dim=1)
 
 

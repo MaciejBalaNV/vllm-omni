@@ -992,6 +992,9 @@ class Cosmos3GenDecoderLayer(nn.Module):
     def _forward_mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.post_attention_layernorm(hidden_states))
 
+    def _add_residual(self, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return residual + output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1028,10 +1031,10 @@ class Cosmos3GenDecoderLayer(nn.Module):
             control_weights=control_weights,
             multiview_layout=multiview_layout,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = self._add_residual(hidden_states, residual)
 
         residual = hidden_states
-        hidden_states = residual + self._forward_mlp(hidden_states)
+        hidden_states = self._add_residual(self._forward_mlp(hidden_states), residual)
 
         return hidden_states
 
