@@ -348,7 +348,7 @@ async def _save_video_artifact(data: bytes, key: str, *, cancel_grace_s: float =
         return await asyncio.shield(task)
     except asyncio.CancelledError:
         # Only joint video/LiDAR jobs request a grace period. Use one deadline
-        # so repeated DELETEs cannot extend it; ordinary video cancels at once.
+        # so repeated DELETEEs cannot extend it; ordinary video cancels at once.
         loop = asyncio.get_running_loop()
         deadline = loop.time() + cancel_grace_s
         while not task.done() and (remaining := deadline - loop.time()) > 0:
