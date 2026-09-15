@@ -45,6 +45,7 @@ from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras.cosmos3 import normalize_multiview_aspect_ratio
+from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
 from vllm_omni.outputs import OmniRequestOutput
 
 SUPPORTED_MODEL_MODES = {"image2video", "text2video"}
@@ -181,6 +182,16 @@ def _extract_payload(value: Any) -> tuple[Any, dict[str, Any]]:
         if "video" in payload:
             return payload["video"], metadata
     return value, {}
+
+
+def _extract_lidar_payload(value: Any) -> torch.Tensor | None:
+    if isinstance(value, list) and len(value) == 1:
+        return _extract_lidar_payload(value[0])
+    if hasattr(value, "multimodal_output"):
+        return _extract_lidar_payload(value.multimodal_output)
+    if isinstance(value, dict):
+        return value.get("payload", value).get("lidar")
+    return None
 
 
 def _resolve_frames_per_view(frames: list[Any], cameras: list[str], metadata: dict[str, Any]) -> int:
@@ -339,6 +350,9 @@ def _run_request(
     result = omni.generate(prompt, sampling_params)
     generation_seconds = time.perf_counter() - started
     video, metadata = _extract_payload(result)
+    lidar = _extract_lidar_payload(result)
+    if lidar_output_requested(extra_args) and lidar is None:
+        raise ValueError("The requested LiDAR output was not returned by the model.")
     frames = _frame_list(video)
     if not frames:
         raise ValueError("Cosmos3 multiview output contains no video frames.")
@@ -385,6 +399,11 @@ def _run_request(
         "files_by_camera": files_by_camera,
         "generation_seconds": generation_seconds,
     }
+    if lidar is not None:
+        data, details = serialize_lidar_output(lidar, metadata.get("lidar", {}))
+        lidar_path = output_dir / "lidar.safetensors"
+        lidar_path.write_bytes(data)
+        manifest["lidar"] = {**details, "file_name": str(lidar_path), "format": "safetensors"}
     (output_dir / "sample_outputs.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 

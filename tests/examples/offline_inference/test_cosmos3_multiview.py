@@ -452,3 +452,44 @@ def test_omitted_geometry_uses_checkpoint_defaults(cosmos3_multiview, monkeypatc
     )
     assert manifest["resolution"] == "720" and manifest["fps"] == 10
     assert (manifest["width"], manifest["height"]) == (1280, 720)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_offline_saves_numeric_lidar_without_video_conversion(cosmos3_multiview, monkeypatch, tmp_path, wrapped):
+    from types import SimpleNamespace
+
+    import torch
+    from safetensors.torch import load_file
+
+    lidar = torch.ones(1, 3, 2, 128, 1800)
+    lidar[:, 0] = 60
+    video = np.zeros((1, 1, 480, 832, 3), dtype=np.float32)
+    metadata = {
+        "multiview": {
+            "cameras": ["front"],
+            "frames_per_view": 1,
+            "fps": 30,
+            "resolution": "480",
+            "aspect_ratio": "16,9",
+        },
+        "lidar": {"fps": 10},
+    }
+
+    class FakeOmni:
+        def generate(self, prompt, sp):
+            assert sp.extra_args["lidar"]["return_output"] is True
+            if wrapped:
+                return [SimpleNamespace(images=[video], multimodal_output={"lidar": lidar, "metadata": metadata})]
+            return {"payload": {"video": video, "lidar": lidar}, "metadata": metadata}
+
+    monkeypatch.setattr(cosmos3_multiview, "export_to_video", lambda *args, **kwargs: None)
+    request = {
+        "lidar": {"control_path": "map.safetensors", "return_output": True},
+        "multiview": {"views": [{"camera_key": "front"}]},
+    }
+    manifest = cosmos3_multiview._run_request(
+        FakeOmni(), request, output_dir=tmp_path, seed=42, fallback_negative_prompt=None
+    )
+    assert manifest["lidar"]["shape"] == [3, 2, 128, 1800]
+    assert manifest["lidar"]["fps"] == 10 and manifest["fps"] == 30
+    torch.testing.assert_close(load_file(tmp_path / "lidar.safetensors")["frames"], lidar[0], rtol=0, atol=0)

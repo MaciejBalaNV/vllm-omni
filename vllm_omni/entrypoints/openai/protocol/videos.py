@@ -371,6 +371,25 @@ class VideoError(BaseModel):
     message: str = Field(..., description="A human-readable description of the error that was returned.")
 
 
+class VideoLidarArtifact(BaseModel):
+    """Download descriptor for numeric LiDAR generated with an async video job."""
+
+    url: str
+    file_name: str
+    format: Literal["safetensors"] = "safetensors"
+    media_type: Literal["application/octet-stream"] = "application/octet-stream"
+    shape: list[int]
+    dtype: Literal["float32"] = "float32"
+    fps: float = Field(gt=0, allow_inf_nan=False)
+    num_frames: int = Field(ge=1)
+    channels: list[str]
+    units: list[str]
+    apply_validity_mask: bool
+    validity_threshold: float = Field(gt=0, lt=1, allow_inf_nan=False)
+    start_time_seconds: float = 0.0
+    range_projection: dict[str, Any]
+
+
 class VideoResponse(BaseModel):
     """Stored metadata for an async video generation job."""
 
@@ -429,6 +448,7 @@ class VideoResponse(BaseModel):
         description="Peak device memory usage in MB reported by the diffusion pipeline.",
     )
     action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
+    lidar: VideoLidarArtifact | None = Field(default=None, description="Generated numeric LiDAR artifact, if requested")
 
     @property
     def file_extension(self) -> str:

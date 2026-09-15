@@ -16,11 +16,11 @@ The two-stage exporter retains `lidar2llm`/`llm2lidar` as
 VAE in `lidar_vae/config.json` and `lidar_vae/diffusion_pytorch_model.safetensors`.
 The component includes coordinates, resolved architecture defaults, streaming
 settings, physical projection, encoder/decoder weights, and latent mean/std.
-Runtime loading reads only encoder/quantization weights and shared buffers in
-FP32. It checks shared metadata and every explicit transformer network setting,
+Runtime loading reads encoder and decoder weights independently from the same
+artifact in FP32. It checks shared metadata and every explicit transformer network setting,
 accepts the VAE's additional defaults, and constructs from the saved VAE config.
-Complete projection weights and the strict encoder state dictionary are still
-required; decoder validation belongs to the exporter. Older unversioned WSM
+Complete projection weights and strict encoder/decoder state dictionaries are
+required. Older unversioned WSM
 artifacts remain loadable.
 
 The runtime uses independent camera/LiDAR shapes, per-camera causal caption
@@ -30,7 +30,9 @@ rates. The packed cursor includes the furthest temporal or spatial endpoint
 for reference parity, but is inert in the current single-sample request path:
 no subsequent sample or modality consumes it.
 The numerical encoder dependency is vendored from imaginaire4 `e55e4fad16a9`;
-only its inference encoder is instantiated. No LiDAR decoder is exposed.
+the decoder is ported from `9ca7bd6adfe` using identical shared blocks.
+`lidar.return_output=true` enables numeric output through offline inference and
+asynchronous video jobs. Default requests retain RGB-only output.
 
 Unified VAE loader tests cover selective tensor reads, exact FP32 preservation
 under a BF16 default, local/Hub component resolution, configuration agreement,
@@ -39,6 +41,8 @@ of a small real encoder without attention execution. The saved
 `apply_validity_mask` setting does not change encoder input masking.
 
 ### Unified VAE loader verification (2026-09-15)
+
+The encoder-only results below predate decoder integration.
 
 - 275 checks passed through the existing CPU adapters across
   `test_cosmos3_lidar.py` and `test_cosmos3_multiview_pipeline.py`.
@@ -287,3 +291,100 @@ pytest packages/cosmos3/cosmos3/scripts/multiview_export_test.py \
 
 The cross-repository normalization check expects sibling `imaginaire4` and
 `vllm-omni` directories; it skips explicitly when the runtime checkout is absent.
+
+## Decoder integration validation (2026-09-15)
+
+The decoder integration adds strict FP32 decoder loading, reference streaming
+cache behavior, physical output conversion, opt-in pipeline output, and
+safetensors persistence/downloads for asynchronous video jobs. It reuses the
+existing unified artifact without changing the exporter.
+
+Local CPU validation uses the existing isolated environment and source adapters
+for unavailable vLLM imports. The checked tensor operations, decoder, pipeline,
+postprocessor, storage, and job lifecycle functions execute repository source.
+These results do **not** establish CUDA NATTEN parity or full engine/HTTP serving:
+
+- Across the selected CPU-adapter runs, 579 decoder, encoder, pipeline,
+  offline, and upload/client checks passed, along with 11 serving-handler and
+  storage checks. Three runtime import/registration/warmup checks were excluded.
+  Ruff lint and formatting passed for all 22 changed Python files, and
+  `git diff --check` passed.
+- Decoder checks cover exact FP32 loading under a BF16 default, missing/invalid
+  weights, asymmetric topology resolution, streaming support validation,
+  latent affine conversion, chunk/context boundaries, single-sweep output,
+  request cache isolation, mask thresholding, width cropping, and safetensors.
+- A small real causal decoder without local attention executes on CPU and
+  matches its full-sequence decode at `rtol=1e-4, atol=1e-4`.
+- Pipeline checks exercise the opt-in output and preserve generated camera
+  latents and request RNG state. Offline/client checks preserve the flag and
+  output metadata through file writing and upload resolution.
+- Storage checks exercise both downloads, partial-save failures, cancellation
+  during a write (including repeated cancellation), deletion, expiration, and
+  synchronous rejection with uploaded-file cleanup.
+
+Cancellation follow-up: all 29 serving/storage checks passed through the CPU
+source adapter. The module now covers fixed cancellation
+deadlines for RGB-only and joint outputs, DELETE returning HTTP 409 while a save
+is stalled, cancellation of the DELETE request itself, bounded cleanup waits,
+and late-write cleanup after success or failure. A blocked filesystem-thread
+case verifies cleanup after the cancelled job has already returned. Deferred
+operations remain owned until completion, including cleanup through their
+original storage manager. These checks use the same CPU source adapter; full
+server shutdown and filesystem failure recovery remain unverified.
+
+Normal pytest collection on this host fails because vLLM is unavailable. CUDA,
+production-checkpoint decoder parity, full HTTP smoke tests, and distributed/
+offload execution remain pending. No GPU performance results are claimed.
+
+### Run on the CUDA validation host
+
+Install the supported vLLM-Omni runtime with `.[cosmos3-lidar]`. Run:
+
+```bash
+pytest tests/diffusion/models/cosmos3/test_cosmos3_lidar_decoder.py \
+  tests/diffusion/models/cosmos3/test_cosmos3_lidar.py \
+  tests/diffusion/models/cosmos3/test_cosmos3_multiview_pipeline.py \
+  tests/diffusion/test_diffusion_output_formatter.py \
+  tests/model_extras/test_cosmos3_multiview_uploads.py \
+  tests/examples/offline_inference/test_cosmos3_multiview.py \
+  tests/entrypoints/openai_api/test_cosmos3_lidar_output.py \
+  tests/entrypoints/openai_api/test_video_server.py
+```
+
+Use the reference checkout and tokenizer dependencies on that host to compare
+identical latents against imaginaire4:
+
+```bash
+python tools/validate_cosmos3_lidar_decoder.py \
+  --model /models/cosmos3-multiview \
+  --reference-root /workspace/imaginaire4 \
+  --frames 19 --seed 42 --report outputs/lidar_decoder_synthetic_parity.json
+```
+
+The default synthetic case crosses the production 9-sweep chunk boundary and
+ends with a partial chunk. Repeat with `--frames 1` for single-sweep decoding.
+For production parity, save the generated normalized LiDAR target from the
+multiview pipeline's `final_targets[1]` to safetensors under `latents`, then run:
+
+```bash
+python tools/validate_cosmos3_lidar_decoder.py \
+  --model /models/cosmos3-multiview \
+  --reference-root /workspace/imaginaire4 \
+  --latents outputs/generated_lidar_latents.safetensors \
+  --report outputs/lidar_decoder_generated_parity.json
+```
+
+The utility checks normalized range/intensity and validity probabilities at
+`rtol=1e-4, atol=1e-4`, then metric output after reference width cropping. Binary
+validity must match exactly. Compare against the reference decoder output,
+before optional smoothing in its artifact writer. Timing includes raw-output
+capture; peak memory includes both decoder implementations. Treat these as
+validation measurements, not isolated decoder benchmarks.
+
+Finally, add `return_output: true` to the prepared iteration-4200 examples' LiDAR
+entries and run the offline and asynchronous HTTP clients documented in
+[the multiview guide](cosmos3_multiview.md#generated-numeric-lidar). Verify valid
+numeric files at 10 Hz alongside the camera outputs, exact RGB agreement with
+the same requests without LiDAR output, and cleanup after job deletion. Run
+eager single-GPU execution first, followed by supported distributed and offload
+configurations. Record actual latency/memory and parity results here.

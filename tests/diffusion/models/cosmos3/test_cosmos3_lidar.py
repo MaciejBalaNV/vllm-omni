@@ -456,8 +456,9 @@ def test_missing_projection_weights_fail_even_when_some_lidar_weights_are_presen
     ],
 )
 @pytest.mark.parametrize("emphasis", [False, True])
-def test_pipeline_shares_schedule_preserves_conditions_and_returns_only_rgb(
-    tmp_path, monkeypatch, mode, noise_source, emphasis
+@pytest.mark.parametrize("return_lidar", [False, True])
+def test_pipeline_shares_schedule_preserves_conditions_and_optional_lidar(
+    tmp_path, monkeypatch, mode, noise_source, emphasis, return_lidar
 ):
     from types import SimpleNamespace
 
@@ -528,13 +529,21 @@ def test_pipeline_shares_schedule_preserves_conditions_and_returns_only_rgb(
         pipeline.multiview_config["lidar"] = lidar_config()
         path = tmp_path / "map.safetensors"
         save_file({"frames": numeric_frames(3)}, path)
-        extra["lidar"] = {"control_path": str(path)}
+        extra["lidar"] = {"control_path": str(path), "return_output": return_lidar}
 
         def encode(frames):
             assert frames.shape[1] == 2  # round(5 * 10 / 30); extra sweep discarded.
             return torch.full((1, 2, 2, 1, 3), 7.0)
 
         pipeline.lidar_encoder = encode
+    lidar_decoded = []
+
+    def decode_lidar(latents):
+        lidar_decoded.append(latents.clone())
+        return torch.ones(1, 3, 2, 128, 1800)
+
+    decode_lidar.config = lidar_config()
+    pipeline.lidar_decoder = decode_lidar
     calls, scheduler_calls = [], []
 
     def predict(**kwargs):
@@ -597,7 +606,15 @@ def test_pipeline_shares_schedule_preserves_conditions_and_returns_only_rgb(
     else:
         assert all(view[:, :, 0].eq(0.5).all() for view in decoded)
     assert set(result.output) == {"payload", "metadata"}
-    assert set(result.output["payload"]) == {"video"}
+    if mode == "joint" and return_lidar:
+        assert set(result.output["payload"]) == {"video", "lidar"}
+        torch.testing.assert_close(lidar_decoded[0], expected_lidar - 0.25)
+        assert result.output["payload"]["lidar"].shape == (1, 3, 2, 128, 1800)
+        assert result.output["metadata"]["lidar"]["fps"] == 10
+        assert result.output["metadata"]["lidar"]["num_frames"] == 2
+    else:
+        assert not lidar_decoded
+        assert set(result.output["payload"]) == {"video"}
     assert result.output["metadata"]["multiview"]["cameras"] == list(cameras)
 
 

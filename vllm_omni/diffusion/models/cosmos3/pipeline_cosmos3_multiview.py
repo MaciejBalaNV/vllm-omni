@@ -30,7 +30,7 @@ from vllm_omni.model_extras.cosmos3 import (
 from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames, required_lidar_sweeps
 
 from .action import find_closest_target_size
-from .lidar import Cosmos3LidarEncoder, validate_lidar_config
+from .lidar import Cosmos3LidarDecoder, Cosmos3LidarEncoder, validate_lidar_config
 from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
@@ -482,12 +482,18 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
         self.multiview_config = multiview_config
         self._encoder_modules = []
+        self._vae_modules = ["vae"]
         self.lidar_encoder = None
+        self.lidar_decoder = None
         if multiview_config.get("lidar") is not None:
             self.lidar_encoder = Cosmos3LidarEncoder.from_pretrained(
                 od_config.model, multiview_config["lidar"], self.device
             )
             self._encoder_modules = ["lidar_encoder"]
+            self.lidar_decoder = Cosmos3LidarDecoder.from_pretrained(
+                od_config.model, multiview_config["lidar"], self.device
+            )
+            self._vae_modules.append("lidar_decoder")
         self.multiview_cameras = tuple(multiview_config["cameras"])
         self.multiview_attention_scope = multiview_config["attention_scope"]
         self.multiview_decomposed_temporal_window_seconds = multiview_config["decomposed_temporal_window_seconds"]
@@ -979,16 +985,38 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             normalize_cfg=as_bool(self._get_sp_param(sp, "normalize_cfg", defaults.get("normalize_cfg", False)), False),
             open_guidance_interval=deployment.get("schema_version") == 2,
         )
-        latents = unpack_state(packed, shared_kwargs["packed_shapes"])[0]
+        final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
+        latents = final_targets[0]
         video = self._decode_multiview_latents(
             latents,
             num_views=num_views,
             latent_frames_per_view=latent_frames_per_view,
         ).clamp(-1, 1)
+        payload = {"video": video}
+        lidar_metadata = {}
+        if lidar_request is not None and lidar_request.get("return_output", False):
+            lidar_output = self.lidar_decoder(final_targets[1])
+            payload["lidar"] = lidar_output
+            lidar_config = self.lidar_decoder.config
+            lidar_metadata = {
+                "lidar": {
+                    "fps": lidar_config["fps"],
+                    "num_frames": lidar_output.shape[2],
+                    "shape": list(lidar_output.shape),
+                    "dtype": "float32",
+                    "channels": ["range", "intensity", "validity"],
+                    "units": ["metres", "unit", "binary" if lidar_config["apply_validity_mask"] else "probability"],
+                    "validity_threshold": lidar_config["range_projection"].get("validity_threshold", 0.5),
+                    "apply_validity_mask": lidar_config["apply_validity_mask"],
+                    "start_time_seconds": 0.0,
+                    "range_projection": dict(lidar_config["range_projection"]),
+                }
+            }
         return DiffusionOutput(
             output={
-                "payload": {"video": video},
+                "payload": payload,
                 "metadata": {
+                    **lidar_metadata,
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,
@@ -997,7 +1025,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         "aspect_ratio": aspect_ratio,
                         "width": width,
                         "height": height,
-                    }
+                    },
                 },
             }
         )

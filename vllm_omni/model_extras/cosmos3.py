@@ -204,8 +204,10 @@ def validate_multiview_request(
     joint = extra.get("lidar") is not None
     if joint:
         lidar = _mapping(extra["lidar"], "lidar")
-        if set(lidar) != {"control_path"} or not isinstance(lidar.get("control_path"), str | Path):
+        if set(lidar) - {"control_path", "return_output"} or not isinstance(lidar.get("control_path"), str | Path):
             raise ValueError("Cosmos3 lidar requires exactly one numeric control_path.")
+        if "return_output" in lidar and type(lidar["return_output"]) is not bool:
+            raise ValueError("Cosmos3 lidar.return_output must be boolean.")
         if Path(lidar["control_path"]).suffix.lower() != ".safetensors":
             raise ValueError("Cosmos3 lidar.control_path must be a .safetensors file.")
     selected_hints = [key for key in COSMOS3_TRANSFER_HINT_KEYS if extra.get(key) is not None]
