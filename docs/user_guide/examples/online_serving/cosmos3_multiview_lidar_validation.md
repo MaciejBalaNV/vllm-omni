@@ -11,11 +11,17 @@ available on the validation host.
 ## Implemented coverage
 
 The two-stage exporter retains `lidar2llm`/`llm2lidar` as
-`lidar_proj_in`/`lidar_proj_out`, including biases. It packages the reference
-V1.2 encoder, coordinates, architecture, streaming settings, physical projection,
-and latent mean/std. Runtime loading checks both metadata copies, complete
-projection weights, and the strict encoder state dictionary. Older unversioned
-WSM artifacts remain loadable.
+`lidar_proj_in`/`lidar_proj_out`, including biases. The exporter at imaginaire4
+`101e4f89b92beca1e99e0bca9df8a42083557d58` packages the complete reference V1.2
+VAE in `lidar_vae/config.json` and `lidar_vae/diffusion_pytorch_model.safetensors`.
+The component includes coordinates, resolved architecture defaults, streaming
+settings, physical projection, encoder/decoder weights, and latent mean/std.
+Runtime loading reads only encoder/quantization weights and shared buffers in
+FP32. It checks shared metadata and every explicit transformer network setting,
+accepts the VAE's additional defaults, and constructs from the saved VAE config.
+Complete projection weights and the strict encoder state dictionary are still
+required; decoder validation belongs to the exporter. Older unversioned WSM
+artifacts remain loadable.
 
 The runtime uses independent camera/LiDAR shapes, per-camera causal caption
 encoding, sensor-specific sparse attention, and a common UniPC schedule. LiDAR
@@ -25,6 +31,32 @@ for reference parity, but is inert in the current single-sample request path:
 no subsequent sample or modality consumes it.
 The numerical encoder dependency is vendored from imaginaire4 `e55e4fad16a9`;
 only its inference encoder is instantiated. No LiDAR decoder is exposed.
+
+Unified VAE loader tests cover selective tensor reads, exact FP32 preservation
+under a BF16 default, local/Hub component resolution, configuration agreement,
+missing files and encoder tensors, invalid precision/statistics, and construction
+of a small real encoder without attention execution. The saved
+`apply_validity_mask` setting does not change encoder input masking.
+
+### Unified VAE loader verification (2026-09-15)
+
+- 275 checks passed through the existing CPU adapters across
+  `test_cosmos3_lidar.py` and `test_cosmos3_multiview_pipeline.py`.
+- Three existing integration checks (generic warmup, lazy runtime imports, and
+  pipeline registration) failed on unavailable runtime imports and were
+  deselected in the focused rerun. Ordinary pytest collection also fails because
+  this host lacks vLLM; the repository virtualenv cannot start.
+- A synthetic small instance of the actual reference `TransformerVAE` was
+  exported with imaginaire4's `export_lidar_vae`, then loaded by the updated
+  vLLM-Omni encoder under a BF16 default dtype. All 58 consumed tensors matched
+  the reference exactly in FP32. The check substituted synthetic tokenizer
+  weights for checkpoint loading and did not execute attention kernels.
+
+Production-checkpoint latent parity, CUDA inference, and offline/HTTP smoke
+validation remain pending. These CPU results do not validate GPU kernels or
+serving behavior.
+
+## Existing runtime validation
 
 Selected CPU checks across the runtime/client and reference suites cover
 metadata/path validation and real FFmpeg chunk trimming. CPU checks exercise:

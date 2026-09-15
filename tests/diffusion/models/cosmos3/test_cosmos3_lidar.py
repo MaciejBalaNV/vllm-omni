@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+import json
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -39,6 +41,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def lidar_config() -> dict:
     return {
         "version": "1.2",
+        "dtype": "float32",
+        "sample_posterior": False,
+        "apply_validity_mask": True,
         "fps": 10.0,
         "latent_channels": 128,
         "spatial_compression": [16, 16],
@@ -167,6 +172,10 @@ def test_physical_normalization_circular_padding_and_validity():
     "field,value",
     [
         ("version", "1"),
+        ("dtype", "bfloat16"),
+        ("sample_posterior", True),
+        ("sample_posterior", 0),
+        ("apply_validity_mask", 1),
         ("fps", 0),
         ("spatial_compression", [8, 8]),
         ("temporal_compression_factor", 4),
@@ -181,10 +190,12 @@ def test_rejects_incompatible_encoder_metadata(field, value):
         validate_lidar_config(config)
 
 
-def test_encoder_uses_fp32_posterior_mean_chunk_context_and_latent_affine():
+@pytest.mark.parametrize("apply_validity_mask", [False, True])
+def test_encoder_uses_fp32_posterior_mean_chunk_context_and_latent_affine(apply_validity_mask):
     model = object.__new__(Cosmos3LidarEncoder)
     torch.nn.Module.__init__(model)
     model.config = lidar_config()
+    model.config["apply_validity_mask"] = apply_validity_mask
     model.coords = torch.zeros(1, 2, 128, 1808)
     model.latent_mean = torch.tensor(0.25)
     model.latent_std = torch.tensor(0.5)
@@ -610,42 +621,201 @@ def test_view_completion_rejects_short_known_video(monkeypatch):
         )
 
 
-def test_encoder_artifact_inventory_and_fp32_loading(tmp_path):
-    import json
+class TinyLidarEncoder(Cosmos3LidarEncoder):
+    def __init__(self, config):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.encoder = torch.nn.Linear(1, config["network_config"].get("base_channels", 1))
+        self.quant_conv = torch.nn.Linear(1, 1)
+        self.register_buffer("coords", torch.zeros(1, 2, 1, 1))
+        self.register_buffer("latent_mean", torch.zeros(1))
+        self.register_buffer("latent_std", torch.ones(1))
 
+
+@pytest.fixture
+def lidar_vae_artifact(tmp_path):
     config = lidar_config()
-    with pytest.raises(ValueError, match="Incomplete joint artifact"):
-        Cosmos3LidarEncoder.from_pretrained(str(tmp_path), config, torch.device("cpu"))
-    folder = tmp_path / "lidar_encoder"
+    component = {**config, "network_config": {**config["network_config"], "base_channels": 4, "decoder_depths": None}}
+    folder = tmp_path / "lidar_vae"
     folder.mkdir()
-    (folder / "config.json").write_text(json.dumps(config))
+    (folder / "config.json").write_text(json.dumps(component))
+    model = TinyLidarEncoder(component).float()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.0001)  # Detect rounding through the pipeline's BF16 default.
+    state = {
+        **model.state_dict(),
+        "decoder.weight": torch.ones(1),
+        "post_quant_conv.weight": torch.ones(1),
+    }
+    save_file(state, folder / "diffusion_pytorch_model.safetensors")
+    return tmp_path, config, component, state
 
-    class TinyEncoder(Cosmos3LidarEncoder):
-        def __init__(self, config):
-            torch.nn.Module.__init__(self)
-            self.weight = torch.nn.Parameter(torch.empty(1))
-            self.register_buffer("latent_mean", torch.empty(1))
-            self.register_buffer("latent_std", torch.empty(1))
 
-    state = {"weight": torch.tensor([1.0001]), "latent_mean": torch.zeros(1), "latent_std": torch.ones(1)}
-    save_file(state, folder / "model.safetensors")
+def test_encoder_artifact_inventory_and_fp32_loading(lidar_vae_artifact, monkeypatch):
+    import safetensors
+
+    path, config, component, state = lidar_vae_artifact
+    safe_open = safetensors.safe_open
+    reads = []
+
+    @contextmanager
+    def encoder_only_open(filename, **kwargs):
+        assert kwargs == {"framework": "pt", "device": "cpu"}
+        with safe_open(filename, **kwargs) as handle:
+
+            def get_slice(name):
+                assert not name.startswith(("decoder.", "post_quant_conv."))
+                return handle.get_slice(name)
+
+            def get_tensor(name):
+                assert not name.startswith(("decoder.", "post_quant_conv."))
+                reads.append(name)
+                return handle.get_tensor(name)
+
+            yield SimpleNamespace(keys=handle.keys, get_slice=get_slice, get_tensor=get_tensor)
+
+    monkeypatch.setattr(safetensors, "safe_open", encoder_only_open)
     previous = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.bfloat16)
-        loaded = TinyEncoder.from_pretrained(str(tmp_path), config, torch.device("cpu"))
+        loaded = TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
     finally:
         torch.set_default_dtype(previous)
-    assert loaded.weight.dtype == torch.float32
-    torch.testing.assert_close(loaded.weight, state["weight"], rtol=0, atol=0)
-    save_file({key: value for key, value in state.items() if key != "weight"}, folder / "model.safetensors")
+    assert loaded.config == component
+    assert loaded.encoder.out_features == 4
+    assert set(reads) == loaded.state_dict().keys()
+    for name, tensor in loaded.state_dict().items():
+        assert tensor.dtype == torch.float32
+        torch.testing.assert_close(tensor, state[name], rtol=0, atol=0)
+    assert not loaded.training and all(not p.requires_grad for p in loaded.parameters())
+    assert not hasattr(loaded, "decoder") and not hasattr(loaded, "decode")
+
+
+def test_encoder_resolves_vae_from_hub(lidar_vae_artifact, monkeypatch):
+    import huggingface_hub
+
+    path, config, _, _ = lidar_vae_artifact
+
+    def download(repo_id, *, allow_patterns):
+        assert repo_id == "test-org/joint-lidar-model"
+        assert allow_patterns == ["lidar_vae/config.json", "lidar_vae/diffusion_pytorch_model.safetensors"]
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    loaded = TinyLidarEncoder.from_pretrained("test-org/joint-lidar-model", config, torch.device("cpu"))
+    assert loaded.encoder.out_features == 4
+
+
+@pytest.mark.parametrize("missing", ["config.json", "diffusion_pytorch_model.safetensors"])
+def test_encoder_requires_vae_files(lidar_vae_artifact, missing):
+    path, config, _, _ = lidar_vae_artifact
+    (path / "lidar_vae" / missing).unlink()
+    with pytest.raises(ValueError, match="Incomplete joint artifact: lidar_vae/config.json"):
+        TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("missing", ["encoder.weight", "quant_conv.weight", "coords", "latent_mean", "latent_std"])
+def test_encoder_requires_complete_encoder_state(lidar_vae_artifact, missing):
+    path, config, _, state = lidar_vae_artifact
+    del state[missing]
+    save_file(state, path / "lidar_vae/diffusion_pytorch_model.safetensors")
     with pytest.raises(RuntimeError, match="Missing key"):
-        TinyEncoder.from_pretrained(str(tmp_path), config, torch.device("cpu"))
-    save_file({**state, "latent_std": torch.zeros(1)}, folder / "model.safetensors")
-    with pytest.raises(ValueError, match="positive standard deviations"):
-        TinyEncoder.from_pretrained(str(tmp_path), config, torch.device("cpu"))
-    (folder / "config.json").write_text(json.dumps({**config, "fps": 11}))
+        TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    "name,value,error,message",
+    [
+        ("encoder.weight", torch.ones(2, 1), RuntimeError, "size mismatch"),
+        ("latent_mean", torch.zeros(2), RuntimeError, "size mismatch"),
+        ("encoder.weight", torch.ones(4, 1, dtype=torch.bfloat16), ValueError, "must be FP32"),
+        ("quant_conv.weight", torch.ones(1, 1, dtype=torch.float16), ValueError, "must be FP32"),
+        ("coords", torch.zeros(1, 2, 1, 1, dtype=torch.bfloat16), ValueError, "must be FP32"),
+        ("latent_std", torch.ones(1, dtype=torch.int64), ValueError, "must be FP32"),
+        ("latent_mean", torch.tensor([float("nan")]), ValueError, "positive standard deviations"),
+        ("latent_mean", torch.tensor([float("inf")]), ValueError, "positive standard deviations"),
+        ("latent_std", torch.tensor([float("nan")]), ValueError, "positive standard deviations"),
+        ("latent_std", torch.tensor([float("inf")]), ValueError, "positive standard deviations"),
+        ("latent_std", torch.tensor([0.0]), ValueError, "positive standard deviations"),
+        ("latent_std", torch.tensor([-1.0]), ValueError, "positive standard deviations"),
+        ("encoder.unexpected", torch.ones(1), ValueError, "Unexpected LiDAR encoder tensors"),
+        ("optimizer.step", torch.ones(1), ValueError, "Unexpected LiDAR encoder tensors"),
+    ],
+)
+def test_encoder_rejects_invalid_vae_encoder_state(lidar_vae_artifact, name, value, error, message):
+    path, config, _, state = lidar_vae_artifact
+    state[name] = value
+    save_file(state, path / "lidar_vae/diffusion_pytorch_model.safetensors")
+    with pytest.raises(error, match=message):
+        TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(
+    "field", ["fps", "network_config", "range_projection", "apply_validity_mask", "decoder_depths", "missing_default"]
+)
+def test_encoder_rejects_conflicting_vae_metadata(lidar_vae_artifact, field):
+    path, config, component, _ = lidar_vae_artifact
+    if field == "network_config":
+        component[field]["depths"] = [1, 1, 1, 1]
+    elif field == "range_projection":
+        component[field] = {**component[field], "max_range_m": 105.0}
+    elif field == "decoder_depths":
+        config["network_config"][field] = [1, 1, 1, 1]
+    elif field == "missing_default":
+        config["network_config"]["decoder_depths"] = None
+        del component["network_config"]["decoder_depths"]
+    else:
+        component[field] = False if field == "apply_validity_mask" else 11.0
+    (path / "lidar_vae/config.json").write_text(json.dumps(component))
     with pytest.raises(ValueError, match="metadata disagrees"):
-        TinyEncoder.from_pretrained(str(tmp_path), config, torch.device("cpu"))
+        TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("field", ["dtype", "sample_posterior", "apply_validity_mask"])
+def test_encoder_requires_vae_policy_metadata(lidar_vae_artifact, field):
+    path, config, component, _ = lidar_vae_artifact
+    del component[field]
+    (path / "lidar_vae/config.json").write_text(json.dumps(component))
+    with pytest.raises(ValueError, match="missing LiDAR metadata"):
+        TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+
+
+def test_encoder_loads_real_architecture_with_saved_constructor_defaults(tmp_path, monkeypatch):
+    import importlib.util
+    import inspect
+    import sys
+    from types import ModuleType
+
+    # Construct the real encoder on CPU; this test must never execute attention kernels.
+    if importlib.util.find_spec("natten") is None:
+        natten = ModuleType("natten")
+        natten.functional = SimpleNamespace(na2d=lambda *args, **kwargs: pytest.fail("Unexpected attention execution"))
+        monkeypatch.setitem(sys.modules, "natten", natten)
+    from vllm_omni.diffusion.models.cosmos3.lidar_encoder.transformer_vae import Encoder
+
+    config = lidar_config()
+    config["latent_channels"] = 4
+    config["network_config"].update(z_dim=4, base_channels=4, depths=[1] * 4, num_heads=[1] * 4)
+    arguments = inspect.signature(Encoder).bind(**config["network_config"])
+    arguments.apply_defaults()
+    network = json.loads(json.dumps(arguments.arguments))
+    # Constructor defaults and decoder-only overrides are absent from deployment metadata.
+    component = {**config, "network_config": {**network, "decoder_depths": None, "out_channels": 3}}
+    model = Cosmos3LidarEncoder(component).float()
+    state = model.state_dict()
+    state["latent_mean"].fill_(0.1234567)
+    state["latent_std"].fill_(0.9876543)
+    state["encoder.tokenizer.0.weight"].fill_(0.1234567)
+    folder = tmp_path / "lidar_vae"
+    folder.mkdir()
+    (folder / "config.json").write_text(json.dumps(component))
+    save_file({**state, "decoder.weight": torch.ones(1)}, folder / "diffusion_pytorch_model.safetensors")
+    loaded = Cosmos3LidarEncoder.from_pretrained(str(tmp_path), config, torch.device("cpu"))
+    assert loaded.config == component
+    assert loaded.state_dict().keys() == state.keys()
+    for name, tensor in loaded.state_dict().items():
+        torch.testing.assert_close(tensor, state[name], rtol=0, atol=0)
 
 
 def test_unipc_updates_mixed_sensor_state_with_one_sigma_schedule():
