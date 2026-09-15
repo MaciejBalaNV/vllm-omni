@@ -138,6 +138,7 @@ def test_encoder_offload_declaration_only_includes_loaded_modules(monkeypatch, j
     monkeypatch.setattr(module, "_validated_multiview_deployment_config", lambda _: config)
     monkeypatch.setattr(module, "validate_multiview_parallel_config", lambda *args, **kwargs: None)
     monkeypatch.setattr(module.Cosmos3LidarEncoder, "from_pretrained", lambda *args: torch.nn.Identity())
+    monkeypatch.setattr(module.Cosmos3LidarDecoder, "from_pretrained", lambda *args: torch.nn.Identity())
 
     def initialize(self, **kwargs):
         torch.nn.Module.__init__(self)
@@ -153,6 +154,7 @@ def test_encoder_offload_declaration_only_includes_loaded_modules(monkeypatch, j
         )
     )
     assert pipeline._encoder_modules == (["lidar_encoder"] if joint else [])
+    assert pipeline._vae_modules == (["vae", "lidar_decoder"] if joint else ["vae"])
     assert all(isinstance(getattr(pipeline, name), torch.nn.Module) for name in pipeline._encoder_modules)
     assert module.Cosmos3MultiviewPipeline._encoder_modules == []
 

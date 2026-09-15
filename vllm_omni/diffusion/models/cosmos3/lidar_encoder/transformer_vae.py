@@ -50,7 +50,7 @@ from vllm_omni.diffusion.models.cosmos3.lidar_encoder.rope3d import (
     apply_rotary_emb,
 )
 
-__all__ = ["Encoder"]
+__all__ = ["Encoder", "Decoder"]
 
 
 # =============================================================================
@@ -1408,3 +1408,358 @@ class Encoder(nn.Module):
         if missing:
             raise ValueError(f"unused temporal KV cache keys: {sorted(missing)}")
         return h, new_cache
+
+
+# Decoder ported from imaginaire4 9ca7bd6adfe. Shared blocks above are unchanged.
+class Decoder(nn.Module):
+    def __init__(
+        self,
+        resolution: list[int],
+        out_channels: int,
+        z_dim: int,
+        base_channels: int = 128,
+        patch_size: list[int] = (1, 4),
+        window_size: list[int] = (3, 9),
+        depths: list[int] = (3, 3, 3, 3),
+        num_heads: list[int] = (2, 4, 8, 16),
+        dilation: list[int] = (1, 1, 1, 1),
+        temporal_downsample: list[bool] = (True, False, False),
+        temporal_upsample: list[bool] | None = None,
+        mlp_ratio: float = 3.0,
+        dropout: float = 0.0,
+        mapping_depth: int = 2,
+        positional_embedding: str = "learnable_embedding",
+        stem_patchify: bool = False,
+        # ---- Bottleneck options ----
+        # If True, replace the bottleneck's factorized (temporal + global
+        # spatial) attention with a single joint 3D self-attention over
+        # (T*H*W) tokens. The up-levels are unchanged (still skip temporal
+        # attn at the highest resolution as before).
+        bottleneck_3d: bool = False,
+        # Max T accepted by the bottleneck-3D's learnable temporal PE. Only
+        # used when bottleneck_3d=True. Set this >= the largest T_z (encoder
+        # latent frames) you'll ever feed the decoder.
+        bottleneck_3d_max_t: int = 32,
+        # If True, the joint 3D attention is causal in time (token (t, h, w)
+        # only attends to (t', h', w') with t' <= t). The causal mask is
+        # materialized as a (T*H*W, T*H*W) bool tensor, so memory scales as
+        # O((T*H*W)^2). Bidirectional is the default for non-streaming use.
+        bottleneck_3d_causal_time: bool = False,
+        # If True (and bottleneck_3d=True), encode position in the joint 3D
+        # attention with a parameter-free 3D RoPE (`VideoRopePosition3DEmb`)
+        # over (t, h, w) instead of the default (learnable temporal PE + 2D
+        # spatial AxialRoPE). Recommended for length-extrapolation: the
+        # learnable temporal PE has uninitialized slots past the largest T
+        # seen in training (= noise at inference); 3D RoPE has none. The
+        # spatial axes of the 3D RoPE replace AxialRoPE -- the bottleneck
+        # operates on a regular (H_z, W_z) grid so Cartesian RoPE is fine
+        # and decouples positional encoding from polar `coords`.
+        # Orthogonal to `bottleneck_3d_causal_time` -- both can be combined.
+        bottleneck_3d_rope: bool = False,
+        # If True, replace each TemporalExpanding with TemporalExpandingWanStyle,
+        # which mirrors the WAN decoder's first-frame-special behavior:
+        # T_in -> 2*T_in - 1 per level. Composed twice this maps T_z latents
+        # to 4*T_z - 3 frames, so when paired with the WAN encoder there's no
+        # over-production and no leading-frame crop needed downstream.
+        temporal_expand_wan_style: bool = False,
+        # ---- Detokenizer (output) options ----
+        # Patch size for the final unpatchify (pixel-shuffle) layer. Defaults
+        # to `patch_size` (symmetric with the stem, the original behavior).
+        # Setting this larger than `patch_size` lets the decoder run the top
+        # (highest-resolution) up-levels at a coarser feature grid and rely
+        # on the final per-pixel Linear + rearrange to upsample to the output
+        # resolution -- substantially cheaper since the top level dominates
+        # the activation memory. The user is responsible for making sure
+        # `bottleneck_size = resolution // out_patch_size >> n_down` matches
+        # the encoder's latent spatial shape (i.e. reduce `depths` by
+        # `log2(out_patch_size / patch_size)` to compensate).
+        out_patch_size: list[int] | None = None,
+        # If False, the local (neighborhood) attention does NOT wrap the W
+        # axis (clamps at the edges). Default True keeps the range-image
+        # azimuth-periodic behavior. Set False for a Cartesian BEV grid.
+        circular_padding: bool = True,
+        # Temporal-mixing mechanism for the mid/up temporal blocks:
+        # "attention" (:class:`CausalTemporalAttention`, default) or "conv"
+        # (WAN-style :class:`CausalTemporalConv`, kernel ``temporal_conv_kernel``).
+        temporal_mixer: Literal["attention", "conv"] = "attention",
+        temporal_conv_kernel: int = 3,
+    ):
+        super().__init__()
+        self.resolution = _pair(resolution)
+        self.patch_size = _pair(patch_size)
+        self.out_patch_size = _pair(out_patch_size) if out_patch_size is not None else self.patch_size
+        self.depths = depths
+        self.temporal_upsample = temporal_upsample if temporal_upsample is not None else temporal_downsample
+        self.stem_patchify = stem_patchify
+        self.bottleneck_3d = bottleneck_3d
+        self._temporal_cls = (
+            functools.partial(TemporalConvBlock, kernel_size=temporal_conv_kernel)
+            if temporal_mixer == "conv"
+            else TemporalBlock
+        )
+        self.temporal_expand_wan_style = temporal_expand_wan_style
+        temporal_expand_cls = TemporalExpandingWanStyle if temporal_expand_wan_style else TemporalExpanding
+
+        # `token_size` is the feature grid at the top up-level, i.e. *before*
+        # the final detokenizer's unpatchify -- this is what RoPE harmonics
+        # and the coordinate pyramid index. With `out_patch_size > patch_size`
+        # the top up-level sits at a coarser grid than the output resolution.
+        token_size = torch.tensor(self.resolution) // torch.tensor(self.out_patch_size)
+        max_harmonics = (token_size / 2).int()
+        n_down = len(depths) - 1
+        bottleneck_dim = base_channels << n_down
+        bottleneck_size = (token_size >> n_down).tolist()
+
+        # Project from z_dim to bottleneck channels.
+        # By default the stem is a per-pixel channel projection (used in the
+        # full TransformerVAE, where the Encoder's Tokenizer has already
+        # patchified the input by `patch_size`). When `stem_patchify=True`,
+        # we instead apply a Conv2d with stride=patch_size, so the decoder
+        # can be paired with an external encoder (e.g. the WAN encoder) whose
+        # latent spatial shape is patch_size larger than the bottleneck.
+        if stem_patchify and tuple(self.patch_size) != (1, 1):
+            self.stem = nn.Sequential(
+                nn.Conv2d(
+                    z_dim,
+                    bottleneck_dim,
+                    kernel_size=self.patch_size,
+                    stride=self.patch_size,
+                    bias=False,
+                ),
+                Rearrange("B C H W -> B H W C"),
+            )
+        else:
+            self.stem = nn.Sequential(
+                Rearrange("B C H W -> B H W C"),
+                nn.Linear(z_dim, bottleneck_dim, bias=False),
+            )
+
+        # Positional embedding at bottleneck resolution
+        if positional_embedding != "learnable_embedding":
+            raise ValueError(
+                "Only positional_embedding='learnable_embedding' is supported "
+                f"(got {positional_embedding!r}). Alternate absolute PE modes were removed."
+            )
+        # mapping_depth is retained for config compatibility with the shipped checkpoint.
+        _ = mapping_depth
+        self.spatial_pe = LearnablePositionalEmbedding(
+            out_dim=bottleneck_dim,
+            resolution=bottleneck_size,
+        )
+
+        # Bottleneck: either factorized (temporal + global spatial), or a
+        # single joint 3D self-attention over (T*H*W) tokens.
+        if bottleneck_3d:
+            self.mid_3d = nn.ModuleList()
+            for _ in range(depths[-1]):
+                self.mid_3d.append(
+                    Bottleneck3DBlock(
+                        in_dim=bottleneck_dim,
+                        num_heads=num_heads[-1],
+                        max_t=bottleneck_3d_max_t,
+                        rope_max_harmonics=(max_harmonics >> n_down).clamp(min=1),
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                        causal_time=bottleneck_3d_causal_time,
+                        use_3d_rope=bottleneck_3d_rope,
+                        # 3D RoPE caches per-axis frequencies up to (len_t,
+                        # len_h, len_w). Spatial caps come from the
+                        # bottleneck's own grid; the temporal cap is shared
+                        # with the learnable-PE path via `bottleneck_3d_max_t`.
+                        len_h=bottleneck_size[0],
+                        len_w=bottleneck_size[1],
+                    )
+                )
+        else:
+            self.mid_temporal = nn.ModuleList()
+            self.mid_spatial = nn.ModuleList()
+            for _ in range(depths[-1]):
+                self.mid_temporal.append(
+                    self._temporal_cls(
+                        in_dim=bottleneck_dim,
+                        num_heads=num_heads[-1],
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                    )
+                )
+                self.mid_spatial.append(
+                    SpatialBlock(
+                        in_dim=bottleneck_dim,
+                        num_heads=num_heads[-1],
+                        attn_type="global",
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                        rope_max_harmonics=(max_harmonics >> n_down).clamp(min=1),
+                    )
+                )
+
+        # Up levels: temporal expand + spatial expand + temporal→spatial blocks
+        # Skip temporal attention at level 0 (highest resolution) for efficiency.
+        self.up_levels = nn.ModuleDict()
+        for i in reversed(range(n_down)):
+            dim_i = base_channels << i
+            dim_above = base_channels << (i + 1)
+
+            if self.temporal_upsample[i]:
+                self.up_levels[f"temporal_expand_{i}"] = temporal_expand_cls(dim_above)
+
+            self.up_levels[f"expand_{i}"] = PatchExpanding(dim_above)
+
+            spatial_blocks = nn.ModuleList()
+            for j in range(depths[i]):
+                spatial_blocks.append(
+                    SpatialBlock(
+                        in_dim=dim_i,
+                        num_heads=num_heads[i],
+                        attn_type="local",
+                        kernel_size=window_size,
+                        dilation=1 if j % 2 == 0 else dilation[i],
+                        mlp_ratio=mlp_ratio,
+                        dropout=dropout,
+                        rope_max_harmonics=(max_harmonics >> i).clamp(min=1),
+                        circular=circular_padding,
+                    )
+                )
+            self.up_levels[f"spatial_{i}"] = spatial_blocks
+            # Temporal blocks are needed at every level that does a temporal
+            # expand (to mix the newly-interpolated frames into a coherent
+            # sequence), plus -- as a cheap-but-useful compute heuristic --
+            # at every level deeper than the top one. The previous condition
+            # was just `i > 0`, which silently skipped temporal attention at
+            # the top level even when temporal_upsample[0] was True, leaving
+            # the just-expanded frames un-mixed.
+            if i > 0 or self.temporal_upsample[i]:
+                temporal_blocks = nn.ModuleList()
+                for j in range(depths[i]):
+                    temporal_blocks.append(
+                        self._temporal_cls(
+                            in_dim=dim_i,
+                            num_heads=num_heads[i],
+                            mlp_ratio=mlp_ratio,
+                            dropout=dropout,
+                        )
+                    )
+                self.up_levels[f"temporal_{i}"] = temporal_blocks
+
+        self.detokenizer = Detokenizer(base_channels, out_channels, self.out_patch_size)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        coords: torch.Tensor,
+        temporal_kv_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        return_temporal_kv_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+        """
+        Args:
+            z: (B, z_dim, T', H_z, W_z) latent
+            coords: (1, 2, H, W) polar coordinates
+        Returns:
+            (B, C, T, H, W) reconstructed video
+        """
+        B = z.shape[0]
+        T_cur = z.shape[2]
+        n_down = len(self.depths) - 1
+        streaming = return_temporal_kv_cache
+        if temporal_kv_cache is not None and not streaming:
+            raise ValueError("temporal_kv_cache requires return_temporal_kv_cache=True")
+        if streaming:
+            if any(self.temporal_upsample):
+                raise NotImplementedError(
+                    "streaming decode currently requires temporal_upsample=False at every decoder level"
+                )
+            if self.bottleneck_3d:
+                if not all(
+                    getattr(block.attn, "causal_time", False) and getattr(block.attn, "use_3d_rope", False)
+                    for block in self.mid_3d
+                ):
+                    raise NotImplementedError(
+                        "streaming decode with bottleneck_3d requires causal_time=True and use_3d_rope=True"
+                    )
+            elif not all(isinstance(block, TemporalBlock) for block in self.mid_temporal):
+                raise NotImplementedError(
+                    "streaming decode currently supports temporal attention, not temporal convolution"
+                )
+        old_cache = temporal_kv_cache or {}
+        new_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # Build coordinate pyramid. The base sits at the *top up-level* token
+        # grid (= resolution // out_patch_size), which is the highest-res grid
+        # the attention blocks actually see -- the final detokenizer's
+        # pixel-shuffle never gets coords.
+        c_base = F.avg_pool2d(coords, kernel_size=self.out_patch_size, stride=self.out_patch_size)
+        c_levels = [c_base]
+        for i in range(n_down):
+            c_levels.append(F.avg_pool2d(c_levels[-1], kernel_size=2, stride=2))
+
+        # Stem per-frame + spatial PE
+        z = einops.rearrange(z, "B C T H W -> (B T) C H W")
+        h = self.stem(z) + self.spatial_pe(c_levels[n_down])  # (BT, H_z, W_z, C)
+        h = einops.rearrange(h, "(B T) H W C -> B T H W C", B=B, T=T_cur)
+
+        # Bottleneck
+        _, _, Hc, Wc, _ = h.shape
+        if self.bottleneck_3d:
+            for block_idx, block in enumerate(self.mid_3d):
+                if streaming:
+                    cache_key = f"mid_3d.{block_idx}"
+                    h, new_cache[cache_key] = block.forward_stream(h, c_levels[n_down], old_cache.pop(cache_key, None))
+                else:
+                    h = block(h, c_levels[n_down])
+        else:
+            # Factorized: temporal then global-spatial (decoder order).
+            for block_idx, (t_block, s_block) in enumerate(zip(self.mid_temporal, self.mid_spatial)):
+                h = einops.rearrange(h, "B T H W C -> (B H W) T C")
+                if streaming:
+                    cache_key = f"mid_temporal.{block_idx}"
+                    h, new_cache[cache_key] = t_block.forward_stream(h, old_cache.pop(cache_key, None))
+                else:
+                    h = t_block(h)
+                h = einops.rearrange(h, "(B H W) T C -> (B T) H W C", B=B, H=Hc, W=Wc)
+                h = s_block(h, c_levels[n_down])
+                h = einops.rearrange(h, "(B T) H W C -> B T H W C", B=B, T=T_cur)
+
+        # Up levels
+        for i in reversed(range(n_down)):
+            # Temporal upsample
+            if self.temporal_upsample[i]:
+                h = self.up_levels[f"temporal_expand_{i}"](h)
+                T_cur = h.shape[1]
+
+            # Spatial upsample per-frame
+            h = einops.rearrange(h, "B T H W C -> (B T) H W C")
+            h = self.up_levels[f"expand_{i}"](h)
+            h = einops.rearrange(h, "(B T) H W C -> B T H W C", B=B, T=T_cur)
+
+            _, _, Hc, Wc, _ = h.shape
+
+            has_temporal = f"temporal_{i}" in self.up_levels
+            t_blocks = self.up_levels[f"temporal_{i}"] if has_temporal else [None] * len(self.up_levels[f"spatial_{i}"])
+            for block_idx, (t_block, s_block) in enumerate(zip(t_blocks, self.up_levels[f"spatial_{i}"])):
+                if t_block is not None:
+                    h = einops.rearrange(h, "B T H W C -> (B H W) T C")
+                    if streaming:
+                        if not isinstance(t_block, TemporalBlock):
+                            raise NotImplementedError(
+                                "streaming decode currently supports temporal attention, not temporal convolution"
+                            )
+                        cache_key = f"up_levels.temporal_{i}.{block_idx}"
+                        h, new_cache[cache_key] = t_block.forward_stream(h, old_cache.pop(cache_key, None))
+                    else:
+                        h = t_block(h)
+                    h = einops.rearrange(h, "(B H W) T C -> (B T) H W C", B=B, H=Hc, W=Wc)
+                else:
+                    h = einops.rearrange(h, "B T H W C -> (B T) H W C")
+                h = s_block(h, c_levels[i])
+                h = einops.rearrange(h, "(B T) H W C -> B T H W C", B=B, T=T_cur)
+
+        # Detokenize per-frame
+        h = einops.rearrange(h, "B T H W C -> (B T) H W C")
+        h = self.detokenizer(h)  # (BT, C_out, H, W)
+        h = einops.rearrange(h, "(B T) C H W -> B C T H W", B=B, T=T_cur)
+        if streaming:
+            missing = set(old_cache) - set(new_cache)
+            if missing:
+                raise ValueError(f"unused temporal KV cache keys: {sorted(missing)}")
+            return h, new_cache
+        return h

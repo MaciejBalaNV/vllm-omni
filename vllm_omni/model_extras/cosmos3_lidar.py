@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,3 +67,26 @@ def load_lidar_frames(path: str | Path, *, num_sweeps: int | None = None) -> tor
     if (frames[0] < 0).any() or (frames[1:] < 0).any() or (frames[1:] > 1).any():
         raise ValueError("LiDAR range must be non-negative; intensity and validity must be in [0,1].")
     return frames
+
+
+def lidar_output_requested(extra: Mapping[str, Any] | None) -> bool:
+    lidar = extra.get("lidar") if extra is not None else None
+    return isinstance(lidar, Mapping) and lidar.get("return_output") is True
+
+
+def serialize_lidar_output(frames: torch.Tensor, metadata: Mapping[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    """Serialize one sample on the same physical grid used by numeric inputs."""
+    import torch
+    from safetensors.torch import save
+
+    if not isinstance(frames, torch.Tensor) or frames.ndim != 5 or frames.shape[:2] != (1, 3):
+        raise ValueError("LiDAR output must be a tensor with shape [1,3,T,128,1800].")
+    if frames.shape[2] < 1 or tuple(frames.shape[-2:]) != (128, 1800) or frames.dtype != torch.float32:
+        raise ValueError("LiDAR output requires nonempty FP32 sweeps on the 128x1800 grid.")
+    frames = frames[0].detach().cpu().contiguous()
+    if not torch.isfinite(frames).all() or (frames[0] < 0).any() or (frames[1:] < 0).any() or (frames[1:] > 1).any():
+        raise ValueError("LiDAR output must contain finite metric ranges and unit intensity/validity.")
+    details = dict(metadata, shape=list(frames.shape), dtype="float32", num_frames=frames.shape[1])
+    if not isinstance(details.get("fps"), int | float) or not math.isfinite(details["fps"]) or details["fps"] <= 0:
+        raise ValueError("LiDAR output metadata requires positive finite FPS.")
+    return save({"frames": frames}, metadata={"lidar": json.dumps(details, allow_nan=False)}), details

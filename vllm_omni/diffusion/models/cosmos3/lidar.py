@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""V1.2 LiDAR encoder loaded from the unified VAE. Deliberately has no decode method."""
+"""Independent V1.2 LiDAR encoder and decoder loaded from the unified VAE."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from typing_extensions import Self
 
 _LIDAR_VAE_SUBFOLDER = "lidar_vae"
 _LIDAR_VAE_WEIGHTS = "diffusion_pytorch_model.safetensors"
@@ -105,25 +106,12 @@ def prepare_lidar_encoder_input(frames: torch.Tensor, projection: dict[str, Any]
     return torch.cat((ranges.masked_fill(~valid, -1), intensities.masked_fill(~valid, -1), valid.float()), dim=1)
 
 
-class Cosmos3LidarEncoder(nn.Module):
-    def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__()
-        validate_lidar_config(config)
-        from .lidar_encoder.encoding import generate_polar_coords
-        from .lidar_encoder.transformer_vae import Encoder
-
-        self.config = config
-        network = config["network_config"]
-        encoder_args = set(inspect.signature(Encoder).parameters)
-        self.encoder = Encoder(**{key: value for key, value in network.items() if key in encoder_args})
-        channels = config["latent_channels"]
-        self.quant_conv = nn.Conv2d(channels * 2, channels * 2, 1)
-        self.register_buffer("coords", generate_polar_coords(*network["resolution"]))
-        self.register_buffer("latent_mean", torch.empty(1, channels, 1, 1, 1))
-        self.register_buffer("latent_std", torch.empty(1, channels, 1, 1, 1))
+class _LidarComponent(nn.Module):
+    _unused_prefixes: tuple[str, ...]
+    _component_name: str
 
     @classmethod
-    def from_pretrained(cls, model_path: str, config: dict[str, Any], device: torch.device) -> Cosmos3LidarEncoder:
+    def from_pretrained(cls, model_path: str, config: dict[str, Any], device: torch.device) -> Self:
         from safetensors import safe_open
 
         checkpoint_path = Path(model_path)
@@ -151,14 +139,14 @@ class Cosmos3LidarEncoder(nn.Module):
         model = cls(component_config).float()
         expected = model.state_dict()
         with safe_open(folder / _LIDAR_VAE_WEIGHTS, framework="pt", device="cpu") as weights:
-            # Leave the unused decoder in the file; only the exporter validates its state.
-            encoder_keys = [name for name in weights.keys() if not name.startswith(("decoder.", "post_quant_conv."))]
-            if unexpected := set(encoder_keys) - expected.keys():
-                raise ValueError(f"Unexpected LiDAR encoder tensors: {sorted(unexpected)}.")
+            # Each component reads only its own parameters and the shared buffers.
+            keys = [name for name in weights.keys() if not name.startswith(cls._unused_prefixes)]
+            if unexpected := set(keys) - expected.keys():
+                raise ValueError(f"Unexpected LiDAR {cls._component_name} tensors: {sorted(unexpected)}.")
             state = {}
-            for name in encoder_keys:
+            for name in keys:
                 if expected[name].is_floating_point() and weights.get_slice(name).get_dtype() != "F32":
-                    raise ValueError(f"LiDAR encoder tensor {name} must be FP32.")
+                    raise ValueError(f"LiDAR {cls._component_name} tensor {name} must be FP32.")
                 state[name] = weights.get_tensor(name)
             model.load_state_dict(state, strict=True)
         if (
@@ -168,6 +156,27 @@ class Cosmos3LidarEncoder(nn.Module):
         ):
             raise ValueError("LiDAR latent statistics must be finite with positive standard deviations.")
         return model.eval().requires_grad_(False).to(device=device, dtype=torch.float32)
+
+
+class Cosmos3LidarEncoder(_LidarComponent):
+    _unused_prefixes = ("decoder.", "post_quant_conv.")
+    _component_name = "encoder"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        validate_lidar_config(config)
+        from .lidar_encoder.encoding import generate_polar_coords
+        from .lidar_encoder.transformer_vae import Encoder
+
+        self.config = config
+        network = config["network_config"]
+        encoder_args = set(inspect.signature(Encoder).parameters)
+        self.encoder = Encoder(**{key: value for key, value in network.items() if key in encoder_args})
+        channels = config["latent_channels"]
+        self.quant_conv = nn.Conv2d(channels * 2, channels * 2, 1)
+        self.register_buffer("coords", generate_polar_coords(*network["resolution"]))
+        self.register_buffer("latent_mean", torch.empty(1, channels, 1, 1, 1))
+        self.register_buffer("latent_std", torch.empty(1, channels, 1, 1, 1))
 
     @torch.inference_mode()
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
@@ -192,3 +201,146 @@ class Cosmos3LidarEncoder(nn.Module):
                 outputs.append(mean.reshape(batch, time, -1, height, width).permute(0, 2, 1, 3, 4))
             latent = torch.cat(outputs, dim=2)
             return (latent - self.latent_mean) / self.latent_std
+
+
+def lidar_decoder_args(network: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the decoder topology exactly as the reference TransformerVAE."""
+    from .lidar_encoder.transformer_vae import Decoder
+
+    args = {key: value for key, value in network.items() if key in inspect.signature(Decoder).parameters}
+    # TransformerVAE never enables the standalone decoder's external-encoder stem.
+    args.pop("stem_patchify", None)
+    for field in ("depths", "num_heads", "dilation"):
+        if network.get(f"decoder_{field}") is not None:
+            args[field] = network[f"decoder_{field}"]
+    if network.get("decoder_depths") is not None:
+        temporal = network.get("decoder_temporal_upsample")
+        if temporal is None:
+            raise ValueError("An asymmetric LiDAR decoder requires decoder_temporal_upsample.")
+        args.update(temporal_downsample=temporal, temporal_upsample=temporal)
+    return args
+
+
+def validate_lidar_decoder_config(config: dict[str, Any]) -> None:
+    validate_lidar_config(config)
+    network = config["network_config"]
+    if (
+        network.get("out_channels") != 3
+        or network.get("predict_validity", False)
+        or network.get("mask_as_input", False)
+        or network.get("formulation", "VAE") != "VAE"
+    ):
+        raise ValueError("V1.2 LiDAR decoding requires three output channels with embedded validity logits.")
+    args = lidar_decoder_args(network)
+    depths = args["depths"]
+    patch = args.get("out_patch_size") or args["patch_size"]
+    temporal = args.get("temporal_upsample")
+    if temporal is None:
+        temporal = args["temporal_downsample"]
+    if (
+        len(depths) < 1
+        or len(patch) != 2
+        or [size * 2 ** (len(depths) - 1) for size in patch] != config["spatial_compression"]
+        or len(temporal) != len(depths) - 1
+        or any(temporal)
+        or any(len(args.get(field, ())) != len(depths) for field in ("num_heads", "dilation"))
+    ):
+        raise ValueError("LiDAR decoder topology must preserve V1.2 spatial and temporal compression.")
+    if args.get("temporal_mixer", "attention") != "attention" or (
+        args.get("bottleneck_3d", False)
+        and not (args.get("bottleneck_3d_causal_time", False) and args.get("bottleneck_3d_rope", False))
+    ):
+        raise ValueError("LiDAR streaming decode requires causal temporal attention with RoPE for a 3D bottleneck.")
+    threshold = config["range_projection"].get("validity_threshold", 0.5)
+    if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0 < threshold < 1:
+        raise ValueError("LiDAR validity_threshold must lie in (0, 1).")
+
+
+def postprocess_lidar_decoder_output(output: torch.Tensor, config: dict[str, Any]) -> torch.Tensor:
+    """Convert raw network predictions to the unpadded metric sensor grid."""
+    projection = config["range_projection"]
+    if (
+        output.ndim != 5
+        or output.shape[1] != 3
+        or tuple(output.shape[-2:])
+        != (
+            projection["native_height"],
+            projection["model_width"],
+        )
+    ):
+        raise ValueError(f"Unexpected LiDAR decoder output shape: {tuple(output.shape)}.")
+    output = output.float()
+    minimum, maximum = projection["min_range_m"], projection["max_range_m"]
+    ranges = (output[:, :1].clamp(-1, 1) + 1) * 0.5 * (maximum - minimum) + minimum
+    intensity = (output[:, 1:2].clamp(-1, 1) + 1) * 0.5
+    validity = output[:, 2:3].sigmoid()
+    if config["apply_validity_mask"]:
+        valid = validity >= projection.get("validity_threshold", 0.5)
+        ranges = ranges.masked_fill(~valid, 0)
+        intensity = intensity.masked_fill(~valid, 0)
+        validity = valid.float()
+    frames = torch.cat((ranges, intensity, validity), dim=1)
+    offset = (projection["model_width"] - projection["semantic_width"]) // 2
+    return frames[..., offset : offset + projection["semantic_width"]].contiguous()
+
+
+class Cosmos3LidarDecoder(_LidarComponent):
+    """Inference-only, FP32 decoder for normalized V1.2 diffusion latents."""
+
+    _unused_prefixes = ("encoder.", "quant_conv.")
+    _component_name = "decoder"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        validate_lidar_decoder_config(config)
+        from .lidar_encoder.encoding import generate_polar_coords
+        from .lidar_encoder.transformer_vae import Decoder
+
+        self.config = config
+        self.decoder = Decoder(**lidar_decoder_args(config["network_config"]))
+        channels = config["latent_channels"]
+        self.post_quant_conv = nn.Conv2d(channels, channels, 1)
+        self.register_buffer("coords", generate_polar_coords(*config["network_config"]["resolution"]))
+        self.register_buffer("latent_mean", torch.empty(1, channels, 1, 1, 1))
+        self.register_buffer("latent_std", torch.empty(1, channels, 1, 1, 1))
+
+    @torch.inference_mode()
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Return [B,3,T,128,1800] metric frames, keeping each request's cache local."""
+        expected_hw = tuple(
+            size // factor
+            for size, factor in zip(self.config["network_config"]["resolution"], self.config["spatial_compression"])
+        )
+        if (
+            latents.ndim != 5
+            or latents.shape[1] != self.config["latent_channels"]
+            or tuple(latents.shape[-2:]) != expected_hw
+            or latents.shape[0] < 1
+            or latents.shape[2] < 1
+        ):
+            raise ValueError(f"Expected nonempty LiDAR latents [B,{self.config['latent_channels']},T,{expected_hw}].")
+        with torch.autocast(device_type=self.coords.device.type, enabled=False):
+            latents = latents.to(device=self.coords.device, dtype=torch.float32)
+            latents = latents * self.latent_std + self.latent_mean
+            chunk = self.config["streaming_chunk_frames"]
+            context = self.config["streaming_context_frames"]
+            outputs, cache = [], None
+            for start in range(0, latents.shape[2], chunk):
+                latent = latents[:, :, start : start + chunk]
+                batch, _, time, height, width = latent.shape
+                if cache is not None and context is not None:
+                    keep = context - time
+                    cache = (
+                        {key: (k[:, :, -keep:], v[:, :, -keep:]) for key, (k, v) in cache.items()} if keep > 0 else None
+                    )
+                latent = latent.permute(0, 2, 1, 3, 4).flatten(0, 1)
+                latent = self.post_quant_conv(latent)
+                latent = latent.reshape(batch, time, -1, height, width).permute(0, 2, 1, 3, 4)
+                output, cache = self.decoder(
+                    latent, self.coords, temporal_kv_cache=cache, return_temporal_kv_cache=True
+                )
+                outputs.append(postprocess_lidar_decoder_output(output, self.config))
+            return torch.cat(outputs, dim=2)
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        return self.decode(latents)

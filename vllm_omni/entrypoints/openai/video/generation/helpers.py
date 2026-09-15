@@ -52,15 +52,17 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoError,
     VideoGenerationRequest,
     VideoGenerationStatus,
+    VideoLidarArtifact,
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import (
+    EncodedVideoResult,
     OmniOpenAIServingVideo,
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, SaveContext, StorageBaseManager
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video_api_utils import (
@@ -98,6 +100,11 @@ CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+VIDEO_DELETE_TIMEOUT_S = 2.0
+_VIDEO_SAVE_CANCEL_GRACE_S = 1.0
+_VIDEO_CLEANUP_TIMEOUT_S = 1.0
+# Keep unfinished storage operations alive after their request stops waiting.
+_VIDEO_STORAGE_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, list[Any] | None]:
@@ -275,11 +282,85 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     )
 
 
+def _lidar_storage_key(video_id: str) -> str:
+    return f"{video_id}.lidar.safetensors"
+
+
 async def _cleanup_video(video_id: str):
+    tasks = []
+    for key in (video_id, _lidar_storage_key(video_id)):
+        task = asyncio.create_task(_cleanup_video_artifact(STORAGE_MANAGER, key))
+        _track_video_storage_task(task, key)
+        tasks.append(task)
+    # Start both deletes even if another cancellation interrupts this cleanup.
+    await asyncio.gather(*(asyncio.shield(task) for task in tasks))
+
+
+async def _cleanup_video_artifact(manager: StorageBaseManager, key: str) -> None:
     try:
-        await STORAGE_MANAGER.delete(video_id)
+        await _delete_video_artifact(manager, key)
     except Exception:
-        logger.warning("Failed to cleanup partial video file '%s'", video_id)
+        logger.warning("Failed to cleanup partial video artifact '%s'", key, exc_info=True)
+
+
+def _track_video_storage_task(task: asyncio.Task[Any], key: str) -> None:
+    _VIDEO_STORAGE_TASKS.add(task)
+
+    def completed(done: asyncio.Task[Any]) -> None:
+        _VIDEO_STORAGE_TASKS.discard(done)
+        if not done.cancelled():
+            try:
+                done.result()
+            except Exception:
+                logger.warning("Deferred video storage operation failed for '%s'", key, exc_info=True)
+
+    task.add_done_callback(completed)
+
+
+async def _delete_video_artifact(manager: StorageBaseManager, key: str) -> None:
+    task = asyncio.create_task(manager.delete(key))
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_VIDEO_CLEANUP_TIMEOUT_S)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # Cancelling a coroutine cannot stop its filesystem thread. Retain the
+        # deletion so it can finish without blocking request cancellation.
+        _track_video_storage_task(task, key)
+        raise
+
+
+def _cleanup_late_video_save(task: asyncio.Task[SaveContext], manager: StorageBaseManager, key: str) -> None:
+    _track_video_storage_task(task, key)
+
+    def completed(done: asyncio.Task[SaveContext]) -> None:
+        if not done.cancelled():
+            # A backend may publish a file and then raise. Clean up on either
+            # success or failure, using the manager that performed the save.
+            cleanup = asyncio.create_task(_cleanup_video_artifact(manager, key))
+            _track_video_storage_task(cleanup, key)
+
+    task.add_done_callback(completed)
+
+
+async def _save_video_artifact(data: bytes, key: str, *, cancel_grace_s: float = 0.0) -> SaveContext:
+    manager = STORAGE_MANAGER
+    task = asyncio.create_task(manager.save(data, key))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Only joint video/LiDAR jobs request a grace period. Use one deadline
+        # so repeated DELETEs cannot extend it; ordinary video cancels at once.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + cancel_grace_s
+        while not task.done() and (remaining := deadline - loop.time()) > 0:
+            try:
+                await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                continue
+        if not task.done():
+            _cleanup_late_video_save(task, manager, key)
+        elif not task.cancelled():
+            task.exception()  # Retrieve errors; the cancelled job cleans up below.
+        raise
 
 
 def _cleanup_video_references(
@@ -301,8 +382,10 @@ def _cleanup_video_references(
 
 
 def _unpack_video_generation_result(
-    result: Sequence[object],
+    result: Sequence[object] | EncodedVideoResult,
 ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
+    if isinstance(result, EncodedVideoResult):
+        return result.video_bytes, result.stage_durations, result.peak_memory_mb, result.action, result.video_metadata
     video_metadata: dict[str, object] = {}
     if len(result) == 5:
         video_bytes, stage_durations, peak_memory_mb, action, raw_metadata = result
@@ -353,17 +436,26 @@ async def _run_video_generation_job(
             logger.warning("Video job %s missing before generation task started; skipping", video_id)
             return
         await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
-        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(
-            await handler.generate_video_bytes(
-                request,
-                video_id,
-                reference_image=reference_image,
-                reference_video=reference_video,
-                reference_audio=reference_audio,
-            )
+        result = await handler.generate_video_bytes(
+            request,
+            video_id,
+            reference_image=reference_image,
+            reference_video=reference_video,
+            reference_audio=reference_audio,
         )
+        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(result)
+        lidar = None
+        if isinstance(result, EncodedVideoResult):
+            lidar = VideoLidarArtifact(
+                url=f"/v1/videos/{video_id}/lidar",
+                file_name=_lidar_storage_key(video_id),
+                **result.lidar_metadata,
+            )
 
-        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
+        cancel_grace_s = _VIDEO_SAVE_CANCEL_GRACE_S if lidar is not None else 0.0
+        save_context = await _save_video_artifact(video_bytes, video_id, cancel_grace_s=cancel_grace_s)
+        if lidar is not None:
+            await _save_video_artifact(result.lidar_bytes, _lidar_storage_key(video_id), cancel_grace_s=cancel_grace_s)
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
@@ -375,6 +467,7 @@ async def _run_video_generation_job(
             "stage_durations": stage_durations,
             "peak_memory_mb": peak_memory_mb,
             "action": action,
+            "lidar": lidar,
         }
         updated_fields.update({key: value for key, value in video_metadata.items() if value is not None})
         if save_context.expires_at is not None:
@@ -415,8 +508,10 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        await _cleanup_video(video_id)
-        await VIDEO_STORE.pop(video_id)
+        try:
+            await _cleanup_video(video_id)
+        finally:
+            await VIDEO_STORE.pop(video_id)
         raise
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path)

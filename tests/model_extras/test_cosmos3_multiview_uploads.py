@@ -180,7 +180,10 @@ def test_client_converts_local_manifest_to_upload_indexes(tmp_path, envelope):
 @pytest.mark.parametrize("mode", ["async", "sync", "failed"])
 @pytest.mark.parametrize("resolution", [None, "480", "720"])
 @pytest.mark.parametrize("aspect_ratio", [None, "auto", "3:4", "9:16"])
-def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, mode, resolution, aspect_ratio):
+@pytest.mark.parametrize("null_lidar", [False, True])
+def test_client_uploads_and_downloads_or_reports_failure(
+    tmp_path, monkeypatch, mode, resolution, aspect_ratio, null_lidar
+):
     httpx = pytest.importorskip("httpx")
     spec = importlib.util.spec_from_file_location(
         "multiview_client", _ROOT / "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
@@ -197,6 +200,8 @@ def test_client_uploads_and_downloads_or_reports_failure(tmp_path, monkeypatch, 
     manifest_path = tmp_path / "manifest.json"
     captions = [f"Raw camera caption {index}." for index in range(11)]
     request_manifest = {"prompt": legacy_prompt(captions), **extra}
+    if null_lidar:
+        request_manifest["lidar"] = None
     if aspect_ratio is not None:
         request_manifest["aspect_ratio"] = "1:1"
         request_manifest["multiview"]["aspect_ratio"] = "16:9"
@@ -598,7 +603,8 @@ def test_numeric_upload_rejects_invalid_or_reused_index(index):
         contract.resolve_multiview_uploads(extra, ["camera.mp4"] * 11 + ["map.safetensors"])
 
 
-def test_joint_client_keeps_captions_and_resolves_numeric_upload(tmp_path, multiview_client):
+@pytest.mark.parametrize("return_output", [None, False, True])
+def test_joint_client_keeps_captions_and_resolves_numeric_upload(tmp_path, multiview_client, return_output):
     camera = contract.COSMOS3_MADS_CAMERAS[3]
     for name in ("camera.mp4", "map.safetensors"):
         (tmp_path / name).write_bytes(b"input")
@@ -610,10 +616,75 @@ def test_joint_client_keeps_captions_and_resolves_numeric_upload(tmp_path, multi
         "lidar": {"control_path": "map.safetensors"},
         "multiview": {"views": [{"camera_key": camera, "control_path": "camera.mp4", "prompt": "Raw."}]},
     }
+    if return_output is not None:
+        request["lidar"]["return_output"] = return_output
     data, paths = multiview_client.prepare_request(request, tmp_path)
     extra = json.loads(data["extra_params"])
     resolved = contract.resolve_multiview_uploads(extra, [str(path) for path in paths])
-    assert resolved["lidar"] == {"control_path": str(tmp_path / "map.safetensors")}
+    assert resolved["lidar"] == {**request["lidar"], "control_path": str(tmp_path / "map.safetensors")}
     assert resolved["multiview"]["views"][0]["prompt"] == "Raw."
     assert resolved["emphasize_control_in_prompt"] is False
     assert data["num_frames"] == "201"
+
+
+@pytest.mark.parametrize("flag", [None, 0, 1, "true", [], {}])
+def test_numeric_upload_rejects_nonboolean_output_flag(flag):
+    extra = manifest()
+    extra["lidar"] = {"control_reference_index": 11, "return_output": flag}
+    with pytest.raises(ValueError, match="return_output must be boolean"):
+        contract.resolve_multiview_uploads(extra, ["camera.mp4"] * 11 + ["map.safetensors"])
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_client_downloads_lidar_or_rejects_sync(tmp_path, multiview_client, monkeypatch, sync):
+    from types import SimpleNamespace
+
+    (tmp_path / "map.safetensors").write_bytes(b"control")
+    manifest_path = tmp_path / "input.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "multiview": {"views": []},
+                "lidar": {"control_path": "map.safetensors", "return_output": True},
+            }
+        )
+    )
+    output = tmp_path / "output.mp4"
+    calls = []
+    job = {"id": "test", "status": "completed", "lidar": {"url": "/v1/videos/test/lidar", "fps": 10}}
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert not sync, "Sync rejection must happen before creating an HTTP client"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def post(self, url, **kwargs):
+            assert json.loads(kwargs["data"]["extra_params"])["lidar"]["return_output"] is True
+            calls.append(url)
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: job)
+
+        def get(self, url):
+            calls.append(url)
+            return SimpleNamespace(raise_for_status=lambda: None, content=b"lidar" if url.endswith("lidar") else b"mp4")
+
+    monkeypatch.setattr(multiview_client.httpx, "Client", Client)
+    argv = ["client", str(manifest_path), "--output", str(output)]
+    if sync:
+        argv.append("--sync")
+    monkeypatch.setattr(sys, "argv", argv)
+    if sync:
+        with pytest.raises(SystemExit) as error:
+            multiview_client.main()
+        assert error.value.code == 2
+        assert not output.exists()
+    else:
+        multiview_client.main()
+        assert output.read_bytes() == b"mp4"
+        assert output.with_suffix(".lidar.safetensors").read_bytes() == b"lidar"
+        assert json.loads(output.with_suffix(".lidar.json").read_text())["fps"] == 10
+        assert calls[-2].endswith("/lidar") and calls[-1].endswith("/content")

@@ -700,24 +700,29 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             return action
 
         pending_action = None
-        pending_action_metadata: dict[str, Any] = {}
+        pending_lidar = None
         envelope_public_metadata: dict[str, Any] = {}
         if isinstance(output, dict) and isinstance(output.get("payload"), dict):
             envelope_payload = dict(output.get("payload") or {})
             metadata = output.get("metadata") or {}
             envelope_metadata = metadata if isinstance(metadata, dict) else {}
             envelope_public_metadata = {key: value for key, value in envelope_metadata.items() if key != "internal"}
+            pending_lidar = envelope_payload.pop("lidar", None)
+            if pending_lidar is not None:
+                if "video" not in envelope_payload:
+                    raise ValueError("Cosmos3 LiDAR output requires a video payload.")
+                # Numeric range images must never pass through RGB processing.
+                pending_lidar = pending_lidar.detach().to(device="cpu", dtype=torch.float32).contiguous()
             action = envelope_payload.pop("actions", None)
             if action is not None:
                 pending_action = _postprocess_action(action, envelope_metadata)
-                pending_action_metadata = envelope_public_metadata
                 if not envelope_payload:
                     return {
                         "payload": {
                             "video": [],
                             "actions": pending_action,
                         },
-                        "metadata": pending_action_metadata,
+                        "metadata": envelope_public_metadata,
                     }
             output = envelope_payload
 
@@ -770,18 +775,15 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         if guardrails_enabled:
             video = check_video_safety(video)
         processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        auxiliary_payload = {}
+        if pending_action is not None:
+            auxiliary_payload["actions"] = pending_action
+        if pending_lidar is not None:
+            auxiliary_payload["lidar"] = pending_lidar
         if audio is None:
-            if pending_action is not None:
+            if auxiliary_payload or envelope_public_metadata:
                 return {
-                    "payload": {
-                        "video": processed_video,
-                        "actions": pending_action,
-                    },
-                    "metadata": pending_action_metadata,
-                }
-            if envelope_public_metadata:
-                return {
-                    "payload": {"video": processed_video},
+                    "payload": {"video": processed_video, **auxiliary_payload},
                     "metadata": envelope_public_metadata,
                 }
             return processed_video
@@ -794,31 +796,27 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         }
         if audio_sample_rate is not None:
             result["audio_sample_rate"] = int(audio_sample_rate)
-        if pending_action is not None:
+        if auxiliary_payload or envelope_public_metadata:
+            video_metadata = envelope_public_metadata.get("video")
+            audio_metadata = envelope_public_metadata.get("audio")
+            video_metadata = (
+                {"fps": result["fps"], **video_metadata} if isinstance(video_metadata, dict) else {"fps": result["fps"]}
+            )
+            audio_metadata = dict(audio_metadata) if isinstance(audio_metadata, dict) else {}
+            if audio_sample_rate is not None:
+                audio_metadata["sample_rate"] = int(audio_sample_rate)
+            else:
+                audio_metadata.setdefault("sample_rate", None)
             return {
                 "payload": {
                     "video": result["video"],
                     "audio": result["audio"],
-                    "actions": pending_action,
-                },
-                "metadata": {
-                    **pending_action_metadata,
-                    "video": {"fps": result["fps"]},
-                    "audio": {"sample_rate": result.get("audio_sample_rate")},
-                },
-            }
-        if envelope_public_metadata:
-            return {
-                "payload": {
-                    "video": result["video"],
-                    "audio": result["audio"],
+                    **auxiliary_payload,
                 },
                 "metadata": {
                     **envelope_public_metadata,
-                    "video": {"fps": result["fps"], **envelope_public_metadata.get("video", {})}
-                    if isinstance(envelope_public_metadata.get("video"), dict)
-                    else {"fps": result["fps"]},
-                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                    "video": video_metadata,
+                    "audio": audio_metadata,
                 },
             }
         return result

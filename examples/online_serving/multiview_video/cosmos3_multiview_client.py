@@ -195,8 +195,10 @@ def prepare_request(
             paths.append(path)
     if extra.get("lidar") is not None:
         lidar = extra["lidar"]
-        if set(lidar) != {"control_path"}:
+        if set(lidar) - {"control_path", "return_output"} or "control_path" not in lidar:
             raise ValueError("The client expects lidar.control_path pointing to one local .safetensors file.")
+        if "return_output" in lidar and type(lidar["return_output"]) is not bool:
+            raise ValueError("lidar.return_output must be boolean.")
         path = Path(lidar.pop("control_path")).expanduser()
         if not path.is_absolute():
             path = base_dir / path
@@ -262,6 +264,9 @@ def main() -> None:
         resolution_override=args.resolution,
         aspect_ratio_override=args.aspect_ratio,
     )
+    lidar_requested = (json.loads(data["extra_params"]).get("lidar") or {}).get("return_output", False)
+    if args.sync and lidar_requested:
+        parser.error("LiDAR output requires asynchronous generation; omit --sync.")
     for key in ("num_inference_steps", "num_frames"):
         if getattr(args, key) is not None:
             data[key] = str(getattr(args, key))
@@ -305,6 +310,16 @@ def main() -> None:
                 job = response.json()
             if job["status"] == "failed":
                 raise RuntimeError(f"Video generation failed: {job.get('error')}")
+            if lidar_requested and not job.get("lidar"):
+                raise RuntimeError("The completed job is missing its requested LiDAR artifact.")
+            if job.get("lidar"):
+                lidar_response = client.get(job_url + "/lidar")
+                lidar_response.raise_for_status()
+                lidar_path = args.output.with_suffix(".lidar.safetensors")
+                lidar_path.parent.mkdir(parents=True, exist_ok=True)
+                lidar_path.write_bytes(lidar_response.content)
+                lidar_path.with_suffix(".json").write_text(json.dumps(job["lidar"], indent=2) + "\n")
+                print(f"Saved {lidar_path}")
             response = client.get(job_url + "/content")
             response.raise_for_status()
         args.output.parent.mkdir(parents=True, exist_ok=True)

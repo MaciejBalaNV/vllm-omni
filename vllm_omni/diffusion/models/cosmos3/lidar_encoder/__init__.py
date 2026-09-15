@@ -1,1 +1,1 @@
-"""Inference-only V1.2 LiDAR encoder; ported from imaginaire4 e55e4fad16a9."""
+"""V1.2 LiDAR inference blocks: encoder e55e4fad16a9, decoder 9ca7bd6adfe."""

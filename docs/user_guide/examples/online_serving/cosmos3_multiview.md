@@ -173,13 +173,13 @@ cross-host file transport.
 New exports have `transformer/config.json` → `multiview.schema_version=2`.
 The joint artifact includes `lidar_vae/config.json` and
 `lidar_vae/diffusion_pytorch_model.safetensors`, containing the complete V1.2
-encoder, decoder, coordinates, and latent statistics. vLLM-Omni loads only
-the encoder, quantization convolution, and shared buffers in FP32; decoder
-tensors are not materialized. Joint inference returns RGB only.
+encoder, decoder, coordinates, and latent statistics. Joint deployments load
+independent FP32 encoder and decoder components at startup. By default, inference
+returns RGB; numeric LiDAR decoding is enabled per request.
 
 The VAE config stores resolved network constructor defaults in addition to the
 explicit settings in `transformer/config.json` → `multiview.lidar`. The runtime
-constructs the encoder from the VAE config and requires every explicit
+constructs both components from the VAE config and requires every explicit
 transformer setting and shared metadata field to agree. The component specifies
 `dtype="float32"` and `sample_posterior=false`. `apply_validity_mask` describes
 decoder behavior and does not change encoder input masking.
@@ -189,8 +189,8 @@ Install the optional runtime dependencies with `pip install -e
 installed PyTorch/CUDA build; the reference uses `0.21.6.dev6` builds for
 PyTorch 2.10. No imaginaire4 training packages are needed by the runtime.
 Missing VAE files, incompatible metadata, missing projection weights, malformed
-encoder tensors, and invalid latent statistics fail loading. Decoder validation
-belongs to the exporter. The component is loaded directly and does not require
+encoder/decoder tensors, unsupported streaming architectures, and invalid latent
+statistics fail loading. The component is loaded directly and does not require
 a LiDAR entry in the Diffusers pipeline indexes.
 
 Each production camera entry must include a nonempty plain-text `prompt`.
@@ -267,8 +267,8 @@ short clips rejected. At 201 frames, 30 camera FPS, and 10 LiDAR FPS, provide
 67 sweeps. Camera frame counts round up to the VAE's `4k+1` grid. The encoder
 adds four circular columns on each side, normalizes with checkpoint physical
 limits, and runs FP32 posterior-mean streaming inference. Camera and LiDAR
-control/target geometries stay independent; only camera targets are decoded.
-There are no LiDAR output files, previews, or endpoints.
+control/target geometries stay independent. Camera targets are always decoded;
+LiDAR targets are decoded when requested as described below.
 
 New artifact defaults are 480p, 30 FPS, 35 steps, guidance 6, shift 10, and
 control guidance 1. Resolution, FPS, and control emphasis come from artifact
@@ -284,3 +284,61 @@ schedule is determined by steps and shift, as in reference rectified-flow
 inference. The preparation utility supplies caption-derived duration.
 
 See [preparation and GPU comparison commands](cosmos3_multiview_lidar_validation.md).
+
+## Generated numeric LiDAR
+
+Set `lidar.return_output` to `true` in an offline manifest or in the asynchronous
+HTTP request's `extra_params`. Keep the existing LiDAR control and camera WSM
+inputs:
+
+```json
+"lidar": {"control_path": "lidar_control.safetensors", "return_output": true}
+```
+
+For direct multipart HTTP requests use `control_reference_index` instead of
+`control_path`. The example client maps local paths to upload indexes and
+preserves `return_output`. It must be a JSON boolean and defaults to `false`.
+
+The offline engine returns `multimodal_output["lidar"]` as a contiguous CPU FP32
+tensor `[1,3,T,128,1800]`, alongside video and `metadata.lidar`. The offline
+example saves `lidar.safetensors` with a tensor named `frames`, shaped
+`[3,T,128,1800]`, and records its metadata in `sample_outputs.json`.
+
+Channels are range in metres, intensity in `[0,1]`, and validity. With the
+checkpoint's `apply_validity_mask=true`, validity is binary and invalid ranges
+and intensities are zero. Otherwise validity contains probabilities. The
+threshold comes from `range_projection.validity_threshold` (default `0.5`).
+Outputs use the physical 1800-column grid: four circular padding columns are
+removed from each side. No smoothing, point-cloud conversion, or RGB processing
+is applied to these tensors.
+
+LiDAR uses its own checkpoint FPS and sweep count, starting at the camera clip's
+time origin. Metadata records these values, channel units, validity settings,
+and the projection configuration; the same metadata is embedded in the
+safetensors header under `lidar` as JSON.
+
+For `POST /v1/videos`, a completed job includes a `lidar` descriptor with `url`,
+`file_name`, `format`, `shape`, `dtype`, `fps`, and sensor metadata. Download the
+numeric file with `GET /v1/videos/{video_id}/lidar`; `/content` continues to return
+the MP4. The example HTTP client downloads `<output-stem>.lidar.safetensors`
+and `<output-stem>.lidar.json` alongside the MP4.
+
+Both files follow the job's retention and deletion lifecycle. A job is marked
+complete only after both requested artifacts are persisted. Failed or cancelled
+jobs clean up partial outputs. Synchronous requests (`/v1/videos/sync`, or the
+client's `--sync`) reject `return_output=true`; use an asynchronous job for LiDAR.
+
+Cancelling a joint output job allows an active write up to one second to finish.
+Repeated cancellation does not extend this period; RGB-only jobs have no save
+grace period. Partial-file deletions run concurrently with a one-second wait
+limit. DELETE waits up to two seconds for an in-progress job to stop, then returns
+HTTP 409 if cancellation is still pending. Writes or deletions that outlive these
+limits retain background ownership, and late writes trigger another cleanup.
+These limits bound request waits; they cannot interrupt blocked filesystem
+threads or guarantee cleanup after the server process exits.
+
+Decoder execution is eager FP32 with checkpoint-owned chunk/context settings.
+It runs independently on each pipeline rank and follows existing VAE device
+placement; no decoder tensor or sequence parallelism is introduced. Joint
+deployments therefore load decoder weights even when an individual request
+does not ask for LiDAR output, but those requests skip decoder execution.
