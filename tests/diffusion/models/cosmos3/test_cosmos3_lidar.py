@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -495,10 +496,33 @@ def test_pipeline_shares_schedule_preserves_conditions_and_optional_lidar(
     pipeline._reset_mixed_precision = lambda: None
     pipeline.progress_bar = lambda steps: steps
     pipeline._encode_video_tensor = lambda pixels: pixels[:, :1, ::4, ::16, ::16].clone()
-    pipeline._prepare_camera_major_pixels = lambda views, **kwargs: torch.full((1, 3, 10, 32, 32), 0.5)
+    pixel_refs, latent_refs = [], []
+
+    def prepare_pixels(views, **kwargs):
+        pixels = torch.full((1, 3, 10, 32, 32), 0.5)
+        pixel_refs.append(weakref.ref(pixels))
+        return pixels
+
+    pipeline._prepare_camera_major_pixels = prepare_pixels
+    prepare_latents = pipeline._prepare_multiview_latents
+    encode_video = pipeline._encode_multiview_video
+
+    def record_latents(**kwargs):
+        result = prepare_latents(**kwargs)
+        latent_refs.extend(weakref.ref(tensor) for tensor in (result[0], result[2]))
+        return result
+
+    def record_encoded_video(*args, **kwargs):
+        result = encode_video(*args, **kwargs)
+        latent_refs.append(weakref.ref(result))
+        return result
+
+    pipeline._prepare_multiview_latents = record_latents
+    pipeline._encode_multiview_video = record_encoded_video
     decoded = []
 
     def decode(latents):
+        assert all(ref() is None for ref in latent_refs)
         decoded.append(latents.clone())
         assert latents.shape == (1, 1, 2, 2, 2)
         return torch.zeros(1, 3, 5, 32, 32)
@@ -551,10 +575,14 @@ def test_pipeline_shares_schedule_preserves_conditions_and_optional_lidar(
 
     decode_lidar.config = lidar_config()
     pipeline.lidar_decoder = decode_lidar
-    calls, scheduler_calls = [], []
+    calls, scheduler_calls, sample_refs = [], [], []
 
     def predict(**kwargs):
-        calls.append(kwargs)
+        assert all(ref() is None for ref in pixel_refs)
+        assert all(ref() is None for ref in sample_refs)
+        sample_refs.append(weakref.ref(kwargs["hidden_states"]))
+        # Keep snapshots for parity assertions without extending lifetimes.
+        calls.append({"hidden_states": kwargs["hidden_states"].clone(), "packed_shapes": kwargs["packed_shapes"]})
         targets = unpack_state(kwargs["hidden_states"], kwargs["packed_shapes"])
         if mode == "joint":
             assert len(targets) == 2 and kwargs["lidar_control_latents"].eq(7).all()

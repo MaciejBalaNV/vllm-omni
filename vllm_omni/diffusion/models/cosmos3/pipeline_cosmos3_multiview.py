@@ -636,6 +636,28 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         assert decoded_output is not None
         return decoded_output
 
+    def _mask_transfer_noise(
+        self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
+    ) -> torch.Tensor:
+        # Only camera frames are conditioned. Broadcast the compact temporal
+        # mask on a view of the packed prediction; LiDAR needs no mask tensor.
+        camera = unpack_state(noise, shared_kwargs["packed_shapes"])[0]
+        camera.mul_(velocity_mask)
+        return noise
+
+    def _apply_transfer_condition(
+        self,
+        latents: torch.Tensor,
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        shared_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        # UniPC and Euler return a new sample, separate from solver history.
+        # Restore camera conditions there without repacking the LiDAR target.
+        camera = unpack_state(latents, shared_kwargs["packed_shapes"])[0]
+        camera.mul_(velocity_mask).add_((1.0 - velocity_mask) * condition_latents)
+        return latents
+
     def _prepare_multiview_latents(
         self,
         *,
@@ -797,6 +819,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             if control_pixels is not None
             else None
         )
+        del target_pixels, control_pixels
         if control_latents is not None and control_latents.shape != latents.shape:
             raise ValueError(
                 "Cosmos3 multiview WSM and target latent shapes must match: "
@@ -829,14 +852,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         items.append(MaskItem(camera_shape, num_views, seconds_per_frame=camera_rate))
         targets = [latents]
-        masks = [velocity_mask.expand_as(latents)]
-        conditions = [condition_latents]
         lidar_control_latents = None
         if lidar_request is not None:
             lidar_config = deployment["lidar"]
             sweeps = required_lidar_sweeps(num_frames, frame_rate, lidar_config["fps"])
             lidar_frames = load_lidar_frames(lidar_request["control_path"], num_sweeps=sweeps)
             lidar_control_latents = self.lidar_encoder(lidar_frames).to(device=self.device, dtype=self.dtype)
+            del lidar_frames
             # Continue the request RNG after camera noise; reseeding would
             # reuse its initial stream and discard caller-supplied RNG state.
             lidar_noise = randn_tensor(
@@ -846,9 +868,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 dtype=self.dtype,
             )
             targets.append(lidar_noise)
-            masks.append(torch.ones_like(lidar_noise))
-            conditions.append(torch.zeros_like(lidar_noise))
             lt, lh, lw = lidar_noise.shape[2:]
+            del lidar_noise
             lhp, lwp, _, _ = self.transformer._pad_to_patch_size(lh, lw)
             for is_control in (True, False):
                 items.append(
@@ -979,8 +1000,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             "temporal_position_period": temporal_position_period,
             "multiview_layout": layout,
         }
+        # Transfer ownership of the initial state to the denoising loop. The
+        # caller must not retain either source tensors or the packed sample.
+        initial_state = [pack_state(targets)]
+        del targets, latents
         packed = self.diffuse_transfer(
-            latents=pack_state(targets),
+            latents=initial_state.pop(),
             timesteps=self.scheduler.timesteps,
             cond_ids=cond_ids,
             cond_mask=cond_mask,
@@ -994,13 +1019,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             guidance_interval=self._get_sp_param(sp, "guidance_interval", defaults.get("guidance_interval")),
             control_latents=[control_latents] if control_latents is not None else [],
             shared_kwargs=shared_kwargs,
-            velocity_mask=pack_state(masks),
-            condition_latents=pack_state(conditions),
+            velocity_mask=velocity_mask,
+            condition_latents=condition_latents,
             generator=generator,
             normalize_cfg=as_bool(self._get_sp_param(sp, "normalize_cfg", defaults.get("normalize_cfg", False)), False),
             open_guidance_interval=deployment.get("schema_version") == 2,
         )
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
+        del condition_latents, control_latents, lidar_control_latents, shared_kwargs
         latents = final_targets[0]
         video = self._decode_multiview_latents(
             latents,

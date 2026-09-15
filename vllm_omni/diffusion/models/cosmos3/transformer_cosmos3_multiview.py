@@ -12,6 +12,7 @@ from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from .multiview_flex_attention import (
+    MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
     padded_multiview_flex_attention,
@@ -71,6 +72,13 @@ class Cosmos3MultiviewGenDecoderLayer(Cosmos3GenDecoderLayer):
 
     def _forward_mlp_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.post_attention_layernorm(hidden_states))
+
+    def _add_residual(self, output: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        # Attention and MLP projections produce fresh outputs. Reuse those
+        # buffers, preserving the caller's input and the normal autograd path.
+        if not torch.is_grad_enabled() and output.dtype == residual.dtype:
+            return output.add_(residual)
+        return super()._add_residual(output, residual)
 
     @torch.compiler.disable(recursive=False)
     def _forward_mlp_chunked(self, hidden_states: torch.Tensor, chunk_size: int) -> torch.Tensor:
@@ -153,6 +161,34 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             if missing:
                 raise ValueError(f"Incomplete joint checkpoint: missing LiDAR projection weights {missing}.")
 
+    def _embed_packed_streams(
+        self,
+        items: tuple[MaskItem, ...],
+        streams: list[torch.Tensor],
+        timestep: torch.Tensor,
+        camera: torch.Tensor,
+        noisy_frame_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # Both targets get the same timestep. Controls never receive it;
+        # camera condition frames receive zero.
+        time = self._embed_timestep(timestep, camera.dtype).unsqueeze(1)
+        embeddings = []
+        for item, latent in zip(items, streams, strict=True):
+            project = self.lidar_proj_in if item.is_lidar else self.proj_in
+            hidden = project(patchify_sensor(latent.to(camera), self.latent_patch_size))
+            if not item.is_control:
+                if not item.is_lidar and noisy_frame_mask is not None:
+                    mask = (
+                        noisy_frame_mask[:, 0, :, 0, 0]
+                        .repeat_interleave(item.token_shape[1] * item.token_shape[2], dim=1)
+                        .unsqueeze(-1)
+                    )
+                    hidden = hidden + time * mask
+                else:
+                    hidden = hidden + time
+            embeddings.append(hidden)
+        return torch.cat(embeddings, dim=1)
+
     def _forward_packed(
         self,
         hidden_states: torch.Tensor,
@@ -202,6 +238,7 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                     )
                     for layer in range(len(caption_caches[0]))
                 ]
+                del caption_caches
             # No subsequent sample/modality follows this request, so the
             # reference-compatible endpoint cursor is intentionally unused.
             positions, _ = packed_position_ids(
@@ -217,9 +254,6 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             self.cached_freqs_gen = (cos.unsqueeze(2), sin.unsqueeze(2))
 
         with self._offload_context("generator"):
-            # Both targets get exactly the same diffusion timestep. Controls
-            # never receive it; camera condition frames receive zero.
-            time = self._embed_timestep(timestep, camera.dtype).unsqueeze(1)
             streams = []
             if has_control:
                 streams.append(control_latents[0])
@@ -234,24 +268,12 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                 streams.append(targets[1])
             if len(streams) != len(items):
                 raise ValueError("Packed stream boundaries do not match the camera/LiDAR inputs.")
-            embeddings = []
-            for item, latent in zip(items, streams, strict=True):
-                project = self.lidar_proj_in if item.is_lidar else self.proj_in
-                hidden = project(patchify_sensor(latent.to(camera), self.latent_patch_size))
-                if not item.is_control:
-                    if not item.is_lidar and noisy_frame_mask is not None:
-                        mask = (
-                            noisy_frame_mask[:, 0, :, 0, 0]
-                            .repeat_interleave(item.token_shape[1] * item.token_shape[2], dim=1)
-                            .unsqueeze(-1)
-                        )
-                        hidden = hidden + time * mask
-                    else:
-                        hidden = hidden + time
-                embeddings.append(hidden)
-            hidden = torch.cat(embeddings, dim=1)
-            del embeddings
-            hidden = self._run_gen_layers(hidden, multiview_layout=context)
+            # Pass a temporary: retaining the packed embedding in this frame
+            # would keep it alive after SP sharding and throughout every layer.
+            hidden = self._run_gen_layers(
+                self._embed_packed_streams(items, streams, timestep, camera, noisy_frame_mask),
+                multiview_layout=context,
+            )
             outputs = []
             for item, latent, part in zip(
                 items, streams, hidden.split([item.num_tokens for item in items], dim=1), strict=True
