@@ -1,4 +1,4 @@
-# Wan VAE Decoder Fast Path
+# Wan VAE Encoder and Decoder Fast Paths
 
 Video pipelines built on the Wan 2.1/2.2 causal VAE (Cosmos3, Wan2.2, LingBot,
 Helios, SANA-Video, LongCat-Video, DreamZero) spend a large share of their
@@ -9,7 +9,7 @@ causal padding, feature-cache bookkeeping, shortcut upsampling). vLLM-Omni
 installs a fast path on every loaded Wan VAE that fuses this data movement into
 a handful of Triton kernels while leaving the convolutions themselves untouched.
 
-## Levels
+## Decoder levels
 
 The fast path is controlled by `--vae-fast-path` (engine argument
 `vae_fast_path`, deploy-config key `vae_fast_path`):
@@ -67,7 +67,104 @@ stages:
   `torch.backends.cudnn.allow_tf32 = False` if full fp32 convolutions are
   required.
 
-## Measured
+## Cosmos3 encoder
+
+`--vae-encode-fast-path` selects the encoder level independently of the decoder.
+The engine/deploy-config field is `vae_encode_fast_path`. The supported target
+is Cosmos3's residual Wan2.2 VAE: 2x2 patchification, 4x temporal compression,
+16x spatial compression, and four residual downsampling stages. The real
+Cosmos3 encoder uses 160/320/640 channels and produces 48 latent channels.
+Other Wan architectures retain their reference encoding path.
+
+| Encoder level | Default | Behavior |
+|---|---|---|
+| `lossless` | yes | Reuses the exact normalization epilogue, causal input/cache assembly and bias/residual fusions. Fuses spatial pad/input assembly and temporal downsampling cache copies. Keeps the reference shortcut averaging reduction. |
+| `channels_last` | no | Also converts encoder convolution weights to channels-last, uses single-pass normalization and fuses shortcut averaging with residual addition. Outputs can differ in the last bits. |
+| `off` | no | Reference encoding. |
+
+Untiled encoding patchifies one temporal chunk at a time and writes encoder
+features into a preallocated buffer. The schedule remains one initial frame,
+then four frames per chunk. `quant_conv` runs once after assembly. Tiled
+encoding retains its existing per-chunk `quant_conv`, tile coordinates and
+blending. Both image conditioning and video conditioning use this path through
+the ordinary `vae.encode(...).latent_dist` interface.
+
+```bash
+# Fast encoder, reference decoder
+vllm serve nvidia/Cosmos3-Nano --omni \
+    --vae-encode-fast-path channels_last --vae-fast-path off
+
+# Reference encoder and decoder
+vllm serve nvidia/Cosmos3-Nano --omni \
+    --vae-encode-fast-path off --vae-fast-path off
+```
+
+```yaml
+stages:
+  - stage_id: 0
+    vae_encode_fast_path: lossless
+    vae_fast_path: channels_last
+```
+
+Encoder installation has independent reports and rollback/uninstall state.
+It preserves weights and parameter names, and rejects custom forwards or hooks
+that a fusion would bypass. A substituted `RMSNormVAE` keeps its own forward
+and numerical semantics. Autograd and compilation use PyTorch fallbacks. The
+encoder can coexist with spatial-sharded decoding, since the two installers
+modify different modules; spatial tiling remains the encoder's parallel mode.
+
+The Python entry points are `install_wan_vae_encoder_fastpath`,
+`is_encoder_installed`, and `uninstall_wan_vae_encoder_fastpath`, exported from
+`vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath`. Uninstall restores
+original forwards and tensor layouts while retaining current weight values.
+
+### Encoder benchmarking
+
+`benchmarks/diffusion/bench_wan_vae_encode.py` loads only the VAE. It compares all
+encoder levels with the same weights, inputs and backend settings, always
+running `off` first. It reports startup/first-call time separately from warmed
+median latency, throughput and peak allocated memory. Reference tensors are
+kept on CPU during candidate timing.
+
+```bash
+# Image conditioning
+python benchmarks/diffusion/bench_wan_vae_encode.py \
+    --model nvidia/Cosmos3-Nano --frames 1 --profile --json encode-image.json
+
+# Video encoding and quality; --revision can pin the checkpoint
+python benchmarks/diffusion/bench_wan_vae_encode.py \
+    --model nvidia/Cosmos3-Nano --frames 93 --check-reconstruction --json encode-video.json
+
+# A preprocessed natural image/video: floating RGB [B, 3, T, H, W] in [-1, 1]
+python benchmarks/diffusion/bench_wan_vae_encode.py \
+    --input pixels.pt --check-reconstruction --json encode-natural.json
+
+# Two GPUs, existing tile-parallel encoding
+torchrun --nproc-per-node 2 benchmarks/diffusion/bench_wan_vae_encode.py \
+    --vae-patch-parallel-size 2 --frames 93 --json encode-tiled.json
+```
+
+The default is BF16, 1280x720, three warmups and ten timed iterations.
+`--tiny` uses a reduced four-stage VAE for development; production performance
+measurements must use real weights. `--tf32 off` controls FP32 convolution math.
+The profiler reports CUDA operator times, including padding, copying,
+normalization, reduction, attention and convolutions.
+
+The benchmark exits unsuccessfully for a lossless bitwise mismatch, nonfinite
+outputs, or channels-last normalized RMSE above 1% for posterior parameters,
+mean or log-variance. `--check-reconstruction` also requires at least 50 dB PSNR
+between reconstructions of the reference and candidate mean, using the same
+reference decoder. These are validation gates, not measured encoder results.
+Single-GPU OOM cases are recorded explicitly; distributed failures terminate
+the run because a failed collective cannot be retried safely on one rank.
+
+Validate on both H100 and GB200, using 256x256, 640x384 and 1280x720 inputs with
+1, 5, 33, 93 and 189 frames. Record repeatable gains separately for images and
+videos, and investigate latency or peak-memory regressions above 5%. The new
+encoder kernel launch sizes are conservative defaults; architecture-specific
+tuning and the numerical gates require validation on those GPUs.
+
+## Measured decoder performance
 
 Cosmos3-Nano VAE, 1280x720 x 189 frames, bf16, one GB200 GPU, `bench_wan_vae_decode.py`
 (best of 2 runs after warmup):
@@ -81,7 +178,7 @@ Cosmos3-Nano VAE, 1280x720 x 189 frames, bf16, one GB200 GPU, `bench_wan_vae_dec
 Peak decode memory was unchanged (about 13 GiB): it is set by the largest
 activations and the cuDNN workspace, not by the output assembly.
 
-## Benchmarking
+## Decoder benchmarking
 
 `benchmarks/diffusion/bench_wan_vae_decode.py` decodes seeded latents with the
 real VAE at each level and reports decode time, peak memory, bitwise equality

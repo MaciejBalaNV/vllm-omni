@@ -65,6 +65,7 @@ class FastPathConfig:
 
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
     channels_last: bool = False
+    clone_encoder_shortcuts: bool = False
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
@@ -300,6 +301,26 @@ def _layout_tag(x: torch.Tensor) -> str:
     return "channels_last" if x.shape[1] > 1 and x.stride(1) == 1 else "channels_first"
 
 
+def _conv_verdict_key(conv: nn.Module, x: torch.Tensor, cache_frames: int) -> tuple:
+    """Do not reuse numerical probes across devices, autocast or backend settings."""
+    autocast = torch.is_autocast_enabled(x.device.type)
+    return (
+        tuple(x.shape),
+        cache_frames,
+        x.dtype,
+        _layout_tag(x),
+        x.device,
+        conv.weight.dtype,
+        conv.weight.stride(),
+        torch.get_autocast_dtype(x.device.type) if autocast else None,
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cudnn.enabled,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+        torch.are_deterministic_algorithms_enabled(),
+    )
+
+
 def _run_cached_causal_conv(
     conv: nn.Module,
     x: torch.Tensor,
@@ -342,7 +363,7 @@ def _run_cached_causal_conv(
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
-        key = (tuple(x.shape), 0 if payload is None else payload.shape[2], x.dtype, _layout_tag(x))
+        key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
         if verdicts.get(key, True):
             pair = dm.cat_time_5d(x, payload, conv._padding[4], keep_cache_frames=CACHE_T)
             if pair is not None:
@@ -389,7 +410,7 @@ def _run_conv_out_channels_last(
     if payload is not None and (payload.device != x.device or payload.dtype != x.dtype):
         return None
     verdicts = _CONV_OUT_LAYOUT_VERDICTS.setdefault(conv, {})
-    key = (tuple(x.shape), 0 if payload is None else payload.shape[2], x.dtype)
+    key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
     if not verdicts.get(key, True):
         return None
     pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T, channels_last_output=True)
