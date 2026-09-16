@@ -238,7 +238,9 @@ def _frame_list(video: Any) -> list[Any]:
     raise TypeError(f"Unsupported multiview video output type: {type(video).__name__}.")
 
 
-def _export_combined_views(frames: list[Any], num_views: int, frames_per_view: int, path: Path, fps: float) -> dict[str, Any]:
+def _export_combined_views(
+    frames: list[Any], num_views: int, frames_per_view: int, path: Path, fps: float
+) -> dict[str, Any]:
     """Stream synchronized camera-major frames into a grid, leaving unused tiles black."""
     import imageio.v2 as imageio
 
