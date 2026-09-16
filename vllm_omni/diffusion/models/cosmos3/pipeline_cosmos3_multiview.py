@@ -884,14 +884,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 )
         separate_captions = deployment.get("separate_view_text_tokenization", False)
         layout = MultiviewLayout(
-            num_views=num_views,
-            latent_frames=actual_latent_t,
-            patch_height=patch_h,
-            patch_width=patch_w,
             attention_scope=self.multiview_attention_scope,  # type: ignore[arg-type]
             decomposed_temporal_window_seconds=self.multiview_decomposed_temporal_window_seconds,
             control_attends_sensor=self.multiview_control_attends_sensor,
-            seconds_per_frame=self.vae_scale_factor_temporal / frame_rate,
             backend=self.multiview_backend,
             items=tuple(items),
             max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate_captions else 1),

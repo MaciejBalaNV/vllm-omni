@@ -1144,23 +1144,6 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     rotary.position_ids.clear()
     model._compute_rope_freqs(
         text_mask=torch.tensor([[1, 1]], dtype=torch.long),
-        t=6,
-        hp=1,
-        wp=1,
-        fps=24.0,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        num_vision_items=2,
-        share_vision_temporal_positions=True,
-        temporal_position_period=3,
-    )
-    _, aligned_shared_gen_pos = rotary.position_ids
-    expected_aligned_item = [102, 103, 104, 102, 103, 104]
-    assert aligned_shared_gen_pos[0, 0].tolist() == expected_aligned_item * 2
-
-    rotary.position_ids.clear()
-    model._compute_rope_freqs(
-        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
         t=2,
         hp=1,
         wp=1,

@@ -358,7 +358,7 @@ def test_multiview_forward_propagates_resolution(
         assert control.shape == latents.shape
         assert shared_kwargs["video_shape"] == tuple(latents.shape[2:])
         layout = shared_kwargs["multiview_layout"]
-        assert (layout.patch_height, layout.patch_width) == patch_hw
+        assert all(item.token_shape[1:] == patch_hw for item in layout.items)
         assert layout.gen_tokens == 2 * 4 * patch_hw[0] * patch_hw[1]
         assert shared_kwargs["noisy_frame_mask"].flatten().tolist() == ([0, 1, 0, 1] if has_vision else [1, 1, 1, 1])
         if has_vision:
@@ -952,7 +952,7 @@ def test_forward_uses_deployment_resolution_fps_and_emphasis_defaults(monkeypatc
     assert (prepared[0]["width"], prepared[0]["height"]) == (width, height)
     shared = diffusion_calls[0]["shared_kwargs"]
     assert shared["fps"] == expected_fps
-    assert shared["multiview_layout"].seconds_per_frame == 4 / expected_fps
+    assert all(item.seconds_per_frame == 4 / expected_fps for item in shared["multiview_layout"].items)
     assert f"{expected_fps} FPS" in prompts[0]
     assert f"{height}x{width}" in prompts[0]
     assert prompts[0].count(control_emphasis("wsm", joint=False)) == int(overrides != "none")

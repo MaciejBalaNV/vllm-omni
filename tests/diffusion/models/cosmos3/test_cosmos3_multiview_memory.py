@@ -92,7 +92,7 @@ def test_packed_embeddings_and_caption_temporaries_released_before_later_layers(
         text_mask=torch.ones(1, 5, dtype=torch.long),
         caption_lengths=(2, 3),
         packed_shapes=(tuple(camera.shape[1:]),),
-        multiview_layout=MultiviewLayout(2, 4, 1, 1, items=(MaskItem((4, 1, 1), 2),)),
+        multiview_layout=MultiviewLayout(items=(MaskItem((4, 1, 1), 2),)),
     )
     assert len(visited) == 2
     torch.testing.assert_close(output, torch.full_like(output, 2))

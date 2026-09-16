@@ -74,8 +74,10 @@ HEAD_GEOMETRIES = [
 @pytest.mark.parametrize("real_und_len", [128, 96])
 def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_heads: int, num_kv_heads: int) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
+        PaddedAttentionGeometry,
         build_multiview_flex_metadata,
         multiview_pair_predicate,
         padded_multiview_flex_attention,
@@ -88,7 +90,11 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
 
     # Two views x four latent frames x 8x8 patches -> 256 tokens per item,
     # 512 packed GEN tokens, which is exactly two 256-row FA4 query blocks.
-    layout = MultiviewLayout(2, 4, 8, 8, backend="fa4", max_und_tokens=_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 8, 8), 2, is_control=control) for control in (True, False)),
+        backend="fa4",
+        max_und_tokens=_MAX_UND,
+    )
     gen = layout.gen_tokens
     context = MultiviewAttentionContext(layout, {})
 
@@ -102,12 +108,9 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
     assert actual.shape == (1, gen, num_heads, head_dim)
 
     metadata = build_multiview_flex_metadata(
-        seq_len=real_und_len + gen,
-        full_q_offsets=(real_und_len, real_und_len + layout.items[0].num_tokens, real_und_len + gen),
-        items_per_sample=layout.items,
+        layout=layout,
+        geometry=PaddedAttentionGeometry(gen, gen, real_und_len, real_und_len),
         device=device,
-        num_und=real_und_len,
-        attention_scope=layout.attention_scope,
     )
     expected = _dense_oracle(q, k_und, k, v_und, v, metadata, multiview_pair_predicate)
 
@@ -134,6 +137,7 @@ def test_fa4_multiview_attention_matches_dense_oracle(real_und_len: int, num_hea
 def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int, patch_hw) -> None:
     """Both backends project the same predicate, so their outputs must match."""
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
         padded_multiview_flex_attention,
@@ -147,7 +151,11 @@ def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int, patch_
     tensors = None
     outputs = {}
     for backend in ("triton", "fa4"):
-        layout = MultiviewLayout(2, 4, *patch_hw, backend=backend, max_und_tokens=_MAX_UND)
+        layout = MultiviewLayout(
+            items=tuple(MaskItem((4, *patch_hw), 2, is_control=control) for control in (True, False)),
+            backend=backend,
+            max_und_tokens=_MAX_UND,
+        )
         gen = layout.gen_tokens
         if tensors is None:
             tensors = (
@@ -178,6 +186,7 @@ def test_fa4_vector_masks_match_scalar_bitwise(num_heads: int, num_kv_heads: int
 
     from vllm_omni.diffusion.models.cosmos3.multiview_fa4 import _build_mask_mod, _load_fa4
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewBlockSparsity,
         MultiviewLayout,
@@ -191,7 +200,12 @@ def test_fa4_vector_masks_match_scalar_bitwise(num_heads: int, num_kv_heads: int
     real_und_len = 96
     # Seventeen frames per view produce more than 32 key runs. The 35-token
     # runs cross vector/tile boundaries, and both UND and GEN require padding.
-    layout = MultiviewLayout(2, 34, 5, 7, backend="fa4", max_und_tokens=_MAX_UND, control_attends_sensor=True)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((34, 5, 7), 2, is_control=control) for control in (True, False)),
+        backend="fa4",
+        max_und_tokens=_MAX_UND,
+        control_attends_sensor=True,
+    )
     plan, geometry = get_multiview_attention_plan(
         MultiviewAttentionContext(layout, {}),
         real_und_len=real_und_len,

@@ -22,6 +22,7 @@ from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
+    PaddedAttentionGeometry,
     build_multiview_flex_metadata,
     get_multiview_attention_plan,
     multiview_pair_predicate,
@@ -236,17 +237,14 @@ def test_mixed_boundaries_caption_isolation_sensor_controls_and_time_window(scop
     offsets = [6]
     for item in items:
         offsets.append(offsets[-1] + item.num_tokens)
-    metadata = build_multiview_flex_metadata(
-        offsets[-1],
-        offsets,
-        items,
-        "cpu",
-        6,
+    layout = MultiviewLayout(
+        items=items,
         attention_scope=scope,
         decomposed_temporal_window_seconds=0.4,
         caption_lengths=(2, 4),
         control_attends_sensor=True,
     )
+    metadata = build_multiview_flex_metadata(layout, PaddedAttentionGeometry(66, 66, 6, 6), "cpu")
     allowed = multiview_pair_predicate(
         metadata, torch.arange(metadata.q_len)[:, None], torch.arange(metadata.kv_len)[None, :]
     )
@@ -266,20 +264,13 @@ def test_mixed_boundaries_caption_isolation_sensor_controls_and_time_window(scop
 
 def test_layout_cache_keys_include_geometry_and_caption_boundaries():
     layout = MultiviewLayout(
-        2,
-        6,
-        1,
-        2,
-        items=mixed_items(),
-        caption_lengths=(2, 4),
-        max_und_tokens=8,
-        decomposed_temporal_window_seconds=0.4,
+        items=mixed_items(), caption_lengths=(2, 4), max_und_tokens=8, decomposed_temporal_window_seconds=0.4
     )
     context = MultiviewAttentionContext(layout, {})
     plan, _ = get_multiview_attention_plan(context, device=torch.device("cpu"), real_q_len=66, real_und_len=6)
     assert plan is not None
     changed = replace(layout, caption_lengths=(3, 3))
-    assert changed.cache_key() != layout.cache_key()
+    assert changed != layout
     other, _ = get_multiview_attention_plan(
         replace(context, layout=changed), device=torch.device("cpu"), real_q_len=66, real_und_len=6
     )
@@ -385,9 +376,7 @@ def test_packed_transformer_isolates_causal_captions_and_only_times_noisy_target
         lidar_control_latents=torch.full_like(lidar, 2),
         noisy_frame_mask=torch.tensor([0, 1, 0, 1]).reshape(1, 1, 4, 1, 1),
         temporal_position_period=2,
-        multiview_layout=MultiviewLayout(
-            2, 4, 1, 1, items=items, max_und_tokens=8, decomposed_temporal_window_seconds=0.4
-        ),
+        multiview_layout=MultiviewLayout(items=items, max_und_tokens=8, decomposed_temporal_window_seconds=0.4),
     )
     prediction = model(**kwargs)
     with monkeypatch.context() as patch:
