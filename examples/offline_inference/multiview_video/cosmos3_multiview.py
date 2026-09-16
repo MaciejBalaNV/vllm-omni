@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -237,6 +238,26 @@ def _frame_list(video: Any) -> list[Any]:
     raise TypeError(f"Unsupported multiview video output type: {type(video).__name__}.")
 
 
+def _export_combined_views(frames: list[Any], num_views: int, frames_per_view: int, path: Path, fps: float) -> dict[str, Any]:
+    """Stream synchronized camera-major frames into a grid, leaving unused tiles black."""
+    import imageio.v2 as imageio
+
+    columns = math.ceil(math.sqrt(num_views))
+    rows = math.ceil(num_views / columns)
+    height, width = np.asarray(frames[0]).shape[:2]
+    with imageio.get_writer(str(path), fps=fps, macro_block_size=1) as writer:
+        for frame_index in range(frames_per_view):
+            grid = np.zeros((rows * height, columns * width, 3), dtype=np.uint8)
+            for view_index in range(num_views):
+                frame = np.asarray(frames[view_index * frames_per_view + frame_index])
+                if np.issubdtype(frame.dtype, np.floating):
+                    frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+                row, column = divmod(view_index, columns)
+                grid[row * height : (row + 1) * height, column * width : (column + 1) * width] = frame[..., :3]
+            writer.append_data(grid)
+    return {"file_name": str(path), "rows": rows, "columns": columns, "width": columns * width, "height": rows * height}
+
+
 def _run_request(
     omni: Omni,
     request: dict[str, Any],
@@ -248,6 +269,7 @@ def _run_request(
     num_frames_override: int | None = None,
     resolution_override: str | None = None,
     aspect_ratio_override: str | None = None,
+    combine_views: bool = False,
 ) -> dict[str, Any]:
     request = {**request.get("extra_params", {}), **request}
     multiview_value = request.get("multiview")
@@ -399,6 +421,10 @@ def _run_request(
         "files_by_camera": files_by_camera,
         "generation_seconds": generation_seconds,
     }
+    if combine_views:
+        manifest["combined_video"] = _export_combined_views(
+            frames, len(cameras), frames_per_view, output_dir / "combined_views.mp4", output_fps
+        )
     if lidar is not None:
         data, details = serialize_lidar_output(lidar, metadata.get("lidar", {}))
         lidar_path = output_dir / "lidar.safetensors"
@@ -422,6 +448,11 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="Exported Cosmos3 Multiview-AV Diffusers directory")
     parser.add_argument("--input", required=True, type=Path, help="Multiview JSON or JSONL file")
     parser.add_argument("--output-dir", type=Path, default=Path("cosmos3_multiview_output"))
+    parser.add_argument(
+        "--combine-views",
+        action="store_true",
+        help="Also save combined_views.mp4 as a synchronized grid in camera order, with unused tiles black",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -525,6 +556,7 @@ def main() -> None:
             num_frames_override=args.num_frames,
             resolution_override=args.resolution,
             aspect_ratio_override=args.aspect_ratio,
+            combine_views=args.combine_views,
         )
         manifests.append({**manifest, "output_dir": str(output_dir)})
 
