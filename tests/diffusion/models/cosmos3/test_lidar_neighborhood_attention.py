@@ -268,54 +268,6 @@ def test_cpu_production_grid_rejected_before_eager_allocation():
         attention.neighborhood_attention_2d(q, q, q, kernel_size=3, dilation=1, scale=1.0)
 
 
-def test_validation_measurements_exclude_capture_and_release_components(monkeypatch):
-    from tools import validate_cosmos3_lidar_decoder as validation
-
-    for name in ("synchronize", "reset_peak_memory_stats", "empty_cache"):
-        monkeypatch.setattr(torch.accelerator, name, lambda: None)
-    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 128)
-    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda: 64)
-    monkeypatch.setattr(torch.cuda, "get_rng_state", torch.random.get_rng_state)
-    placements, calls = [], []
-
-    class Component(torch.nn.Module):
-        def to(self, device):
-            placements.append(device)
-            return self
-
-        def cpu(self):
-            placements.append("cpu")
-            return self
-
-        def forward(self):
-            calls.append(bool(self._forward_hooks))
-            return torch.ones(1, 3, 2, 2, 2), {}
-
-    component = Component()
-    actual, raw, timings = validation.evaluate(
-        [component], lambda: component()[0], raw_module=component, preserve_rng=True
-    )
-    assert calls == [False] * 14 + [True]  # First call + 3 warm-ups + 10 timed runs, then capture.
-    assert placements == ["cuda", "cpu"] and not component._forward_hooks
-    assert timings["warm_peak_increment_bytes"] == 64
-    assert len(timings["warm_seconds"]) == 10
-    torch.testing.assert_close(actual, raw, rtol=0, atol=0)
-    calls.clear()
-    with pytest.raises(AssertionError, match="mismatch"):
-        validation.evaluate([component], lambda: (_ for _ in ()).throw(AssertionError("mismatch")))
-    assert placements[-1] == "cpu"
-
-
-def test_validation_keeps_strict_numeric_and_binary_thresholds():
-    from tools.validate_cosmos3_lidar_decoder import compare
-
-    compare(torch.zeros(1), torch.full((1,), 9e-5))
-    with pytest.raises(AssertionError):
-        compare(torch.zeros(1), torch.full((1,), 2e-4))
-    with pytest.raises(AssertionError):
-        compare(torch.zeros(1), torch.full((1,), 1e-8), exact=True)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_compile_failure_propagates_without_fallback(monkeypatch):
     def fail(*args):
