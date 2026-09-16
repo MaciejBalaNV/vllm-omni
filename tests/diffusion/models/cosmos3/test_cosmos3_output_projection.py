@@ -9,18 +9,22 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3 as cosmos3
+from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _output_model(dtype: torch.dtype = torch.float32) -> cosmos3.Cosmos3VFMTransformer:
+def _output_model(
+    dtype: torch.dtype = torch.float32,
+    *,
+    model_cls: type[cosmos3.Cosmos3VFMTransformer] = cosmos3.Cosmos3VFMTransformer,
+) -> cosmos3.Cosmos3VFMTransformer:
     # Only the output head is needed; do not construct weights or TP layers.
-    model = object.__new__(cosmos3.Cosmos3VFMTransformer)
+    model = object.__new__(model_cls)
     nn.Module.__init__(model)
     model.norm_moe_gen = cosmos3.RMSNorm(8, eps=1e-6, dtype=dtype)
     model.norm_moe_gen.weight.data.copy_(torch.linspace(0.5, 1.5, 8, dtype=dtype))
     model.proj_out = nn.Linear(8, 3, dtype=dtype)
-    model._output_projection_chunk_size = 8
     return model
 
 
@@ -28,9 +32,10 @@ def _output_model(dtype: torch.dtype = torch.float32) -> cosmos3.Cosmos3VFMTrans
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("sequence_length", [3, 8, 19])
 @torch.inference_mode()
-def test_output_projection_matches_native_norm_with_bounded_chunks(dtype, batch, sequence_length) -> None:
+def test_multiview_output_projection_matches_native_norm_with_bounded_chunks(dtype, batch, sequence_length) -> None:
     torch.manual_seed(42)
-    model = _output_model(dtype)
+    model = _output_model(dtype, model_cls=Cosmos3MultiviewVFMTransformer)
+    model._output_projection_chunk_size = 8
     # A target slice can retain the strides of a larger control+target tensor.
     packed = torch.randn(batch, sequence_length + 3, 8, dtype=dtype) * 20
     hidden = packed[:, 3:]
@@ -55,9 +60,10 @@ def test_output_projection_matches_native_norm_with_bounded_chunks(dtype, batch,
 
 @pytest.mark.parametrize("sequence_length", [3, 19])
 @torch.inference_mode()
-def test_output_projection_preserves_autocast_dtype(sequence_length) -> None:
+def test_multiview_output_projection_preserves_autocast_dtype(sequence_length) -> None:
     torch.manual_seed(42)
-    model = _output_model()
+    model = _output_model(model_cls=Cosmos3MultiviewVFMTransformer)
+    model._output_projection_chunk_size = 8
     hidden = torch.randn(1, sequence_length, 8)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         expected = model.proj_out(model.norm_moe_gen.forward_native(hidden))
@@ -125,13 +131,13 @@ def test_shared_gen_runner_preserves_wrapped_layers_and_sp_routing(grouped, sequ
 
 
 @pytest.mark.parametrize("controls,modality", [(0, None), (1, None), (2, None), (0, "action"), (0, "sound")])
+@pytest.mark.parametrize("cached", [False, True])
 @torch.inference_mode()
-def test_forward_output_matches_full_norm_and_skips_controls(monkeypatch, controls, modality) -> None:
+def test_shared_output_normalizes_once_and_matches_reference(monkeypatch, controls, modality, cached) -> None:
     torch.manual_seed(42)
     monkeypatch.setattr(cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
     monkeypatch.setattr(cosmos3, "current_omni_platform", SimpleNamespace(device_type="cpu"))
     model = _output_model()
-    model._output_projection_chunk_size = 5
     model.latent_channel_size = 2
     model.latent_patch_size = 2
     model.proj_in = nn.Linear(8, 8)
@@ -178,7 +184,7 @@ def test_forward_output_matches_full_norm_and_skips_controls(monkeypatch, contro
     layer.register_forward_pre_hook(check_embeddings_released)
     norm_inputs = []
     model.norm_moe_gen.register_forward_pre_hook(lambda module, args: norm_inputs.append(args[0].clone()))
-    actual = model(
+    forward_kwargs = dict(
         hidden_states=hidden,
         timestep=torch.tensor([1.0]),
         text_ids=torch.tensor([[1, 2]]),
@@ -187,10 +193,17 @@ def test_forward_output_matches_full_norm_and_skips_controls(monkeypatch, contro
         control_latents=[torch.randn_like(hidden) for _ in range(controls)],
         **extra,
     )
+    if cached:
+        from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
+
+        context = extract_cosmos3_context(model, **forward_kwargs)
+        actual = context.postprocess(context.run_transformer_blocks()[0])
+    else:
+        actual = model(**forward_kwargs)
 
     video_tokens = 12  # Two latent frames, each padded to 2 x 3 spatial patches.
     target_start = controls * video_tokens
-    # Reference the previous output path: normalize the entire packed sequence,
+    # Normalize the entire packed sequence,
     # discard controls, then project each output modality in one operation.
     full_norm = model.norm_moe_gen.forward_native(layer.output)
     expected_video = model.unpatchify(model.proj_out(full_norm[:, target_start : target_start + video_tokens]), 2, 3, 5)
@@ -204,6 +217,6 @@ def test_forward_output_matches_full_norm_and_skips_controls(monkeypatch, contro
     else:
         expected = expected_video
     torch.testing.assert_close(actual, expected)
-    # No control tokens reach the output norm, and camera/token order is retained.
-    torch.testing.assert_close(torch.cat(norm_inputs, dim=1), layer.output[:, target_start:], rtol=0, atol=0)
-    assert max(chunk.shape[1] for chunk in norm_inputs) <= 5
+    # Ordinary forward and cache execution share one full-sequence final norm.
+    assert len(norm_inputs) == 1
+    torch.testing.assert_close(norm_inputs[0], layer.output, rtol=0, atol=0)

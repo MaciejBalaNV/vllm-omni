@@ -117,6 +117,31 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
     _repeated_blocks = ["Cosmos3MultiviewGenDecoderLayer"]
     _cross_attention_cls = Cosmos3MultiviewCrossAttention
 
+    # At hidden size 4096, each FP32 RMSNorm temporary is at most 128 MiB
+    # for the single-sample video requests served by this pipeline.
+    _output_projection_chunk_size = 8192
+
+    def _project_video_tokens(self, hidden_video: torch.Tensor) -> torch.Tensor:
+        """Normalize/project video tokens without full-sequence FP32 temporaries.
+
+        Keep the existing RMSNorm arithmetic, including its FP32 intermediates.
+        Only the smaller projected latent tokens are retained between chunks;
+        collecting normalized chunks would recreate the large hidden tensor.
+        """
+        batch, sequence_length, _ = hidden_video.shape
+        chunk_size = max(1, self._output_projection_chunk_size // batch)
+        projected = self.proj_out(self.norm_moe_gen(hidden_video[:, :chunk_size]))
+        if sequence_length <= chunk_size:
+            return projected
+
+        # Allocate from the projection result to preserve its dtype under autocast.
+        output = projected.new_empty(batch, sequence_length, projected.shape[-1])
+        output[:, :chunk_size] = projected
+        for start in range(chunk_size, sequence_length, chunk_size):
+            end = min(start + chunk_size, sequence_length)
+            output[:, start:end] = self.proj_out(self.norm_moe_gen(hidden_video[:, start:end]))
+        return output
+
     @staticmethod
     def _validate_supported_config(model_config: Any) -> None:
         Cosmos3VFMTransformer._validate_supported_config(model_config)
