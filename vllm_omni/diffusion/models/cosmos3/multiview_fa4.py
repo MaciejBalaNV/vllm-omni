@@ -29,7 +29,7 @@ from typing import Any, NamedTuple
 import torch
 from vllm.logger import init_logger
 
-from .multiview_flex_attention import FA4_MASK_CHUNK_SIZE, MultiviewBlockSparsity
+from .multiview_flex_attention import MultiviewBlockSparsity
 
 logger = init_logger(__name__)
 
@@ -46,7 +46,7 @@ class _Fa4Entry(NamedTuple):
 _entry: _Fa4Entry | None = None
 
 
-def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1, use_run_metadata: bool = False):
+def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
     """Compile-time-free multiview mask_mod over the packed run truth table.
 
     ``aux_tensors`` are, in order:
@@ -58,15 +58,12 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1, use_run_metad
     * ``k_group_ids``  ``(seqlen_k,)``  int32 -- the key token's run id.
     * ``allowed_words`` ``(q_runs * words_per_row,)`` int32 -- the truth table
       over run pairs, bit-packed 32 keys per word.
-    * ``k_run_chunks`` ``(ceil(seqlen_k / 32), 3)`` int32 -- endpoint run IDs
-      and membership bits, consumed only when ``use_run_metadata`` is enabled.
 
     FA4 wraps the indices modulo ``seqlen_q``/``seqlen_k`` before calling a
     mask_mod that has aux tensors (``utils.compute_fastdiv_mods``), so reads on
     out-of-range padded lanes stay in bounds; those lanes are force-masked after
-    this returns. The per-token q_word_base/k_group_ids must cover exactly
-    ``seqlen_q``/``seqlen_k`` entries, and k_run_chunks must cover every key
-    chunk; ``multiview_fa4_attention`` checks these lengths.
+    this returns.  That holds only while the aux tensors are exactly
+    ``seqlen_q``/``seqlen_k`` long, which ``multiview_fa4_attention`` checks.
 
     The scalar callback returns Boolean predicates. On SM100/SM110, vectors
     return a Uint32 whose bit j is the predicate for n_idx[j], allowing FA4
@@ -75,8 +72,6 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1, use_run_metad
     """
     if vec_size not in (1, 8, 32):
         raise ValueError(f"Cosmos3 multiview FA4 mask vector size must be 1, 8, or 32, got {vec_size}.")
-    if use_run_metadata and vec_size != FA4_MASK_CHUNK_SIZE:
-        raise ValueError("Cosmos3 multiview FA4 run metadata requires 32-key vectors.")
 
     @cute.jit
     def multiview_mask_mod(
@@ -99,70 +94,24 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1, use_run_metad
         else:
             result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
             result[0] = cutlass.Uint32(0)
-        use_fallback = cutlass.Boolean(True)
-        if cutlass.const_expr(use_run_metadata):
-            chunks = aux_tensors[3]
-            # FA4 has already wrapped auxiliary indices into [0, seqlen_k),
-            # so the chunk lookup is in bounds even when fallback is needed.
-            start = cutlass.Uint32(n_idx[0])
-            chunk = cutlass.Int32(start // cutlass.Uint32(FA4_MASK_CHUNK_SIZE))
-            last_run = chunks[chunk, 1]
-            aligned = start % cutlass.Uint32(FA4_MASK_CHUNK_SIZE) == cutlass.Uint32(0)
-            contiguous = n_idx[FA4_MASK_CHUNK_SIZE - 1] == n_idx[0] + cutlass.Int32(FA4_MASK_CHUNK_SIZE - 1)
-            use_fallback = ~(aligned & contiguous & (last_run >= cutlass.Int32(0)))
-            if not use_fallback:
-                first_run = chunks[chunk, 0]
-                first_u = cutlass.Uint32(first_run)
-                word = allowed_words[base + cutlass.Int32(first_u // cutlass.Uint32(32))]
-                keep = fa_utils.shr_u32(cutlass.Uint32(word), first_u % cutlass.Uint32(32)) & cutlass.Uint32(1)
-                # Unsigned subtraction broadcasts one predicate to all 32
-                # bits, including bit 31, without shifting by the word width.
-                first_bits = cutlass.Uint32(0) - keep
-                if first_run == last_run:
-                    result[0] = first_bits
-                else:
-                    last_u = cutlass.Uint32(last_run)
-                    word = allowed_words[base + cutlass.Int32(last_u // cutlass.Uint32(32))]
-                    keep = fa_utils.shr_u32(cutlass.Uint32(word), last_u % cutlass.Uint32(32)) & cutlass.Uint32(1)
-                    last_bits = cutlass.Uint32(0) - keep
-                    first_run_bits = cutlass.Uint32(chunks[chunk, 2])
-                    result[0] = (first_bits & first_run_bits) | (last_bits & ~first_run_bits)
-        if use_fallback:
-            for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
-                group_k = k_group_ids[n_idx[j]]
-                # Run ids are non-negative, so the unsigned read is lossless and lets
-                # the divide and modulo reduce to one shift each.
-                group_u = cutlass.Uint32(group_k)
-                word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
-                shift = group_u % cutlass.Uint32(32)
-                keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
-                if cutlass.const_expr(vec_size == 1):
-                    result[j] = cutlass.Boolean(keep)
-                else:
-                    result[0] = result[0] | (keep << cutlass.Uint32(j))
+        for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
+            group_k = k_group_ids[n_idx[j]]
+            # Run ids are non-negative, so the unsigned read is lossless and lets
+            # the divide and modulo reduce to one shift each.
+            group_u = cutlass.Uint32(group_k)
+            word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
+            shift = group_u % cutlass.Uint32(32)
+            keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
+            if cutlass.const_expr(vec_size == 1):
+                result[j] = cutlass.Boolean(keep)
+            else:
+                result[0] = result[0] | (keep << cutlass.Uint32(j))
         return result.load()
 
     # FA4 includes this attribute in the compile-cache key as well as using it
     # to select the scalar/vector callback ABI. Never mutate it during a launch.
     multiview_mask_mod.__vec_size__ = vec_size
     return multiview_mask_mod
-
-
-def _build_run_mask_mod(cutlass, cute, fa_utils):
-    """Reuse one or two truth-table lookups across an aligned 32-key vector.
-
-    aux_tensors[3] describes each aligned key chunk as (first_run, last_run,
-    first_run_bits). A negative last_run selects the per-key fallback. The
-    cached plan proves that every key in a fast chunk belongs to one of these
-    two runs; equal endpoint visibility alone would not establish that.
-
-    FA4 supplies adjacent logical key indices. Its auxiliary-index wrapping
-    can break adjacency at a sequence tail, so only aligned, nonwrapping
-    vectors use the chunk table. Other vectors retain the exact fallback.
-    """
-    # Keep both paths in one specialization rather than capturing a fallback
-    # callable: FA4 hashes closures with repr(), including function addresses.
-    return _build_mask_mod(cutlass, cute, fa_utils, vec_size=FA4_MASK_CHUNK_SIZE, use_run_metadata=True)
 
 
 def _load_fa4() -> _Fa4Entry:
@@ -191,7 +140,7 @@ def _load_fa4() -> _Fa4Entry:
         flash_attn_func=flash_attn_func,
         block_sparse_cls=BlockSparseTensorsTorch,
         mask_mod=_build_mask_mod(cutlass, cute, fa_utils),
-        vector_mask_mod=_build_run_mask_mod(cutlass, cute, fa_utils),
+        vector_mask_mod=_build_mask_mod(cutlass, cute, fa_utils, vec_size=32),
     )
     logger.info("Cosmos3 multiview attention using the FlashAttention-4 CuTe backend.")
     return _entry
@@ -231,9 +180,6 @@ def _validate(
         raise ValueError("Cosmos3 multiview FA4 q_word_base must have one entry per padded query token.")
     if sparsity.k_group_ids.numel() != sparsity.kv_len:
         raise ValueError("Cosmos3 multiview FA4 k_group_ids must have one entry per padded key token.")
-    expected_chunks = (sparsity.kv_len + FA4_MASK_CHUNK_SIZE - 1) // FA4_MASK_CHUNK_SIZE
-    if sparsity.k_run_chunks.shape != (expected_chunks, 3):
-        raise ValueError("Cosmos3 multiview FA4 k_run_chunks must describe each padded 32-key chunk.")
 
 
 # Wrapping the FA4 launch as a torch.library custom op keeps it opaque to
@@ -262,7 +208,6 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
         q_word_base: torch.Tensor,
         k_group_ids: torch.Tensor,
         allowed_words: torch.Tensor,
-        k_run_chunks: torch.Tensor,
         q_block_size: int,
         kv_block_size: int,
     ) -> torch.Tensor:
@@ -295,7 +240,7 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
             mask_mod=mask_mod,
             # Same order as MultiviewBlockSparsity.aux_tensors(), which is the
             # order _build_mask_mod indexes them in.
-            aux_tensors=[q_word_base, k_group_ids, allowed_words, k_run_chunks],
+            aux_tensors=[q_word_base, k_group_ids, allowed_words],
             block_sparse_tensors=block_sparse,
             # pack_gqa is left to FA4's own heuristic.  Cosmos3 defaults to 32 query
             # heads over 8 KV heads, so packing matters here, and FA4 handles it with
@@ -321,7 +266,6 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
         q_word_base,
         k_group_ids,
         allowed_words,
-        k_run_chunks,
         q_block_size,
         kv_block_size,
     ):
@@ -370,7 +314,6 @@ def multiview_fa4_attention(
         sparsity.q_word_base,
         sparsity.k_group_ids,
         sparsity.allowed_words,
-        sparsity.k_run_chunks,
         sparsity.q_block_size,
         sparsity.kv_block_size,
     )

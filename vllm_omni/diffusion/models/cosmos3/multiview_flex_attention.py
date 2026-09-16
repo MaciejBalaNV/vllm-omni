@@ -43,7 +43,6 @@ TRITON_NUM_WARPS = 4
 # flash_attn/cute/block_sparsity.py::normalize_block_sparse_config.
 FA4_SPARSE_Q_BLOCK_SIZE = 256
 FA4_SPARSE_KV_BLOCK_SIZE = 128
-FA4_MASK_CHUNK_SIZE = 32
 
 # Coarser blocks admit more disallowed pairs into partially-masked tiles, where
 # the mask_mod resolves them exactly.  Measured on the released 11-view / 21-frame
@@ -611,45 +610,6 @@ def _pack_allowed_bits(group_allowed: torch.Tensor) -> tuple[torch.Tensor, int]:
     return words.reshape(-1).to(torch.int32).contiguous(), words_per_row
 
 
-def _build_key_run_chunks(k_group_ids: torch.Tensor) -> torch.Tensor:
-    """Describe each 32-key chunk with endpoint run IDs and first-run bits.
-
-    The contiguous int32 result has columns ``(first_run, last_run,
-    first_run_bits)``. Bit j identifies keys belonging to ``first_run``;
-    every other key belongs to ``last_run``. If any key differs from both
-    endpoint IDs, ``last_run`` is -1 and the mask must use its per-key fallback.
-    Checking every key keeps this representation exact even without relying on
-    monotonic run IDs. A homogeneous chunk has identical endpoint IDs.
-
-    A short final chunk repeats its last real run ID only in this metadata;
-    FA4 still excludes out-of-bounds keys. This does not add keys to attention.
-    All decisions depend on tensor shapes or tensor operations, avoiding device
-    synchronization while the request-local attention plan is built.
-    """
-    if k_group_ids.ndim != 1:
-        raise ValueError("Cosmos3 multiview key run IDs must be a one-dimensional tensor.")
-    num_keys = k_group_ids.numel()
-    if num_keys == 0:
-        return torch.empty((0, 3), dtype=torch.int32, device=k_group_ids.device)
-
-    num_chunks = (num_keys + FA4_MASK_CHUNK_SIZE - 1) // FA4_MASK_CHUNK_SIZE
-    if num_keys % FA4_MASK_CHUNK_SIZE:
-        indexes = torch.arange(num_chunks * FA4_MASK_CHUNK_SIZE, device=k_group_ids.device)
-        chunks = k_group_ids[indexes.clamp_max(num_keys - 1)].reshape(num_chunks, FA4_MASK_CHUNK_SIZE)
-    else:
-        chunks = k_group_ids.reshape(num_chunks, FA4_MASK_CHUNK_SIZE)
-    first = chunks[:, 0]
-    last = chunks[:, -1]
-    belongs_to_first = chunks == first[:, None]
-    endpoints_cover_chunk = (belongs_to_first | (chunks == last[:, None])).all(dim=-1)
-    last = torch.where(endpoints_cover_chunk, last, -1)
-
-    bit_offsets = torch.arange(FA4_MASK_CHUNK_SIZE, dtype=torch.int64, device=k_group_ids.device)
-    first_bits = (belongs_to_first.to(torch.int64) << bit_offsets).sum(dim=-1)
-    first_bits = torch.where(first_bits >= 2**31, first_bits - 2**32, first_bits)
-    return torch.stack((first, last, first_bits), dim=-1).to(torch.int32).contiguous()
-
-
 # eq=False: the fields are tensors, so a generated __eq__ would return a tensor
 # rather than a bool. Instances are cache values compared by identity.
 @dataclass(frozen=True, eq=False)
@@ -660,10 +620,8 @@ class MultiviewBlockSparsity:
     FlashAttention-4 consumes unchanged as ``BlockSparseTensorsTorch``.  The
     remaining fields are the exact per-element fallback used inside partially
     masked tiles: a token-to-run id for each side plus the packed truth table
-    over run pairs. The key-chunk metadata lets FA4 evaluate that same table
-    once per endpoint run when a 32-key chunk permits it. Together they encode
-    ``multiview_pair_predicate`` without the kernel knowing anything about
-    views, frames, or timestamps.
+    over run pairs.  Together they encode ``multiview_pair_predicate`` without
+    the kernel knowing anything about views, frames, or timestamps.
     """
 
     partial_counts: torch.Tensor
@@ -673,7 +631,6 @@ class MultiviewBlockSparsity:
     q_word_base: torch.Tensor
     k_group_ids: torch.Tensor
     allowed_words: torch.Tensor
-    k_run_chunks: torch.Tensor
     group_allowed: torch.Tensor
     words_per_row: int
     q_block_size: int
@@ -690,7 +647,7 @@ class MultiviewBlockSparsity:
 
     def aux_tensors(self) -> list[torch.Tensor]:
         """The mask_mod auxiliary tensors, in the order the kernel indexes them."""
-        return [self.q_word_base, self.k_group_ids, self.allowed_words, self.k_run_chunks]
+        return [self.q_word_base, self.k_group_ids, self.allowed_words]
 
     def to_block_mask(self) -> BlockMask:
         metadata = self.metadata
@@ -778,7 +735,6 @@ def build_multiview_block_sparsity(
         q_word_base=q_word_base,
         k_group_ids=k_group_ids.to(torch.int32).contiguous(),
         allowed_words=allowed_words,
-        k_run_chunks=_build_key_run_chunks(k_group_ids),
         group_allowed=group_allowed,
         words_per_row=words_per_row,
         q_block_size=q_block_size,

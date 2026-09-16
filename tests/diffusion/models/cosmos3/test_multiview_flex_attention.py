@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import random
 
 import pytest
 import torch
@@ -935,175 +934,10 @@ def test_packed_allowed_bits_round_trip() -> None:
     torch.testing.assert_close(unpacked, sparsity.group_allowed)
 
 
-def _python_packed_words(allowed: list[bool]) -> list[int]:
-    """Encode the test oracle without using the production bit-table builder."""
-    words = []
-    for start in range(0, len(allowed), 32):
-        word = sum(1 << bit for bit, value in enumerate(allowed[start : start + 32]) if value)
-        words.append(word if word < 2**31 else word - 2**32)
-    return words
-
-
-def _decode_key_run_chunks(
-    group_ids: list[int], chunks: torch.Tensor, allowed_words: list[int], word_base: int = 0
-) -> list[bool]:
-    """Interpret the chunk ABI in Python, including its per-token fallback."""
-
-    def allowed(group: int) -> bool:
-        word = allowed_words[word_base + group // 32] & 0xFFFFFFFF
-        return bool(word & (1 << (group % 32)))
-
-    result = []
-    for chunk_index, (first, last, first_bits) in enumerate(chunks.tolist()):
-        real_ids = group_ids[chunk_index * 32 : (chunk_index + 1) * 32]
-        for bit, group in enumerate(real_ids):
-            if last == -1:
-                result.append(allowed(group))
-            else:
-                selected = first if (first_bits & 0xFFFFFFFF) & (1 << bit) else last
-                result.append(allowed(selected))
-    return result
-
-
-def test_key_run_chunks_cover_every_split_and_allowed_combination() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _build_key_run_chunks
-
-    # Adjacent IDs straddle truth-table words, including their signed bit 31.
-    for first, second in ((31, 32), (63, 64)):
-        for split in range(33):
-            group_ids = [first] * split + [second] * (32 - split)
-            chunks = _build_key_run_chunks(torch.tensor(group_ids, dtype=torch.int32))
-            assert chunks.shape == (1, 3)
-            assert chunks.dtype == torch.int32 and chunks.is_contiguous()
-            first_id, last_id, first_bits = chunks[0].tolist()
-            assert (first_id, last_id) == (group_ids[0], group_ids[-1])
-            expected_bits = sum(1 << bit for bit, group in enumerate(group_ids) if group == first_id)
-            assert first_bits & 0xFFFFFFFF == expected_bits
-            if split in (0, 32):
-                assert first_id == last_id and first_bits == -1
-            for allowed_first, allowed_second in ((False, False), (False, True), (True, False), (True, True)):
-                allowed = [False] * (second + 1)
-                allowed[first], allowed[second] = allowed_first, allowed_second
-                words = _python_packed_words(allowed)
-                if allowed_first:
-                    assert words[first // 32] < 0
-                assert _decode_key_run_chunks(group_ids, chunks, words) == [allowed[group] for group in group_ids]
-
-
-def test_key_run_chunks_fall_back_when_endpoints_do_not_cover_the_chunk() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _build_key_run_chunks
-
-    cases = [
-        [31] * 10 + [32] * 11 + [33] * 11,
-        [31] * 10 + [32] * 11 + [31] * 11,
-        list(range(31, 63)),
-    ]
-    for group_ids in cases:
-        chunks = _build_key_run_chunks(torch.tensor(group_ids, dtype=torch.int32))
-        assert chunks[0, 1].item() == -1
-        # Allowed endpoints with a forbidden middle must not become an all-one
-        # mask, even when the first and last IDs happen to be identical.
-        allowed = [False] * (max(group_ids) + 1)
-        allowed[group_ids[0]] = allowed[group_ids[-1]] = True
-        expected = [allowed[group] for group in group_ids]
-        assert any(expected) and not all(expected)
-        assert _decode_key_run_chunks(group_ids, chunks, _python_packed_words(allowed)) == expected
-
-
-def test_key_run_chunks_handle_empty_short_and_noncontiguous_inputs() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _build_key_run_chunks
-
-    for length in range(66):
-        group_ids = [31 + index // 7 for index in range(length)]
-        # A stride-two input ensures the public result still satisfies the
-        # contiguous int32 ABI used by the CUDA auxiliary-tensor loads.
-        storage = torch.tensor([[group, -99] for group in group_ids], dtype=torch.int32).reshape(length, 2)
-        chunks = _build_key_run_chunks(storage[:, 0])
-        assert chunks.shape == ((length + 31) // 32, 3)
-        assert chunks.dtype == torch.int32 and chunks.is_contiguous()
-        assert chunks.device == storage.device
-        allowed = [bool(group % 2) for group in range(64)]
-        words = _python_packed_words(allowed)
-        assert _decode_key_run_chunks(group_ids, chunks, words) == [allowed[group] for group in group_ids]
-        if length and length % 32:
-            padded_ids = group_ids + [group_ids[-1]] * (-length % 32)
-            padded_chunks = _build_key_run_chunks(torch.tensor(padded_ids, dtype=torch.int32))
-            torch.testing.assert_close(chunks, padded_chunks, atol=0, rtol=0)
-
-
-def test_key_run_chunks_randomized_reconstruction_matches_independent_oracle() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import _build_key_run_chunks
-
-    rng = random.Random(29)
-    saw_fast = saw_fallback = False
-    for _ in range(64):
-        length = rng.randrange(1, 258)
-        group_ids = []
-        next_group = rng.randrange(25, 66)
-        while len(group_ids) < length:
-            group_ids.extend([next_group] * rng.randrange(1, 49))
-            next_group += 1
-        group_ids = group_ids[:length]
-        chunks = _build_key_run_chunks(torch.tensor(group_ids, dtype=torch.int32))
-        endpoints = chunks[:, 1].tolist()
-        saw_fast |= any(last >= 0 for last in endpoints)
-        saw_fallback |= -1 in endpoints
-        for _ in range(4):
-            allowed = [bool(rng.getrandbits(1)) for _ in range(next_group)]
-            assert _decode_key_run_chunks(group_ids, chunks, _python_packed_words(allowed)) == [
-                allowed[group] for group in group_ids
-            ]
-    assert saw_fast and saw_fallback
-
-
-def test_key_run_chunk_cache_tracks_cfg_lengths_and_caption_boundaries() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
-        MultiviewAttentionContext,
-        MultiviewLayout,
-        get_multiview_attention_plan,
-        multiview_pair_predicate,
-    )
-
-    cache = {}
-    plans = []
-    snapshots = []
-    # The middle pair preserves total text length but moves the per-camera
-    # caption boundary; the final call must recover the original CFG plan.
-    for caption_lengths in ((35, 61), (61, 35), (17, 47), (35, 61)):
-        layout = MultiviewLayout(
-            2, 4, 5, 7, backend="fa4", max_und_tokens=_FA4_MAX_UND, caption_lengths=caption_lengths
-        )
-        plan, _ = get_multiview_attention_plan(
-            MultiviewAttentionContext(layout, cache),
-            real_und_len=sum(caption_lengths),
-            real_q_len=layout.gen_tokens,
-            device=torch.device("cpu"),
-        )
-        aux = plan.aux_tensors()
-        assert len(aux) == 4 and aux[3] is plan.k_run_chunks
-        assert plan.k_run_chunks.shape == ((plan.kv_len + 31) // 32, 3)
-        group_ids = plan.k_group_ids.tolist()
-        words = plan.allowed_words.tolist()
-        for query in (0, layout.items[0].num_tokens, layout.gen_tokens - 1, plan.q_len - 1):
-            actual = _decode_key_run_chunks(group_ids, plan.k_run_chunks, words, plan.q_word_base[query].item())
-            expected = multiview_pair_predicate(plan.metadata, torch.tensor(query), torch.arange(plan.kv_len)).tolist()
-            assert actual == expected
-        plans.append(plan)
-        snapshots.append(plan.k_run_chunks.clone())
-
-    assert len(cache) == 3 and plans[0] is plans[3]
-    assert len({plan.k_run_chunks.data_ptr() for plan in plans}) == 3
-    assert not torch.equal(snapshots[0], snapshots[1])
-    assert not torch.equal(snapshots[0], snapshots[2])
-    for plan, snapshot in zip(plans, snapshots, strict=True):
-        torch.testing.assert_close(plan.k_run_chunks, snapshot, atol=0, rtol=0)
-
-
 def test_block_sparsity_does_not_extract_tensor_scalars() -> None:
     from torch.utils._python_dispatch import TorchDispatchMode
 
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
-        _build_key_run_chunks,
         build_multiview_block_sparsity,
     )
 
@@ -1117,8 +951,6 @@ def test_block_sparsity_does_not_extract_tensor_scalars() -> None:
     metadata = _tiny_metadata()
     with NoScalarExtraction():
         sparsity = build_multiview_block_sparsity(metadata, q_block_size=2, kv_block_size=2)
-        for length in (0, 1, 31, 32, 33, 65):
-            _build_key_run_chunks(torch.arange(length, dtype=torch.int32) // 7)
 
     assert sparsity.k_group_ids.min() >= 0
 
@@ -1175,34 +1007,6 @@ def test_backend_validation_is_reusable_and_lists_choices() -> None:
     assert validate_multiview_backend("triton") == "triton"
     with pytest.raises(ValueError, match=r"must be one of \['fa4', 'triton'\]"):
         validate_multiview_backend("tirton")
-
-
-def test_fa4_fake_op_accepts_key_run_chunks_without_loading_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
-    from dataclasses import replace
-
-    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-
-    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
-
-    layout = MultiviewLayout(2, 4, 5, 7, backend="fa4", max_und_tokens=_FA4_MAX_UND)
-    plan, _ = _fa4_plan(layout, real_und_len=96)
-    malformed_plan = replace(plan, k_run_chunks=plan.k_run_chunks[:, :2])
-
-    def unexpected_cuda_access(*args, **kwargs):
-        pytest.fail("The registered fake op must not import FA4 or query CUDA hardware")
-
-    monkeypatch.setattr(multiview_fa4, "_load_fa4", unexpected_cuda_access)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_cuda_access)
-    with FakeTensorMode(allow_non_fake_inputs=True):
-        q = torch.empty(1, plan.q_len, 32, 128, device="cuda", dtype=torch.bfloat16)
-        k = torch.empty(1, plan.kv_len, 8, 128, device="cuda", dtype=torch.bfloat16)
-        v = torch.empty_like(k)
-        output = multiview_fa4.multiview_fa4_attention(q, k, v, plan)
-        assert isinstance(output, FakeTensor)
-        assert output.shape == q.shape and output.dtype == q.dtype and output.device == q.device
-        with pytest.raises(ValueError, match="k_run_chunks must describe each padded 32-key chunk"):
-            multiview_fa4.multiview_fa4_attention(q, k, v, malformed_plan)
 
 
 def test_fa4_layout_registers_the_opaque_kernel_op() -> None:
