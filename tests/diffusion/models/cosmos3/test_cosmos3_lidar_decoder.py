@@ -389,7 +389,7 @@ def test_cosmos3_postprocess_preserves_numeric_lidar(config):
 
     lidar = torch.ones(1, 3, 2, 128, 1800)
     lidar[:, 0] = 60
-    process = get_cosmos3_post_process_func(SimpleNamespace())
+    process = get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
     output = process(
         {
             "payload": {"video": torch.zeros(1, 3, 1, 16, 16), "lidar": lidar},
@@ -428,7 +428,7 @@ def test_cosmos3_postprocess_preserves_combined_modalities(with_lidar, with_acti
     if audio_source:
         expected_metadata["audio"]["sample_rate"] = 48000
 
-    process = get_cosmos3_post_process_func(SimpleNamespace())
+    process = get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
     result = process(
         {"payload": payload, "metadata": metadata},
         sampling_params=SimpleNamespace(extra_args={"resolved_frame_rate": 12}),
@@ -447,7 +447,7 @@ def test_cosmos3_postprocess_preserves_combined_modalities(with_lidar, with_acti
 def test_cosmos3_postprocess_resolves_fps_for_lidar_with_audio():
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
 
-    result = get_cosmos3_post_process_func(SimpleNamespace())(
+    result = get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))(
         {
             "payload": {
                 "video": torch.zeros(1, 3, 1, 16, 16),
@@ -470,13 +470,13 @@ def test_cosmos3_postprocess_rejects_lidar_without_video(companion):
     if companion is not None:
         payload[companion] = torch.zeros(1, 3, 1, 16, 16)
     with pytest.raises(ValueError, match="LiDAR output requires a video payload"):
-        get_cosmos3_post_process_func(SimpleNamespace())({"payload": payload})
+        get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))({"payload": payload})
 
 
 def test_cosmos3_postprocess_preserves_legacy_outputs():
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
 
-    process = get_cosmos3_post_process_func(SimpleNamespace())
+    process = get_cosmos3_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
     video = torch.zeros(1, 3, 1, 16, 16)
     assert not isinstance(process({"video": video}), dict)
     assert process({"image": video})[0].size == (16, 16)

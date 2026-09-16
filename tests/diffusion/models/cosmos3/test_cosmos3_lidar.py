@@ -747,7 +747,7 @@ def test_encoder_artifact_inventory_and_fp32_loading(lidar_vae_artifact, monkeyp
 
 
 def test_encoder_resolves_vae_from_hub(lidar_vae_artifact, monkeypatch):
-    import huggingface_hub
+    from vllm_omni.transformers_utils import repo_utils
 
     path, config, _, _ = lidar_vae_artifact
 
@@ -756,7 +756,7 @@ def test_encoder_resolves_vae_from_hub(lidar_vae_artifact, monkeypatch):
         assert allow_patterns == ["lidar_vae/config.json", "lidar_vae/diffusion_pytorch_model.safetensors"]
         return str(path)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(repo_utils.hf_api(), "snapshot_download", download)
     loaded = TinyLidarEncoder.from_pretrained("test-org/joint-lidar-model", config, torch.device("cpu"))
     assert loaded.encoder.out_features == 4
 
