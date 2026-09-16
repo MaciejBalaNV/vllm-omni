@@ -383,15 +383,29 @@ at each upsampling level. The CPU operator tests use an independent FP64
 neighborhood oracle. CUDA cases exercise the compiled operator and multiple
 devices when available.
 
-For reference qualification, use the imaginaire4 checkout and its tokenizer
-dependencies, including its original NATTEN build, in a separate validation
-environment. Compare identical inputs using a real exported checkpoint:
+Reference qualification deliberately runs as two separate processes so
+imaginaire4's NATTEN environment and vLLM-Omni's FlexAttention environment do
+not need compatible dependencies. First, activate the imaginaire4 environment
+and export a self-contained reference artifact:
 
 ```bash
 python tools/validate_cosmos3_lidar_decoder.py \
+  --mode imaginaire4 \
   --model /models/cosmos3-multiview \
-  --reference-root /workspace/imaginaire4 \
-  --frames 19 --seed 42 --report outputs/lidar_decoder_synthetic_parity.json
+  --imaginaire-root ../imaginaire4 \
+  --frames 19 --seed 42 \
+  --artifact outputs/lidar_decoder_19f_reference.safetensors
+```
+
+Copy that artifact to the vLLM-Omni environment, activate that environment,
+and run the candidate comparison:
+
+```bash
+python tools/validate_cosmos3_lidar_decoder.py \
+  --mode vllm-omni \
+  --model /models/cosmos3-multiview \
+  --artifact outputs/lidar_decoder_19f_reference.safetensors \
+  --report outputs/lidar_decoder_19f_parity.json
 ```
 
 The default synthetic case crosses the production 9-sweep chunk boundary and
@@ -401,14 +415,28 @@ Use artifacts with bounded and unbounded context and symmetric/asymmetric
 decoder topology. Synthetic tensors establish execution and streaming behavior;
 they do not qualify production output quality.
 For production parity, save the generated normalized LiDAR target from the
-multiview pipeline's `final_targets[1]` to safetensors under `latents`, then run:
+multiview pipeline's `final_targets[1]` to safetensors under `latents`. Save the
+prepared metric FP32 encoder input under `frames`, then create the reference in
+the imaginaire4 environment:
 
 ```bash
 python tools/validate_cosmos3_lidar_decoder.py \
+  --mode imaginaire4 \
   --model /models/cosmos3-multiview \
-  --reference-root /workspace/imaginaire4 \
+  --imaginaire-root ../imaginaire4 \
   --latents outputs/generated_lidar_latents.safetensors \
   --encoder-input outputs/prepared_lidar_control.safetensors \
+  --production-inputs \
+  --artifact outputs/lidar_production_reference.safetensors
+```
+
+Then compare in the vLLM-Omni environment:
+
+```bash
+python tools/validate_cosmos3_lidar_decoder.py \
+  --mode vllm-omni \
+  --model /models/cosmos3-multiview \
+  --artifact outputs/lidar_production_reference.safetensors \
   --report outputs/lidar_decoder_generated_parity.json
 ```
 
@@ -419,11 +447,16 @@ validity must match exactly. It also checks the encoder's normalized latents
 against reference encoding at the same tolerances. Decoder comparison precedes
 optional smoothing in the reference artifact writer.
 
+The safetensors reference artifact contains the exact inputs, raw decoder
+outputs, validity probabilities, cropped metric outputs, optional encoder
+latents, checkpoint hashes, and imaginaire4 measurements. This makes the second
+launch independent of the reference Python environment and rejects comparison
+against different weights or configuration.
+
 Each implementation's first call is measured separately from three warm-ups
-and ten timed runs. Timed runs have no capture hooks. Only one implementation's
-encoder or decoder resides on CUDA during each measurement; the report records
-resident inputs/cache memory and peak allocation separately. Persistent compiler
-disk caches are not cleared, and the report identifies this limit on cold-start
+and ten timed runs. Timed runs have no capture hooks. The report records
+resident memory and peak allocation separately. Persistent compiler disk caches
+are not cleared, and the report identifies this limit on cold-start
 measurements. Repeated requests must reuse cached attention geometry/code,
 preserve RNG state, and produce identical output. On production spatial grids,
 the warmed memory increment must remain below one dense FP32 spatial score
