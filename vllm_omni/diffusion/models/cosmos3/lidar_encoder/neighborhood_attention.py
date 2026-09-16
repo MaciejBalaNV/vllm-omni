@@ -13,6 +13,7 @@ from functools import lru_cache
 from types import FunctionType
 
 import torch
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 _BLOCK_SIZE = 64
@@ -107,7 +108,13 @@ def _get_block_mask(
 
 
 def _run_attention(query, key, value, block_mask, scale):
-    return flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=_KERNEL_OPTIONS)
+    head_dim = query.shape[-1]
+    # CUDA FlexAttention requires head dimensions >= 16 in some PyTorch
+    # versions. Zero padding preserves Q @ K and P @ V with an explicit scale.
+    if head_dim < 16:
+        query, key, value = (F.pad(t, (0, 16 - head_dim)) for t in (query, key, value))
+    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=_KERNEL_OPTIONS)
+    return output[..., :head_dim] if head_dim < 16 else output
 
 
 @lru_cache(maxsize=_CACHE_SIZE)

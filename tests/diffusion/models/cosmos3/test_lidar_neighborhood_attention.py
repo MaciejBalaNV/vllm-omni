@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import weakref
 
@@ -144,6 +145,9 @@ def test_geometry_lru_reuse_eviction_and_no_request_tensor_retention():
     attention.neighborhood_attention_2d(larger_batch, larger_batch, larger_batch, kernel_size=3, dilation=1, scale=1.0)
     assert attention._get_block_mask.cache_info().misses == 1
     del q
+    # Eager FlexAttention can leave temporary reference cycles. A live cache
+    # reference would survive collection, so collect before checking ownership.
+    gc.collect()
     assert tensor_ref() is None
     for width in range(8, 41):
         attention._get_block_mask(torch.device("cpu"), 3, width, (3, 3), (1, 1))
@@ -193,10 +197,13 @@ def test_fullgraph_specializations_execute_beyond_dynamo_recompile_limit(monkeyp
     attention._get_compiled_runner.cache_clear()
 
 
-def test_fp32_layout_scale_and_local_kernel_precision(monkeypatch):
+@pytest.mark.parametrize("head_dim", [4, 8, 16, 32])
+def test_fp32_layout_scale_and_local_kernel_precision(monkeypatch, head_dim):
     def flex(query, key, value, *, block_mask, scale, kernel_options):
-        assert all(t.shape == (2, 3, 35, 8) and t.is_contiguous() for t in (query, key, value))
+        assert all(t.shape == (2, 3, 35, max(16, head_dim)) and t.is_contiguous() for t in (query, key, value))
         assert all(t.dtype == torch.float32 for t in (query, key, value))
+        if head_dim < 16:
+            assert all(torch.count_nonzero(t[..., head_dim:]) == 0 for t in (query, key, value))
         assert not torch.is_autocast_enabled("cpu") and scale == 1.0
         assert kernel_options["FLOAT32_PRECISION"] == "'ieee'"
         assert (kernel_options["BLOCK_M"], kernel_options["BLOCK_N"]) == (64, 64)
@@ -205,7 +212,7 @@ def test_fp32_layout_scale_and_local_kernel_precision(monkeypatch):
         return value
 
     monkeypatch.setattr(attention, "flex_attention", flex)
-    q = torch.randn(2, 5, 7, 3, 8)
+    q = torch.randn(2, 5, 7, 3, head_dim)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         actual = attention.neighborhood_attention_2d(q, q, q, kernel_size=3, dilation=1, scale=1.0)
     torch.testing.assert_close(actual, q, rtol=0, atol=0)
