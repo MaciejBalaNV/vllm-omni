@@ -76,7 +76,7 @@ COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
 COSMOS3_MULTIVIEW_DEFAULT_FPS = 30.0
 # Rates and frame counts outside these bounds are allowed with a warning.
 COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE = (10.0, 30.0)
-COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE = (24, 300)
+COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE = (24, 400)
 # The negative prompt carries the same duration/FPS and resolution sentences as
 # the positive prompt. Requests may override this through sampling params.
 COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE = "same"
