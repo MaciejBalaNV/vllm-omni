@@ -18,8 +18,8 @@ themselves stay in Python, and this kernel never learns what a view or a frame
 is.
 
 Everything CuTe/CUTLASS is imported lazily: ``flash-attn-4`` is an optional
-Blackwell-only extra (``pip install vllm-omni[fa4]``), and the multiview module
-must stay importable on CPU-only hosts.
+extra (``pip install vllm-omni[fa4]``), and the multiview module must stay
+importable on CPU-only hosts.
 """
 
 from __future__ import annotations
@@ -40,12 +40,13 @@ class _Fa4Entry(NamedTuple):
     flash_attn_func: Any
     block_sparse_cls: Any
     mask_mod: Any
+    vector_mask_mod: Any
 
 
 _entry: _Fa4Entry | None = None
 
 
-def _build_mask_mod(cutlass, cute, fa_utils):
+def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
     """Compile-time-free multiview mask_mod over the packed run truth table.
 
     ``aux_tensors`` are, in order:
@@ -63,7 +64,14 @@ def _build_mask_mod(cutlass, cute, fa_utils):
     out-of-range padded lanes stay in bounds; those lanes are force-masked after
     this returns.  That holds only while the aux tensors are exactly
     ``seqlen_q``/``seqlen_k`` long, which ``multiview_fa4_attention`` checks.
+
+    The scalar callback returns Boolean predicates. On SM100/SM110, vectors
+    return a Uint32 whose bit j is the predicate for n_idx[j], allowing FA4
+    to apply the mask with packed predicate instructions. Only the predicate
+    representation changes; the truth table and attention traversal stay fixed.
     """
+    if vec_size not in (1, 8, 32):
+        raise ValueError(f"Cosmos3 multiview FA4 mask vector size must be 1, 8, or 32, got {vec_size}.")
 
     @cute.jit
     def multiview_mask_mod(
@@ -78,10 +86,14 @@ def _build_mask_mod(cutlass, cute, fa_utils):
         k_group_ids = aux_tensors[1]
         allowed_words = aux_tensors[2]
 
-        # The query row is shared by every lane of a scalar mask_mod call, so
-        # its lookup is hoisted out of the per-key loop.
+        # FA4 broadcasts one logical query row across the vector, including
+        # when GQA packs multiple heads into the physical query tile.
         base = q_word_base[m_idx[0]]
-        result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
+        if cutlass.const_expr(vec_size == 1):
+            result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
+        else:
+            result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+            result[0] = cutlass.Uint32(0)
         for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
             group_k = k_group_ids[n_idx[j]]
             # Run ids are non-negative, so the unsigned read is lossless and lets
@@ -89,14 +101,21 @@ def _build_mask_mod(cutlass, cute, fa_utils):
             group_u = cutlass.Uint32(group_k)
             word = allowed_words[base + cutlass.Int32(group_u // cutlass.Uint32(32))]
             shift = group_u % cutlass.Uint32(32)
-            result[j] = cutlass.Boolean(fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1))
+            keep = fa_utils.shr_u32(cutlass.Uint32(word), shift) & cutlass.Uint32(1)
+            if cutlass.const_expr(vec_size == 1):
+                result[j] = cutlass.Boolean(keep)
+            else:
+                result[0] = result[0] | (keep << cutlass.Uint32(j))
         return result.load()
 
+    # FA4 includes this attribute in the compile-cache key as well as using it
+    # to select the scalar/vector callback ABI. Never mutate it during a launch.
+    multiview_mask_mod.__vec_size__ = vec_size
     return multiview_mask_mod
 
 
 def _load_fa4() -> _Fa4Entry:
-    """Import FA4 and build the mask_mod once per process.
+    """Import FA4 and build both mask callbacks once per process.
 
     Raises rather than falling back: ``backend='fa4'`` is an explicit request,
     and silently running a different kernel would invalidate any comparison
@@ -114,14 +133,14 @@ def _load_fa4() -> _Fa4Entry:
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "Cosmos3 multiview backend='fa4' requires the optional FlashAttention-4 "
-            "CuTe package (pip install 'vllm-omni[fa4]'), which is CUDA 13 and "
-            f"Blackwell specific. Import failed: {exc}"
+            f"CuTe package (pip install 'vllm-omni[fa4]'). Import failed: {exc}"
         ) from exc
 
     _entry = _Fa4Entry(
         flash_attn_func=flash_attn_func,
         block_sparse_cls=BlockSparseTensorsTorch,
         mask_mod=_build_mask_mod(cutlass, cute, fa_utils),
+        vector_mask_mod=_build_mask_mod(cutlass, cute, fa_utils, vec_size=32),
     )
     logger.info("Cosmos3 multiview attention using the FlashAttention-4 CuTe backend.")
     return _entry
@@ -199,6 +218,12 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
         process-level ``_load_fa4`` singleton, which costs one dict lookup.
         """
         entry = _load_fa4()
+        # Vector mask application is implemented only on SM100/SM110. Select
+        # by the input device, since a process can launch on different GPUs.
+        # This stays inside the opaque op, outside Dynamo's traced region.
+        mask_mod = (
+            entry.vector_mask_mod if torch.cuda.get_device_capability(q.device)[0] in (10, 11) else entry.mask_mod
+        )
         # FA4 accepts singleton batch/head dims and broadcasts them; the
         # multiview mask is identical across both.
         block_sparse = entry.block_sparse_cls(
@@ -212,7 +237,7 @@ if not hasattr(torch.ops.vllm_omni, "cosmos3_multiview_fa4"):
             q,
             k,
             v,
-            mask_mod=entry.mask_mod,
+            mask_mod=mask_mod,
             # Same order as MultiviewBlockSparsity.aux_tensors(), which is the
             # order _build_mask_mod indexes them in.
             aux_tensors=[q_word_base, k_group_ids, allowed_words],

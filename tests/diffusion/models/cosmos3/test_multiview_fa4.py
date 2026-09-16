@@ -161,3 +161,86 @@ def test_fa4_and_triton_backends_agree(num_heads: int, num_kv_heads: int, patch_
         outputs[backend] = padded_multiview_flex_attention(*tensors, context)
 
     torch.testing.assert_close(outputs["fa4"].float(), outputs["triton"].float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads",
+    [
+        pytest.param(32, 8, id="production-gqa"),
+        pytest.param(4, 1, id="cp8-local-gqa"),
+    ],
+)
+def test_fa4_vector_masks_match_scalar_bitwise(num_heads: int, num_kv_heads: int) -> None:
+    """Changing Boolean mask evaluation must preserve the attention result's bits."""
+    import cutlass
+    import cutlass.cute as cute
+    from flash_attn.cute import utils as fa_utils
+
+    from vllm_omni.diffusion.models.cosmos3.multiview_fa4 import _build_mask_mod, _load_fa4
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MultiviewAttentionContext,
+        MultiviewBlockSparsity,
+        MultiviewLayout,
+        _pack_padded_bshd,
+        get_multiview_attention_plan,
+    )
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim = 128
+    real_und_len = 96
+    # Seventeen frames per view produce more than 32 key runs. The 35-token
+    # runs cross vector/tile boundaries, and both UND and GEN require padding.
+    layout = MultiviewLayout(2, 34, 5, 7, backend="fa4", max_und_tokens=_MAX_UND, control_attends_sensor=True)
+    plan, geometry = get_multiview_attention_plan(
+        MultiviewAttentionContext(layout, {}),
+        real_und_len=real_und_len,
+        real_q_len=layout.gen_tokens,
+        device=device,
+    )
+    assert isinstance(plan, MultiviewBlockSparsity)
+    assert geometry.real_q_len < geometry.padded_q_len
+    assert geometry.real_und_len < geometry.padded_und_len
+    assert plan.k_group_ids.max().item() > 31
+    assert (plan.allowed_words < 0).any().item(), "Exercise bit 31 in signed int32 packed words"
+    assert plan.partial_counts.sum().item() > 0
+    assert plan.full_counts.sum().item() > 0
+
+    torch.manual_seed(23)
+    q = torch.randn(1, layout.gen_tokens, num_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(1, layout.gen_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    k_und = torch.randn(1, real_und_len, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v_und = torch.randn_like(k_und)
+    q_padded = _pack_padded_bshd((q, geometry.padded_q_len))
+    k_padded = _pack_padded_bshd((k_und, geometry.padded_und_len), (k, geometry.padded_q_len))
+    v_padded = _pack_padded_bshd((v_und, geometry.padded_und_len), (v, geometry.padded_q_len))
+
+    entry = _load_fa4()
+    block_sparse = entry.block_sparse_cls(
+        mask_block_cnt=plan.partial_counts[None, None],
+        mask_block_idx=plan.partial_indices[None, None],
+        full_block_cnt=plan.full_counts[None, None],
+        full_block_idx=plan.full_indices[None, None],
+        block_size=(plan.q_block_size, plan.kv_block_size),
+    )
+    reference_bits = None
+    # Three kernels per head geometry; all use identical tensors and the same
+    # block map/GQA heuristic, isolating scalar versus packed mask evaluation.
+    for vec_size in (1, 8, 32):
+        output = entry.flash_attn_func(
+            q_padded,
+            k_padded,
+            v_padded,
+            mask_mod=_build_mask_mod(cutlass, cute, fa_utils, vec_size=vec_size),
+            aux_tensors=plan.aux_tensors(),
+            block_sparse_tensors=block_sparse,
+        )
+        if isinstance(output, tuple):
+            output = output[0]
+        assert torch.isfinite(output).all().item()
+        bits = output.contiguous().view(torch.int16)
+        if reference_bits is None:
+            reference_bits = bits.clone()
+        else:
+            assert torch.equal(bits, reference_bits), f"vec_size={vec_size} changed attention output bits"
