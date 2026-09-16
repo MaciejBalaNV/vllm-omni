@@ -556,6 +556,9 @@ def _semantic_groups(vectors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, t
     if any(vector.numel() != seq_len for vector in vectors):
         raise ValueError("Cosmos3 multiview semantic grouping fields must have equal lengths.")
     changed = torch.zeros(seq_len, dtype=torch.bool, device=vectors[0].device)
+    # Start run zero even when metadata fields contain negative padding or
+    # LiDAR sentinels. The cumulative count therefore produces non-negative
+    # IDs, as required by FA4's unsigned packed-table lookup.
     changed[:1] = True
     for vector in vectors:
         changed[1:] |= vector[1:] != vector[:-1]
@@ -694,14 +697,6 @@ def build_multiview_block_sparsity(
     k_vectors = metadata.key_vectors()
     q_group_ids, q_representatives = _semantic_groups(metadata.query_grouping_vectors())
     k_group_ids, k_representatives = _semantic_groups(metadata.key_grouping_vectors())
-
-    # mask_mod reads these as unsigned, so a negative id becomes a huge offset
-    # and reads past the packed table rather than selecting the wrong bit.
-    if int(k_group_ids.min()) < 0:
-        raise ValueError(
-            "Cosmos3 multiview semantic run ids must be non-negative for the packed "
-            f"mask table, got min={int(k_group_ids.min())}."
-        )
 
     pair_allowed = _make_pair_allowed(
         q_vectors,

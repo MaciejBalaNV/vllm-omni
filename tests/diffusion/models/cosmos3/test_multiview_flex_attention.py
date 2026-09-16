@@ -934,6 +934,27 @@ def test_packed_allowed_bits_round_trip() -> None:
     torch.testing.assert_close(unpacked, sparsity.group_allowed)
 
 
+def test_block_sparsity_does_not_extract_tensor_scalars() -> None:
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        build_multiview_block_sparsity,
+    )
+
+    class NoScalarExtraction(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            # int(tensor), bool(tensor), and item() all reach this op, which
+            # synchronizes CUDA and breaks Dynamo's default graph capture.
+            assert func != torch.ops.aten._local_scalar_dense.default, "Mask construction extracted a tensor scalar"
+            return func(*args, **(kwargs or {}))
+
+    metadata = _tiny_metadata()
+    with NoScalarExtraction():
+        sparsity = build_multiview_block_sparsity(metadata, q_block_size=2, kv_block_size=2)
+
+    assert sparsity.k_group_ids.min() >= 0
+
+
 def test_fa4_block_map_matches_dense_token_projection() -> None:
     """The (256, 128) map must still separate full from partial tiles exactly."""
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
