@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import torch
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from safetensors.torch import load_file
 
 from vllm_omni.entrypoints.openai import api_server
@@ -64,9 +64,21 @@ def storage(monkeypatch, tmp_path):
     return manager, store
 
 
+@pytest.fixture
+def raw_request():
+    handler = SimpleNamespace(abort_request=AsyncMock())
+    app = SimpleNamespace(state=SimpleNamespace(openai_serving_video=handler))
+    return Request({"type": "http", "app": app})
+
+
 async def run_job(store, encoded):
     await store.upsert("test", VideoResponse(id="test", model="cosmos3", prompt="drive"))
-    handler = SimpleNamespace(generate_video_bytes=AsyncMock(return_value=encoded))
+
+    async def generate(*args, on_started, **kwargs):
+        await on_started()
+        return encoded
+
+    handler = SimpleNamespace(generate_video_bytes=AsyncMock(side_effect=generate))
     request = VideoGenerationRequest(
         prompt="drive",
         extra_params={"lidar": {"return_output": True}} if isinstance(encoded, EncodedVideoResult) else None,
@@ -84,7 +96,7 @@ async def drain_storage_tasks():
         await asyncio.sleep(0)
 
 
-def test_async_job_persists_downloads_and_deletes_both_artifacts(storage, encoded, frames_and_metadata):
+def test_async_job_persists_downloads_and_deletes_both_artifacts(storage, encoded, frames_and_metadata, raw_request):
     manager, store = storage
 
     async def check():
@@ -99,7 +111,7 @@ def test_async_job_persists_downloads_and_deletes_both_artifacts(storage, encode
         assert lidar.filename == "test.lidar.safetensors"
         torch.testing.assert_close(load_file(lidar.path)["frames"], frames_and_metadata[0][0], rtol=0, atol=0)
         assert job.expires_at is not None
-        await api_server.delete_video("test")
+        await api_server.delete_video("test", raw_request)
         assert await store.get("test") is None
         assert list(Path(manager.storage_path).iterdir()) == []
 
@@ -131,7 +143,7 @@ def test_partial_write_failure_cleans_all_artifacts(storage, encoded, monkeypatc
 
 
 @pytest.mark.parametrize("fail_key", ["test", "test.lidar.safetensors"])
-def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypatch, caplog, fail_key):
+def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypatch, caplog, fail_key, raw_request):
     manager, store = storage
     delete = manager.delete
     attempted = []
@@ -149,7 +161,7 @@ def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypat
         await store.upsert("test", VideoResponse(id="test", model="cosmos3", prompt="drive", status="failed"))
         for key in ("test", "test.lidar.safetensors"):
             await manager.save(b"partial", key)
-        result = await api_server.delete_video("test")
+        result = await api_server.delete_video("test", raw_request)
         assert result.deleted and await store.get("test") is None
         assert set(attempted) == {"test", "test.lidar.safetensors"}
         assert [path.name for path in Path(manager.storage_path).iterdir()] == [fail_key]
@@ -158,7 +170,7 @@ def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypat
     assert "Failed to cleanup partial video artifact" in caplog.text
 
 
-def test_completed_rgb_job_delete_skips_lidar_storage(storage, monkeypatch):
+def test_completed_rgb_job_delete_skips_lidar_storage(storage, monkeypatch, raw_request):
     manager, store = storage
     delete = manager.delete
 
@@ -174,7 +186,7 @@ def test_completed_rgb_job_delete_skips_lidar_storage(storage, monkeypatch):
             "test", VideoResponse(id="test", model="cosmos3", prompt="drive", status="completed", file_name="test.mp4")
         )
         await manager.save(b"mp4", "test")
-        result = await api_server.delete_video("test")
+        result = await api_server.delete_video("test", raw_request)
         assert result.deleted and await store.get("test") is None
         assert list(Path(manager.storage_path).iterdir()) == []
 
@@ -182,7 +194,7 @@ def test_completed_rgb_job_delete_skips_lidar_storage(storage, monkeypatch):
 
 
 @pytest.mark.parametrize("fail_key", ["test", "test.lidar.safetensors"])
-def test_completed_joint_job_delete_can_retry_storage_errors(storage, encoded, monkeypatch, fail_key):
+def test_completed_joint_job_delete_can_retry_storage_errors(storage, encoded, monkeypatch, fail_key, raw_request):
     manager, store = storage
     delete = manager.delete
 
@@ -195,10 +207,10 @@ def test_completed_joint_job_delete_can_retry_storage_errors(storage, encoded, m
         await run_job(store, encoded)
         monkeypatch.setattr(manager, "delete", fail)
         with pytest.raises(OSError, match="disk failure"):
-            await api_server.delete_video("test")
+            await api_server.delete_video("test", raw_request)
         assert await store.get("test") is not None
         monkeypatch.setattr(manager, "delete", delete)
-        result = await api_server.delete_video("test")
+        result = await api_server.delete_video("test", raw_request)
         assert result.deleted and await store.get("test") is None
         assert list(Path(manager.storage_path).iterdir()) == []
 
@@ -287,10 +299,11 @@ def test_cancelled_save_has_fixed_deadline_and_cleans_late_output(
     asyncio.run(check())
 
 
-def test_delete_returns_409_while_save_is_stalled(storage, encoded, monkeypatch):
+def test_delete_returns_409_while_save_is_stalled(storage, encoded, monkeypatch, raw_request):
     manager, store = storage
     save = manager.save
     monkeypatch.setattr(helpers, "_VIDEO_SAVE_CANCEL_GRACE_S", 0.5)
+    monkeypatch.setattr(api_server, "VIDEO_ABORT_TIMEOUT_S", 0.02)
     monkeypatch.setattr(api_server, "VIDEO_DELETE_TIMEOUT_S", 0.02)
 
     async def check():
@@ -305,13 +318,14 @@ def test_delete_returns_409_while_save_is_stalled(storage, encoded, monkeypatch)
         task = asyncio.create_task(run_job(store, encoded))
         await api_server.VIDEO_TASKS.upsert("test", task)
         await writing.wait()
-        deleting = asyncio.create_task(api_server.delete_video("test"))
+        deleting = asyncio.create_task(api_server.delete_video("test", raw_request))
         try:
             done, _ = await asyncio.wait({deleting}, timeout=0.2)
             assert done, "DELETE waited for the cancelled writer beyond its timeout"
             with pytest.raises(HTTPException) as error:
                 deleting.result()
             assert error.value.status_code == 409
+            raw_request.app.state.openai_serving_video.abort_request.assert_awaited_once_with("test")
             assert not task.done() and await store.get("test") is not None
             assert task.cancelling() == 1, "The DELETE timeout must not cancel the job again"
         finally:
@@ -359,7 +373,7 @@ def test_cancelled_threaded_write_is_cleaned_after_publication(storage, monkeypa
     asyncio.run(check())
 
 
-def test_cancelling_delete_request_keeps_in_progress_job(storage, encoded, monkeypatch):
+def test_cancelling_delete_request_keeps_in_progress_job(storage, encoded, monkeypatch, raw_request):
     manager, store = storage
     save = manager.save
     monkeypatch.setattr(helpers, "_VIDEO_SAVE_CANCEL_GRACE_S", 1)
@@ -376,7 +390,7 @@ def test_cancelling_delete_request_keeps_in_progress_job(storage, encoded, monke
         task = asyncio.create_task(run_job(store, encoded))
         await api_server.VIDEO_TASKS.upsert("test", task)
         await writing.wait()
-        deleting = asyncio.create_task(api_server.delete_video("test"))
+        deleting = asyncio.create_task(api_server.delete_video("test", raw_request))
         try:
             await asyncio.sleep(0.01)
             deleting.cancel()
