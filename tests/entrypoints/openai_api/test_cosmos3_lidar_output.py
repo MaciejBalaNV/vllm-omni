@@ -6,7 +6,7 @@ import asyncio
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -143,10 +143,12 @@ def test_partial_write_failure_cleans_all_artifacts(storage, encoded, monkeypatc
 
 
 @pytest.mark.parametrize("fail_key", ["test", "test.lidar.safetensors"])
-def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypatch, caplog, fail_key, raw_request):
+def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypatch, fail_key, raw_request):
     manager, store = storage
     delete = manager.delete
     attempted = []
+    warning = Mock()
+    monkeypatch.setattr(helpers.logger, "warning", warning)
 
     async def fail(key):
         attempted.append(key)
@@ -167,7 +169,7 @@ def test_failed_job_delete_attempts_both_files_despite_errors(storage, monkeypat
         assert [path.name for path in Path(manager.storage_path).iterdir()] == [fail_key]
 
     asyncio.run(check())
-    assert "Failed to cleanup partial video artifact" in caplog.text
+    warning.assert_called_once_with("Failed to cleanup partial video artifact '%s'", fail_key, exc_info=True)
 
 
 def test_completed_rgb_job_delete_skips_lidar_storage(storage, monkeypatch, raw_request):
