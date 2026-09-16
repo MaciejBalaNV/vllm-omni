@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 VFM Transformer for vllm-omni.
 
 Implements the Mixture-of-Transformers architecture with two pathways:
@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -439,7 +439,7 @@ class TimestepEmbedder(nn.Module):
         max_period: int = 10000,
     ) -> None:
         super().__init__()
-        # Following diffusers naming pattern here for checkpoint compatibility.
+        # Preserve checkpoint-compatible parameter names.
         self.linear_1 = nn.Linear(frequency_embedding_size, hidden_size, bias=True)
         self.act = nn.SiLU()
         self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -1142,6 +1142,29 @@ class Cosmos3GenSPPrepare(nn.Module):
         return hidden_gen, freqs_cos, freqs_sin
 
 
+class _GenPrepared(NamedTuple):
+    """GEN-pathway state shared by normal and cached execution."""
+
+    hidden_gen: torch.Tensor
+    time_embed: torch.Tensor
+    t: int
+    h: int
+    w: int
+    s_video: int
+    s_control: int
+    s_action: int
+    s_sound: int
+    has_control: bool
+    has_action: bool
+    has_sound: bool
+    action_domain_ids: torch.Tensor | None
+    ulysses_size: int
+    use_multi_control_attention: bool
+    multi_control_token_sizes: tuple[int, ...] | None
+    multi_control_weights: tuple[float, ...] | None
+    multiview_layout: Any | None = None
+
+
 class Cosmos3VFMTransformer(nn.Module):
     """Cosmos3 VFM Transformer: UND language model + GEN denoising layers.
 
@@ -1818,7 +1841,55 @@ class Cosmos3VFMTransformer(nn.Module):
         multiview_layout: Any | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run the shared Cosmos3 GEN preprocess, stack, and postprocess path."""
+        if kwargs:
+            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+        prep = self._gen_preprocess(
+            hidden_states,
+            timestep,
+            text_ids,
+            text_mask,
+            video_shape,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            sound_latents=sound_latents,
+            noisy_frame_mask=noisy_frame_mask,
+            control_latents=control_latents,
+            control_weights=control_weights,
+            transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+            temporal_position_period=temporal_position_period,
+            multiview_layout=multiview_layout,
+        )
+        return self._gen_postprocess(self._run_gen_stack(prep, normalize=False), prep, normalized=False)
+
+    def _gen_preprocess(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        sound_latents: torch.Tensor | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
+        multiview_layout: Any | None = None,
+    ) -> _GenPrepared:
         """
+        Prepare the packed GEN sequence before its cacheable execution region.
+
         Args:
             hidden_states: [B, C, t, h, w] noisy latents
             timestep: [B] diffusion timestep
@@ -1841,13 +1912,9 @@ class Cosmos3VFMTransformer(nn.Module):
                 transfer controls. Values are normalized to sum to one.
 
         Returns:
-            [B, C, t, h, w] velocity prediction, or
-            tuple outputs in video, action, sound order when action/sound streams
-            are provided. Transfer-control streams condition the video prediction
-            and are not returned.
+            Packed GEN inputs and metadata consumed by the shared execution and
+            postprocessing helpers.
         """
-        if kwargs:
-            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
         text_lengths = text_mask.sum(dim=1)
@@ -2051,46 +2118,82 @@ class Cosmos3VFMTransformer(nn.Module):
             if has_control:
                 del hidden_control  # The loop variable also retains the last control.
 
-            hidden_gen = self._run_gen_layers(
-                hidden_gen,
-                use_sequence_parallel=not use_multi_control_attention,
-                control_token_sizes=multi_control_token_sizes,
-                control_weights=multi_control_weights,
+            return _GenPrepared(
+                hidden_gen=hidden_gen,
+                time_embed=time_embed,
+                t=t,
+                h=h,
+                w=w,
+                s_video=s_video,
+                s_control=s_control,
+                s_action=s_action,
+                s_sound=s_sound,
+                has_control=has_control,
+                has_action=has_action,
+                has_sound=has_sound,
+                action_domain_ids=action_domain_ids,
+                ulysses_size=ulysses_size,
+                use_multi_control_attention=use_multi_control_attention,
+                multi_control_token_sizes=multi_control_token_sizes,
+                multi_control_weights=multi_control_weights,
                 multiview_layout=multiview_layout,
             )
 
-            # Final norm and project back to latent space. Split first: control
-            # tokens only condition generation and need no output normalization.
-            if not has_action and not has_sound and not has_control:
-                return self.unpatchify(self._project_video_tokens(hidden_gen), t, h, w)
+    def _run_gen_stack(self, prep: _GenPrepared, *, normalize: bool = True) -> torch.Tensor:
+        """Include final normalization in cached residuals; defer it for chunked output otherwise."""
+        hidden_gen = self._run_gen_layers(
+            prep.hidden_gen,
+            use_sequence_parallel=not prep.use_multi_control_attention,
+            control_token_sizes=prep.multi_control_token_sizes,
+            control_weights=prep.multi_control_weights,
+            multiview_layout=prep.multiview_layout,
+        )
+        return self.norm_moe_gen(hidden_gen) if normalize else hidden_gen
 
-            split_sizes = []
-            if has_control:
-                split_sizes.append(s_control)
-            split_sizes.append(s_video)
-            if has_action:
-                split_sizes.append(s_action)
-            if has_sound:
-                split_sizes.append(s_sound)
-            split_hidden = hidden_gen.split(split_sizes, dim=1)
-            split_idx = 0
-            if has_control:
-                split_idx += 1
-            hidden_video = split_hidden[split_idx]
+    def _gen_postprocess(
+        self,
+        hidden_gen: torch.Tensor,
+        prep: _GenPrepared,
+        *,
+        normalized: bool = True,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Project cached normalized states or normalize ordinary output tokens in chunks."""
+        project_video = self.proj_out if normalized else self._project_video_tokens
+        if not prep.has_action and not prep.has_sound and not prep.has_control:
+            return self.unpatchify(project_video(hidden_gen), prep.t, prep.h, prep.w)
+
+        split_sizes = []
+        if prep.has_control:
+            split_sizes.append(prep.s_control)
+        split_sizes.append(prep.s_video)
+        if prep.has_action:
+            split_sizes.append(prep.s_action)
+        if prep.has_sound:
+            split_sizes.append(prep.s_sound)
+        split_hidden = hidden_gen.split(split_sizes, dim=1)
+        split_idx = 0
+        if prep.has_control:
             split_idx += 1
-            video_pred = self.unpatchify(self._project_video_tokens(hidden_video), t, h, w)
-            if has_control:
-                return video_pred
-            outputs: list[torch.Tensor] = [video_pred]
-            if has_action:
-                hidden_action = self.norm_moe_gen(split_hidden[split_idx])
-                split_idx += 1
-                assert action_domain_ids is not None
-                outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
-            if has_sound:
-                hidden_sound = self.norm_moe_gen(split_hidden[split_idx])
-                outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
-            return tuple(outputs)
+        hidden_video = split_hidden[split_idx]
+        split_idx += 1
+        video_pred = self.unpatchify(project_video(hidden_video), prep.t, prep.h, prep.w)
+        if prep.has_control:
+            return video_pred
+
+        outputs: list[torch.Tensor] = [video_pred]
+        if prep.has_action:
+            hidden_action = split_hidden[split_idx]
+            if not normalized:
+                hidden_action = self.norm_moe_gen(hidden_action)
+            split_idx += 1
+            assert prep.action_domain_ids is not None
+            outputs.append(self.unpack_action(self.action_proj_out(hidden_action, prep.action_domain_ids)))
+        if prep.has_sound:
+            hidden_sound = split_hidden[split_idx]
+            if not normalized:
+                hidden_sound = self.norm_moe_gen(hidden_sound)
+            outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
+        return tuple(outputs)
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""

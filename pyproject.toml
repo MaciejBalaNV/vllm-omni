@@ -126,6 +126,11 @@ fa4 = [
     "flash-attn-4[cu13]==4.0.0b18",
 ]
 
+# FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.
+vsa = [
+    "fastvideo-kernel==0.3.4",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -381,6 +386,9 @@ ba = "ba"
 SER = "SER"
 # NumPy ndarray.flags.writeable (canonical flag name, not "writable").
 writeable = "writeable"
+# ARPAbet phoneme symbol (Fish Speech phoneme-control token example, e.g.
+# "IY0"), not a typo of "IT".
+IY = "IY"
 # "convnet" abbreviates convolutional network. It appears in the vendored Fish
 # Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
 # typo of "convent".
