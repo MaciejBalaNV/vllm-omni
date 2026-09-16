@@ -34,9 +34,6 @@ class VideoRopePosition3DEmb(nn.Module):
         len_t, len_h, len_w: Maximum supported grid sizes (frequencies are
             cached for these). ``forward`` accepts any smaller ``(T, H, W)``.
         base_theta: RoPE base (``10000.0`` matches LLaMA/Cosmos).
-        t_extrapolation_ratio, h_extrapolation_ratio, w_extrapolation_ratio:
-            NTK-aware extrapolation factors, applied as
-            ``theta *= ratio ** (dim_axis / (dim_axis - 2))``.
     """
 
     def __init__(
@@ -47,9 +44,6 @@ class VideoRopePosition3DEmb(nn.Module):
         len_h: int,
         len_w: int,
         base_theta: float = 10000.0,
-        t_extrapolation_ratio: float = 1.0,
-        h_extrapolation_ratio: float = 1.0,
-        w_extrapolation_ratio: float = 1.0,
     ) -> None:
         super().__init__()
         dim = head_dim
@@ -65,27 +59,12 @@ class VideoRopePosition3DEmb(nn.Module):
         self.max_h = len_h
         self.max_w = len_w
 
-        # NTK-aware extrapolation exponent ``dim_axis / (dim_axis - 2)`` is
-        # only well-defined for ``dim_axis > 2``. Smaller axes are degenerate
-        # (only one frequency bucket) and would also raise ZeroDivisionError
-        # below regardless of the ratio. Fall back to base_theta in that
-        # case -- when the ratio is 1.0 (the default) the expression is a
-        # no-op anyway, so we lose nothing.
-        def _theta(ratio: float, dim: int) -> float:
-            if ratio == 1.0 or dim <= 2:
-                return base_theta
-            return base_theta * (ratio ** (dim / (dim - 2)))
-
-        h_theta = _theta(h_extrapolation_ratio, dim_h)
-        w_theta = _theta(w_extrapolation_ratio, dim_w)
-        t_theta = _theta(t_extrapolation_ratio, dim_t)
-
         idx_h = torch.arange(0, dim_h, 2, dtype=torch.float32) / dim_h
         idx_w = torch.arange(0, dim_w, 2, dtype=torch.float32) / dim_w
         idx_t = torch.arange(0, dim_t, 2, dtype=torch.float32) / dim_t
-        self.register_buffer("freqs_h", 1.0 / (h_theta**idx_h), persistent=False)
-        self.register_buffer("freqs_w", 1.0 / (w_theta**idx_w), persistent=False)
-        self.register_buffer("freqs_t", 1.0 / (t_theta**idx_t), persistent=False)
+        self.register_buffer("freqs_h", 1.0 / (base_theta**idx_h), persistent=False)
+        self.register_buffer("freqs_w", 1.0 / (base_theta**idx_w), persistent=False)
+        self.register_buffer("freqs_t", 1.0 / (base_theta**idx_t), persistent=False)
         self.register_buffer("seq_h", torch.arange(len_h, dtype=torch.float32), persistent=False)
         self.register_buffer("seq_w", torch.arange(len_w, dtype=torch.float32), persistent=False)
         self.register_buffer("seq_t", torch.arange(len_t, dtype=torch.float32), persistent=False)
