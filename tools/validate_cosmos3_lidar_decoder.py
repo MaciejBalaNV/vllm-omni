@@ -32,6 +32,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from vllm_omni.platforms import current_omni_platform
+
 ARTIFACT_METADATA_KEY = "cosmos3_lidar_validation"
 SCHEMA_VERSION = 1
 LIDAR_VAE_SUBFOLDER = "lidar_vae"
@@ -218,9 +220,8 @@ def _postprocess(raw, config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _sync(device) -> None:
-    torch = _torch()
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        current_omni_platform.synchronize()
 
 
 def _rng_state(device) -> tuple[Any, Any | None]:
@@ -249,13 +250,12 @@ def _benchmark(
     after_first: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], Measurement]:
     """Measure compilation separately from warmed calls and verify determinism."""
-    torch = _torch()
     gc.collect()
     if device.type == "cuda":
-        torch.cuda.empty_cache()
+        current_omni_platform.empty_cache()
         _sync(device)
-        resident = torch.cuda.memory_allocated(device)
-        torch.cuda.reset_peak_memory_stats(device)
+        resident = current_omni_platform.memory_allocated()
+        current_omni_platform.reset_peak_memory_stats()
     else:
         resident = None
     before_rng = _rng_state(device)
@@ -263,7 +263,7 @@ def _benchmark(
     first_device = dict(function())
     _sync(device)
     first_ms = (time.perf_counter() - started) * 1000
-    first_peak = torch.cuda.max_memory_allocated(device) - resident if resident is not None else None
+    first_peak = current_omni_platform.max_memory_allocated() - resident if resident is not None else None
     first = _cpu_tensors(first_device)
     del first_device
     if after_first is not None:
@@ -277,8 +277,8 @@ def _benchmark(
         del current
 
     if device.type == "cuda":
-        warmed_resident = torch.cuda.memory_allocated(device)
-        torch.cuda.reset_peak_memory_stats(device)
+        warmed_resident = current_omni_platform.memory_allocated()
+        current_omni_platform.reset_peak_memory_stats()
     else:
         warmed_resident = None
     durations = []
@@ -289,7 +289,9 @@ def _benchmark(
         durations.append((time.perf_counter() - started) * 1000)
         identical = identical and _outputs_equal(first, _cpu_tensors(current))
         del current
-    warmed_peak = torch.cuda.max_memory_allocated(device) - warmed_resident if warmed_resident is not None else None
+    warmed_peak = (
+        current_omni_platform.max_memory_allocated() - warmed_resident if warmed_resident is not None else None
+    )
     after_rng = _rng_state(device)
     measurement = Measurement(
         first_call_ms=first_ms,
@@ -333,7 +335,7 @@ def _environment(mode: str, device) -> dict[str, Any]:
     }
     if device.type == "cuda":
         result.update(
-            cuda_device_count=torch.cuda.device_count(),
+            cuda_device_count=current_omni_platform.get_device_count(),
             cuda_device_name=torch.cuda.get_device_name(device),
             cuda_capability=list(torch.cuda.get_device_capability(device)),
         )
@@ -674,7 +676,7 @@ def run_vllm_omni(args: argparse.Namespace) -> None:
     latents = None
     gc.collect()
     if device.type == "cuda":
-        torch.cuda.empty_cache()
+        current_omni_platform.empty_cache()
 
     if "encoder_frames" in reference:
         encoder = Cosmos3LidarEncoder.from_pretrained(str(root), config, device)
