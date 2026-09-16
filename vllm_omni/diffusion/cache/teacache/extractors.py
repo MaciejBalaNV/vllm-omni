@@ -1486,8 +1486,6 @@ def extract_cosmos3_context(
     control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
     control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
     transfer_share_vision_temporal_positions: bool = True,
-    temporal_position_period: int | None = None,
-    multiview_layout: Any | None = None,
     **kwargs: Any,
 ) -> CacheContext:
     """Build the shared cache execution context for Cosmos3's GEN pathway."""
@@ -1511,8 +1509,6 @@ def extract_cosmos3_context(
         control_latents=control_latents,
         control_weights=control_weights,
         transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
-        temporal_position_period=temporal_position_period,
-        multiview_layout=multiview_layout,
     )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:

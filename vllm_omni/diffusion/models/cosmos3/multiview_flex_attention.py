@@ -148,25 +148,19 @@ class MaskItem:
 class MultiviewLayout:
     """Explicit packed camera/LiDAR streams and request-invariant attention geometry.
 
-    Items may have different shapes and optional controls. For camera-only
-    geometry callers, omitting items constructs a camera control/target pair
-    once at initialization; attention always consumes the resulting items.
+    Items own all sensor geometry, including optional controls and independent
+    camera/LiDAR shapes and frame rates.
     """
 
-    num_views: int
-    latent_frames: int
-    patch_height: int
-    patch_width: int
+    items: tuple[MaskItem, ...]
     attention_scope: AttentionScope = "decomposed"
     decomposed_temporal_window_seconds: float | None = None
     control_attends_sensor: bool = False
-    seconds_per_frame: float = 1.0
     backend: str = "triton"
     #: Capacity the UND stream is padded to, independent of any one prompt's
     #: length, so the compiled attention sees a single shape.  See
     #: ``DEFAULT_MAX_UND_TOKENS``.
     max_und_tokens: int = DEFAULT_MAX_UND_TOKENS
-    items: tuple[MaskItem, ...] = ()
     caption_lengths: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
@@ -182,15 +176,8 @@ class MultiviewLayout:
             from . import multiview_fa4  # noqa: F401
         if self.max_und_tokens <= 0:
             raise ValueError(f"Cosmos3 multiview max_und_tokens must be positive, got {self.max_und_tokens}.")
-        if self.num_views <= 0 or self.latent_frames <= 0:
-            raise ValueError("Cosmos3 multiview num_views and latent_frames must be positive.")
-        if self.latent_frames % self.num_views:
-            raise ValueError(
-                "Cosmos3 multiview latent_frames must be camera-major and divisible by num_views: "
-                f"latent_frames={self.latent_frames}, num_views={self.num_views}."
-            )
-        if self.patch_height <= 0 or self.patch_width <= 0:
-            raise ValueError("Cosmos3 multiview patch dimensions must be positive.")
+        if not self.items:
+            raise ValueError("Cosmos3 multiview layout requires at least one vision item.")
         if self.decomposed_temporal_window_seconds is not None and (
             isinstance(self.decomposed_temporal_window_seconds, bool)
             or not isinstance(self.decomposed_temporal_window_seconds, int | float)
@@ -207,25 +194,21 @@ class MultiviewLayout:
                 f"got {type(self.control_attends_sensor).__name__}."
             )
         if (
-            isinstance(self.seconds_per_frame, bool)
-            or not isinstance(self.seconds_per_frame, int | float)
-            or not math.isfinite(self.seconds_per_frame)
-            or self.seconds_per_frame <= 0
+            self.attention_scope == "decomposed"
+            and len({item.view_offset for item in self.items}) > 1
+            and self.decomposed_temporal_window_seconds is None
         ):
             raise ValueError(
-                f"Cosmos3 multiview seconds_per_frame must be finite and positive, got {self.seconds_per_frame!r}."
+                "Cosmos3 decomposed attention does not support mixed view offsets without a temporal window."
             )
-
-        if not self.items:
-            shape = (self.latent_frames, self.patch_height, self.patch_width)
-            object.__setattr__(
-                self,
-                "items",
-                (
-                    MaskItem(shape, self.num_views, is_control=True, seconds_per_frame=self.seconds_per_frame),
-                    MaskItem(shape, self.num_views, seconds_per_frame=self.seconds_per_frame),
-                ),
-            )
+        rates_by_view_offset: dict[int, float] = {}
+        for item in self.items:
+            expected = rates_by_view_offset.setdefault(item.view_offset, item.seconds_per_frame)
+            if not math.isclose(item.seconds_per_frame, expected):
+                raise ValueError(
+                    "Cosmos3 multiview items sharing a view offset must use the same seconds_per_frame: "
+                    f"offset={item.view_offset}, got {item.seconds_per_frame}, expected {expected}."
+                )
 
     @property
     def gen_tokens(self) -> int:
@@ -235,22 +218,6 @@ class MultiviewLayout:
     def block_sizes(self) -> tuple[int, int]:
         """The ``(q, kv)`` sparse block granularity this backend demands."""
         return _BACKEND_BLOCK_SIZES[self.backend]
-
-    def cache_key(self) -> tuple[Any, ...]:
-        return (
-            self.num_views,
-            self.latent_frames,
-            self.patch_height,
-            self.patch_width,
-            self.attention_scope,
-            self.decomposed_temporal_window_seconds,
-            self.control_attends_sensor,
-            self.seconds_per_frame,
-            self.backend,
-            self.max_und_tokens,
-            self.items,
-            self.caption_lengths,
-        )
 
 
 @dataclass(frozen=True)
@@ -351,55 +318,20 @@ def expand_multiview_condition_frame_indexes(
 
 
 def build_multiview_flex_metadata(
-    seq_len: int,
-    full_q_offsets: Sequence[int],
-    items_per_sample: Sequence[Sequence[MaskItem]] | Sequence[MaskItem],
+    layout: MultiviewLayout,
+    geometry: PaddedAttentionGeometry,
     device: torch.device | str,
-    num_und: int,
-    attention_scope: AttentionScope = "decomposed",
-    decomposed_temporal_window_seconds: float | None = None,
-    control_attends_sensor: bool = False,
-    caption_lengths: Sequence[int] = (),
 ) -> MultiviewFlexMetadata:
-    """Build metadata without ever materializing a token-by-token dense mask.
-
-    ``full_q_offsets`` contains the start of every packed vision item plus the
-    end of the final item.  The first offset is also the query start and may be
-    larger than ``num_und`` because UND is padded independently.
-    """
-    attention_scope = _validate_attention_scope(attention_scope)
-    if decomposed_temporal_window_seconds is not None and (
-        isinstance(decomposed_temporal_window_seconds, bool)
-        or not isinstance(decomposed_temporal_window_seconds, int | float)
-        or not math.isfinite(decomposed_temporal_window_seconds)
-        or decomposed_temporal_window_seconds < 0
-    ):
-        raise ValueError(
-            "Cosmos3 multiview decomposed_temporal_window_seconds must be null or a finite "
-            f"non-negative number, got {decomposed_temporal_window_seconds!r}."
-        )
-    if not isinstance(control_attends_sensor, bool):
-        raise TypeError("Cosmos3 multiview control_attends_sensor must be boolean.")
+    """Derive single-sample token metadata from the streams and their padding."""
     device = torch.device(device)
-    if seq_len <= 0 or num_und < 0 or num_und > seq_len:
-        raise ValueError(f"Invalid Cosmos3 multiview sequence geometry: seq_len={seq_len}, num_und={num_und}.")
-    if items_per_sample and isinstance(items_per_sample[0], MaskItem):  # type: ignore[index]
-        samples: list[list[MaskItem]] = [list(items_per_sample)]  # type: ignore[arg-type]
-    else:
-        samples = [list(items) for items in items_per_sample]  # type: ignore[arg-type]
-    if len(samples) != 1:
-        raise ValueError("Cosmos3 multiview v1 supports exactly one sample per request.")
-    items = samples[0]
-    if not items:
-        raise ValueError("Cosmos3 multiview metadata requires at least one vision item.")
-    if len(full_q_offsets) != len(items) + 1:
-        raise ValueError(
-            "Cosmos3 multiview full_q_offsets must contain one boundary per item plus the end: "
-            f"offsets={list(full_q_offsets)}, items={len(items)}."
-        )
-    offsets = tuple(int(offset) for offset in full_q_offsets)
-    if offsets[0] < num_und or offsets[-1] > seq_len or any(a > b for a, b in zip(offsets, offsets[1:])):
-        raise ValueError(f"Invalid Cosmos3 multiview item offsets: {offsets} for seq_len={seq_len}.")
+    num_und = geometry.real_und_len
+    if (
+        geometry.real_q_len != layout.gen_tokens
+        or geometry.padded_q_len < geometry.real_q_len
+        or not 0 <= num_und <= min(geometry.padded_und_len, layout.max_und_tokens)
+    ):
+        raise ValueError(f"Invalid Cosmos3 multiview padding geometry: {geometry}.")
+    seq_len = geometry.padded_und_len + geometry.padded_q_len
 
     sample_id = torch.full((seq_len,), -1, dtype=torch.int64, device=device)
     frame_id = torch.full_like(sample_id, -1)
@@ -409,32 +341,17 @@ def build_multiview_flex_metadata(
     timestamp = torch.full((seq_len,), -1.0, dtype=torch.float32, device=device)
     sample_id[:num_und] = 0
     is_und[:num_und] = True
-    if caption_lengths:
-        if sum(caption_lengths) != num_und or any(length <= 0 for length in caption_lengths):
+    if layout.caption_lengths:
+        if sum(layout.caption_lengths) != num_und or any(length <= 0 for length in layout.caption_lengths):
             raise ValueError("Caption boundaries must partition the real text tokens.")
         start = 0
-        for view, length in enumerate(caption_lengths):
+        for view, length in enumerate(layout.caption_lengths):
             view_id[start : start + length] = view
             start += length
 
-    view_offsets = {item.view_offset for item in items}
-    if attention_scope == "decomposed" and len(view_offsets) > 1 and decomposed_temporal_window_seconds is None:
-        raise ValueError("Cosmos3 decomposed attention does not support mixed view offsets without a temporal window.")
-
-    rates_by_view_offset: dict[int, float] = {}
-    for item in items:
-        expected = rates_by_view_offset.setdefault(item.view_offset, item.seconds_per_frame)
-        if not math.isclose(item.seconds_per_frame, expected):
-            raise ValueError(
-                "Cosmos3 multiview items sharing a view offset must use the same seconds_per_frame: "
-                f"offset={item.view_offset}, got {item.seconds_per_frame}, expected {expected}."
-            )
-
-    for item_index, (item, start, end) in enumerate(zip(items, offsets[:-1], offsets[1:], strict=True)):
-        if end - start != item.num_tokens:
-            raise ValueError(
-                f"Cosmos3 multiview item {item_index} occupies {end - start} tokens, expected {item.num_tokens}."
-            )
+    start = geometry.padded_und_len
+    for item in layout.items:
+        end = start + item.num_tokens
         latent_t, patch_h, patch_w = item.token_shape
         spatial_tokens = patch_h * patch_w
         frames_per_view = latent_t // item.num_views
@@ -454,6 +371,7 @@ def build_multiview_flex_metadata(
         view_id[start:end] = -2 if item.is_lidar else item_views
         is_control[start:end] = item.is_control
         timestamp[start:end] = item_timestamps
+        start = end
 
     return MultiviewFlexMetadata(
         sample_id=sample_id,
@@ -462,10 +380,10 @@ def build_multiview_flex_metadata(
         is_control=is_control,
         is_und=is_und,
         timestamp=timestamp,
-        query_start=offsets[0],
-        attention_scope=attention_scope,
-        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
-        control_attends_sensor=control_attends_sensor,
+        query_start=geometry.padded_und_len,
+        attention_scope=layout.attention_scope,
+        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
+        control_attends_sensor=layout.control_attends_sensor,
     )
 
 
@@ -771,7 +689,7 @@ def get_multiview_attention_plan(
             "Cosmos3 multiview packed GEN length does not match the request layout: "
             f"attention={real_q_len}, layout={layout.gen_tokens}."
         )
-    if real_und_len > layout.max_und_tokens:
+    if not 0 <= real_und_len <= layout.max_und_tokens:
         raise ValueError(
             "Cosmos3 multiview UND stream exceeds the layout capacity the attention was sized for: "
             f"tokens={real_und_len}, max_und_tokens={layout.max_und_tokens}."
@@ -780,36 +698,12 @@ def get_multiview_attention_plan(
     padded_q_len = _round_up(real_q_len, q_block_size)
     padded_und_len = _round_up(layout.max_und_tokens, kv_block_size)
     geometry = PaddedAttentionGeometry(real_q_len, padded_q_len, real_und_len, padded_und_len)
-    key = (
-        layout.cache_key(),
-        real_und_len,
-        padded_und_len,
-        real_q_len,
-        padded_q_len,
-        q_block_size,
-        kv_block_size,
-        device.type,
-        device.index,
-    )
+    key = (layout, real_und_len, device)
     cached = context.mask_cache.get(key)
     if cached is not None:
         return cached, geometry
 
-    items = layout.items
-    item_offsets = [padded_und_len]
-    for item in items:
-        item_offsets.append(item_offsets[-1] + item.num_tokens)
-    metadata = build_multiview_flex_metadata(
-        seq_len=padded_und_len + padded_q_len,
-        full_q_offsets=item_offsets,
-        items_per_sample=items,
-        device=device,
-        num_und=real_und_len,
-        attention_scope=layout.attention_scope,
-        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
-        control_attends_sensor=layout.control_attends_sensor,
-        caption_lengths=layout.caption_lengths,
-    )
+    metadata = build_multiview_flex_metadata(layout, geometry, device)
     sparsity = build_multiview_block_sparsity(
         metadata,
         q_block_size=q_block_size,
@@ -817,28 +711,6 @@ def get_multiview_attention_plan(
     )
     plan = sparsity if layout.backend == "fa4" else sparsity.to_block_mask()
     context.mask_cache[key] = plan
-    return plan, geometry
-
-
-def get_multiview_block_mask(
-    context: MultiviewAttentionContext,
-    *,
-    real_und_len: int,
-    real_q_len: int,
-    device: torch.device,
-) -> tuple[BlockMask, PaddedAttentionGeometry]:
-    """Request-local ``BlockMask`` for the Triton FlexAttention backend."""
-    plan, geometry = get_multiview_attention_plan(
-        context,
-        real_und_len=real_und_len,
-        real_q_len=real_q_len,
-        device=device,
-    )
-    if not isinstance(plan, BlockMask):
-        raise TypeError(
-            "Cosmos3 multiview get_multiview_block_mask requires backend='triton', got "
-            f"{context.layout.backend!r}; use get_multiview_attention_plan instead."
-        )
     return plan, geometry
 
 

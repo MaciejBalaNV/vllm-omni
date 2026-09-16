@@ -1162,7 +1162,6 @@ class _GenPrepared(NamedTuple):
     use_multi_control_attention: bool
     multi_control_token_sizes: tuple[int, ...] | None
     multi_control_weights: tuple[float, ...] | None
-    multiview_layout: Any | None = None
 
 
 class Cosmos3VFMTransformer(nn.Module):
@@ -1644,7 +1643,6 @@ class Cosmos3VFMTransformer(nn.Module):
         t_sound: int | None = None,
         num_vision_items: int = 1,
         share_vision_temporal_positions: bool = False,
-        temporal_position_period: int | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
         if num_vision_items <= 0:
@@ -1673,7 +1671,6 @@ class Cosmos3VFMTransformer(nn.Module):
                     base_fps=self.base_fps,
                     temporal_compression_factor=self.temporal_compression_factor,
                     enable_fps_modulation=self.enable_fps_modulation,
-                    temporal_position_period=temporal_position_period,
                 )
                 gen_positions.extend([v_pos] * num_vision_items)
             else:
@@ -1688,7 +1685,6 @@ class Cosmos3VFMTransformer(nn.Module):
                         base_fps=self.base_fps,
                         temporal_compression_factor=self.temporal_compression_factor,
                         enable_fps_modulation=self.enable_fps_modulation,
-                        temporal_position_period=temporal_position_period,
                     )
                     gen_positions.append(v_pos)
             if action_frames > 0:
@@ -1837,8 +1833,6 @@ class Cosmos3VFMTransformer(nn.Module):
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
-        temporal_position_period: int | None = None,
-        multiview_layout: Any | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run the shared Cosmos3 GEN preprocess, stack, and postprocess path."""
@@ -1861,8 +1855,6 @@ class Cosmos3VFMTransformer(nn.Module):
             control_latents=control_latents,
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
-            temporal_position_period=temporal_position_period,
-            multiview_layout=multiview_layout,
         )
         return self._gen_postprocess(self._run_gen_stack(prep, normalize=False), prep, normalized=False)
 
@@ -1884,8 +1876,6 @@ class Cosmos3VFMTransformer(nn.Module):
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
-        temporal_position_period: int | None = None,
-        multiview_layout: Any | None = None,
     ) -> _GenPrepared:
         """
         Prepare the packed GEN sequence before its cacheable execution region.
@@ -2030,7 +2020,6 @@ class Cosmos3VFMTransformer(nn.Module):
                 t_sound=s_sound,
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
-                temporal_position_period=temporal_position_period,
             )
             self.cached_freqs_gen = freqs_gen
 
@@ -2136,7 +2125,6 @@ class Cosmos3VFMTransformer(nn.Module):
                 use_multi_control_attention=use_multi_control_attention,
                 multi_control_token_sizes=multi_control_token_sizes,
                 multi_control_weights=multi_control_weights,
-                multiview_layout=multiview_layout,
             )
 
     def _run_gen_stack(self, prep: _GenPrepared, *, normalize: bool = True) -> torch.Tensor:
@@ -2146,7 +2134,6 @@ class Cosmos3VFMTransformer(nn.Module):
             use_sequence_parallel=not prep.use_multi_control_attention,
             control_token_sizes=prep.multi_control_token_sizes,
             control_weights=prep.multi_control_weights,
-            multiview_layout=prep.multiview_layout,
         )
         return self.norm_moe_gen(hidden_gen) if normalize else hidden_gen
 

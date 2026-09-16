@@ -50,10 +50,10 @@ def test_varying_prompt_lengths_do_not_recompile_the_flex_kernel(monkeypatch: py
     import vllm_omni.diffusion.models.cosmos3.multiview_flex_attention as module
 
     layout = module.MultiviewLayout(
-        num_views=_NUM_VIEWS,
-        latent_frames=_LATENT_FRAMES,
-        patch_height=_PATCH,
-        patch_width=_PATCH,
+        items=tuple(
+            module.MaskItem((_LATENT_FRAMES, _PATCH, _PATCH), _NUM_VIEWS, is_control=control)
+            for control in (True, False)
+        ),
         max_und_tokens=_MAX_UND,
     )
     device, dtype = torch.device("cuda"), torch.bfloat16
@@ -108,7 +108,13 @@ def test_switching_resolutions_and_ratios_reuses_warmed_flex_kernels(monkeypatch
         (26, 35),
         (35, 26),
     )
-    layouts = [module.MultiviewLayout(2, 2, h, w, max_und_tokens=_MAX_UND) for h, w in geometries]
+    layouts = [
+        module.MultiviewLayout(
+            items=tuple(module.MaskItem((2, h, w), 2, is_control=control) for control in (True, False)),
+            max_und_tokens=_MAX_UND,
+        )
+        for h, w in geometries
+    ]
     tensors = []
     for layout in layouts:
         q = torch.randn(1, layout.gen_tokens, _HEADS, _HEAD_DIM, device="cuda", dtype=torch.bfloat16)

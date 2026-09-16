@@ -89,7 +89,7 @@ def _pipeline(config, device):
 
 
 def _denoise(pipeline, backend, request_index):
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem, MultiviewLayout
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 
     # Square then portrait layouts cut across all cameras; 330 portrait GEN
@@ -131,10 +131,9 @@ def _denoise(pipeline, backend, request_index):
             "control_latents": [control],
             "temporal_position_period": frames_per_view,
             "multiview_layout": MultiviewLayout(
-                11,
-                frames,
-                spatial_h,
-                spatial_w,
+                items=tuple(
+                    MaskItem((frames, spatial_h, spatial_w), 11, is_control=control) for control in (True, False)
+                ),
                 backend=backend,
                 max_und_tokens=64,
                 decomposed_temporal_window_seconds=0.5,
@@ -320,7 +319,10 @@ def _recompile_worker(rank, port):
         q = torch.randn(1, 66, 8, 128, dtype=torch.bfloat16, device=device)
         k = torch.randn(1, 66, 2, 128, dtype=torch.bfloat16, device=device)
         v = torch.randn_like(k)
-        layout = sparse.MultiviewLayout(11, 33, 1, 1, max_und_tokens=64)
+        layout = sparse.MultiviewLayout(
+            items=tuple(sparse.MaskItem((33, 1, 1), 11, is_control=control) for control in (True, False)),
+            max_und_tokens=64,
+        )
         counter = CompileCounterWithBackend("inductor")
         sparse._compiled_flex_attention = torch.compile(sparse.torch_flex_attention, backend=counter, dynamic=False)
         for text_len in (3, 7, 35, 47):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -34,6 +35,8 @@ def _tiny_metadata(
 ):
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
+        MultiviewLayout,
+        PaddedAttentionGeometry,
         build_multiview_flex_metadata,
     )
 
@@ -49,14 +52,14 @@ def _tiny_metadata(
         seconds_per_frame=0.5,
     )
     return build_multiview_flex_metadata(
-        seq_len=10,
-        full_q_offsets=(2, 6, 10),
-        items_per_sample=(control, target),
+        layout=MultiviewLayout(
+            items=(control, target),
+            attention_scope=attention_scope,
+            decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+            control_attends_sensor=control_attends_sensor,
+        ),
+        geometry=PaddedAttentionGeometry(8, 8, 2, 2),
         device="cpu",
-        num_und=2,
-        attention_scope=attention_scope,
-        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
-        control_attends_sensor=control_attends_sensor,
     )
 
 
@@ -64,18 +67,22 @@ def test_attention_scope_defaults_are_decomposed() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
         MultiviewLayout,
+        PaddedAttentionGeometry,
         build_multiview_flex_metadata,
     )
 
     metadata = build_multiview_flex_metadata(
-        seq_len=2,
-        full_q_offsets=(0, 2),
-        items_per_sample=(MaskItem(token_shape=(2, 1, 1), num_views=1),),
+        layout=MultiviewLayout(items=(MaskItem(token_shape=(2, 1, 1), num_views=1),)),
+        geometry=PaddedAttentionGeometry(2, 2, 0, 0),
         device="cpu",
-        num_und=0,
     )
 
-    assert MultiviewLayout(1, 2, 1, 1).attention_scope == "decomposed"
+    assert (
+        MultiviewLayout(
+            items=tuple(MaskItem((2, 1, 1), 1, is_control=control) for control in (True, False))
+        ).attention_scope
+        == "decomposed"
+    )
     assert metadata.attention_scope == "decomposed"
 
 
@@ -90,6 +97,8 @@ def test_expand_multiview_condition_indexes_camera_major() -> None:
 def test_metadata_is_camera_major_and_marks_padding() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
+        MultiviewLayout,
+        PaddedAttentionGeometry,
         build_multiview_flex_metadata,
     )
 
@@ -99,12 +108,9 @@ def test_metadata_is_camera_major_and_marks_padding() -> None:
         seconds_per_frame=0.4,
     )
     metadata = build_multiview_flex_metadata(
-        seq_len=18,
-        full_q_offsets=(4, 16),
-        items_per_sample=(item,),
+        layout=MultiviewLayout(items=(item,), attention_scope="same_view"),
+        geometry=PaddedAttentionGeometry(12, 14, 3, 4),
         device="cpu",
-        num_und=3,
-        attention_scope="same_view",
     )
 
     assert metadata.sample_id.tolist() == [0, 0, 0, -1] + [0] * 12 + [-1, -1]
@@ -116,6 +122,27 @@ def test_metadata_is_camera_major_and_marks_padding() -> None:
         torch.tensor([0.0, 0.0, 0.4, 0.4, 0.8, 0.8] * 2),
     )
     assert not hasattr(metadata, "is_noisy")
+
+
+@pytest.mark.parametrize("geometry", [(11, 14, 3, 4), (12, 11, 3, 4), (12, 14, 5, 4), (12, 14, -1, 4)])
+def test_metadata_rejects_padding_that_does_not_fit_the_streams(geometry) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
+        MultiviewLayout,
+        PaddedAttentionGeometry,
+        build_multiview_flex_metadata,
+    )
+
+    layout = MultiviewLayout(items=(MaskItem((6, 1, 2), 2),))
+    with pytest.raises(ValueError, match="padding geometry"):
+        build_multiview_flex_metadata(layout, PaddedAttentionGeometry(*geometry), "cpu")
+
+
+def test_layout_requires_explicit_streams() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+
+    with pytest.raises(ValueError, match="at least one vision item"):
+        MultiviewLayout(items=())
 
 
 # Truth table transcribed from the Multiview-AV visibility spec, one row per
@@ -236,6 +263,8 @@ def test_visibility_predicate_matches_spec_truth_table(
 def test_padding_queries_attend_only_padding(attention_scope: str) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
+        MultiviewLayout,
+        PaddedAttentionGeometry,
         build_multiview_flex_metadata,
         multiview_pair_predicate,
     )
@@ -245,12 +274,9 @@ def test_padding_queries_attend_only_padding(attention_scope: str) -> None:
         num_views=1,
     )
     metadata = build_multiview_flex_metadata(
-        seq_len=9,
-        full_q_offsets=(3, 7),
-        items_per_sample=(item,),
+        layout=MultiviewLayout(items=(item,), attention_scope=attention_scope),
+        geometry=PaddedAttentionGeometry(4, 6, 2, 3),
         device="cpu",
-        num_und=2,
-        attention_scope=attention_scope,
     )
     allowed = multiview_pair_predicate(
         metadata,
@@ -346,11 +372,12 @@ def test_traced_pair_predicate_captures_tensor_configuration_only() -> None:
 
 
 def test_attention_metadata_has_no_condition_or_noise_state() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem, MultiviewLayout
 
-    i2v_layout = MultiviewLayout(2, 4, 1, 1)
-    t2v_layout = MultiviewLayout(2, 4, 1, 1)
-    assert i2v_layout.cache_key() == t2v_layout.cache_key()
+    i2v_layout = MultiviewLayout(items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)))
+    t2v_layout = MultiviewLayout(items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)))
+    assert i2v_layout == t2v_layout
+    assert hash(i2v_layout) == hash(t2v_layout)
     assert "condition_frame_indexes" not in MultiviewLayout.__dataclass_fields__
     assert not hasattr(_tiny_metadata(), "is_noisy")
 
@@ -399,25 +426,25 @@ def test_timestamp_is_constant_within_every_discrete_semantic_run() -> None:
 
 def test_compressed_block_mask_and_request_cache() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
-        get_multiview_block_mask,
+        get_multiview_attention_plan,
     )
 
     layout = MultiviewLayout(
-        num_views=2,
-        latent_frames=4,
-        patch_height=1,
-        patch_width=1,
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)),
         max_und_tokens=_TRITON_MAX_UND,
     )
     cache = {}
     context = MultiviewAttentionContext(layout, cache)
-    first, geometry = get_multiview_block_mask(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
-    second, second_geometry = get_multiview_block_mask(
-        context, real_und_len=3, real_q_len=8, device=torch.device("cpu")
+    first, geometry = get_multiview_attention_plan(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
+    second, second_geometry = get_multiview_attention_plan(
+        MultiviewAttentionContext(replace(layout), cache), real_und_len=3, real_q_len=8, device=torch.device("cpu")
     )
-    different_branch, _ = get_multiview_block_mask(context, real_und_len=7, real_q_len=8, device=torch.device("cpu"))
+    different_branch, _ = get_multiview_attention_plan(
+        context, real_und_len=7, real_q_len=8, device=torch.device("cpu")
+    )
 
     assert first is second
     assert first is not different_branch
@@ -435,26 +462,28 @@ def test_compressed_block_mask_and_request_cache() -> None:
 
 def test_mask_cache_separates_every_predicate_and_backend_setting() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
         get_multiview_attention_plan,
     )
 
     cache = {}
+    base = MultiviewLayout(
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)),
+        max_und_tokens=_TRITON_MAX_UND,
+    )
     layouts = [
-        MultiviewLayout(2, 4, 1, 1, max_und_tokens=_TRITON_MAX_UND),
-        MultiviewLayout(2, 4, 1, 1, attention_scope="same_view", max_und_tokens=_TRITON_MAX_UND),
-        MultiviewLayout(
-            2,
-            4,
-            1,
-            1,
-            decomposed_temporal_window_seconds=0.5,
-            max_und_tokens=_TRITON_MAX_UND,
-        ),
-        MultiviewLayout(2, 4, 1, 1, control_attends_sensor=True, max_und_tokens=_TRITON_MAX_UND),
-        MultiviewLayout(2, 4, 1, 1, seconds_per_frame=0.4, max_und_tokens=_TRITON_MAX_UND),
-        MultiviewLayout(2, 4, 1, 1, backend="fa4", max_und_tokens=_FA4_MAX_UND),
+        base,
+        replace(base, attention_scope="same_view"),
+        replace(base, decomposed_temporal_window_seconds=0.5),
+        replace(base, control_attends_sensor=True),
+        replace(base, items=tuple(replace(item, seconds_per_frame=0.4) for item in base.items)),
+        replace(base, backend="fa4", max_und_tokens=_FA4_MAX_UND),
+        replace(base, max_und_tokens=2 * _TRITON_MAX_UND),
+        replace(base, items=base.items[1:]),
+        replace(base, items=tuple(replace(item, num_views=1) for item in base.items)),
+        replace(base, items=tuple(replace(item, token_shape=(2, 1, 2)) for item in base.items)),
     ]
     for layout in layouts:
         get_multiview_attention_plan(
@@ -478,17 +507,20 @@ def test_und_padding_is_independent_of_prompt_length() -> None:
     therefore be a function of the layout alone.
     """
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
-        get_multiview_block_mask,
+        get_multiview_attention_plan,
     )
 
-    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=200)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)), max_und_tokens=200
+    )
     context = MultiviewAttentionContext(layout, {})
 
     shapes = set()
     for real_und_len in (1, 63, 64, 65, 199, 200):
-        block_mask, geometry = get_multiview_block_mask(
+        block_mask, geometry = get_multiview_attention_plan(
             context,
             real_und_len=real_und_len,
             real_q_len=layout.gen_tokens,
@@ -510,7 +542,7 @@ def test_und_padding_is_independent_of_prompt_length() -> None:
     assert len(shapes) == 1, f"prompt length changed a compile-relevant shape: {shapes}"
 
     with pytest.raises(ValueError, match="exceeds the layout capacity"):
-        get_multiview_block_mask(
+        get_multiview_attention_plan(
             context,
             real_und_len=201,
             real_q_len=layout.gen_tokens,
@@ -529,6 +561,7 @@ def test_und_capacity_padding_does_not_change_attention_output() -> None:
     magnitude above this.
     """
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
         padded_multiview_flex_attention,
@@ -543,7 +576,10 @@ def test_und_capacity_padding_does_not_change_attention_output() -> None:
 
     outputs = []
     for max_und_tokens in (5, 64, 200):
-        layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=max_und_tokens)
+        layout = MultiviewLayout(
+            items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)),
+            max_und_tokens=max_und_tokens,
+        )
         outputs.append(
             padded_multiview_flex_attention(q, k, v, k_und, v_und, MultiviewAttentionContext(layout, {}, {}))
         )
@@ -558,13 +594,17 @@ def test_block_mask_uses_canonical_full_width_contiguous_layout() -> None:
     contiguous memory. Trimmed column slices are non-contiguous and violate
     that contract (see pytorch/pytorch#153344)."""
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
-        get_multiview_block_mask,
+        get_multiview_attention_plan,
     )
 
-    layout = MultiviewLayout(2, 4, 8, 8, max_und_tokens=_TRITON_MAX_UND)
-    block_mask, geometry = get_multiview_block_mask(
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 8, 8), 2, is_control=control) for control in (True, False)),
+        max_und_tokens=_TRITON_MAX_UND,
+    )
+    block_mask, geometry = get_multiview_attention_plan(
         MultiviewAttentionContext(layout, {}),
         real_und_len=3,
         real_q_len=layout.gen_tokens,
@@ -594,45 +634,33 @@ def test_compressed_block_mask_matches_dense_token_projection(
     temporal_window: float | None,
 ) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
         build_multiview_flex_metadata,
-        get_multiview_block_mask,
+        get_multiview_attention_plan,
         multiview_pair_predicate,
     )
 
     q_block_size = 64
     kv_block_size = 64
     layout = MultiviewLayout(
-        2,
-        4,
-        8,
-        8,
+        items=tuple(MaskItem((4, 8, 8), 2, is_control=control, seconds_per_frame=0.5) for control in (True, False)),
         attention_scope=attention_scope,
         decomposed_temporal_window_seconds=temporal_window,
         control_attends_sensor=control_attends_sensor,
-        seconds_per_frame=0.5,
         max_und_tokens=_TRITON_MAX_UND,
     )
-    block_mask, geometry = get_multiview_block_mask(
+    block_mask, geometry = get_multiview_attention_plan(
         MultiviewAttentionContext(layout, {}),
         real_und_len=3,
         real_q_len=layout.gen_tokens,
         device=torch.device("cpu"),
     )
     metadata = build_multiview_flex_metadata(
-        seq_len=geometry.padded_und_len + geometry.padded_q_len,
-        full_q_offsets=(
-            geometry.padded_und_len,
-            geometry.padded_und_len + layout.items[0].num_tokens,
-            geometry.padded_und_len + layout.gen_tokens,
-        ),
-        items_per_sample=layout.items,
+        layout=layout,
+        geometry=geometry,
         device="cpu",
-        num_und=3,
-        attention_scope=layout.attention_scope,
-        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
-        control_attends_sensor=layout.control_attends_sensor,
     )
     dense = multiview_pair_predicate(
         metadata,
@@ -663,15 +691,20 @@ def test_compressed_block_mask_matches_dense_token_projection(
 
 def test_flex_attention_matches_dense_masked_gqa_oracle() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
+        PaddedAttentionGeometry,
         build_multiview_flex_metadata,
         multiview_pair_predicate,
         padded_multiview_flex_attention,
     )
 
     torch.manual_seed(4)
-    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=_TRITON_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)),
+        max_und_tokens=_TRITON_MAX_UND,
+    )
     context = MultiviewAttentionContext(layout, {})
     q = torch.randn(1, 8, 4, 8)
     k = torch.randn(1, 8, 2, 8)
@@ -681,12 +714,9 @@ def test_flex_attention_matches_dense_masked_gqa_oracle() -> None:
     actual = padded_multiview_flex_attention(q, k, v, k_und, v_und, context)
 
     metadata = build_multiview_flex_metadata(
-        seq_len=11,
-        full_q_offsets=(3, 7, 11),
-        items_per_sample=layout.items,
+        layout=layout,
+        geometry=PaddedAttentionGeometry(8, 8, 3, 3),
         device="cpu",
-        num_und=3,
-        attention_scope=layout.attention_scope,
     )
     allowed = multiview_pair_predicate(
         metadata,
@@ -704,6 +734,7 @@ def test_flex_attention_matches_dense_masked_gqa_oracle() -> None:
 @pytest.mark.parametrize("backend", ["triton", "fa4"])
 def test_attention_plans_distinguish_resolutions(backend) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
         get_multiview_attention_plan,
@@ -712,7 +743,11 @@ def test_attention_plans_distinguish_resolutions(backend) -> None:
     cache = {}
     plans = []
     for height, width in ((15, 26), (23, 40), (15, 26)):
-        layout = MultiviewLayout(2, 2, height, width, backend=backend, max_und_tokens=128)
+        layout = MultiviewLayout(
+            items=tuple(MaskItem((2, height, width), 2, is_control=control) for control in (True, False)),
+            backend=backend,
+            max_und_tokens=128,
+        )
         context = MultiviewAttentionContext(layout, cache)
         plan, geometry = get_multiview_attention_plan(
             context, real_und_len=7, real_q_len=layout.gen_tokens, device=torch.device("cpu")
@@ -733,13 +768,17 @@ def test_packing_buffers_are_reused_and_never_leak_stale_rows() -> None:
     so that collision is the normal case rather than an edge case.
     """
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewLayout,
         padded_multiview_flex_attention,
     )
 
     torch.manual_seed(11)
-    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=_TRITON_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)),
+        max_und_tokens=_TRITON_MAX_UND,
+    )
     q = torch.randn(1, 8, 4, 8)
     k = torch.randn(1, 8, 2, 8)
     v = torch.randn(1, 8, 2, 8)
@@ -790,7 +829,7 @@ def test_flex_attention_explicitly_pins_triton_backend(monkeypatch: pytest.Monke
 def test_decomposed_without_window_rejects_mixed_view_offsets() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
-        build_multiview_flex_metadata,
+        MultiviewLayout,
     )
 
     items = (
@@ -798,20 +837,13 @@ def test_decomposed_without_window_rejects_mixed_view_offsets() -> None:
         MaskItem((2, 1, 1), num_views=1, view_offset=10),
     )
     with pytest.raises(ValueError, match="mixed view offsets"):
-        build_multiview_flex_metadata(
-            seq_len=5,
-            full_q_offsets=(1, 3, 5),
-            items_per_sample=items,
-            device="cpu",
-            num_und=1,
-            attention_scope="decomposed",
-        )
+        MultiviewLayout(items=items, attention_scope="decomposed")
 
 
-def test_metadata_rejects_inconsistent_rates_on_one_view_grid() -> None:
+def test_layout_rejects_inconsistent_rates_on_one_view_grid() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
         MaskItem,
-        build_multiview_flex_metadata,
+        MultiviewLayout,
     )
 
     items = (
@@ -819,13 +851,7 @@ def test_metadata_rejects_inconsistent_rates_on_one_view_grid() -> None:
         MaskItem((2, 1, 1), num_views=1, seconds_per_frame=0.5),
     )
     with pytest.raises(ValueError, match="same seconds_per_frame"):
-        build_multiview_flex_metadata(
-            seq_len=5,
-            full_q_offsets=(1, 3, 5),
-            items_per_sample=items,
-            device="cpu",
-            num_und=1,
-        )
+        MultiviewLayout(items=items)
 
 
 # --- FlashAttention-4 backend: host-side mask encoding ----------------------
@@ -852,14 +878,18 @@ def _fa4_plan(layout, real_und_len: int):
 
 def test_fa4_layout_uses_the_block_geometry_the_sm100_kernel_demands() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewAttentionContext,
         MultiviewBlockSparsity,
         MultiviewLayout,
         get_multiview_attention_plan,
-        get_multiview_block_mask,
     )
 
-    layout = MultiviewLayout(2, 4, 1, 1, backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)),
+        backend="fa4",
+        max_und_tokens=_FA4_MAX_UND,
+    )
     context = MultiviewAttentionContext(layout, {})
     first, geometry = get_multiview_attention_plan(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
     second, _ = get_multiview_attention_plan(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
@@ -875,15 +905,14 @@ def test_fa4_layout_uses_the_block_geometry_the_sm100_kernel_demands() -> None:
     assert first.partial_indices.dtype == torch.int32
     assert first.partial_indices.is_contiguous()
 
-    with pytest.raises(TypeError, match="backend='triton'"):
-        get_multiview_block_mask(context, real_und_len=3, real_q_len=8, device=torch.device("cpu"))
-
 
 def test_fa4_rejects_unknown_backend() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem, MultiviewLayout
 
     with pytest.raises(ValueError, match="backend must be one of"):
-        MultiviewLayout(2, 4, 1, 1, backend="cudnn")
+        MultiviewLayout(
+            items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)), backend="cudnn"
+        )
 
 
 def test_run_table_reproduces_the_pair_predicate_exactly() -> None:
@@ -894,11 +923,16 @@ def test_run_table_reproduces_the_pair_predicate_exactly() -> None:
     correctness claim for the FA4 mask_mod.
     """
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewLayout,
         multiview_pair_predicate,
     )
 
-    layout = MultiviewLayout(2, 4, 2, 2, backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 2, 2), 2, is_control=control) for control in (True, False)),
+        backend="fa4",
+        max_und_tokens=_FA4_MAX_UND,
+    )
     sparsity, _ = _fa4_plan(layout, real_und_len=3)
     metadata = sparsity.metadata
 
@@ -916,9 +950,13 @@ def test_run_table_reproduces_the_pair_predicate_exactly() -> None:
 
 
 def test_packed_allowed_bits_round_trip() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem, MultiviewLayout
 
-    layout = MultiviewLayout(2, 4, 2, 2, backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 2, 2), 2, is_control=control) for control in (True, False)),
+        backend="fa4",
+        max_und_tokens=_FA4_MAX_UND,
+    )
     sparsity, _ = _fa4_plan(layout, real_und_len=3)
 
     num_q_groups, num_k_groups = sparsity.group_allowed.shape
@@ -958,6 +996,7 @@ def test_block_sparsity_does_not_extract_tensor_scalars() -> None:
 def test_fa4_block_map_matches_dense_token_projection() -> None:
     """The (256, 128) map must still separate full from partial tiles exactly."""
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        MaskItem,
         MultiviewLayout,
         multiview_pair_predicate,
     )
@@ -965,7 +1004,11 @@ def test_fa4_block_map_matches_dense_token_projection() -> None:
     # A UND length that fills its KV block exactly is what makes fully-allowed
     # tiles reachable here: every real query attends every real UND token, but a
     # block padded out with sentinels is partial by construction.
-    layout = MultiviewLayout(2, 4, 8, 8, backend="fa4", max_und_tokens=_FA4_MAX_UND)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 8, 8), 2, is_control=control) for control in (True, False)),
+        backend="fa4",
+        max_und_tokens=_FA4_MAX_UND,
+    )
     sparsity, geometry = _fa4_plan(layout, real_und_len=128)
     metadata = sparsity.metadata
 
@@ -1019,13 +1062,10 @@ def test_fa4_layout_registers_the_opaque_kernel_op() -> None:
     fa4 layout is what registers the boundary, and it happens host-side so the
     registration never runs under Dynamo.
     """
-    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MultiviewLayout
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem, MultiviewLayout
 
     MultiviewLayout(
-        num_views=2,
-        latent_frames=8,
-        patch_height=4,
-        patch_width=4,
+        items=tuple(MaskItem((8, 4, 4), 2, is_control=control) for control in (True, False)),
         backend="fa4",
         max_und_tokens=_FA4_MAX_UND,
     )

@@ -9,6 +9,7 @@ import torch
 
 from vllm_omni.diffusion.models.cosmos3 import multiview_parallel as parallel
 from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+    MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
     padded_multiview_flex_attention,
@@ -82,10 +83,7 @@ def test_head_and_mlp_constraints_use_checkpoint_dimensions():
 def test_ulysses_preserves_global_mask_and_strips_only_cp_padding(monkeypatch, world_size, scope, und_len):
     # 66 GEN tokens: shard boundaries cut cameras and CP4/8 need tail padding.
     layout = MultiviewLayout(
-        11,
-        33,
-        1,
-        1,
+        items=tuple(MaskItem((33, 1, 1), 11, is_control=control) for control in (True, False)),
         attention_scope=scope,
         max_und_tokens=64,
         decomposed_temporal_window_seconds=0.5,
@@ -132,7 +130,9 @@ def test_ulysses_preserves_global_mask_and_strips_only_cp_padding(monkeypatch, w
 
 
 def test_ulysses_rejects_unsharded_inputs_before_communication(monkeypatch):
-    layout = MultiviewLayout(2, 4, 1, 1, max_und_tokens=64)
+    layout = MultiviewLayout(
+        items=tuple(MaskItem((4, 1, 1), 2, is_control=control) for control in (True, False)), max_und_tokens=64
+    )
     q = torch.zeros(1, layout.gen_tokens, 4, 8)
     ku = torch.zeros(1, 3, 4, 8)
 
@@ -161,7 +161,9 @@ def _gloo_worker(rank, world_size, rendezvous, cp):
         group = groups[rank // cp]
         cp_rank = rank % cp
         torch.manual_seed(100 + rank // cp)
-        layout = MultiviewLayout(11, 33, 1, 1, max_und_tokens=64)
+        layout = MultiviewLayout(
+            items=tuple(MaskItem((33, 1, 1), 11, is_control=control) for control in (True, False)), max_und_tokens=64
+        )
         q = torch.randn(1, layout.gen_tokens, 8, 8)
         k = torch.randn(1, layout.gen_tokens, 4, 8)
         v = torch.randn_like(k)
