@@ -1959,11 +1959,12 @@ def test_invalid_lora_returns_400(test_client):
 
 def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_backends, mocker: MockerFixture):
     """Regression (merge seam): when async generation raises, the failure handler
-    must ``await _cleanup_video(video_id)`` (single-arg, async) and still record
-    FAILED. Upstream carried a sync ``_cleanup_video(video_id, output_path)`` whose
-    stale call in the generic handler sat outside the conflict markers; against the
-    PR's async storage manager that raised NameError before the FAILED update,
-    wedging the job in IN_PROGRESS and orphaning the artifact."""
+    must ``await _cleanup_video(video_id)`` (single-arg, async), remove every
+    possible output artifact, and still record FAILED. Upstream carried a sync
+    ``_cleanup_video(video_id, output_path)`` whose stale call in the generic
+    handler sat outside the conflict markers; against the PR's async storage
+    manager that raised NameError before the FAILED update, wedging the job in
+    IN_PROGRESS and orphaning the artifact."""
     _store, _tasks, storage = isolated_video_backends
     delete_spy = mocker.spy(storage, "delete")
     mocker.patch.object(
@@ -1979,7 +1980,9 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
     assert failed["error"]["code"] == 500
     assert "GPU exploded" in failed["error"]["message"]
-    delete_spy.assert_called_once_with(video_id)
+    assert delete_spy.call_count == 2
+    delete_spy.assert_any_call(video_id)
+    delete_spy.assert_any_call(f"{video_id}.lidar.safetensors")
 
 
 def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
