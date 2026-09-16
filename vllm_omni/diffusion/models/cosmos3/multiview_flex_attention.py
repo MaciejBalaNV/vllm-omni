@@ -870,39 +870,27 @@ def padded_multiview_flex_attention(
     # has consumed the previous one before the next overwrites them, so the
     # buffers are reused for the whole request instead of being re-zeroed.
     buffers = context.buffer_cache
-    if context.layout.backend == "fa4":
-        # Imported lazily: the CuTe/CUTLASS stack is an optional, Blackwell-only
-        # dependency, and this module must stay importable on CPU-only hosts.
-        from .multiview_fa4 import multiview_fa4_attention
-
-        q_padded = _pack_padded_bshd((q, geometry.padded_q_len), buffer_cache=buffers, slot="q")
-        k_all = _pack_padded_bshd(
-            (k_und, geometry.padded_und_len),
-            (k, geometry.padded_q_len),
-            buffer_cache=buffers,
-            slot="k",
-        )
-        v_all = _pack_padded_bshd(
-            (v_und, geometry.padded_und_len),
-            (v, geometry.padded_q_len),
-            buffer_cache=buffers,
-            slot="v",
-        )
-        output = multiview_fa4_attention(q_padded, k_all, v_all, plan)
-        return output[:, : geometry.real_q_len]
-
-    q_padded = _pack_padded_bhsd((q, geometry.padded_q_len), buffer_cache=buffers, slot="q")
-    k_all = _pack_padded_bhsd(
+    pack = _pack_padded_bshd if context.layout.backend == "fa4" else _pack_padded_bhsd
+    q_padded = pack((q, geometry.padded_q_len), buffer_cache=buffers, slot="q")
+    k_all = pack(
         (k_und, geometry.padded_und_len),
         (k, geometry.padded_q_len),
         buffer_cache=buffers,
         slot="k",
     )
-    v_all = _pack_padded_bhsd(
+    v_all = pack(
         (v_und, geometry.padded_und_len),
         (v, geometry.padded_q_len),
         buffer_cache=buffers,
         slot="v",
     )
+    if context.layout.backend == "fa4":
+        # Imported lazily: the CuTe/CUTLASS stack is an optional dependency for
+        # Hopper and Blackwell; this module must stay importable on CPU-only hosts.
+        from .multiview_fa4 import multiview_fa4_attention
+
+        output = multiview_fa4_attention(q_padded, k_all, v_all, plan)
+        return output[:, : geometry.real_q_len]
+
     output = flex_attention(q_padded, k_all, v_all, block_mask=plan, backend=context.layout.backend)
     return output[:, :, : geometry.real_q_len].transpose(1, 2)

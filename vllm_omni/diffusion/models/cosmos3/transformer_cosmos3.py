@@ -1533,31 +1533,6 @@ class Cosmos3VFMTransformer(nn.Module):
             return nullcontext()
         return self._model_cpu_offload_context(name)
 
-    # At hidden size 4096, each FP32 RMSNorm temporary is at most 128 MiB
-    # for the single-sample video requests served by this pipeline.
-    _output_projection_chunk_size = 8192
-
-    def _project_video_tokens(self, hidden_video: torch.Tensor) -> torch.Tensor:
-        """Normalize/project video tokens without full-sequence FP32 temporaries.
-
-        Keep the existing RMSNorm arithmetic, including its FP32 intermediates.
-        Only the smaller projected latent tokens are retained between chunks;
-        collecting normalized chunks would recreate the large hidden tensor.
-        """
-        batch, sequence_length, _ = hidden_video.shape
-        chunk_size = max(1, self._output_projection_chunk_size // batch)
-        projected = self.proj_out(self.norm_moe_gen(hidden_video[:, :chunk_size]))
-        if sequence_length <= chunk_size:
-            return projected
-
-        # Allocate from the projection result to preserve its dtype under autocast.
-        output = projected.new_empty(batch, sequence_length, projected.shape[-1])
-        output[:, :chunk_size] = projected
-        for start in range(chunk_size, sequence_length, chunk_size):
-            end = min(start + chunk_size, sequence_length)
-            output[:, start:end] = self.proj_out(self.norm_moe_gen(hidden_video[:, start:end]))
-        return output
-
     # -- Patchify / Unpatchify -----------------------------------------------
 
     def _pad_to_patch_size(self, h: int, w: int) -> tuple[int, int, int, int]:
@@ -1856,7 +1831,7 @@ class Cosmos3VFMTransformer(nn.Module):
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
         )
-        return self._gen_postprocess(self._run_gen_stack(prep, normalize=False), prep, normalized=False)
+        return self._gen_postprocess(self._run_gen_stack(prep), prep)
 
     def _gen_preprocess(
         self,
@@ -2127,27 +2102,24 @@ class Cosmos3VFMTransformer(nn.Module):
                 multi_control_weights=multi_control_weights,
             )
 
-    def _run_gen_stack(self, prep: _GenPrepared, *, normalize: bool = True) -> torch.Tensor:
-        """Include final normalization in cached residuals; defer it for chunked output otherwise."""
+    def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
+        """Execute the cacheable full-layout GEN stack, including final norm."""
         hidden_gen = self._run_gen_layers(
             prep.hidden_gen,
             use_sequence_parallel=not prep.use_multi_control_attention,
             control_token_sizes=prep.multi_control_token_sizes,
             control_weights=prep.multi_control_weights,
         )
-        return self.norm_moe_gen(hidden_gen) if normalize else hidden_gen
+        return self.norm_moe_gen(hidden_gen)
 
     def _gen_postprocess(
         self,
         hidden_gen: torch.Tensor,
         prep: _GenPrepared,
-        *,
-        normalized: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Project cached normalized states or normalize ordinary output tokens in chunks."""
-        project_video = self.proj_out if normalized else self._project_video_tokens
+        """Project an already-normalized packed GEN state to model outputs."""
         if not prep.has_action and not prep.has_sound and not prep.has_control:
-            return self.unpatchify(project_video(hidden_gen), prep.t, prep.h, prep.w)
+            return self.unpatchify(self.proj_out(hidden_gen), prep.t, prep.h, prep.w)
 
         split_sizes = []
         if prep.has_control:
@@ -2163,22 +2135,18 @@ class Cosmos3VFMTransformer(nn.Module):
             split_idx += 1
         hidden_video = split_hidden[split_idx]
         split_idx += 1
-        video_pred = self.unpatchify(project_video(hidden_video), prep.t, prep.h, prep.w)
+        video_pred = self.unpatchify(self.proj_out(hidden_video), prep.t, prep.h, prep.w)
         if prep.has_control:
             return video_pred
 
         outputs: list[torch.Tensor] = [video_pred]
         if prep.has_action:
             hidden_action = split_hidden[split_idx]
-            if not normalized:
-                hidden_action = self.norm_moe_gen(hidden_action)
             split_idx += 1
             assert prep.action_domain_ids is not None
             outputs.append(self.unpack_action(self.action_proj_out(hidden_action, prep.action_domain_ids)))
         if prep.has_sound:
             hidden_sound = split_hidden[split_idx]
-            if not normalized:
-                hidden_sound = self.norm_moe_gen(hidden_sound)
             outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
         return tuple(outputs)
 
