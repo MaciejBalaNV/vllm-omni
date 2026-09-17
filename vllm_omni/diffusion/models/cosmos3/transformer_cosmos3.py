@@ -14,8 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -1106,11 +1105,10 @@ class Cosmos3GenSPPrepare(nn.Module):
         return hidden_gen, freqs_cos, freqs_sin
 
 
-@dataclass
-class _GenPrepared:
-    """GEN inputs consumed once by the stack, plus postprocessing metadata."""
+class _GenPrepared(NamedTuple):
+    """GEN-pathway state shared by normal and cached execution."""
 
-    hidden_gen: torch.Tensor | None
+    hidden_gen: torch.Tensor
     time_embed: torch.Tensor
     t: int
     h: int
@@ -1127,14 +1125,6 @@ class _GenPrepared:
     use_multi_control_attention: bool
     multi_control_token_sizes: tuple[int, ...] | None
     multi_control_weights: tuple[float, ...] | None
-
-    def take_hidden_gen(self) -> torch.Tensor:
-        """Transfer the embedding to the stack without retaining its storage."""
-        hidden_gen = self.hidden_gen
-        if hidden_gen is None:
-            raise RuntimeError("Prepared Cosmos3 GEN inputs have already been consumed.")
-        self.hidden_gen = None
-        return hidden_gen
 
 
 class Cosmos3VFMTransformer(nn.Module):
@@ -2082,9 +2072,7 @@ class Cosmos3VFMTransformer(nn.Module):
     def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
         """Execute the cacheable full-layout GEN stack, including final norm."""
         hidden_gen = self._run_gen_layers(
-            # Pass ownership directly: a local variable here or a reference in
-            # prep would keep the full embedding alive after SP sharding.
-            prep.take_hidden_gen(),
+            prep.hidden_gen,
             s_video=prep.s_video,
             s_control=prep.s_control,
             s_action=prep.s_action,

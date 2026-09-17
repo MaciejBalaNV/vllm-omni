@@ -6,7 +6,6 @@ import weakref
 import pytest
 import torch
 from torch import nn
-from torch.multiprocessing.reductions import StorageWeakRef
 
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelConfig,
@@ -87,96 +86,6 @@ def test_cosmos3_real_sp_hook_releases_full_embedding(parallel_state, sequence_l
             shard_ref = weakref.ref(hidden)
             hidden = hidden + 1
             assert shard_ref() is None
-
-
-@pytest.mark.parametrize("sequence_length", [16, 17])
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("world_size", [1, 4])
-@pytest.mark.parametrize("grouped_layers", [False, True])
-@torch.inference_mode()
-def test_cosmos3_forward_releases_prepared_embedding(
-    monkeypatch, parallel_state, sequence_length, batch, world_size, grouped_layers
-):
-    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
-
-    parallel_state(size=world_size, rank=0)
-    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (world_size, 0, None))
-    layer_calls = []
-
-    class RecordingLayer(nn.Module):
-        def __init__(self, index):
-            super().__init__()
-            self.index = index
-
-        def forward(self, hidden, **kwargs):
-            layer_calls.append(self.index)
-            # SP releases the full allocation before the first layer. Without
-            # SP, replacing that layer's input must release it by the next one.
-            if world_size > 1 or self.index > 0:
-                assert model.full_ref() is None
-                assert model.full_storage.expired()
-            if world_size > 1 and self.index == 0:
-                assert hidden.untyped_storage().data_ptr() != model.full_pointer
-                assert hidden.untyped_storage().nbytes() == hidden.numel() * hidden.element_size()
-            hidden = hidden + self.index + 1
-            return (hidden,) if grouped_layers else hidden
-
-    class Gather(nn.Module):
-        def forward(self, hidden):
-            # Tokens are identical within each sample. Repeating rank 0's
-            # shard and trimming padding simulates the collective on CPU.
-            return hidden.repeat(1, world_size, 1)[:, :sequence_length]
-
-    class TinyCosmos3(transformer_cosmos3.Cosmos3VFMTransformer):
-        def __init__(self):
-            # Exercise the real preprocess/stack/postprocess without loading
-            # checkpoint weights, attention kernels, or distributed groups.
-            nn.Module.__init__(self)
-            self.latent_patch_size = 1
-            self.latent_channel_size = 8
-            self.timestep_scale = 1.0
-            self.time_embedder = lambda t: t.unsqueeze(1).expand(-1, 8)
-            self.proj_in = nn.Identity()
-            self.proj_out = nn.Identity()
-            self.norm_moe_gen = nn.Identity()
-            self.gen_sp_prepare = transformer_cosmos3.Cosmos3GenSPPrepare()
-            self.gen_sp_gather = Gather()
-            self.gen_layers = nn.ModuleList([RecordingLayer(0), RecordingLayer(1)])
-            # A different cache/block count selects the grouped cache-dit path.
-            self.cached_kv = [(torch.empty(0), torch.empty(0))] * (1 if grouped_layers else 2)
-            self.cached_freqs_gen = (
-                torch.ones(batch, sequence_length, 1, 2),
-                torch.zeros(batch, sequence_length, 1, 2),
-            )
-
-        def _gen_preprocess(self, *args, **kwargs):
-            prep = super()._gen_preprocess(*args, **kwargs)
-            self.full_ref = weakref.ref(prep.hidden_gen)
-            self.full_storage = StorageWeakRef(prep.hidden_gen.untyped_storage())
-            self.full_pointer = prep.hidden_gen.untyped_storage().data_ptr()
-            return prep
-
-    model = TinyCosmos3()
-    if world_size > 1:
-        apply_sequence_parallel(
-            model,
-            SequenceParallelConfig(ulysses_degree=world_size),
-            {"gen_sp_prepare": model._sp_plan["gen_sp_prepare"]},
-        )
-    video = torch.arange(batch * 8, dtype=torch.bfloat16).reshape(batch, 8, 1, 1, 1)
-    video = video.expand(-1, -1, 1, 1, sequence_length)
-    for _ in range(2):
-        with set_forward_context():
-            prediction = model(
-                hidden_states=video,
-                timestep=torch.ones(batch),
-                text_ids=torch.ones(batch, 2, dtype=torch.long),
-                text_mask=torch.ones(batch, 2, dtype=torch.long),
-                video_shape=(1, 1, sequence_length),
-            )
-        torch.testing.assert_close(prediction, video + 4, rtol=0, atol=0)
-        assert model.full_storage.expired()
-    assert layer_calls == [0, 1, 0, 1]
 
 
 @pytest.mark.parametrize("clone_shard", [False, True])
