@@ -339,26 +339,26 @@ class DuplexSessionConfig:
         ``_session_create_from_realtime``.
         """
         from vllm_omni.engine.duplex.realtime_commands import (
-            RealtimeInputDefaults,
+            DUPLEX_REALTIME_CAPABILITIES,
             duplex_response_format,
+        )
+        from vllm_omni.engine.duplex.turn_detection import normalize_turn_detection_session_payload
+        from vllm_omni.protocol.duplex import (
+            RealtimeInputDefaults,
             input_audio_transcription_config,
             json_safe_realtime_payload,
             realtime_max_output_tokens,
             realtime_overlap_fields,
-            validate_realtime_session_audio_formats,
-        )
-        from vllm_omni.engine.duplex.turn_detection import (
-            normalize_turn_detection_session_payload,
-            validate_realtime_turn_detection,
+            validate_session_payload,
         )
 
         payload: dict[str, object] = dict(session_payload)
-        format_error = validate_realtime_session_audio_formats(payload)
-        if format_error is not None:
-            raise DuplexConfigError(format_error, code="unsupported_audio_format")
-        turn_detection_error = validate_realtime_turn_detection(payload)
-        if turn_detection_error is not None:
-            raise DuplexConfigError(turn_detection_error, code="unsupported_turn_detection", param="turn_detection")
+        # One session check for every consumer (ENTRY-INV-002): the same
+        # capability object ``translate_realtime_command`` uses, so a session
+        # object is accepted or refused identically whichever door it came in.
+        rejection = validate_session_payload(payload, capabilities=DUPLEX_REALTIME_CAPABILITIES)
+        if rejection is not None:
+            raise DuplexConfigError(rejection.message, code=rejection.code, param=rejection.param)
         normalize_turn_detection_session_payload(payload)
         defaults = RealtimeInputDefaults().with_session_payload(payload)
         payload.update(realtime_overlap_fields(payload))
@@ -446,9 +446,9 @@ class DuplexSessionConfig:
         when the patch changes something a live session cannot change.
         ``audio_started`` is ``playback.generated_ms > 0 or playback.sent_ms > 0``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
+        from vllm_omni.protocol.duplex import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
-            duplex_response_format,
             input_audio_transcription_config,
             json_safe_realtime_payload,
             parse_realtime_audio_format,
@@ -629,9 +629,9 @@ class ResponseCreateOptions:
         for options a model-native duplex session cannot apply per response.
         Private runtime keys in ``extra_body`` are dropped.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.duplex.realtime_commands import duplex_response_format
+        from vllm_omni.protocol.duplex import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
-            duplex_response_format,
             parse_realtime_audio_format,
             realtime_max_output_tokens,
         )
@@ -782,14 +782,14 @@ def realtime_item_to_history_message(item: object) -> dict[str, object] | None:
 
 def realtime_max_output_tokens(value: object) -> int | None:
     """Normalize Realtime max output tokens (``"inf"`` -> ``None``)."""
-    from vllm_omni.engine.duplex.realtime_commands import realtime_max_output_tokens as _impl
+    from vllm_omni.protocol.duplex import realtime_max_output_tokens as _impl
 
     return _impl(value)
 
 
 def input_audio_transcription_config(session_payload: Mapping[str, object]) -> dict[str, object] | None:
     """Return the ``input_audio_transcription`` object of a Realtime session payload."""
-    from vllm_omni.engine.duplex.realtime_commands import input_audio_transcription_config as _impl
+    from vllm_omni.protocol.duplex import input_audio_transcription_config as _impl
 
     return _impl(session_payload)
 

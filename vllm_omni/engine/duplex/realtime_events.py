@@ -15,6 +15,12 @@ carries the input-side bookkeeping the old input translator kept (input buffer
 flags, conversation items, response-id fallbacks); the ``resolve_*`` /
 ``note_*`` helpers give the runner the same behaviour for the corresponding
 commands.
+
+What is *not* here is the model- and runtime-agnostic half of the codec ---
+audio format negotiation, conversation-item shape and truncation, transcript
+extraction, audio conversion. That lives in ``vllm_omni.protocol.realtime`` so
+a non-duplex Realtime surface can use it without the duplex session; this
+module is the duplex consumer of it (RFC #6592 P0a).
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from vllm_omni.engine.duplex.audio import convert_output_audio
 from vllm_omni.engine.duplex.commands import (
     AppendAudio,
     CancelResponse,
@@ -74,10 +79,11 @@ from vllm_omni.engine.duplex.events import (
     TranscriptDone,
     error_event,
 )
-from vllm_omni.engine.duplex.realtime_commands import (
+from vllm_omni.engine.duplex.realtime_commands import build_append_audio
+from vllm_omni.protocol.duplex import (
     RealtimeInputDefaults,
     apply_realtime_session_defaults,
-    build_append_audio,
+    convert_output_audio,
     copy_realtime_input_hints,
     input_looks_like_speech,
     input_transcript_from_item,
