@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, TypeVar
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.audio import convert_input_audio_with_rate
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
@@ -103,6 +102,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
 from vllm_omni.metrics.stats import StageRequestStats
+from vllm_omni.protocol.duplex import convert_input_audio_with_rate
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
