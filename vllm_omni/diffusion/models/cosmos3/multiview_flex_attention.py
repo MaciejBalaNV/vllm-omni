@@ -77,7 +77,7 @@ DEFAULT_MAX_UND_TOKENS = 4096 + 2
 _VALID_ATTENTION_SCOPES = frozenset({"all_views", "same_view", "decomposed"})
 
 
-MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted(_BACKEND_BLOCK_SIZES))
+MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted({*_BACKEND_BLOCK_SIZES, "maskless"}))
 
 
 def validate_multiview_backend(backend: str) -> str:
@@ -87,11 +87,20 @@ def validate_multiview_backend(backend: str) -> str:
     once a request arrives, which would otherwise defer a config typo to the
     first generation.
     """
-    if backend not in _BACKEND_BLOCK_SIZES:
+    if backend not in MULTIVIEW_BACKENDS:
         raise ValueError(
             f"Cosmos3 multiview attention backend must be one of {list(MULTIVIEW_BACKENDS)}, got {backend!r}."
         )
     return backend
+
+
+def validate_maskless_semantics(scope: str, window: float | None, control_attends_sensor: bool) -> None:
+    """Maskless folds encode different semantics from sparse visibility masks."""
+    if scope not in {"decomposed", "same_view"} or window is not None or control_attends_sensor is not True:
+        raise ValueError(
+            "Maskless attention requires scope='decomposed' or 'same_view', a null temporal window, "
+            "and control_attends_sensor=true. Re-export the matching training configuration."
+        )
 
 
 def _validate_attention_scope(attention_scope: str) -> AttentionScope:
@@ -157,11 +166,12 @@ class MultiviewLayout:
     decomposed_temporal_window_seconds: float | None = None
     control_attends_sensor: bool = False
     backend: str = "triton"
-    #: Capacity the UND stream is padded to, independent of any one prompt's
+    #: Sparse UND padding capacity (maskless uses only the admission ceiling), independent of any one prompt's
     #: length, so the compiled attention sees a single shape.  See
     #: ``DEFAULT_MAX_UND_TOKENS``.
     max_und_tokens: int = DEFAULT_MAX_UND_TOKENS
     caption_lengths: tuple[int, ...] = ()
+    lidar_attends_captions: bool = True
 
     def __post_init__(self) -> None:
         _validate_attention_scope(self.attention_scope)
@@ -193,8 +203,15 @@ class MultiviewLayout:
                 "Cosmos3 multiview control_attends_sensor must be boolean, "
                 f"got {type(self.control_attends_sensor).__name__}."
             )
+        if self.backend == "maskless":
+            validate_maskless_semantics(
+                self.attention_scope, self.decomposed_temporal_window_seconds, self.control_attends_sensor
+            )
+        if not isinstance(self.lidar_attends_captions, bool):
+            raise TypeError("Cosmos3 lidar_attends_captions must be boolean.")
         if (
-            self.attention_scope == "decomposed"
+            self.backend != "maskless"
+            and self.attention_scope == "decomposed"
             and len({item.view_offset for item in self.items}) > 1
             and self.decomposed_temporal_window_seconds is None
         ):
@@ -217,6 +234,8 @@ class MultiviewLayout:
     @property
     def block_sizes(self) -> tuple[int, int]:
         """The ``(q, kv)`` sparse block granularity this backend demands."""
+        if self.backend == "maskless":
+            raise RuntimeError("Maskless attention has no sparse block geometry; use its varlen plan.")
         return _BACKEND_BLOCK_SIZES[self.backend]
 
 
@@ -234,6 +253,7 @@ class MultiviewFlexMetadata:
     attention_scope: AttentionScope
     decomposed_temporal_window_seconds: float | None = None
     control_attends_sensor: bool = False
+    lidar_attends_captions: bool = True
 
     @property
     def kv_len(self) -> int:
@@ -283,8 +303,10 @@ class MultiviewAttentionContext:
     """Runtime wrapper that keeps the request-local caches on the transformer."""
 
     layout: MultiviewLayout
-    mask_cache: MutableMapping[tuple[Any, ...], BlockMask | MultiviewBlockSparsity]
+    mask_cache: MutableMapping[tuple[Any, ...], BlockMask | MultiviewBlockSparsity | list[torch.Tensor]]
     buffer_cache: MutableMapping[tuple[Any, ...], torch.Tensor] = field(default_factory=dict)
+    maskless_plan: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None
+    fa_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -384,6 +406,7 @@ def build_multiview_flex_metadata(
         attention_scope=layout.attention_scope,
         decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
         control_attends_sensor=layout.control_attends_sensor,
+        lidar_attends_captions=layout.lidar_attends_captions,
     )
 
 
@@ -393,6 +416,7 @@ def _make_pair_allowed(
     attention_scope: AttentionScope,
     decomposed_temporal_window_seconds: float | None,
     control_attends_sensor: bool,
+    lidar_attends_captions: bool = True,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build the exact pair predicate with tensor-only traced configuration.
 
@@ -405,6 +429,7 @@ def _make_pair_allowed(
     reaches_every_view = torch.tensor(attention_scope == "all_views", device=device)
     is_decomposed = torch.tensor(attention_scope == "decomposed", device=device)
     control_reaches_sensor = torch.tensor(control_attends_sensor, device=device)
+    lidar_reads_caption = torch.tensor(lidar_attends_captions, device=device)
     has_temporal_window = torch.tensor(decomposed_temporal_window_seconds is not None, device=device)
     temporal_window = torch.tensor(
         0.0 if decomposed_temporal_window_seconds is None else decomposed_temporal_window_seconds,
@@ -443,6 +468,7 @@ def _make_pair_allowed(
         control_to_control = q_control & k_control & same_view
         control_to_sensor = control_reaches_sensor & q_control & (~k_control) & same_view
         reads_caption = k_und & ((k_view == -1) | (q_view == -2) | same_view)
+        reads_caption = reads_caption & ((q_view != -2) | lidar_reads_caption)
         return same_sample & (
             reads_caption | (~k_und & (sensor_to_sensor | sensor_to_control | control_to_control | control_to_sensor))
         )
@@ -462,6 +488,7 @@ def multiview_pair_predicate(
         metadata.attention_scope,
         metadata.decomposed_temporal_window_seconds,
         metadata.control_attends_sensor,
+        metadata.lidar_attends_captions,
     )
     return pair_allowed(q_index, kv_index)
 
@@ -575,6 +602,7 @@ class MultiviewBlockSparsity:
             metadata.attention_scope,
             metadata.decomposed_temporal_window_seconds,
             metadata.control_attends_sensor,
+            metadata.lidar_attends_captions,
         )
 
         def mask_mod(
@@ -622,6 +650,7 @@ def build_multiview_block_sparsity(
         metadata.attention_scope,
         metadata.decomposed_temporal_window_seconds,
         metadata.control_attends_sensor,
+        metadata.lidar_attends_captions,
     )
     group_allowed = pair_allowed(q_representatives[:, None], k_representatives[None, :])
     q_presence = _block_group_presence(q_group_ids, q_block_size, q_representatives.numel())

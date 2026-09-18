@@ -34,6 +34,7 @@ classifiers = [
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
 
 [project.optional-dependencies]
+cosmos3-maskless = ["natten==0.21.6"]
 
 # V1.2 LiDAR encoder/decoder; neighborhood attention uses PyTorch FlexAttention.
 cosmos3-lidar = ["einops>=0.8.0", "safetensors>=0.4.0"]

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 transformer variant with Multiview-AV FlexAttention."""
+"""Cosmos3 transformer variant with sparse and maskless multiview attention."""
 
 from __future__ import annotations
 
@@ -11,12 +11,13 @@ import torch
 from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
 
+from .multiview_attention import multiview_attention
 from .multiview_flex_attention import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
-    padded_multiview_flex_attention,
 )
+from .multiview_maskless_attention import build_maskless_plan, load_maskless_runtime, make_merge_scratch
 from .multiview_packing import pack_state, packed_position_ids, patchify_sensor, unpack_state, unpatchify_sensor
 from .multiview_parallel import multiview_ulysses_attention
 from .transformer_cosmos3 import (
@@ -31,7 +32,7 @@ from .transformer_cosmos3 import (
 
 
 class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
-    """Use sparse rectangular attention when a multiview context is present."""
+    """Dispatch the checkpoint's attention semantics through a model-local context."""
 
     def _forward_multiview(
         self,
@@ -55,7 +56,7 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
                 q, k, v, k_und, v_und, multiview_layout, group=group, rank=rank, world_size=size
             )
         else:
-            output = padded_multiview_flex_attention(q, k, v, k_und, v_und, multiview_layout)
+            output = multiview_attention(q, k, v, k_und, v_und, multiview_layout)
         return output.reshape(q.shape[0], q.shape[1], -1)
 
 
@@ -153,9 +154,15 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             )
 
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
         od_config = kwargs.get("od_config", args[0] if args else None)
         deployment = _tf_config_get(od_config.tf_model_config, "multiview", {})
+        self._maskless_fa_version = (
+            load_maskless_runtime() if _tf_config_get(deployment, "backend", "triton") == "maskless" else 0
+        )
+        self._maskless_gqa_ratio = _tf_config_get(
+            od_config.tf_model_config, "num_attention_heads", 32
+        ) // _tf_config_get(od_config.tf_model_config, "num_key_value_heads", 8)
+        super().__init__(*args, **kwargs)
         self.lidar_config = _tf_config_get(deployment, "lidar", None)
         if self.lidar_config is not None:
             from .lidar import validate_lidar_config
@@ -235,6 +242,8 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         """
         if kwargs.get("action_latents") is not None or kwargs.get("sound_latents") is not None:
             raise ValueError("Multiview generation cannot be combined with action or sound.")
+        if multiview_layout.backend == "maskless" and hidden_states.shape[0] != 1:
+            raise ValueError("Maskless multiview transformer requires B == 1 (including each CFG branch).")
         targets = unpack_state(hidden_states, packed_shapes)
         camera = targets[0]
         has_control = control_latents is not None and len(control_latents) > 0
@@ -243,7 +252,6 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != text_ids.shape[1]:
             raise ValueError("Packed caption lengths must cover the compacted text tokens with nonempty segments.")
         layout = replace(multiview_layout, items=items, caption_lengths=lengths if len(lengths) > 1 else ())
-        context = MultiviewAttentionContext(layout, self._multiview_mask_cache, self._multiview_buffer_cache)
         if self.cached_kv is None or self.cached_freqs_gen is None:
             dummy = camera.new_empty(0)
             rotary = self.language_model.rotary_emb
@@ -277,6 +285,42 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             )
             cos, sin = rotary(dummy, position_ids=positions.unsqueeze(1).to(camera.device))
             self.cached_freqs_gen = (cos.unsqueeze(2), sin.unsqueeze(2))
+
+        context = MultiviewAttentionContext(layout, self._multiview_mask_cache, self._multiview_buffer_cache)
+        if layout.backend == "maskless":
+            cp = _get_ulysses_state()[0] if _is_sp_active() else 1
+            key = self.cached_kv[0][0]
+            kv_heads, head_dim = key.shape[2] // cp, key.shape[3]
+            query_heads = kv_heads * self._maskless_gqa_ratio
+            cache_key = (
+                "maskless",
+                layout,
+                text_ids.data_ptr(),
+                text_ids.shape[1],
+                key.device,
+                key.dtype,
+                query_heads,
+                kv_heads,
+                head_dim,
+            )
+            if cache_key not in self._multiview_mask_cache:
+                plan = build_maskless_plan(layout, text_ids.shape[1], key.device, query_heads, kv_heads, head_dim)
+                self._multiview_mask_cache[cache_key] = plan
+            scratch_key = ("maskless_merge", query_heads, head_dim, key.dtype, key.device)
+            if (*scratch_key, 0) not in self._multiview_buffer_cache:
+                for index, buffer in enumerate(make_merge_scratch(query_heads, head_dim, key.dtype, key.device)):
+                    self._multiview_buffer_cache[(*scratch_key, index)] = buffer
+            scratch = [self._multiview_buffer_cache[(*scratch_key, index)] for index in range(6)]
+            # Compact prompt-dependent dimensions cross the compiled GEN boundary
+            # as dynamic tensors; caption lengths/maxima are plan tensor data.
+            for k_und, v_und in self.cached_kv:
+                torch._dynamo.mark_dynamic(k_und, 1)
+                torch._dynamo.mark_dynamic(v_und, 1)
+            context = replace(
+                context,
+                maskless_plan=(self._multiview_mask_cache[cache_key], scratch),
+                fa_version=self._maskless_fa_version,
+            )
 
         with self._offload_context("generator"):
             streams = []

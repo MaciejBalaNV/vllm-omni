@@ -1041,14 +1041,16 @@ def test_fa4_block_map_matches_dense_token_projection() -> None:
 
 def test_backend_validation_is_reusable_and_lists_choices() -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
+        _BACKEND_BLOCK_SIZES,
         MULTIVIEW_BACKENDS,
         validate_multiview_backend,
     )
 
-    assert MULTIVIEW_BACKENDS == ("fa4", "triton")
-    assert validate_multiview_backend("fa4") == "fa4"
-    assert validate_multiview_backend("triton") == "triton"
-    with pytest.raises(ValueError, match=r"must be one of \['fa4', 'triton'\]"):
+    assert set(MULTIVIEW_BACKENDS) == set(_BACKEND_BLOCK_SIZES) | {"maskless"}
+    assert "maskless" not in _BACKEND_BLOCK_SIZES
+    for backend in MULTIVIEW_BACKENDS:
+        assert validate_multiview_backend(backend) == backend
+    with pytest.raises(ValueError, match="must be one of"):
         validate_multiview_backend("tirton")
 
 
