@@ -241,7 +241,9 @@ class DiffusionWorker:
         rank: int,
         od_config: OmniDiffusionConfig,
         skip_load_model: bool = False,
+        distributed_init_method: str | None = None,
     ):
+        self.distributed_init_method = distributed_init_method
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
@@ -301,15 +303,16 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        # Set environment variables for local distributed initialization.
+        if self.distributed_init_method is None:
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
         # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
@@ -335,7 +338,12 @@ class DiffusionWorker:
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
         ):
-            init_distributed_environment(world_size=world_size, rank=rank)
+            init_distributed_environment(
+                world_size=world_size,
+                rank=rank,
+                distributed_init_method=self.distributed_init_method or "env://",
+                local_rank=self.local_rank,
+            )
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
             parallel_config = self.od_config.parallel_config
@@ -1560,15 +1568,21 @@ class WorkerWrapperBase:
         wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        rank: int | None = None,
+        distributed_init_method: str | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
 
         Args:
-            gpu_id: GPU device ID
+            gpu_id: Local GPU device ID
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
             custom_pipeline_args: Optional arguments for custom pipeline initialization
+            rank: Global distributed rank. Defaults to ``gpu_id`` for local
+                multiprocessing.
+            distributed_init_method: Explicit rendezvous URL, or None for the
+                local launcher's environment-based rendezvous.
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
@@ -1586,9 +1600,10 @@ class WorkerWrapperBase:
         # sleep mode.
         self.worker = worker_class(
             local_rank=gpu_id,
-            rank=gpu_id,
+            rank=gpu_id if rank is None else rank,
             od_config=od_config,
             skip_load_model=(self.custom_pipeline_args is not None),
+            distributed_init_method=distributed_init_method,
         )
 
         # Re-initialize pipeline with custom pipeline if provided

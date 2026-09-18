@@ -1982,7 +1982,10 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    if len(physical_devices) < num_devices_per_stage:
+    # Ray validates cluster-wide GPU availability through its placement
+    # group. The stage driver only sees the GPUs on its own node, so a local
+    # device-count check would reject every valid multi-node configuration.
+    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"
