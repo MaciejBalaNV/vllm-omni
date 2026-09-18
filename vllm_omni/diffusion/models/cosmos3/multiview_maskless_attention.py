@@ -6,11 +6,10 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
-from importlib.metadata import version
-from inspect import signature
 from itertools import accumulate
 
 import torch
+import torch.nn.functional as F
 
 from .multiview_flex_attention import DEFAULT_MAX_UND_TOKENS, MultiviewLayout
 
@@ -22,32 +21,13 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def load_maskless_runtime() -> int:
     """Resolve and retain one FA implementation per serving worker."""
-    try:
-        import natten
-        from natten.functional import merge_attentions  # noqa: F401
-
-        installed = version("natten")
-        if installed != "0.21.6":
-            raise RuntimeError(f"found NATTEN {installed}")
-        parameters = signature(merge_attentions).parameters
-        if not {"outputs", "lse_tensors", "torch_compile", "use_autograd_fix"} <= parameters.keys():
-            raise RuntimeError("NATTEN merge_attentions has an incompatible API")
-        # Importing functional also loads the extension and detects ABI failures.
-        del natten
-    except (ImportError, OSError, RuntimeError) as exc:
-        raise RuntimeError(
-            "Cosmos3 maskless requires compatible natten==0.21.6. Install the cosmos3-maskless extra "
-            "using a wheel matching the existing PyTorch/CUDA, or build NATTEN from source; "
-            "do not downgrade PyTorch. See docs/user_guide/examples/online_serving/cosmos3_maskless.md."
-        ) from exc
     from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
 
     fa_version = resolve_vllm_flash_attn_version()
     logger.info(
-        "Cosmos3 maskless: GPU=%s FA=%s NATTEN=%s PyTorch=%s CUDA=%s",
+        "Cosmos3 maskless: GPU=%s FA=%s merge=local-fp32 PyTorch=%s CUDA=%s",
         torch.cuda.get_device_name(),
         fa_version,
-        installed,
         torch.__version__,
         torch.version.cuda,
     )
@@ -194,6 +174,35 @@ def make_merge_scratch(query_heads: int, head_dim: int, dtype: torch.dtype, devi
     ]
 
 
+def _merge_attention_outputs(outputs: list[torch.Tensor], lse_tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Merge branch contexts, including duplicate keys, in inference mode.
+
+    LSE is natural-log, FP32, and shaped [batch, tokens, heads]. Preserve the
+    sequential sigmoid/logsigmoid recurrence used by NATTEN 0.21.6, with all
+    weighting and accumulation in FP32 and only the final output cast back.
+    The caller supplies a valid first branch for every row, including padding;
+    absent later contributions have zero output and minimum-FP32 LSE.
+    """
+    if not outputs or len(outputs) != len(lse_tensors):
+        raise ValueError("Maskless merge requires matching nonempty output and LSE lists.")
+    if len(outputs) == 1:
+        return outputs[0]
+    output = outputs[0].float()
+    lse = lse_tensors[0].float()
+    for index in range(1, len(outputs)):
+        next_lse = lse_tensors[index].float()
+        weight = torch.sigmoid(next_lse - lse).unsqueeze(-1)
+        output = output - weight * (output - outputs[index].float())
+        if index + 1 < len(outputs):
+            lse = lse - F.logsigmoid(lse - next_lse)
+    return output.to(outputs[0].dtype)
+
+
+# Fixed-size scratch chunks keep prompt lengths out of the merge specialization.
+# Fullgraph prevents a silent fallback to eager elementwise GPU launches.
+_compiled_merge_attention_outputs = torch.compile(_merge_attention_outputs, fullgraph=True)
+
+
 @torch.library.custom_op("vllm_omni::cosmos3_maskless_attention", mutates_args=("scratch",))
 def maskless_attention_op(
     q: torch.Tensor,
@@ -205,8 +214,6 @@ def maskless_attention_op(
     scratch: list[torch.Tensor],
     fa_version: int,
 ) -> torch.Tensor:
-    from natten.functional import merge_attentions
-
     from vllm_omni.diffusion.attention.backends.utils.fa import vllm_flash_attn_varlen_with_lse
 
     if q.ndim != 4 or q.shape[0] != 1:
@@ -272,7 +279,7 @@ def maskless_attention_op(
                     weights[:, count:].fill_(0 if branch == 0 else torch.finfo(weights.dtype).min)
                 outputs.append(output)
                 lses.append(weights)
-            merged, _ = merge_attentions(outputs=outputs, lse_tensors=lses, use_autograd_fix=True, torch_compile=True)
+            merged = _compiled_merge_attention_outputs(outputs, lses)
             result[:, start : start + count] = merged[:, :count]
         return result
 

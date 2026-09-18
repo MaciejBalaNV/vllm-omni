@@ -22,30 +22,33 @@ caption. Every CFG branch retains batch one. Plans and merge workspace are
 model-local and reset with request caches. TP, Ulysses, CFG parallelism and HSDP
 retain the existing topology constraints (including no simultaneous TP/HSDP).
 FA is selected once per worker according to hardware and retained during serving.
-Worker logs identify GPU, FA, NATTEN, PyTorch and CUDA versions. Cross-GPU bitwise
-reproducibility is not guaranteed.
+Worker logs identify GPU, FA, the local FP32 merge, PyTorch and CUDA versions.
+Cross-GPU bitwise reproducibility is not guaranteed.
+
+Branch outputs and natural-log LSE are combined by a local compiled PyTorch
+merge. It preserves the sequential FP32 sigmoid/logsigmoid calculation and
+branch order previously supplied by NATTEN 0.21.6, casting only the final output
+back to the attention dtype. The fixed 8,192-token merge workspace bounds
+temporary memory and avoids prompt-length recompilation. A single active branch
+passes through directly. This is an inference-only merge; it does not provide
+NATTEN's custom backward for training.
 
 ## Install
 
-Use the existing supported vLLM PyTorch/CUDA environment. The optional group
-`cosmos3-maskless` pins `natten==0.21.6`, matching the reference training image.
-Install a NATTEN 0.21.6 wheel built for that exact PyTorch/CUDA environment, or
-build from source with its CUDA toolkit and build dependencies installed:
+Use the existing supported vLLM PyTorch/CUDA environment. Maskless attention
+uses vLLM's bundled FlashAttention and the local PyTorch merge; it requires no
+NATTEN installation. The `cosmos3-maskless` extra remains available as an empty
+compatibility extra for existing installation commands.
 
 ```bash
-# Matching wheel downloaded from the NATTEN distribution for this environment:
-python -m pip install --no-deps /wheels/natten-0.21.6-*.whl
-# Alternatively, compile against the currently installed PyTorch/CUDA:
-python -m pip install --no-deps --no-build-isolation --no-binary=natten natten==0.21.6
 python -m pip check
-python -c 'import torch, natten; from natten.functional import merge_attentions; print(torch.__version__, torch.version.cuda, natten.__version__)'
+python -c 'from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import load_maskless_runtime; print("FlashAttention version:", load_maskless_runtime())'
 ```
 
-Do not downgrade PyTorch to fit a wheel. Installing `.[cosmos3-maskless]` also
-expresses the dependency, but check the resolver's proposed environment changes
-before applying them. Loading a maskless transformer fails immediately if
-NATTEN is missing, has the wrong version, or its merge API/extension cannot load.
-Sparse loading does not import NATTEN.
+Loading a maskless transformer resolves an available FA2/FA3/FA4 implementation
+for the device and fails immediately if none is available. Removing the merge
+dependency does not change the attention pattern or require re-exporting an
+existing valid schema-version-2 maskless checkpoint.
 
 ## Run inference
 
@@ -98,24 +101,27 @@ Implementation base revisions (plus this working-tree update):
 
 | Repository | Base SHA |
 |---|---|
-| vllm-omni | `4ddeb4dc22cded115527a529f89229d646868874` |
+| vllm-omni | `16ce934e194025d25a652ebccba704e234fe53d2` |
 
 Before production qualification, record the final committed SHAs, completed
 checkpoint URI/iteration/checksum, resolved config, reference media checksums,
-GPU/driver, selected FA, NATTEN, PyTorch, CUDA and vLLM versions with the results.
+GPU/driver, selected FA, PyTorch, CUDA and vLLM versions with the results.
 A completed Phase 2.2 checkpoint has **not** been pinned or validated here.
 
 Local checks use macOS CPU. Runtime tests use a temporary bootstrap for unavailable
 vLLM package initialization; PyTorch tensor operations and the repository's
-attention/planning code run unchanged. CPU FlashAttention/NATTEN stand-ins are
-independent mathematical oracles, not validation of CUDA kernels. The compact
-attention boundary is tested under both Dynamo's eager backend and CPU Inductor.
+attention/planning code run unchanged. CPU FlashAttention stand-ins are
+independent mathematical oracles, not validation of CUDA kernels. The local
+FP32 merge runs unchanged, including CPU Inductor compilation, with NATTEN
+imports blocked in the attention tests. The compact attention boundary is tested
+under both Dynamo's eager backend and CPU Inductor.
 
 | Check | Status |
 |---|---|
-| Maskless float64 oracle, duplicates, mixed rates/geometries, controls, GQA, captions, indexing, batch admission, chunk tails, dynamic prompt compilation | 97 passed; 7 GPU tests skipped |
-| Packed transformer, cache reuse/reset, control-CFG removal, backend overrides | 48 selected CPU adapter tests passed |
-| Real FA/BF16 attention, standalone FP32/BF16 NATTEN merge against an independent oracle, internal merge compilation | Tests added; pending CUDA environment |
+| Maskless float64 oracle, duplicates, mixed rates/geometries, controls, GQA, captions, indexing, batch admission, chunk tails, dynamic prompt compilation, local merge | 108 passed; 16 GPU tests skipped |
+| Packed transformer, cache reuse/reset, control-CFG removal, backend overrides | Previous qualification: 48 selected CPU adapter tests passed |
+| FP32/FP16/BF16 local merge against an independent FP64 oracle, absent branches, single-branch execution, internal merge compilation | CPU passed (included above); CUDA pending |
+| Real FA2/FA3/FA4 FP16/BF16 attention with local merge | Tests parameterized over available versions; pending CUDA environment |
 | Eager/regional GEN with TP/Ulysses/CFG/HSDP, repeated requests and >8 prompt lengths | Distributed tests extended; pending GPUs |
 | Completed checkpoint conversion, offline/HTTP generation, optional LiDAR outputs | Pending checkpoint, media and GPUs |
 | 7/11-camera 480p and 6-camera 720p camera-only/joint T2V/I2V visual review, latency/memory | Pending |
@@ -127,37 +133,28 @@ Run in the installed vLLM-Omni environment:
 pytest tests/diffusion/models/cosmos3/test_multiview_maskless_attention.py \
   tests/diffusion/attention/test_fa_varlen.py
 pytest tests/diffusion/models/cosmos3/test_multiview_flex_attention.py \
+  tests/diffusion/models/cosmos3/test_multiview_fa4.py \
   tests/diffusion/models/cosmos3/test_multiview_parallel.py \
   tests/diffusion/models/cosmos3/test_cosmos3_lidar.py \
   tests/diffusion/models/cosmos3/test_cosmos3_multiview_pipeline.py
 pytest tests/diffusion/distributed/test_cosmos3_multiview_parallel.py -k maskless
 ```
 
-The attention tests use independent mathematical oracles and the installed
-FlashAttention/NATTEN kernels. GPU qualification remains pending until the
-completed Phase 2.2 checkpoint and reference media have been exercised.
+The attention tests use independent mathematical oracles, the local merge, and
+the installed FlashAttention kernels on CUDA. GPU qualification remains pending
+until the completed Phase 2.2 checkpoint and reference media have been exercised.
 
-Local execution details: Python 3.12.11; attention bootstrap PyTorch 2.12.0,
-transformer/pipeline adapter PyTorch 2.14.0; CUDA unavailable. Alongside the 97
-maskless checks, 106 existing sparse/FA4-metadata/topology checks passed, and two
-real Gloo subgroup collective checks passed outside the sandbox. The wider
-attention run skipped 41 additional CUDA-only sparse tests. Ruff lint/format
-and `git diff --check` passed for the runtime changes. These results do not
-establish NATTEN kernel, deployed serving, or production visual qualification.
+Local execution details for this replacement: Python 3.12.13, PyTorch 2.12.0,
+CUDA unavailable. The maskless, FA-version, sparse, FA4-metadata and topology
+suites passed 224 CPU checks, including two real Gloo subgroup collective tests
+rerun outside the sandbox for loopback access; 57 CUDA-only checks were skipped.
+Ruff lint/format and `git diff --check` passed. These results do not establish
+CUDA kernel, deployed serving, HSDP or production visual qualification.
 
-Review fixes: merge scratch initialization now touches only partial-chunk tails;
-resolved FA versions must be 2, 3 or 4; the custom op allocates its result in the
-caller's tensor mode before entering inference mode for its kernels. The initial review-fix
-suite passed 96 CPU checks (88 maskless plus eight FA-version cases), with seven
-GPU checks skipped. Regressions cover poisoned scratch reused across
-full/partial chunks and calls, and output tensor mode under no-grad/inference
-contexts in both eager and Inductor execution. HSDP GPU qualification is still
-pending; these changes do not claim to establish it.
-
-Further review fixes keep the two-element maxima tensors static in shape, reject
-GEN/plan token-count mismatches before attention, gather directly into merge
-scratch with in-place zeroing of excluded rows, and derive valid backend names
-from sparse registrations plus maskless. The maskless and sparse-attention suites
-passed 164 CPU checks (97 maskless, 67 sparse), with seven GPU checks
-skipped. New cases include singleton broadcasting mismatches in eager/compiled
-execution and nonfinite placeholders in excluded instant/caption contributions.
+A separate CPU comparison against the isolated NATTEN 0.21.6 Python forward
+function found identical outputs in all 12 combinations of two/three branches,
+FP32/FP16/BF16, and eager/Inductor execution on 8,192-row inputs. This comparison
+did not load the NATTEN binary extension and does not establish CUDA bitwise
+parity. Before deployment, compare the replacement with the installed reference
+merge on the same GPU and exercise each available FA version with a completed
+checkpoint.
