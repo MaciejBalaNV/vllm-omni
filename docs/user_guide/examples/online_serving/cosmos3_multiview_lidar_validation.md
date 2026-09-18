@@ -11,8 +11,7 @@ available on the validation host.
 ## Implemented coverage
 
 The two-stage exporter retains `lidar2llm`/`llm2lidar` as
-`lidar_proj_in`/`lidar_proj_out`, including biases. The exporter at imaginaire4
-`101e4f89b92beca1e99e0bca9df8a42083557d58` packages the complete reference V1.2
+`lidar_proj_in`/`lidar_proj_out`, including biases. The export packages the complete V1.2
 VAE in `lidar_vae/config.json` and `lidar_vae/diffusion_pytorch_model.safetensors`.
 The component includes coordinates, resolved architecture defaults, streaming
 settings, physical projection, encoder/decoder weights, and latent mean/std.
@@ -29,8 +28,7 @@ positions rewind to the camera origin and advance by 0.75 at the production
 rates. The packed cursor includes the furthest temporal or spatial endpoint
 for reference parity, but is inert in the current single-sample request path:
 no subsequent sample or modality consumes it.
-The numerical encoder dependency is vendored from imaginaire4 `e55e4fad16a9`;
-the decoder is ported from `9ca7bd6adfe` using identical shared blocks.
+The numerical encoder and decoder implementations use identical shared blocks.
 `lidar.return_output=true` enables numeric output through offline inference and
 asynchronous video jobs. Default requests retain RGB-only output.
 
@@ -51,7 +49,7 @@ The encoder-only results below predate decoder integration.
   deselected in the focused rerun. Ordinary pytest collection also fails because
   this host lacks vLLM; the repository virtualenv cannot start.
 - A synthetic small instance of the actual reference `TransformerVAE` was
-  exported with imaginaire4's `export_lidar_vae`, then loaded by the updated
+  exported with `export_lidar_vae`, then loaded by the updated
   vLLM-Omni encoder under a BF16 default dtype. All 58 consumed tensors matched
   the reference exactly in FP32. The check substituted synthetic tokenizer
   weights for checkpoint loading and did not execute attention kernels.
@@ -134,7 +132,7 @@ for each sensor with the sample seed, and that helper constructs a fresh NumPy
 
 ## Export the iteration-4200 checkpoint
 
-Run in the installed imaginaire4 Cosmos3 environment, from the imaginaire4 root.
+Run in the installed Cosmos3 export environment, from its repository root.
 Set these paths to the supplied checkpoint and its resolved training config;
 do not substitute a teacher-forcing experiment.
 
@@ -166,7 +164,7 @@ camera files and numeric safetensors. Both clients resolve relative local paths
 against their request file's directory.
 
 ```bash
-# In imaginaire4; chunk zero, camera conditions retained, seeds 42 through 46.
+# In the Cosmos3 preparation environment; chunk zero, conditions retained, seeds 42 through 46.
 python -m cosmos3.scripts.prepare_multiview_lidar \
   packages/cosmos3/inputs/omni_multiview/wsm_lidar_transfer_i2v.jsonl \
   --output /data/prepared/joint-i2v --limit 5 --chunk 0 --seed 42
@@ -218,7 +216,7 @@ resolution, and RGB-condition selection as the prepared requests. Keep the
 original reference LiDAR archive path. Then run:
 
 ```bash
-# In imaginaire4, against the supplied checkpoint's own configuration.
+# In the Cosmos3 reference environment, using the checkpoint's own configuration.
 python -m cosmos3.scripts.inference \
   --checkpoint-path "$COSMOS3_JOINT_DCP" --config-file "$COSMOS3_JOINT_CONFIG" \
   -i /data/reference-five-records.jsonl -o /data/results/reference-i2v \
@@ -270,7 +268,7 @@ memory, including runtime overhead and any other GPU processes. Preserve the
 server's reported stage durations and peak-memory fields when available.
 There are no numerical-similarity or performance pass thresholds.
 
-## Checks in the supported development environments
+## Checks in the supported runtime environment
 
 ```bash
 # vllm-omni
@@ -283,14 +281,7 @@ pytest tests/model_extras/test_cosmos3_multiview_uploads.py \
   tests/diffusion/models/cosmos3/test_cosmos3_gen_mlp.py \
   tests/diffusion/models/cosmos3/test_multiview_flex_attention.py
 pytest tests/entrypoints/openai_api/test_video_server.py -k 'multiview or joint_invalid'
-
-# imaginaire4
-pytest packages/cosmos3/cosmos3/scripts/multiview_export_test.py \
-  packages/cosmos3/cosmos3/scripts/prepare_multiview_lidar_test.py
 ```
-
-The cross-repository normalization check expects sibling `imaginaire4` and
-`vllm-omni` directories; it skips explicitly when the runtime checkout is absent.
 
 ## Decoder integration validation (2026-09-15)
 
@@ -383,22 +374,10 @@ at each upsampling level. The CPU operator tests use an independent FP64
 neighborhood oracle. CUDA cases exercise the compiled operator and multiple
 devices when available.
 
-Reference qualification deliberately runs as two separate processes so
-imaginaire4's NATTEN environment and vLLM-Omni's FlexAttention environment do
-not need compatible dependencies. First, activate the imaginaire4 environment
-and export a self-contained reference artifact:
-
-```bash
-python tools/validate_cosmos3_lidar_decoder.py \
-  --mode imaginaire4 \
-  --model /models/cosmos3-multiview \
-  --imaginaire-root ../imaginaire4 \
-  --frames 19 --seed 42 \
-  --artifact outputs/lidar_decoder_19f_reference.safetensors
-```
-
-Copy that artifact to the vLLM-Omni environment, activate that environment,
-and run the candidate comparison:
+Reference qualification consumes a self-contained safetensors artifact produced
+separately for the same checkpoint. It must contain the reference tensors and
+metadata expected by `tools/validate_cosmos3_lidar_decoder.py`. Copy the artifact
+to the vLLM-Omni environment and run the candidate comparison:
 
 ```bash
 python tools/validate_cosmos3_lidar_decoder.py \
@@ -408,29 +387,17 @@ python tools/validate_cosmos3_lidar_decoder.py \
   --report outputs/lidar_decoder_19f_parity.json
 ```
 
-The default synthetic case crosses the production 9-sweep chunk boundary and
-ends with a partial chunk. For chunk length 9, run positive lengths
-`--frames 1`, `8`, `9`, `10`, and `19`, and repeat with `--batch-size 2`.
+The 19-sweep synthetic case crosses the production 9-sweep chunk boundary and
+ends with a partial chunk. For chunk length 9, obtain artifacts with positive
+lengths 1, 8, 9, 10, and 19, and repeat with batch size 2.
 Use artifacts with bounded and unbounded context and symmetric/asymmetric
 decoder topology. Synthetic tensors establish execution and streaming behavior;
 they do not qualify production output quality.
 For production parity, save the generated normalized LiDAR target from the
 multiview pipeline's `final_targets[1]` to safetensors under `latents`. Save the
-prepared metric FP32 encoder input under `frames`, then create the reference in
-the imaginaire4 environment:
-
-```bash
-python tools/validate_cosmos3_lidar_decoder.py \
-  --mode imaginaire4 \
-  --model /models/cosmos3-multiview \
-  --imaginaire-root ../imaginaire4 \
-  --latents outputs/generated_lidar_latents.safetensors \
-  --encoder-input outputs/prepared_lidar_control.safetensors \
-  --production-inputs \
-  --artifact outputs/lidar_production_reference.safetensors
-```
-
-Then compare in the vLLM-Omni environment:
+prepared metric FP32 encoder input under `frames`. Obtain a reference artifact
+computed from those exact inputs and marked with `production_inputs: true`,
+then compare in the vLLM-Omni environment:
 
 ```bash
 python tools/validate_cosmos3_lidar_decoder.py \
@@ -449,7 +416,7 @@ optional smoothing in the reference artifact writer.
 
 The safetensors reference artifact contains the exact inputs, raw decoder
 outputs, validity probabilities, cropped metric outputs, optional encoder
-latents, checkpoint hashes, and imaginaire4 measurements. This makes the second
+latents, checkpoint hashes, and reference measurements. This makes the candidate
 launch independent of the reference Python environment and rejects comparison
 against different weights or configuration.
 

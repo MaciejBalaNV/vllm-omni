@@ -392,9 +392,8 @@ def test_natten_internal_compile_is_stable_and_matches_unchunked():
         assert counters["stats"]["unique_graphs"] == warmed
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires reference CUDA environment")
-def test_natten_matches_reference_wrapper():
-    reference = pytest.importorskip("imaginaire.attention")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and real NATTEN")
+def test_natten_bfloat16_merge_matches_oracle():
     from natten.functional import merge_attentions
 
     m.load_maskless_runtime()
@@ -402,7 +401,7 @@ def test_natten_matches_reference_wrapper():
     lses = [torch.randn(1, 8192, 2, device="cuda") for _ in range(3)]
     with torch.inference_mode():
         actual, _ = merge_attentions(outputs=outputs, lse_tensors=lses, torch_compile=True, use_autograd_fix=True)
-        expected, _ = reference.merge_attentions(outputs=outputs, lse_tensors=lses, torch_compile=True)
+        expected, _ = merge_oracle(outputs, lses)
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
