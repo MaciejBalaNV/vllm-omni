@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU mathematical oracles; CUDA tests exercise real FA and NATTEN separately."""
+"""Independent attention oracles, the real FP32 merge, and optional CUDA FA checks."""
 
 from __future__ import annotations
 
@@ -23,10 +23,10 @@ from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
-def merge_oracle(outputs, lse_tensors, **kwargs):
+def merge_oracle(outputs, lse_tensors):
     """Independent mathematical merge, used only in tests."""
     weights = torch.stack(lse_tensors).double().softmax(0)
-    return (torch.stack(outputs).double() * weights[..., None]).sum(0).to(outputs[0].dtype), None
+    return (torch.stack(outputs).double() * weights[..., None]).sum(0)
 
 
 def varlen_oracle(q, k, v, *, cu_seqlens_q, cu_seqlens_k, **kwargs):
@@ -45,9 +45,9 @@ def cpu_kernels(monkeypatch):
     fa = types.ModuleType("vllm_omni.diffusion.attention.backends.utils.fa")
     fa.vllm_flash_attn_varlen_with_lse = varlen_oracle
     monkeypatch.setitem(sys.modules, fa.__name__, fa)
-    natten = types.ModuleType("natten.functional")
-    natten.merge_attentions = merge_oracle
-    monkeypatch.setitem(sys.modules, natten.__name__, natten)
+    # Only FA is substituted: the production merge executes, without NATTEN.
+    monkeypatch.setitem(sys.modules, "natten", None)
+    monkeypatch.setitem(sys.modules, "natten.functional", None)
 
 
 def layout(joint=True, views=2, controls=True, **kwargs):
@@ -63,11 +63,17 @@ def layout(joint=True, views=2, controls=True, **kwargs):
     return MultiviewLayout(tuple(items), backend="maskless", control_attends_sensor=True, **kwargs)
 
 
-def tensors(spec, num_und=5, device="cpu", dtype=torch.float64):
+def tensors(spec, num_und=5, device="cpu", dtype=torch.float64, head_dim=4, kv_heads=2):
     torch.manual_seed(4)
     return [
-        torch.randn(1, n, heads, 4, device=device, dtype=dtype)
-        for n, heads in ((spec.gen_tokens, 4), (spec.gen_tokens, 2), (spec.gen_tokens, 2), (num_und, 2), (num_und, 2))
+        torch.randn(1, n, heads, head_dim, device=device, dtype=dtype)
+        for n, heads in (
+            (spec.gen_tokens, 4),
+            (spec.gen_tokens, kv_heads),
+            (spec.gen_tokens, kv_heads),
+            (num_und, kv_heads),
+            (num_und, kv_heads),
+        )
     ]
 
 
@@ -81,7 +87,7 @@ def context(spec, qkv):
 def attention_oracle(spec, qkv):
     """Enumerate token semantics independently, concatenate branch keys WITH duplicates."""
     q, k, v, ku, vu = [x[0].double() for x in qkv]
-    k, v, ku, vu = [x.repeat_interleave(2, 1) for x in (k, v, ku, vu)]
+    k, v, ku, vu = [x.repeat_interleave(q.shape[1] // k.shape[1], 1) for x in (k, v, ku, vu)]
     anchor = next(x.seconds_per_frame for x in spec.items if not x.is_lidar)
     tokens = []
     for item in spec.items:
@@ -176,6 +182,14 @@ def test_zero_caption_groups_are_removed(cpu_kernels):
     )
 
 
+@pytest.mark.parametrize("views", [1, 2])
+def test_same_view_without_captions_uses_one_branch(cpu_kernels, views):
+    spec = layout(joint=False, views=views, attention_scope="same_view")
+    qkv = tensors(spec, num_und=0)
+    actual = multiview_attention(*qkv, context(spec, qkv))
+    torch.testing.assert_close(actual, attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.parametrize(
     "joint,scope,chunk_size",
     [
@@ -196,27 +210,27 @@ def test_chunk_shapes_and_tail(cpu_kernels, monkeypatch, joint, scope, chunk_siz
         buffer.fill_(float("nan"))
     seen = []
     chunks_per_call = math.ceil(spec.gen_tokens / chunk_size)
+    merge_outputs = m._compiled_merge_attention_outputs
 
-    def merge(outputs, lse_tensors, **kwargs):
+    def merge(outputs, lse_tensors):
         chunk_index = len(seen) % chunks_per_call
         count = min(chunk_size, spec.gen_tokens - chunk_index * chunk_size)
         seen.append(outputs[0].shape[1])
         assert torch.is_inference_mode_enabled()
-        assert kwargs == {"use_autograd_fix": True, "torch_compile": True}
         assert len(outputs) == (3 if joint else 2)
         for branch, (out, lse) in enumerate(zip(outputs, lse_tensors, strict=True)):
             assert torch.isfinite(out).all() and torch.isfinite(lse).all()
             assert torch.count_nonzero(out[:, count:]) == 0
             sentinel = 0 if branch == 0 else torch.finfo(lse.dtype).min
             assert (lse[:, count:] == sentinel).all()
-        result = merge_oracle(outputs, lse_tensors)
+        result = merge_outputs(outputs, lse_tensors)
         # A later chunk/call must overwrite every row it consumes, including
         # absent contributions and dummy tail rows, regardless of stale data.
         for buffer in (*outputs, *lse_tensors):
             buffer.fill_(float("nan"))
         return result
 
-    monkeypatch.setattr(sys.modules["natten.functional"], "merge_attentions", merge)
+    monkeypatch.setattr(m, "_compiled_merge_attention_outputs", merge)
     for _ in range(2):
         actual = multiview_attention(*qkv, ctx)
         torch.testing.assert_close(actual, attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
@@ -265,49 +279,41 @@ def test_prompt_lengths_do_not_recompile(cpu_kernels, compiler_backend):
     assert counter.frame_count == 1
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA, real FlashAttention and NATTEN")
-def test_gpu_attention():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and real FlashAttention")
+@pytest.mark.parametrize("fa_version", [2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gpu_attention(fa_version, dtype, monkeypatch):
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    if not is_fa_version_supported(fa_version):
+        pytest.skip(f"FlashAttention {fa_version} is unavailable on this device")
+    monkeypatch.setitem(sys.modules, "natten", None)
+    monkeypatch.setitem(sys.modules, "natten.functional", None)
     spec = layout(caption_lengths=(2, 3))
-    qkv = tensors(spec, device="cuda", dtype=torch.bfloat16)
-    ctx = replace(context(spec, qkv), fa_version=m.load_maskless_runtime())
+    qkv = tensors(spec, device="cuda", dtype=dtype, head_dim=128, kv_heads=1)
+    ctx = replace(context(spec, qkv), fa_version=fa_version)
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
     with torch.inference_mode():
         torch.testing.assert_close(
-            multiview_attention(*qkv, ctx).double(), attention_oracle(spec, qkv), atol=1e-2, rtol=1e-2
+            multiview_attention(*qkv, ctx).double(), attention_oracle(spec, qkv), atol=tolerance, rtol=tolerance
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and real NATTEN")
-@pytest.mark.parametrize("branches", [2, 3])
-@pytest.mark.parametrize("absent", [float("-inf"), torch.finfo(torch.float32).min])
-def test_real_natten_merge(branches, absent):
-    m.load_maskless_runtime()
-    from natten.functional import merge_attentions
-
-    outputs = [torch.full((1, 8192, 2, 4), float(i + 1), device="cuda") for i in range(branches)]
-    lses = [torch.full((1, 8192, 2), math.log(i + 1), device="cuda") for i in range(branches)]
-    lses[1][:, :7] = absent
-    lses[1][:, 7:14] = -10000
-    with torch.inference_mode():
-        result, _ = merge_attentions(outputs=outputs, lse_tensors=lses, use_autograd_fix=True, torch_compile=True)
-        torch.testing.assert_close(result, merge_oracle(outputs, lses)[0], atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.parametrize("failure", ["missing", "version", "api"])
-def test_missing_or_incompatible_natten(monkeypatch, failure):
+@pytest.mark.parametrize("failure", [ImportError, RuntimeError])
+def test_unavailable_flash_attention_fails_at_load(monkeypatch, failure):
     m.load_maskless_runtime.cache_clear()
-    natten = types.ModuleType("natten")
-    functional = types.ModuleType("natten.functional")
-    functional.merge_attentions = lambda outputs, lse_tensors, torch_compile, use_autograd_fix: None
-    monkeypatch.setitem(sys.modules, "natten", natten)
-    monkeypatch.setitem(sys.modules, "natten.functional", functional)
-    monkeypatch.setattr(m, "version", lambda _: "0.21.6" if failure != "version" else "0.20.0")
-    if failure == "missing":
-        monkeypatch.setitem(sys.modules, "natten.functional", None)
-    if failure == "api":
-        functional.merge_attentions = lambda: None
-    with pytest.raises(RuntimeError, match="cosmos3-maskless extra"):
-        m.load_maskless_runtime()
-    m.load_maskless_runtime.cache_clear()
+    fa = types.ModuleType("vllm_omni.diffusion.attention.backends.utils.fa")
+
+    def unavailable():
+        raise failure("FlashAttention unavailable")
+
+    fa.resolve_vllm_flash_attn_version = unavailable
+    monkeypatch.setitem(sys.modules, fa.__name__, fa)
+    try:
+        with pytest.raises(failure, match="FlashAttention unavailable"):
+            m.load_maskless_runtime()
+    finally:
+        m.load_maskless_runtime.cache_clear()
 
 
 def test_sparse_honors_lidar_caption_disable():
@@ -356,27 +362,68 @@ def test_ulysses_maskless_trims_padding_and_preserves_batch_one(cpu_kernels, mon
         torch.testing.assert_close(result, expected[:, rank * length : (rank + 1) * length])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and real NATTEN")
-def test_natten_internal_compile_is_stable_and_matches_unchunked():
-    from natten.functional import merge_attentions
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))],
+)
+@pytest.mark.parametrize("branches", [1, 2, 3])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_merge_matches_fp64_reference(device, branches, dtype):
+    # Each serving worker has fixed head geometry/dtype. Isolate unrelated test
+    # specializations while still exercising the real compiled merge.
+    torch._dynamo.reset()
+    generator = torch.Generator(device=device).manual_seed(721)
+    outputs = [torch.randn(1, 8192, 2, 16, device=device, generator=generator).to(dtype) for _ in range(branches)]
+    lses = [torch.randn(1, 8192, 2, device=device, generator=generator) * 3 for _ in range(branches)]
+    if branches > 1:
+        # Known weighted cancellation detects casting weights/products to BF16
+        # or FP16 before the final sum. Other rows cover absent/dominant branches.
+        outputs[0][:, :1], outputs[1][:, :1] = 1, -1
+        lses[0][:, :1], lses[1][:, :1] = math.log(0.3), math.log(0.7)
+        for branch in range(1, branches):
+            outputs[branch][:, 1:15] = 0
+            lses[branch][:, 1:8] = float("-inf")
+            lses[branch][:, 8:15] = torch.finfo(torch.float32).min
+            lses[branch][:, 15:22] = -10000
+            lses[branch][:, 22:29] = 10000 if branch == 1 else -10000
+        if branches == 3:
+            outputs[2][:, :1] = 0
+            lses[2][:, :1] = torch.finfo(torch.float32).min
+    originals = [x.clone() for x in (*outputs, *lses)]
+    expected = merge_oracle(outputs, lses)
+    tolerance = {torch.float32: 1e-6, torch.float16: 1e-3, torch.bfloat16: 1e-2}[dtype]
+    with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16):
+        for merge in (m._merge_attention_outputs, m._compiled_merge_attention_outputs):
+            actual = merge(outputs, lses)
+            assert actual.dtype == dtype and torch.isfinite(actual).all()
+            torch.testing.assert_close(actual.double(), expected, atol=tolerance, rtol=tolerance)
+            if branches > 1 and dtype != torch.float32:
+                torch.testing.assert_close(actual[:, :1], expected[:, :1].to(dtype), atol=0, rtol=0)
+            if branches == 1:
+                torch.testing.assert_close(actual, outputs[0], atol=0, rtol=0)
+    for actual, original in zip((*outputs, *lses), originals, strict=True):
+        torch.testing.assert_close(actual, original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))],
+)
+def test_merge_internal_compile_is_stable_and_matches_unchunked(device):
     from torch._dynamo.utils import counters
 
-    m.load_maskless_runtime()
     torch._dynamo.reset()
     before = counters["stats"]["unique_graphs"]
-    kwargs = dict(use_autograd_fix=True, torch_compile=True)
     with torch.inference_mode():
-        warm_out = [torch.randn(1, 8192, 2, 8, device="cuda") for _ in range(3)]
-        warm_lse = [torch.randn(1, 8192, 2, device="cuda") for _ in range(3)]
-        merge_attentions(outputs=warm_out, lse_tensors=warm_lse, **kwargs)
+        warm_out = [torch.randn(1, 8192, 2, 8, device=device) for _ in range(3)]
+        warm_lse = [torch.randn(1, 8192, 2, device=device) for _ in range(3)]
+        m._compiled_merge_attention_outputs(warm_out, warm_lse)
         warmed = counters["stats"]["unique_graphs"]
         assert warmed > before
         for length in [3, 17, 29, 55, 89, 144, 233, 377, 610, 8193, 16401]:
-            outputs = [torch.randn(1, length, 2, 8, device="cuda") for _ in range(3)]
-            lses = [torch.randn(1, length, 2, device="cuda") for _ in range(3)]
-            expected, _ = merge_attentions(
-                outputs=outputs, lse_tensors=lses, use_autograd_fix=True, torch_compile=False
-            )
+            outputs = [torch.randn(1, length, 2, 8, device=device) for _ in range(3)]
+            lses = [torch.randn(1, length, 2, device=device) for _ in range(3)]
+            expected = merge_oracle(outputs, lses)
             chunks = []
             for start in range(0, length, 8192):
                 count = min(length - start, 8192)
@@ -386,23 +433,10 @@ def test_natten_internal_compile_is_stable_and_matches_unchunked():
                     warm_out[branch][:, :count] = outputs[branch][:, start : start + count]
                     warm_lse[branch][:, :count] = lses[branch][:, start : start + count]
                 warm_lse[0][:, count:] = 0
-                merged, _ = merge_attentions(outputs=warm_out, lse_tensors=warm_lse, **kwargs)
+                merged = m._compiled_merge_attention_outputs(warm_out, warm_lse)
                 chunks.append(merged[:, :count].clone())
-            torch.testing.assert_close(torch.cat(chunks, 1), expected)
+            torch.testing.assert_close(torch.cat(chunks, 1).double(), expected, atol=1e-6, rtol=1e-6)
         assert counters["stats"]["unique_graphs"] == warmed
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and real NATTEN")
-def test_natten_bfloat16_merge_matches_oracle():
-    from natten.functional import merge_attentions
-
-    m.load_maskless_runtime()
-    outputs = [torch.randn(1, 8192, 2, 16, dtype=torch.bfloat16, device="cuda") for _ in range(3)]
-    lses = [torch.randn(1, 8192, 2, device="cuda") for _ in range(3)]
-    with torch.inference_mode():
-        actual, _ = merge_attentions(outputs=outputs, lse_tensors=lses, torch_compile=True, use_autograd_fix=True)
-        expected, _ = merge_oracle(outputs, lses)
-        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 def test_float64_midpoint_boundary():
@@ -422,9 +456,6 @@ def test_float64_midpoint_boundary():
 
 def test_worker_pins_fa_selection(monkeypatch):
     m.load_maskless_runtime.cache_clear()
-    natten = types.ModuleType("natten")
-    functional = types.ModuleType("natten.functional")
-    functional.merge_attentions = lambda outputs, lse_tensors, torch_compile, use_autograd_fix: None
     fa = types.ModuleType("vllm_omni.diffusion.attention.backends.utils.fa")
     calls = []
 
@@ -433,10 +464,9 @@ def test_worker_pins_fa_selection(monkeypatch):
         return 3
 
     fa.resolve_vllm_flash_attn_version = resolve
-    monkeypatch.setitem(sys.modules, "natten", natten)
-    monkeypatch.setitem(sys.modules, "natten.functional", functional)
+    monkeypatch.setitem(sys.modules, "natten", None)
+    monkeypatch.setitem(sys.modules, "natten.functional", None)
     monkeypatch.setitem(sys.modules, fa.__name__, fa)
-    monkeypatch.setattr(m, "version", lambda _: "0.21.6")
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "test GPU")
     try:
         assert m.load_maskless_runtime() == m.load_maskless_runtime() == 3
@@ -500,16 +530,18 @@ def test_excluded_rows_zero_nonfinite_gather_placeholders(cpu_kernels, monkeypat
         calls += 1
         return out, lse
 
-    def check_merge(outputs, lse_tensors, **kwargs):
+    merge_outputs = m._compiled_merge_attention_outputs
+
+    def check_merge(outputs, lse_tensors):
         assert torch.count_nonzero(outputs[branch][0, : spec.gen_tokens][excluded]) == 0
         assert (lse_tensors[branch][0, : spec.gen_tokens][excluded] == torch.finfo(torch.float32).min).all()
-        return merge_oracle(outputs, lse_tensors)
+        return merge_outputs(outputs, lse_tensors)
 
     monkeypatch.setattr(
         sys.modules["vllm_omni.diffusion.attention.backends.utils.fa"],
         "vllm_flash_attn_varlen_with_lse",
         poison_placeholder,
     )
-    monkeypatch.setattr(sys.modules["natten.functional"], "merge_attentions", check_merge)
+    monkeypatch.setattr(m, "_compiled_merge_attention_outputs", check_merge)
     actual = multiview_attention(*qkv, ctx)
     torch.testing.assert_close(actual[:, excluded], attention_oracle(spec, qkv)[:, excluded], atol=1e-6, rtol=1e-6)
