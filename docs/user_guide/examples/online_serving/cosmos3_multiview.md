@@ -1,5 +1,8 @@
 # Cosmos3 multiview and numeric LiDAR
 
+For Phase 2.2 checkpoints, see [maskless attention setup and qualification](cosmos3_maskless.md).
+
+
 ## Multi-GPU serving
 
 Use the existing engine parallelism flags; the video API payload is unchanged:

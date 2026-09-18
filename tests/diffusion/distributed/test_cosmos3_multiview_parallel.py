@@ -40,7 +40,7 @@ SCALE_CASES = [
 ]
 
 
-def _config(case):
+def _config(case, backend="triton"):
     from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 
     cfg, cp, tp, shard, replicate = case
@@ -57,6 +57,7 @@ def _config(case):
     )
     config.tf_model_config = {
         "backbone_type": "cosmos3_multiview",
+        "multiview": {"backend": backend},
         "hidden_size": 64,
         "num_hidden_layers": 2,
         "num_attention_heads": 32,
@@ -88,8 +89,9 @@ def _pipeline(config, device):
     return pipeline
 
 
-def _denoise(pipeline, backend, request_index):
+def _denoise(pipeline, backend, request_index, prompt_length=None):
     from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem, MultiviewLayout
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import pack_state, unpack_state
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 
     # Square then portrait layouts cut across all cameras; 330 portrait GEN
@@ -106,6 +108,8 @@ def _denoise(pipeline, backend, request_index):
         mask[:, :, ::frames_per_view] = 0
         latents = mask * latents + (1 - mask) * condition
     pos_len, neg_len = 7 + request_index, 3 + request_index
+    if prompt_length is not None:
+        pos_len, neg_len = prompt_length, max(2, prompt_length - 1)
     positive = torch.arange(pos_len, device=pipeline.device).unsqueeze(0)
     negative = torch.arange(neg_len, device=pipeline.device).unsqueeze(0) + 10
     pipeline.scheduler = FlowUniPCMultistepScheduler()
@@ -115,17 +119,18 @@ def _denoise(pipeline, backend, request_index):
         lambda _module, args: und_calls.append((args[0].shape[1], args[0][0, 0].item()))
     )
     result = pipeline.diffuse(
-        latents=latents,
+        latents=pack_state([latents]),
         timesteps=pipeline.scheduler.timesteps,
         cond_ids=positive,
         cond_mask=torch.ones_like(positive),
         uncond_ids=negative,
         uncond_mask=torch.ones_like(negative),
         guidance_scale=6.0 if request_index == 0 else 1.0,
-        velocity_mask=mask,
-        condition_latents=condition,
+        velocity_mask=pack_state([mask.expand_as(latents)]),
+        condition_latents=pack_state([condition]),
         shared_kwargs={
-            "video_shape": (frames, spatial_h, spatial_w),
+            "packed_shapes": (tuple(latents.shape[1:]),),
+            "_multiview_caption_lengths": {positive.data_ptr(): (pos_len,), negative.data_ptr(): (neg_len,)},
             "fps": 30.0,
             "noisy_frame_mask": mask,
             "control_latents": [control],
@@ -136,12 +141,13 @@ def _denoise(pipeline, backend, request_index):
                 ),
                 backend=backend,
                 max_und_tokens=64,
-                decomposed_temporal_window_seconds=0.5,
+                decomposed_temporal_window_seconds=None if backend == "maskless" else 0.5,
                 control_attends_sensor=True,
             ),
         },
     )
     handle.remove()
+    result = unpack_state(result, (tuple(latents.shape[1:]),))[0]
     if request_index:
         expected_calls = [(pos_len, 0)]
     elif pipeline.od_config.parallel_config.cfg_parallel_size == 2:
@@ -187,7 +193,7 @@ def _worker(rank, world_size, port, case, backend, compile_blocks):
         init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank)
         initialize_model_parallel(data_parallel_size=world_size)
         vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
-        reference_config = _config((1, 1, 1, 0, 1))
+        reference_config = _config((1, 1, 1, 0, 1), backend)
         with (
             set_forward_context(vllm_config=vllm_config, omni_diffusion_config=reference_config),
             set_current_diffusion_config(reference_config),
@@ -211,7 +217,7 @@ def _worker(rank, world_size, port, case, backend, compile_blocks):
         destroy_model_parallel()
 
         cfg, cp, tp, shard, replicate = case
-        config = _config(case)
+        config = _config(case, backend)
         initialize_model_parallel(
             cfg_parallel_size=cfg,
             sequence_parallel_size=cp,
@@ -262,6 +268,18 @@ def _worker(rank, world_size, port, case, backend, compile_blocks):
                 dist.all_gather(gathered, actual)
                 for other in gathered:
                     torch.testing.assert_close(actual, other, atol=0, rtol=0)
+            if backend == "maskless" and compile_blocks:
+                from torch._dynamo.utils import counters
+
+                # Both GEN geometries and NATTEN branch shapes are now warm.
+                # New requests reset caches and carry unequal, compact CFG text.
+                compiled_graphs = counters["stats"]["unique_graphs"]
+                for length in range(3, 14):
+                    _denoise(pipeline, backend, 0, prompt_length=length)
+                for i in range(2):
+                    actual = _denoise(pipeline, backend, i)
+                    torch.testing.assert_close(actual.cpu(), expected[i], atol=2e-2, rtol=2e-2)
+                assert counters["stats"]["unique_graphs"] == compiled_graphs
     finally:
         destroy_distributed_env()
 
@@ -279,21 +297,21 @@ def _run(case, backend, port, compile_blocks=False):
 
 
 @pytest.mark.parametrize("case", TWO_GPU_CASES)
-@pytest.mark.parametrize("backend", ["triton", "fa4"])
+@pytest.mark.parametrize("backend", ["triton", "fa4", "maskless"])
 @hardware_test(res={"cuda": "B200"}, num_cards=2)
 def test_multiview_two_gpu_denoising(case, backend, unused_tcp_port):
     _run(case, backend, unused_tcp_port)
 
 
 @pytest.mark.parametrize("case", SCALE_CASES)
-@pytest.mark.parametrize("backend", ["triton", "fa4"])
+@pytest.mark.parametrize("backend", ["triton", "fa4", "maskless"])
 @hardware_test(res={"cuda": "B200"}, num_cards=8)
 def test_multiview_scaling_denoising(case, backend, unused_tcp_port):
     _run(case, backend, unused_tcp_port)
 
 
 @pytest.mark.parametrize("case", [(1, 2, 1, 0, 1), (2, 1, 1, 2, 1), (1, 1, 2, 0, 1)])
-@pytest.mark.parametrize("backend", ["triton", "fa4"])
+@pytest.mark.parametrize("backend", ["triton", "fa4", "maskless"])
 @hardware_test(res={"cuda": "B200"}, num_cards=2)
 def test_multiview_compiled_denoising(case, backend, unused_tcp_port):
     _run(case, backend, unused_tcp_port, compile_blocks=True)

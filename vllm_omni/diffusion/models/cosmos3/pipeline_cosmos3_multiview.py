@@ -36,6 +36,7 @@ from .multiview_flex_attention import (
     MaskItem,
     MultiviewLayout,
     expand_multiview_condition_frame_indexes,
+    validate_maskless_semantics,
     validate_multiview_backend,
 )
 from .multiview_packing import pack_state, unpack_state
@@ -428,6 +429,12 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
     if not isinstance(backend, str):
         raise TypeError("Cosmos3 multiview backend must be a string.")
     validate_multiview_backend(backend)
+    if backend == "maskless":
+        if version != 2:
+            raise ValueError("Maskless artifacts require multiview.schema_version=2; re-export the checkpoint.")
+        validate_maskless_semantics(attention_scope, temporal_window, config["control_attends_sensor"])
+    if not isinstance(config.get("lidar_attends_captions", True), bool):
+        raise TypeError("Cosmos3 multiview lidar_attends_captions must be boolean.")
     return {
         **config,
         "decomposed_temporal_window_seconds": temporal_window,
@@ -464,6 +471,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
+        resolved_backend = self._resolve_attention_backend(multiview_config)
         validate_multiview_parallel_config(
             od_config.parallel_config,
             num_attention_heads=int(_tf_config_get(od_config.tf_model_config, "num_attention_heads", 32)),
@@ -474,7 +482,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError("Cosmos3 multiview v1 does not support enable_session_state_manager.")
         super().__init__(od_config=od_config, prefix=prefix)
         if self.device.type != "cuda":
-            raise ValueError("Cosmos3 multiview v1 requires CUDA for its sparse attention backends.")
+            raise ValueError("Cosmos3 multiview v1 requires CUDA for multiview attention.")
         if not isinstance(self.transformer, Cosmos3MultiviewVFMTransformer):
             raise ValueError(
                 "Cosmos3MultiviewPipeline requires transformer/config.json backbone_type='cosmos3_multiview'."
@@ -499,26 +507,25 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self.multiview_decomposed_temporal_window_seconds = multiview_config["decomposed_temporal_window_seconds"]
         self.multiview_control_attends_sensor = multiview_config["control_attends_sensor"]
         self.multiview_align_temporal_positions_across_views = multiview_config["align_temporal_positions_across_views"]
-        self.multiview_backend = self._resolve_attention_backend(multiview_config)
+        self.multiview_backend = resolved_backend
 
     @staticmethod
     def _resolve_attention_backend(multiview_config: Mapping[str, Any]) -> str:
-        """Pick the sparse attention backend, env override winning over the checkpoint.
+        """Allow sparse kernel overrides, but never change checkpoint attention semantics.
 
-        Unlike ``attention_scope``, the backend does not change what the model
-        computes -- both backends project the same visibility predicate -- so it
-        is safe to override without editing the checkpoint.  That matters for
-        A/B measurement, which is the reason the second backend exists.
-
-        Validated here rather than in ``MultiviewLayout`` so a bad name fails at
-        load time instead of on the first generated frame.
+        Triton and FA4 implement the same sparse predicate. Maskless intentionally
+        counts overlapping branch keys twice and requires a matching checkpoint.
         """
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
         backend = override if override else _required_deployment_field(multiview_config, "backend")
         if not isinstance(backend, str):
             raise TypeError("Cosmos3 multiview attention backend must be a string.")
         try:
-            return validate_multiview_backend(backend)
+            validate_multiview_backend(backend)
+            source_backend = _required_deployment_field(multiview_config, "backend")
+            if (backend == "maskless") != (source_backend == "maskless"):
+                raise ValueError("Cannot override sparse attention with maskless or maskless with sparse attention.")
+            return backend
         except ValueError as exc:
             source = (
                 f"{COSMOS3_MULTIVIEW_BACKEND_ENV}={override!r}" if override else "transformer config multiview.backend"
@@ -888,6 +895,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             decomposed_temporal_window_seconds=self.multiview_decomposed_temporal_window_seconds,
             control_attends_sensor=self.multiview_control_attends_sensor,
             backend=self.multiview_backend,
+            lidar_attends_captions=deployment.get("lidar_attends_captions", True),
             items=tuple(items),
             max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate_captions else 1),
         )

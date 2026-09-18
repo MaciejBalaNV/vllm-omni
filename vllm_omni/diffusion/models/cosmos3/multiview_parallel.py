@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Parallel topology validation and sparse Ulysses attention for Multiview-AV."""
+"""Parallel topology validation and Ulysses attention for Multiview-AV."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from .multiview_flex_attention import MultiviewAttentionContext, padded_multiview_flex_attention
+from .multiview_attention import multiview_attention
+from .multiview_flex_attention import MultiviewAttentionContext
 
 
 def validate_multiview_parallel_config(
@@ -67,9 +68,8 @@ def multiview_ulysses_attention(
     """Attend over global tokens/local heads, then return local tokens/all heads.
 
     Inputs have shape [B, local_GEN, TP_local_heads, D]. UND K/V are replicated
-    across CP ranks, already TP-local. Sparse masks stay in global camera-major
-    coordinates. CP padding is removed before the sparse kernel's independent
-    UND/GEN block padding and restored before the inverse exchange.
+    across CP ranks, already TP-local. Plans and sparse masks stay in global camera-major coordinates. CP padding
+    is removed before dispatch and restored before the inverse exchange.
     """
     if world_size < 2 or not 0 <= rank < world_size:
         raise ValueError("Multiview Ulysses requires a valid rank in a group of at least two workers.")
@@ -94,7 +94,7 @@ def multiview_ulysses_attention(
     v_full = _all_to_all(v, group, 2, 1)
     kv_heads = k.shape[2] // world_size
     start = rank * kv_heads
-    output = padded_multiview_flex_attention(
+    output = multiview_attention(
         q_full[:, :real_len],
         k_full[:, :real_len],
         v_full[:, :real_len],

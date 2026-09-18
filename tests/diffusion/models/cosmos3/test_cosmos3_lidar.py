@@ -312,7 +312,8 @@ def test_exact_reference_camera_labels_and_mode_emphasis():
     assert "lidar" not in control_emphasis("wsm", joint=False)
 
 
-def test_packed_transformer_isolates_causal_captions_and_only_times_noisy_targets(monkeypatch):
+@pytest.mark.parametrize("backend", ["triton", "maskless"])
+def test_packed_transformer_isolates_causal_captions_and_only_times_noisy_targets(monkeypatch, backend):
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 
     model = object.__new__(Cosmos3MultiviewVFMTransformer)
@@ -326,6 +327,7 @@ def test_packed_transformer_isolates_causal_captions_and_only_times_noisy_target
     model.timestep_scale = 1
     model.cached_kv = model.cached_freqs_gen = None
     model._multiview_mask_cache, model._multiview_buffer_cache = {}, {}
+    model._maskless_gqa_ratio, model._maskless_fa_version = 1, 2
     model._offload_context = lambda _: nullcontext()
     model.gen_sp_prepare = lambda hidden, cos, sin: (hidden, cos, sin)
     model.gen_sp_gather = torch.nn.Identity()
@@ -376,9 +378,21 @@ def test_packed_transformer_isolates_causal_captions_and_only_times_noisy_target
         lidar_control_latents=torch.full_like(lidar, 2),
         noisy_frame_mask=torch.tensor([0, 1, 0, 1]).reshape(1, 1, 4, 1, 1),
         temporal_position_period=2,
-        multiview_layout=MultiviewLayout(items=items, max_und_tokens=8, decomposed_temporal_window_seconds=0.4),
+        multiview_layout=MultiviewLayout(
+            items=items,
+            max_und_tokens=8,
+            backend=backend,
+            control_attends_sensor=True,
+            decomposed_temporal_window_seconds=None if backend == "maskless" else 0.4,
+        ),
     )
+    if backend == "maskless":
+        with pytest.raises(ValueError, match="B == 1"):
+            model(**{**kwargs, "hidden_states": kwargs["hidden_states"].expand(2, -1)})
     prediction = model(**kwargs)
+    if backend == "maskless":
+        assert len(model._multiview_mask_cache) == 1
+        assert len(model._multiview_buffer_cache) == 6
     with monkeypatch.context() as patch:
         patch.setattr(
             torch.Tensor, "item", lambda *args: pytest.fail("Denoising steps must not synchronize text lengths")

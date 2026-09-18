@@ -957,3 +957,42 @@ def test_forward_uses_deployment_resolution_fps_and_emphasis_defaults(monkeypatc
     assert f"{height}x{width}" in prompts[0]
     assert prompts[0].count(control_emphasis("wsm", joint=False)) == int(overrides != "none")
     assert prompts[1] == ""
+
+
+@pytest.mark.parametrize(
+    "source,override", [("maskless", "triton"), ("maskless", "fa4"), ("triton", "maskless"), ("fa4", "maskless")]
+)
+def test_attention_override_cannot_change_semantics(monkeypatch, source, override):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKEND_ENV,
+        Cosmos3MultiviewPipeline,
+    )
+
+    monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, override)
+    with pytest.raises(ValueError, match="Cannot override sparse attention"):
+        Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": source})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("attention_scope", "all_views"), ("control_attends_sensor", False), ("decomposed_temporal_window_seconds", 0.4)],
+)
+def test_maskless_deployment_semantics(field, value):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _validated_multiview_deployment_config
+
+    config = {**_versioned_deployment_config(), "backend": "maskless"}
+    assert _validated_multiview_deployment_config(_deployment_model_config(config))["backend"] == "maskless"
+    config[field] = value
+    with pytest.raises(ValueError, match="Maskless attention requires"):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
+
+
+def test_maskless_deployment_requires_schema_two_and_boolean_caption_access():
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _validated_multiview_deployment_config
+
+    config = {**_deployment_config(), "backend": "maskless"}
+    with pytest.raises(ValueError, match="schema_version=2"):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
+    config = {**_versioned_deployment_config(), "backend": "maskless", "lidar_attends_captions": "false"}
+    with pytest.raises(TypeError, match="lidar_attends_captions"):
+        _validated_multiview_deployment_config(_deployment_model_config(config))
