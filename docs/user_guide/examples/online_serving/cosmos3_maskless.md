@@ -37,8 +37,7 @@ NATTEN's custom backward for training.
 
 Use the existing supported vLLM PyTorch/CUDA environment. Maskless attention
 uses vLLM's bundled FlashAttention and the local PyTorch merge; it requires no
-NATTEN installation. The `cosmos3-maskless` extra remains available as an empty
-compatibility extra for existing installation commands.
+NATTEN installation or additional package extra.
 
 ```bash
 python -m pip check

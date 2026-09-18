@@ -34,12 +34,6 @@ classifiers = [
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
 
 [project.optional-dependencies]
-# Compatibility extra; maskless uses bundled FlashAttention and a local PyTorch merge.
-cosmos3-maskless = []
-
-# V1.2 LiDAR encoder/decoder; neighborhood attention uses PyTorch FlexAttention.
-cosmos3-lidar = ["einops>=0.8.0", "safetensors>=0.4.0"]
-
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
