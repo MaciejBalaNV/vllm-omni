@@ -187,10 +187,10 @@ transformer setting and shared metadata field to agree. The component specifies
 `dtype="float32"` and `sample_posterior=false`. `apply_validity_mask` describes
 decoder behavior and does not change encoder input masking.
 
-Install the optional runtime dependencies in the supported CUDA environment:
+Install vLLM-Omni in the supported CUDA environment:
 
 ```bash
-uv pip install -e '.[cosmos3-lidar]'
+uv pip install -e .
 ```
 
 The encoder and decoder use PyTorch FlexAttention for spatial neighborhood

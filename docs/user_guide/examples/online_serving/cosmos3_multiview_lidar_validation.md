@@ -354,7 +354,7 @@ CPU results do not satisfy the GPU acceptance criteria.
 
 ### Run on the CUDA validation host
 
-Install the supported vLLM-Omni runtime with `.[cosmos3-lidar]`. Run:
+Install the supported vLLM-Omni runtime. Run:
 
 ```bash
 pytest tests/diffusion/models/cosmos3/test_cosmos3_lidar_decoder.py \
