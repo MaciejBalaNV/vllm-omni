@@ -53,10 +53,29 @@ def _branch(
     query_heads: int,
     kv_heads: int,
     head_dim: int,
-) -> list[torch.Tensor]:
+    dense_eligible: list[bool] | None = None,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
     q_lengths, k_lengths = [x.numel() for x in queries], [x.numel() for x in keys]
     validate_indexing(q_lengths, query_heads, head_dim)
     validate_indexing(k_lengths, kv_heads, head_dim)
+    # Reorder once on the host: equal-length camera buckets first, followed by
+    # one ragged remainder. The inverse map restores the original GEN order.
+    buckets: dict[tuple[int, int], list[int]] = {}
+    if dense_eligible is not None:
+        for index, eligible in enumerate(dense_eligible):
+            if eligible:
+                buckets.setdefault((q_lengths[index], k_lengths[index]), []).append(index)
+    dense = [indices for indices in buckets.values() if len(indices) > 1]
+    order = [index for indices in dense for index in indices]
+    selected = set(order)
+    remainder = [index for index in range(len(queries)) if index not in selected]
+    # [batch, Q length, K length]; batch=0 marks the trailing varlen call.
+    launches = [(len(indices), q_lengths[indices[0]], k_lengths[indices[0]]) for indices in dense]
+    if remainder:
+        launches.append((0, max(q_lengths[i] for i in remainder), max(k_lengths[i] for i in remainder)))
+    order.extend(remainder)
+    queries, keys = [queries[i] for i in order], [keys[i] for i in order]
+    q_lengths, k_lengths = [q_lengths[i] for i in order], [k_lengths[i] for i in order]
     empty = torch.empty(0, dtype=torch.int64, device="cpu")
     qi = torch.cat(queries) if queries else empty
     ki = torch.cat(keys) if keys else empty
@@ -64,7 +83,7 @@ def _branch(
     inverse[qi] = torch.arange(qi.numel(), device="cpu")
     # Maxima stay tensor data even when caption lengths change between requests.
     maxima = torch.tensor([max(q_lengths, default=0), max(k_lengths, default=0)], dtype=torch.int64, device="cpu")
-    return [
+    tensors = [
         qi.to(device),
         ki.to(device),
         torch.tensor([0, *accumulate(q_lengths)], dtype=torch.int32, device=device),
@@ -72,6 +91,7 @@ def _branch(
         inverse.to(device),
         maxima,
     ]
+    return tensors, torch.tensor(launches, dtype=torch.int64, device="cpu").reshape(-1, 3)
 
 
 def build_maskless_plan(
@@ -81,11 +101,16 @@ def build_maskless_plan(
     query_heads: int,
     kv_heads: int,
     head_dim: int,
+    *,
+    dense_camera_batches: bool = True,
 ) -> list[torch.Tensor]:
     """Build same-view, target-only instant and caption partitions in packed order.
 
     Sensor identity participates in grouping, so one camera plus LiDAR is two
     groups. Shared captions repeat keys per group, bounding query indexing.
+    Three six-tensor branch plans are followed by three CPU launch tables.
+    Dense schedules affect only FA4; FA2/FA3 retain one varlen call per branch.
+    ``dense_camera_batches=False`` builds the original varlen-only baseline.
     """
     if layout.backend != "maskless":
         raise ValueError("A maskless plan requires backend='maskless'.")
@@ -149,16 +174,29 @@ def build_maskless_plan(
             continue  # No zero-key sequences reach FlashAttention.
         caption_q.append(queries)
         caption_k.append(torch.arange(first, last, device="cpu"))
-    result = []
-    for queries, keys in ((views, views), (instant_groups, instant_groups), (caption_q, caption_k)):
-        branch = _branch(queries, keys, start, device, query_heads, kv_heads, head_dim)
+    result, launch_tables = [], []
+    camera_views = [not lidar for lidar, _ in groups] if dense_camera_batches else None
+    camera_instants = (
+        [True] * len(instant_groups)
+        if dense_camera_batches and not any(item.is_lidar for item in layout.items)
+        else None
+    )
+    for queries, keys, eligible in (
+        (views, views, camera_views),
+        (instant_groups, instant_groups, camera_instants),
+        (caption_q, caption_k, None),
+    ):
+        branch, launches = _branch(queries, keys, start, device, query_heads, kv_heads, head_dim, eligible)
         # Indices/offsets can change length; maxima always has shape [2]. Its
         # prompt-dependent values remain opaque tensor data with a static shape.
         for tensor in branch[:-1]:
             if tensor.numel() > 1:
                 torch._dynamo.mark_dynamic(tensor, 0)
         result.extend(branch)
-    return result
+        if launches.shape[0] > 1:
+            torch._dynamo.mark_dynamic(launches, 0)
+        launch_tables.append(launches)
+    return result + launch_tables
 
 
 def normalize_varlen_lse(lse: torch.Tensor, tokens: int, query_heads: int) -> torch.Tensor:
@@ -166,6 +204,74 @@ def normalize_varlen_lse(lse: torch.Tensor, tokens: int, query_heads: int) -> to
     if lse.ndim != 2 or lse.shape != (query_heads, tokens):
         raise ValueError(f"Expected FlashAttention LSE [heads,tokens]={query_heads, tokens}, got {tuple(lse.shape)}.")
     return lse.transpose(0, 1).unsqueeze(0).contiguous()
+
+
+def _run_attention_branch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cuq: torch.Tensor,
+    cuk: torch.Tensor,
+    maxq: int,
+    maxk: int,
+    launches: torch.Tensor,
+    fa_version: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a gathered branch, returning packed output and token-major LSE."""
+    from vllm_omni.diffusion.attention.backends.utils.fa import (
+        vllm_flash_attn4_dense_with_lse,
+        vllm_flash_attn_varlen_with_lse,
+    )
+
+    schedule = launches.tolist()  # CPU metadata; never synchronize CUDA here.
+    if fa_version != 4 or schedule[0][0] == 0:
+        out, lse = vllm_flash_attn_varlen_with_lse(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cuq,
+            cu_seqlens_k=cuk,
+            max_seqlen_q=maxq,
+            max_seqlen_k=maxk,
+            causal=False,
+            fa_version=fa_version,
+            fa_version_is_resolved=True,
+        )
+        return out, normalize_varlen_lse(lse, q.shape[0], q.shape[1])[0]
+
+    # All calls write into disjoint slices; avoid concatenating full-size
+    # attention outputs when a joint request also has a ragged LiDAR tail.
+    output = torch.empty_like(q)
+    weights = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+    q_start = k_start = sequence_start = 0
+    for batch, q_length, k_length in schedule:
+        if batch:
+            q_end, k_end = q_start + batch * q_length, k_start + batch * k_length
+            _, lse = vllm_flash_attn4_dense_with_lse(
+                q[q_start:q_end].view(batch, q_length, *q.shape[1:]),
+                k[k_start:k_end].view(batch, k_length, *k.shape[1:]),
+                v[k_start:k_end].view(batch, k_length, *v.shape[1:]),
+                out=output[q_start:q_end].view(batch, q_length, *q.shape[1:]),
+            )
+            weights[q_start:q_end].view(batch, q_length, q.shape[1]).copy_(lse.transpose(1, 2))
+            q_start, k_start = q_end, k_end
+            sequence_start += batch
+        else:
+            _, lse = vllm_flash_attn_varlen_with_lse(
+                q[q_start:],
+                k[k_start:],
+                v[k_start:],
+                cu_seqlens_q=cuq[sequence_start:] - q_start,
+                cu_seqlens_k=cuk[sequence_start:] - k_start,
+                max_seqlen_q=q_length,
+                max_seqlen_k=k_length,
+                causal=False,
+                fa_version=fa_version,
+                fa_version_is_resolved=True,
+                out=output[q_start:],
+            )
+            weights[q_start:].copy_(normalize_varlen_lse(lse, q.shape[0] - q_start, q.shape[1])[0])
+    return output, weights
 
 
 def make_merge_scratch(query_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device) -> list[torch.Tensor]:
@@ -214,8 +320,6 @@ def maskless_attention_op(
     scratch: list[torch.Tensor],
     fa_version: int,
 ) -> torch.Tensor:
-    from vllm_omni.diffusion.attention.backends.utils.fa import vllm_flash_attn_varlen_with_lse
-
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("Maskless multiview attention requires B == 1.")
     # Every branch's inverse map spans exactly the planned packed GEN stream.
@@ -247,19 +351,18 @@ def maskless_attention_op(
             validate_indexing([maxq], q.shape[2], q.shape[3])
             validate_indexing([maxk], k.shape[2], k.shape[3])
             keys, values = (k_und[0], v_und[0]) if branch == 2 else (k[0], v[0])
-            out, lse = vllm_flash_attn_varlen_with_lse(
+            out, lse = _run_attention_branch(
                 q[0].index_select(0, qi),
                 keys.index_select(0, ki),
                 values.index_select(0, ki),
-                cu_seqlens_q=cuq,
-                cu_seqlens_k=cuk,
-                max_seqlen_q=maxq,
-                max_seqlen_k=maxk,
-                causal=False,
-                fa_version=fa_version,
-                fa_version_is_resolved=True,
+                cuq,
+                cuk,
+                maxq,
+                maxk,
+                plan[18 + branch],
+                fa_version,
             )
-            branches.append((out, normalize_varlen_lse(lse, qi.numel(), q.shape[2])[0], inverse))
+            branches.append((out, lse, inverse))
         for start in range(0, q.shape[1], MERGE_CHUNK_SIZE):
             count = min(MERGE_CHUNK_SIZE, q.shape[1] - start)
             outputs, lses = [], []

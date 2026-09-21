@@ -25,6 +25,31 @@ FA is selected once per worker according to hardware and retained during serving
 Worker logs identify GPU, FA, the local FP32 merge, PyTorch and CUDA versions.
 Cross-GPU bitwise reproducibility is not guaranteed.
 
+When the worker selects FA4, equal-length camera sequences are grouped into
+dense batches. Same-view camera groups are bucketed by their exact Q/K lengths;
+camera-only instant groups can also use dense batches. Each bucket contains at
+least two sequences. Singleton groups, LiDAR groups, mixed camera/LiDAR instant
+groups and captions retain variable-length attention. Bucketing never pads
+keys or changes visibility, and overlapping view/instant keys still count twice.
+FA2 and FA3 retain variable-length execution for every pass.
+
+Dense calls use **vLLM's bundled CuTe FA4**, the same implementation as the
+variable-length path, with `[batch, sequence, heads, dim]` inputs and no
+cumulative lengths.
+FA4 chooses the kernel supported by the installed version, toolkit and GPU;
+dense dispatch does not force two-CTA execution or guarantee a speedup.
+Planning and bucket metadata remain host-side and request-cached. Dense and
+ragged calls write into slices of one branch output before the existing
+FP32 merge; no full-size output concatenation is required.
+
+The attention tests compare dense execution with the independent multiset-key
+oracle and the original varlen-only plan. Operator benchmarks can construct
+that baseline with `build_maskless_plan(..., dense_camera_batches=False)` while
+keeping `fa_version=4`. Compare warmed complete-attention latency and peak
+memory on the same GB200 setup, including CP4 and CFG2 × CP2. Floating-point
+reduction order can differ, so CUDA numerical and generation qualification is
+still required before claiming production parity or a performance gain.
+
 Branch outputs and natural-log LSE are combined by a local compiled PyTorch
 merge. It preserves the sequential FP32 sigmoid/logsigmoid calculation and
 branch order previously supplied by NATTEN 0.21.6, casting only the final output

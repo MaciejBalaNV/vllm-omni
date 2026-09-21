@@ -224,6 +224,7 @@ def vllm_flash_attn_varlen_with_lse(
     deterministic: bool = False,
     fa_version: int | None = None,
     fa_version_is_resolved: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed vLLM FlashAttention and retain LSE for post-processing."""
 
@@ -250,7 +251,47 @@ def vllm_flash_attn_varlen_with_lse(
         deterministic=deterministic,
         return_softmax_lse=True,
         fa_version=version,
+        out=out,
     )
+    return out, lse
+
+
+def vllm_flash_attn4_dense_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inference-only bundled FA4 on [batch, sequence, heads, dim], with [B,H,Q] LSE.
+
+    vLLM's public varlen wrapper requires cumulative lengths. Use the same
+    bundled CuTe entry point it calls, with genuinely dense inputs and no
+    cumulative lengths, so FA4 can select its dense kernels. This must not
+    import the independently installed ``flash_attn.cute`` package.
+    """
+    if any(tensor.ndim != 4 for tensor in (q, k, v)):
+        raise ValueError("Dense FlashAttention requires [batch, sequence, heads, dim] Q/K/V.")
+    if k.shape != v.shape or q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1]:
+        raise ValueError("Dense FlashAttention Q/K/V geometry mismatch.")
+
+    from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+
+    out, lse, _, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        num_splits=0,  # Match vLLM's automatic split selection.
+        return_lse=True,
+        out=out,
+    )
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    if lse is None or lse.shape != expected_lse_shape:
+        raise ValueError(f"Expected dense FlashAttention LSE [batch,heads,tokens]={expected_lse_shape}.")
     return out, lse
 
 

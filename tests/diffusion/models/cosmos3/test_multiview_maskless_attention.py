@@ -29,8 +29,8 @@ def merge_oracle(outputs, lse_tensors):
     return (torch.stack(outputs).double() * weights[..., None]).sum(0)
 
 
-def varlen_oracle(q, k, v, *, cu_seqlens_q, cu_seqlens_k, **kwargs):
-    out = torch.empty_like(q)
+def varlen_oracle(q, k, v, *, cu_seqlens_q, cu_seqlens_k, out=None, **kwargs):
+    out = torch.empty_like(q) if out is None else out
     lse = torch.empty(q.shape[1], q.shape[0], dtype=torch.float32, device=q.device)
     k, v = [x.repeat_interleave(q.shape[1] // k.shape[1], 1) for x in (k, v)]
     for qa, qb, ka, kb in zip(cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_k[:-1], cu_seqlens_k[1:]):
@@ -40,10 +40,22 @@ def varlen_oracle(q, k, v, *, cu_seqlens_q, cu_seqlens_k, **kwargs):
     return out, lse
 
 
+def dense_oracle(q, k, v, *, out=None, **kwargs):
+    """Independent batched GQA reference with the native dense [B,H,Q] LSE."""
+    k, v = [x.repeat_interleave(q.shape[2] // k.shape[2], 2).double() for x in (k, v)]
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.double(), k) / math.sqrt(q.shape[-1])
+    result = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v).to(q.dtype)
+    if out is not None:
+        out.copy_(result)
+        result = out
+    return result, scores.logsumexp(-1).float()
+
+
 @pytest.fixture
 def cpu_kernels(monkeypatch):
     fa = types.ModuleType("vllm_omni.diffusion.attention.backends.utils.fa")
     fa.vllm_flash_attn_varlen_with_lse = varlen_oracle
+    fa.vllm_flash_attn4_dense_with_lse = dense_oracle
     monkeypatch.setitem(sys.modules, fa.__name__, fa)
     # Only FA is substituted: the production merge executes, without NATTEN.
     monkeypatch.setitem(sys.modules, "natten", None)
@@ -63,12 +75,12 @@ def layout(joint=True, views=2, controls=True, **kwargs):
     return MultiviewLayout(tuple(items), backend="maskless", control_attends_sensor=True, **kwargs)
 
 
-def tensors(spec, num_und=5, device="cpu", dtype=torch.float64, head_dim=4, kv_heads=2):
+def tensors(spec, num_und=5, device="cpu", dtype=torch.float64, head_dim=4, kv_heads=2, query_heads=4):
     torch.manual_seed(4)
     return [
         torch.randn(1, n, heads, head_dim, device=device, dtype=dtype)
         for n, heads in (
-            (spec.gen_tokens, 4),
+            (spec.gen_tokens, query_heads),
             (spec.gen_tokens, kv_heads),
             (spec.gen_tokens, kv_heads),
             (num_und, kv_heads),
@@ -77,11 +89,13 @@ def tensors(spec, num_und=5, device="cpu", dtype=torch.float64, head_dim=4, kv_h
     ]
 
 
-def context(spec, qkv):
+def context(spec, qkv, fa_version=2, *, dense_camera_batches=True):
     q, k, _, ku, _ = qkv
-    plan = m.build_maskless_plan(spec, ku.shape[1], q.device, q.shape[2], k.shape[2], q.shape[3])
+    plan = m.build_maskless_plan(
+        spec, ku.shape[1], q.device, q.shape[2], k.shape[2], q.shape[3], dense_camera_batches=dense_camera_batches
+    )
     scratch = m.make_merge_scratch(q.shape[2], q.shape[3], q.dtype, q.device)
-    return MultiviewAttentionContext(spec, {}, {}, (plan, scratch), 2)
+    return MultiviewAttentionContext(spec, {}, {}, (plan, scratch), fa_version)
 
 
 def attention_oracle(spec, qkv):
@@ -124,8 +138,10 @@ def attention_oracle(spec, qkv):
 @pytest.mark.parametrize("scope", ["same_view", "decomposed"])
 @pytest.mark.parametrize("captions", [(), (2, 3)])
 @pytest.mark.parametrize("lidar_captions", [True, False])
+@pytest.mark.parametrize("fa_version", [2, 4])
+@pytest.mark.cpu
 def test_attention_matches_concatenated_key_oracle(
-    cpu_kernels, joint, views, controls, scope, captions, lidar_captions
+    cpu_kernels, joint, views, controls, scope, captions, lidar_captions, fa_version
 ):
     if views == 1 and captions:
         captions = (5,)
@@ -133,8 +149,77 @@ def test_attention_matches_concatenated_key_oracle(
         joint, views, controls, attention_scope=scope, caption_lengths=captions, lidar_attends_captions=lidar_captions
     )
     qkv = tensors(spec)
-    actual = multiview_attention(*qkv, context(spec, qkv))
+    actual = multiview_attention(*qkv, context(spec, qkv, fa_version))
     torch.testing.assert_close(actual, attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
+
+
+def test_dense_camera_buckets_restore_order_and_keep_lidar_ragged(cpu_kernels, monkeypatch):
+    # Two interleaved camera buckets, a singleton camera, and a LiDAR group
+    # whose length matches a camera bucket but must stay in the ragged tail.
+    sizes = (2, 3, 2, 4, 3, 2)
+    spec = MultiviewLayout(
+        tuple(MaskItem((1, 1, size), 1, view_offset=view, is_lidar=view == 5) for view, size in enumerate(sizes)),
+        backend="maskless",
+        control_attends_sensor=True,
+        caption_lengths=(1, 0, 2, 1, 1),
+    )
+    qkv = tensors(spec)
+    dense_calls, ragged_calls = [], []
+
+    def dense(q, k, v, **kwargs):
+        dense_calls.append((q.shape, kwargs["out"].untyped_storage().data_ptr()))
+        return dense_oracle(q, k, v, **kwargs)
+
+    def ragged(q, k, v, **kwargs):
+        ragged_calls.append((kwargs["cu_seqlens_q"].tolist(), kwargs.get("out")))
+        return varlen_oracle(q, k, v, **kwargs)
+
+    module = sys.modules["vllm_omni.diffusion.attention.backends.utils.fa"]
+    monkeypatch.setattr(module, "vllm_flash_attn4_dense_with_lse", dense)
+    monkeypatch.setattr(module, "vllm_flash_attn_varlen_with_lse", ragged)
+    actual = multiview_attention(*qkv, context(spec, qkv, 4))
+    torch.testing.assert_close(actual, attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
+    assert [shape[:2] for shape, _ in dense_calls] == [(2, 2), (2, 3)]
+    assert ragged_calls[0][0] == [0, 4, 6]
+    # Dense and ragged portions write into one branch output, without a cat.
+    assert dense_calls[0][1] == dense_calls[1][1] == ragged_calls[0][1].untyped_storage().data_ptr()
+    baseline = multiview_attention(*qkv, context(spec, qkv, 4, dense_camera_batches=False))
+    torch.testing.assert_close(actual, baseline, atol=1e-6, rtol=1e-6)
+
+
+def test_camera_only_view_and_instant_dense_batches(cpu_kernels, monkeypatch):
+    spec = layout(joint=False, views=3)
+    qkv = tensors(spec)
+    calls = []
+
+    def dense(q, k, v, **kwargs):
+        calls.append(q.shape[:2])
+        return dense_oracle(q, k, v, **kwargs)
+
+    monkeypatch.setattr(
+        sys.modules["vllm_omni.diffusion.attention.backends.utils.fa"], "vllm_flash_attn4_dense_with_lse", dense
+    )
+    actual = multiview_attention(*qkv, context(spec, qkv, 4))
+    # Each view contains control+target tokens; only targets enter instants.
+    assert calls == [(3, 8), (2, 6)]
+    torch.testing.assert_close(actual, attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("fa_version,dense_camera_batches", [(2, True), (3, True), (4, False)])
+def test_varlen_execution_is_retained(cpu_kernels, monkeypatch, fa_version, dense_camera_batches):
+    spec = layout(joint=False)
+    qkv = tensors(spec)
+
+    def unexpected_dense(*args, **kwargs):
+        pytest.fail("Dense FA4 must not run for this execution policy")
+
+    monkeypatch.setattr(
+        sys.modules["vllm_omni.diffusion.attention.backends.utils.fa"],
+        "vllm_flash_attn4_dense_with_lse",
+        unexpected_dense,
+    )
+    ctx = context(spec, qkv, fa_version, dense_camera_batches=dense_camera_batches)
+    torch.testing.assert_close(multiview_attention(*qkv, ctx), attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
 
 
 def test_backend_geometry_and_semantics():
@@ -183,10 +268,11 @@ def test_zero_caption_groups_are_removed(cpu_kernels):
 
 
 @pytest.mark.parametrize("views", [1, 2])
-def test_same_view_without_captions_uses_one_branch(cpu_kernels, views):
+@pytest.mark.parametrize("fa_version", [2, 4])
+def test_same_view_without_captions_uses_one_branch(cpu_kernels, views, fa_version):
     spec = layout(joint=False, views=views, attention_scope="same_view")
     qkv = tensors(spec, num_und=0)
-    actual = multiview_attention(*qkv, context(spec, qkv))
+    actual = multiview_attention(*qkv, context(spec, qkv, fa_version))
     torch.testing.assert_close(actual, attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
 
 
@@ -199,13 +285,14 @@ def test_same_view_without_captions_uses_one_branch(cpu_kernels, views):
         (True, "decomposed", 11),
     ],
 )
-def test_chunk_shapes_and_tail(cpu_kernels, monkeypatch, joint, scope, chunk_size):
+@pytest.mark.parametrize("fa_version", [2, 4])
+def test_chunk_shapes_and_tail(cpu_kernels, monkeypatch, joint, scope, chunk_size, fa_version):
     spec = layout(joint=joint, controls=joint, attention_scope=scope)
     qkv = tensors(spec)
     # Force multiple chunks cheaply; production constant is checked separately.
     assert m.MERGE_CHUNK_SIZE == 8192
     monkeypatch.setattr(m, "MERGE_CHUNK_SIZE", chunk_size)
-    ctx = context(spec, qkv)
+    ctx = context(spec, qkv, fa_version)
     for buffer in ctx.maskless_plan[1]:
         buffer.fill_(float("nan"))
     seen = []
@@ -239,10 +326,11 @@ def test_chunk_shapes_and_tail(cpu_kernels, monkeypatch, joint, scope, chunk_siz
 
 @pytest.mark.parametrize("inference", [False, True])
 @pytest.mark.parametrize("compiled", [False, True])
-def test_output_preserves_callers_tensor_mode(cpu_kernels, inference, compiled):
+@pytest.mark.parametrize("fa_version", [2, 4])
+def test_output_preserves_callers_tensor_mode(cpu_kernels, inference, compiled, fa_version):
     spec = layout()
     qkv = tensors(spec)
-    ctx = context(spec, qkv)
+    ctx = context(spec, qkv, fa_version)
     attention = (
         torch.compile(multiview_attention, backend="inductor", fullgraph=True) if compiled else multiview_attention
     )
@@ -256,7 +344,8 @@ def test_output_preserves_callers_tensor_mode(cpu_kernels, inference, compiled):
 
 
 @pytest.mark.parametrize("compiler_backend", ["eager", "inductor"])
-def test_prompt_lengths_do_not_recompile(cpu_kernels, compiler_backend):
+@pytest.mark.parametrize("fa_version", [2, 4])
+def test_prompt_lengths_do_not_recompile(cpu_kernels, compiler_backend, fa_version):
     from torch._dynamo.testing import CompileCounterWithBackend
 
     torch._dynamo.reset()
@@ -274,7 +363,7 @@ def test_prompt_lengths_do_not_recompile(cpu_kernels, compiler_backend):
                 qkv = tensors(spec, branch_length)
                 for t in qkv[3:]:
                     torch._dynamo.mark_dynamic(t, 1)
-                ctx = context(spec, qkv)  # Request cache reset, unequal CFG lengths.
+                ctx = context(spec, qkv, fa_version)  # Request cache reset, unequal CFG lengths.
                 torch.testing.assert_close(compiled(*qkv, ctx), attention_oracle(spec, qkv), atol=1e-6, rtol=1e-6)
     assert counter.frame_count == 1
 
@@ -282,21 +371,24 @@ def test_prompt_lengths_do_not_recompile(cpu_kernels, compiler_backend):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and real FlashAttention")
 @pytest.mark.parametrize("fa_version", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_gpu_attention(fa_version, dtype, monkeypatch):
+@pytest.mark.parametrize("joint", [False, True])
+def test_gpu_attention(fa_version, dtype, joint, monkeypatch):
     from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
 
     if not is_fa_version_supported(fa_version):
         pytest.skip(f"FlashAttention {fa_version} is unavailable on this device")
     monkeypatch.setitem(sys.modules, "natten", None)
     monkeypatch.setitem(sys.modules, "natten.functional", None)
-    spec = layout(caption_lengths=(2, 3))
+    spec = layout(joint=joint, caption_lengths=(2, 3))
     qkv = tensors(spec, device="cuda", dtype=dtype, head_dim=128, kv_heads=1)
     ctx = replace(context(spec, qkv), fa_version=fa_version)
     tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
     with torch.inference_mode():
-        torch.testing.assert_close(
-            multiview_attention(*qkv, ctx).double(), attention_oracle(spec, qkv), atol=tolerance, rtol=tolerance
-        )
+        actual = multiview_attention(*qkv, ctx)
+        torch.testing.assert_close(actual.double(), attention_oracle(spec, qkv), atol=tolerance, rtol=tolerance)
+        if fa_version == 4:
+            baseline = multiview_attention(*qkv, context(spec, qkv, 4, dense_camera_batches=False))
+            torch.testing.assert_close(actual, baseline, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.parametrize("failure", [ImportError, RuntimeError])
@@ -332,13 +424,15 @@ def test_sparse_honors_lidar_caption_disable():
     assert not multiview_pair_predicate(metadata, torch.tensor(16), torch.tensor(0))
 
 
-def test_ulysses_maskless_trims_padding_and_preserves_batch_one(cpu_kernels, monkeypatch):
+@pytest.mark.parametrize("fa_version", [2, 4])
+@pytest.mark.parametrize("views", [1, 2])
+@pytest.mark.parametrize("cp", [2, 4])
+def test_ulysses_maskless_trims_padding_and_preserves_batch_one(cpu_kernels, monkeypatch, fa_version, views, cp):
     from vllm_omni.diffusion.models.cosmos3 import multiview_parallel as parallel
 
-    spec = layout(views=1)
-    qkv = tensors(spec)
+    spec = layout(views=views, controls=False)
+    qkv = tensors(spec, query_heads=32, kv_heads=8)
     q, k, v, ku, vu = qkv
-    cp = 2
     length = (spec.gen_tokens + cp - 1) // cp
     padded = [torch.nn.functional.pad(x, (0, 0, 0, 0, 0, length * cp - x.shape[1])) for x in (q, k, v)]
     for rank in range(cp):
@@ -354,8 +448,9 @@ def test_ulysses_maskless_trims_padding_and_preserves_batch_one(cpu_kernels, mon
 
         monkeypatch.setattr(parallel, "_all_to_all", exchange)
         local_qkv = [x[:, rank * length : (rank + 1) * length] for x in padded] + [ku, vu]
-        head_qkv = [x[:, : spec.gen_tokens] for x in full] + [ku[:, :, rank : rank + 1], vu[:, :, rank : rank + 1]]
-        ctx = context(spec, head_qkv)
+        kv_start, kv_end = rank * k.shape[2] // cp, (rank + 1) * k.shape[2] // cp
+        head_qkv = [x[:, : spec.gen_tokens] for x in full] + [ku[:, :, kv_start:kv_end], vu[:, :, kv_start:kv_end]]
+        ctx = context(spec, head_qkv, fa_version)
         result = parallel.multiview_ulysses_attention(*local_qkv, ctx, group=object(), rank=rank, world_size=cp)
         expected = multiview_attention(*head_qkv, ctx)
         expected = torch.nn.functional.pad(expected, (0, 0, 0, 0, 0, length * cp - spec.gen_tokens))
