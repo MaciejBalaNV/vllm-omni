@@ -50,9 +50,10 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
     from vllm_omni.diffusion.distributed import hsdp
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3, transformer_cosmos3_edge
+    from vllm_omni.platforms import current_omni_platform
 
-    torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
+    current_omni_platform.set_device(device)
     dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=120))
     try:
         with ExitStack() as stack:
