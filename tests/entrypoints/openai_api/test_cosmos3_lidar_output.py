@@ -526,7 +526,7 @@ def test_sync_lidar_rejection_cleans_uploaded_files(storage, tmp_path):
     path.write_bytes(b"upload")
     handler = SimpleNamespace(generate_video_bytes=AsyncMock())
     request = VideoGenerationRequest(prompt="drive", extra_params={"lidar": {"return_output": True}})
-    ctx = (request, handler, "cosmos3", None, None, None, None, helpers.VideoUploadResources([str(path)]))
+    ctx = (request, handler, "cosmos3", None, None, None, None, helpers.VideoUploadResources([str(path)]), None)
 
     async def check():
         with pytest.raises(HTTPException) as error:
