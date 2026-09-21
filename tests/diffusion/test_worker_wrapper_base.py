@@ -587,7 +587,7 @@ def test_worker_rendezvous_preserves_local_device_rank(
 
     from vllm_omni.diffusion.worker import diffusion_worker as worker_module
 
-    class ReachedRendezvous(Exception):
+    class ReachedRendezvousError(Exception):
         pass
 
     worker = object.__new__(DiffusionWorker)
@@ -598,7 +598,7 @@ def test_worker_rendezvous_preserves_local_device_rank(
     config = SimpleNamespace(kernel_config=SimpleNamespace(ir_op_priority=None))
     platform = Mock()
     platform.get_torch_device.return_value = "cuda:0"
-    rendezvous = Mock(side_effect=ReachedRendezvous)
+    rendezvous = Mock(side_effect=ReachedRendezvousError)
     monkeypatch.setenv("MASTER_ADDR", "unrelated-host")
     monkeypatch.setenv("MASTER_PORT", "9999")
     # Restore these variables after init_device publishes the worker identity.
@@ -611,7 +611,7 @@ def test_worker_rendezvous_preserves_local_device_rank(
     monkeypatch.setattr(worker_module, "set_current_vllm_config", lambda config: nullcontext())
     monkeypatch.setattr(worker_module, "init_distributed_environment", rendezvous)
 
-    with pytest.raises(ReachedRendezvous):
+    with pytest.raises(ReachedRendezvousError):
         worker.init_device()
 
     rendezvous.assert_called_once_with(
