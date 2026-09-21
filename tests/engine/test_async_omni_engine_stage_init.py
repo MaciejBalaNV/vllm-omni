@@ -68,6 +68,31 @@ def test_stage_runtime_env_accepts_typed_runtime_config(monkeypatch):
     assert env_key not in os.environ
 
 
+@pytest.mark.parametrize("typed", [False, True])
+def test_build_ray_diffusion_config_preserves_explicit_stage_env(monkeypatch, typed):
+    from vllm_omni.engine import stage_init_utils as init_mod
+
+    env = {"CUSTOM_PLUGIN_SETTING": "stage", "OMP_NUM_THREADS": 2}
+    runtime_cfg = OmniStageRuntimeConfig(env=env) if typed else {"env": env}
+    metadata = types.SimpleNamespace(runtime_cfg=runtime_cfg, stage_id=1, cfg_kv_collect_func=None)
+    config = types.SimpleNamespace(
+        distributed_executor_backend="ray", parallel_config=types.SimpleNamespace(world_size=2)
+    )
+    monkeypatch.setattr(init_mod, "build_engine_args_dict", lambda *args: {})
+    monkeypatch.setattr(init_mod.OmniDiffusionConfig, "from_kwargs", lambda **kwargs: config)
+    monkeypatch.setattr(
+        init_mod,
+        "current_omni_platform",
+        types.SimpleNamespace(device_control_env_var=None, get_device_count=lambda: 0),
+    )
+
+    result = init_mod.build_diffusion_config("model", {}, metadata)
+
+    assert result.ray_worker_env == {"CUSTOM_PLUGIN_SETTING": "stage", "OMP_NUM_THREADS": "2"}
+    assert result.num_gpus == 2
+    assert env["OMP_NUM_THREADS"] == 2
+
+
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
     engine = object.__new__(AsyncOmniEngine)
     engine.orchestrator_thread = types.SimpleNamespace(is_alive=lambda: True)

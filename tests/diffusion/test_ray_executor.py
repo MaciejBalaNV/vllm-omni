@@ -15,6 +15,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def test_cross_node_workers_get_global_rank_and_explicit_rendezvous(monkeypatch):
+    monkeypatch.setenv("NCCL_SOCKET_IFNAME", "eth-test")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,4,5")
     actors = []
     for ip in ["10.0.0.2", "10.0.0.1", "10.0.0.2"]:
         actor = Mock()
@@ -30,18 +32,54 @@ def test_cross_node_workers_get_global_rank_and_explicit_rendezvous(monkeypatch)
     monkeypatch.setattr(ray_module, "get_ip", lambda: "10.0.0.1")
     monkeypatch.setattr(ray_module, "PlacementGroupSchedulingStrategy", Mock())
     executor = object.__new__(ray_module.RayDiffusionExecutor)
-    executor.od_config = SimpleNamespace(num_gpus=3)
+    executor.od_config = SimpleNamespace(num_gpus=3, ray_worker_env={"CUSTOM_PLUGIN_SETTING": "enabled"})
     executor.workers = []
     executor._init_workers(object())
     assert fake_ray.remote.call_args.kwargs["max_concurrency"] == 1
     assert fake_ray.remote.call_args.kwargs["concurrency_groups"] == {"health": 1}
+    worker_env = fake_ray.remote.call_args.kwargs["runtime_env"]["env_vars"]
+    assert worker_env["NCCL_SOCKET_IFNAME"] == "eth-test"
+    assert worker_env["CUSTOM_PLUGIN_SETTING"] == "enabled"
+    assert "CUDA_VISIBLE_DEVICES" not in worker_env
     assert len(fake_ray.get.call_args_list) == 3
     assert all(call.kwargs["timeout"] == ray_module._WORKER_INIT_TIMEOUT_S for call in fake_ray.get.call_args_list)
     assert [worker.ip for worker in executor.workers] == ["10.0.0.1", "10.0.0.2", "10.0.0.2"]
     for rank, metadata in enumerate(executor.workers):
-        metadata.worker.init_worker.remote.assert_called_once_with(
-            executor.od_config, rank, "tcp://10.0.0.1:23456"
-        )
+        metadata.worker.init_worker.remote.assert_called_once_with(executor.od_config, rank, "tcp://10.0.0.1:23456")
+
+
+def test_worker_env_forwards_stage_overrides_without_driver_identity(monkeypatch):
+    from unittest.mock import patch
+
+    driver_env = {
+        "HF_TOKEN": "test-token",
+        "VLLM_PLUGINS": "test-plugin",
+        "NCCL_DEBUG": "WARN",
+        "DIFFUSION_ATTENTION_BACKEND": "FLASH_ATTN",
+        "PYTHONPATH": "/test/modules",
+        "UNRELATED_SECRET": "do-not-copy",
+        "HOME": "/driver/home",
+    }
+    protected = {
+        "CUDA_VISIBLE_DEVICES": "7",
+        "VLLM_HOST_IP": "10.0.0.1",
+        "VLLM_HOST_PORT": "1234",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "10.0.0.1",
+        "LOCAL_RANK": "7",
+        "RANK": "7",
+        "WORLD_SIZE": "8",
+        "MASTER_ADDR": "driver-host",
+        "MASTER_PORT": "1234",
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+    }
+    config = SimpleNamespace(ray_worker_env={**protected, "NCCL_DEBUG": "INFO", "CUSTOM_PLUGIN_SETTING": "stage"})
+    with patch.dict(ray_module.os.environ, {**driver_env, **protected}, clear=True):
+        env = ray_module._worker_env(config)
+        assert env == {key: value for key, value in driver_env.items() if key not in {"UNRELATED_SECRET", "HOME"}} | {
+            "NCCL_DEBUG": "INFO",
+            "CUSTOM_PLUGIN_SETTING": "stage",
+        }
+        assert ray_module.os.environ["NCCL_DEBUG"] == "WARN"
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -85,6 +123,48 @@ def test_shutdown_preserves_borrowed_placement_group(monkeypatch):
     monkeypatch.setattr(ray_module, "ray", fake_ray)
     ray_module._RayExecutorResources([], object(), False)()
     fake_ray.util.remove_placement_group.assert_not_called()
+
+
+@pytest.mark.parametrize("failure_kind", ["GetTimeoutError", "RayActorError", "RayTaskError"])
+@pytest.mark.parametrize("output_rank", [None, 0])
+def test_rpc_failure_kills_peers_and_rejects_subsequent_work(monkeypatch, failure_kind, output_rank):
+    fake_ray = Mock()
+    fake_ray.exceptions = SimpleNamespace(
+        **{name: type(name, (Exception,), {}) for name in ("GetTimeoutError", "RayActorError", "RayTaskError")}
+    )
+    failure = getattr(fake_ray.exceptions, failure_kind)("rank failed while peers are still running")
+    fake_ray.get.side_effect = failure
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    group = object()
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    callback = Mock()
+    executor._failure_callbacks = [callback]
+    executor.workers = [ray_module._RayWorkerMetadata(actor, rank=rank) for rank, actor in enumerate(actors)]
+    executor._finalizer = ray_module._RayExecutorResources(executor.workers, group, True)
+
+    expected_error = TimeoutError if failure_kind == "GetTimeoutError" else ray_module.EngineDeadError
+    with pytest.raises(expected_error) as raised:
+        executor.collective_rpc("execute_model", unique_reply_rank=output_rank, exec_all_ranks=True)
+
+    assert raised.value.__cause__ is failure
+    assert executor.is_dead
+    assert executor._is_failed
+    assert executor._closed
+    callback.assert_called_once_with()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+
+    with pytest.raises(RuntimeError, match="closed"):
+        executor.collective_rpc("execute_model", unique_reply_rank=output_rank, exec_all_ranks=True)
+    for actor in actors:
+        actor.execute_rpc.remote.assert_called_once()
+    fake_ray.get.assert_called_once()
+    executor.shutdown()
+    assert fake_ray.kill.call_count == len(actors)
+    callback.assert_called_once_with()
 
 
 def test_actor_death_during_shutdown_does_not_report_failure():

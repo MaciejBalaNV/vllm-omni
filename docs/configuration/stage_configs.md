@@ -93,6 +93,13 @@ The executor reuses Ray when already initialized; otherwise it calls
 `RAY_ADDRESS`. There is no diffusion-specific address setting. Ray must be
 installed on every node.
 
+Ray diffusion workers receive the driver's `VLLM_*`, `OMNI_*`, `DIFFUSION_*`,
+`NCCL_*`, `TORCH_NCCL_*`, `UCX_*`, and Hugging Face environment settings,
+plus `PYTHONPATH`, `CUDA_LAUNCH_BLOCKING`, and `OMP_NUM_THREADS`.
+Explicit stage `runtime.env` entries are also forwarded and take precedence.
+Device visibility, rank/rendezvous settings, worker host addresses, and `RAY_*`
+variables are excluded so each worker retains its own assignment and identity.
+
 For multiple nodes, start the cluster before launching Omni. For example,
 with head IP `10.0.0.1`:
 

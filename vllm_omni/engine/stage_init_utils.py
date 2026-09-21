@@ -1973,6 +1973,10 @@ def build_diffusion_config(
     )
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
 
+    if od_config.distributed_executor_backend == "ray":
+        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
+        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
+
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None

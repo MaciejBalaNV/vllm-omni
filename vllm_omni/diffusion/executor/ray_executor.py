@@ -59,6 +59,45 @@ except ImportError:
     PlacementGroupSchedulingStrategy = None  # type: ignore[assignment,misc]
 
 
+def _worker_env(od_config: OmniDiffusionConfig) -> dict[str, str]:
+    """Copy inference settings, keeping worker identity local to each actor."""
+    prefixes = (
+        "VLLM_",
+        "OMNI_",
+        "DIFFUSION_",
+        "NCCL_",
+        "TORCH_NCCL_",
+        "UCX_",
+        "HF_",
+        "HUGGINGFACE_",
+        "HUGGING_FACE_HUB_",
+    )
+    names = {"PYTHONPATH", "CUDA_LAUNCH_BLOCKING", "OMP_NUM_THREADS"}
+    env = {key: value for key, value in os.environ.items() if key.startswith(prefixes) or key in names}
+    # Explicit stage settings may include plugin-specific variables outside
+    # the standard prefixes, and take precedence over the driver's defaults.
+    env.update(getattr(od_config, "ray_worker_env", {}))
+    worker_specific = {
+        "CUDA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "ASCEND_RT_VISIBLE_DEVICES",
+        "MUSA_VISIBLE_DEVICES",
+        "ONEAPI_DEVICE_SELECTOR",
+        "VLLM_HOST_IP",
+        "VLLM_HOST_PORT",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST",
+        "VLLM_LOCAL_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "RANK",
+        "WORLD_SIZE",
+    }
+    return {key: value for key, value in env.items() if key not in worker_specific and not key.startswith("RAY_")}
+
+
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
     parallel_config = getattr(od_config, "parallel_config", None)
     return bool(
@@ -320,6 +359,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         actor_cls = ray.remote(
             num_cpus=0,
             num_gpus=1,
+            runtime_env={"env_vars": _worker_env(self.od_config)},
             max_concurrency=1,
             concurrency_groups={"health": 1},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -352,9 +392,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
 
         unique_ips = {item.ip for item in self.workers}
         master_addr = "127.0.0.1" if len(unique_ips) == 1 else self.workers[0].ip
-        master_port = ray.get(
-            self.workers[0].worker.get_open_port.remote(), timeout=_WORKER_INIT_TIMEOUT_S
-        )
+        master_port = ray.get(self.workers[0].worker.get_open_port.remote(), timeout=_WORKER_INIT_TIMEOUT_S)
         distributed_init_method = get_distributed_init_method(master_addr, master_port)
 
         logger.info(
@@ -363,8 +401,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
             len(unique_ips),
         )
         futures = [
-            item.worker.init_worker.remote(self.od_config, item.rank, distributed_init_method)
-            for item in self.workers
+            item.worker.init_worker.remote(self.od_config, item.rank, distributed_init_method) for item in self.workers
         ]
         ray.get(futures, timeout=_WORKER_INIT_TIMEOUT_S)
         logger.info("All %d Ray diffusion workers initialized", num_gpus)
@@ -413,12 +450,20 @@ class RayDiffusionExecutor(DiffusionExecutor):
             ]
             envelopes = ray.get(futures, timeout=timeout)
         except ray.exceptions.GetTimeoutError as exc:
+            self._mark_failed(exc)
+            self.shutdown()
             raise TimeoutError(f"RPC call to {method} timed out") from exc
         except ray.exceptions.RayActorError as exc:
             self._mark_failed(exc)
+            self.shutdown()
             raise EngineDeadError() from exc
         except ray.exceptions.RayTaskError as exc:
-            raise RuntimeError(f"RPC call to {method} failed: {exc}") from exc
+            # ray.get raises on the first failed rank without waiting for its
+            # peers. They may still be blocked in a collective, so no worker
+            # can safely accept another RPC from this executor.
+            self._mark_failed(exc)
+            self.shutdown()
+            raise EngineDeadError() from exc
 
         replies = sorted(
             (envelope for envelope in envelopes if envelope["replied"]),
