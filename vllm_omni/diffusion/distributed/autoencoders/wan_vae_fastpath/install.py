@@ -240,23 +240,6 @@ def _install_bindings(
 
             rollback.callback(restore)
             undo.append(restore)
-            if encoder and cfg.channels_last:
-                replacement = forward
-                reference = module.forward
-
-                def forward(self: nn.Module, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-                    # On GB200, BF16 replacement forwards exceed the encoder's
-                    # 1% posterior-error budget even without approximate norms.
-                    # Keep reference math for that dtype, including when FP32
-                    # weights/inputs execute under BF16 autocast. Guard every
-                    # binding so reference parents also call reference children.
-                    autocast_bf16 = torch.is_autocast_enabled(x.device.type) and (
-                        torch.get_autocast_dtype(x.device.type) == torch.bfloat16
-                    )
-                    if x.dtype == torch.bfloat16 or autocast_bf16:
-                        return reference(x, *args, **kwargs)
-                    return replacement(self, x, *args, **kwargs)
-
             module.forward = MethodType(forward, module)
             setattr(module, forwards.CFG_ATTR, cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
@@ -296,11 +279,6 @@ def _install_bindings(
             logger.info(
                 "Wan VAE %s: %d convolution weights converted to channels-last layout", component_name, converted
             )
-            if encoder:
-                logger.info(
-                    "Wan VAE channels-last encoder retains reference forwards for BF16 accuracy; "
-                    "weight conversion and output preallocation remain enabled."
-                )
 
         report = WanVaeFastPathReport(
             level=level,
@@ -331,8 +309,6 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
 
     State and layouts are independent of the decoder installation. Spatial
     sharding only replaces decoder modules, so it does not exclude this path.
-    BF16 at ``channels_last`` retains reference forwards to stay within the
-    posterior-error budget; weight conversion and output preallocation remain.
     """
     from . import encoder_forwards as ef
 

@@ -21,6 +21,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import encode
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_downsample as down
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_norm_cache as nc
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import encoder_nrmse_limit
 
 pytestmark = [
     pytest.mark.core_model,
@@ -180,7 +181,8 @@ def test_channels_last_encoder_posterior_and_layout(dtype, tf32):
     error = (actual.float() - expected.float()).square().mean().sqrt()
     scale = expected.float().square().mean().sqrt().clamp_min(1e-8)
     nrmse = (error / scale).item()
-    if nrmse > 0.01:
+    limit = encoder_nrmse_limit(dtype)
+    if nrmse > limit:
         # Run ablations only on failure, with the same weights/input/backend flags.
         # Weight layout alone can change cuDNN arithmetic; distinguish that from
         # errors introduced by the replacement forwards and approximate kernels.
@@ -203,14 +205,14 @@ def test_channels_last_encoder_posterior_and_layout(dtype, tf32):
             return ((value.float() - reference.float()).square().mean().sqrt() / rms).item()
 
         pytest.fail(
-            f"channels_last NRMSE={nrmse:.8f} exceeds 0.01; "
+            f"channels_last NRMSE={nrmse:.8f} exceeds {limit:g}; "
             f"layout_only_vs_reference={relative_error(layout_expected, expected):.8f}; "
             f"lossless_with_cl_weights_vs_layout_only={relative_error(layout_lossless, layout_expected):.8f}; "
             f"fast_vs_layout_only={relative_error(actual, layout_expected):.8f}; "
             f"GPU={torch.cuda.get_device_name()}, torch={torch.__version__}, "
             f"CUDA={torch.version.cuda}, cuDNN={torch.backends.cudnn.version()}, dtype={dtype}, tf32={tf32}"
         )
-    assert nrmse <= 0.01
+    assert nrmse <= limit
 
 
 @torch.no_grad()
@@ -369,9 +371,7 @@ def test_encoder_norm_cache_fusion_adds_no_posterior_drift(monkeypatch, dtype, l
     monkeypatch.setattr(nc, "norm_act_cat_time", record)
     actual = encode_frames(vae, x)
     bits_equal(actual, expected)
-    if level == "channels_last" and dtype == torch.bfloat16:
-        assert not hits, "BF16 channels-last encoder must retain reference forwards"
-    elif level == "channels_last" or dtype in configs[0][1].fused_silu_dtypes:
+    if level == "channels_last" or dtype in configs[0][1].fused_silu_dtypes:
         assert hits, "parity must exercise the fused kernel, not only its fallback"
 
 

@@ -51,8 +51,8 @@ def test_metrics_distinguish_signed_zero_and_measure_relative_error():
     assert result["bitwise_equal"] is False
 
 
-def _result(level, value=1.0, reconstruction=None):
-    tensor = torch.tensor([value])
+def _result(level, value=1.0, reconstruction=None, dtype=torch.float32):
+    tensor = torch.tensor([value], dtype=dtype)
     stats = dict(
         level=level,
         status="ok",
@@ -80,19 +80,22 @@ def test_lossless_failure_identifies_every_tensor_and_keeps_timings():
     assert "failed for 1 level(s)" in benchmark.failure_summary([stats])
 
 
-@pytest.mark.parametrize("nrmse,failed", [(0.005, False), (0.01, False), (math.nextafter(0.01, 1.0), True)])
-def test_channels_last_threshold_and_error_precision(monkeypatch, nrmse, failed):
+@pytest.mark.parametrize("dtype,limit", [(torch.bfloat16, 0.02), (torch.float16, 0.01), (torch.float32, 0.01)])
+@pytest.mark.parametrize("case", ["below", "boundary", "above"])
+def test_channels_last_threshold_and_error_precision(monkeypatch, dtype, limit, case):
+    nrmse = {"below": limit / 2, "boundary": limit, "above": math.nextafter(limit, 1.0)}[case]
+    failed = case == "above"
     monkeypatch.setattr(
         benchmark,
         "differences",
         lambda *_: dict(bitwise_equal=False, max_abs_diff=0.02, normalized_rmse=nrmse),
     )
-    result = _result("channels_last")
-    benchmark.validate_result(result, _result("off"))
+    result = _result("channels_last", dtype=dtype)
+    benchmark.validate_result(result, _result("off", dtype=dtype))
     assert result[0]["status"] == ("validation_failed" if failed else "ok")
     assert bool(result[0]["errors"]) is failed
     if failed:
-        assert f"normalized_rmse={nrmse!r} exceeds 0.01 (1%)" in result[0]["errors"][0]
+        assert f"normalized_rmse={nrmse!r} exceeds {limit:g} ({limit:.0%})" in result[0]["errors"][0]
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])

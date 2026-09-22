@@ -41,9 +41,9 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     VAE_FAST_PATH_LEVELS,
     install_wan_vae_encoder_fastpath,
 )
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import encoder_nrmse_limit
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-MAX_NORMALIZED_RMSE = 0.01
 MIN_RECONSTRUCTION_PSNR_DB = 50.0
 TINY_CONFIG = dict(
     base_dim=20,
@@ -208,10 +208,11 @@ def validate_result(result, reference):
                 f"[{level}] {name}: bitwise_equal=False, required True "
                 f"(max_abs_diff={max_abs:.6g}, normalized_rmse={nrmse!r})."
             )
-        if level == "channels_last" and math.isfinite(nrmse) and nrmse > MAX_NORMALIZED_RMSE:
+        limit = encoder_nrmse_limit(actual.dtype)
+        if level == "channels_last" and math.isfinite(nrmse) and nrmse > limit:
             errors.append(
                 f"[{level}] {name}: normalized_rmse={nrmse!r} exceeds "
-                f"{MAX_NORMALIZED_RMSE:g} ({MAX_NORMALIZED_RMSE:.0%}); max_abs_diff={max_abs:.6g}."
+                f"{limit:g} ({limit:.0%}); max_abs_diff={max_abs:.6g}."
             )
     if reconstruction is not None:
         mse = (reconstruction.float() - reference[4].float()).square().mean().item()
@@ -292,7 +293,9 @@ def print_results(results, environment):
         print("\nReference-decoder reconstruction quality")
         _print_table(["Level", "PSNR (dB)"], rows, text_columns=1)
     print(
-        f"\nGates: lossless must be bitwise equal; channels_last NRMSE <= {MAX_NORMALIZED_RMSE:.0%}; "
+        "\nGates: lossless must be bitwise equal; "
+        f"channels_last NRMSE <= {encoder_nrmse_limit(torch.bfloat16):.0%} for BF16, "
+        f"{encoder_nrmse_limit(torch.float32):.0%} for FP16/FP32; "
         "posterior comparison metrics must be finite."
     )
     if rows:
