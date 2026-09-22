@@ -83,6 +83,36 @@ def test_encoder_and_chunk_assembly_match_reference(frames, dtype):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("autocast", [False, True])
+def test_bf16_channels_last_encoder_retains_reference_forwards(monkeypatch, autocast):
+    dtype = torch.float32 if autocast else torch.bfloat16
+    ref, fast = pair(dtype)
+    # Compare against the same layout with unmodified reference forwards.
+    for module in (*ref.encoder.modules(), ref.quant_conv):
+        if isinstance(module, nn.Conv3d):
+            module.to(memory_format=torch.channels_last_3d)
+        elif isinstance(module, nn.Conv2d):
+            module.to(memory_format=torch.channels_last)
+
+    def fail(*args, **kwargs):
+        pytest.fail("BF16 channels-last encoder reached a replacement forward")
+
+    monkeypatch.setattr(ef, "encoder_forward", fail)
+    monkeypatch.setattr(ef, "residual_down_block_forward", fail)
+    monkeypatch.setattr(ef, "downsample_forward", fail)
+    monkeypatch.setattr(fp, "residual_block_forward", fail)
+    monkeypatch.setattr(fp, "causal_conv_forward", fail)
+    monkeypatch.setattr(fp, "rms_norm_forward", fail)
+    assert install_wan_vae_encoder_fastpath(fast, level="channels_last").installed
+    x = torch.randn(1, 3, 5, 16, 32).to(dtype)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        bits_equal(encode_frames(fast, x), ref.encode(x).latent_dist.parameters)
+    uninstall_wan_vae_encoder_fastpath(fast)
+    assert "forward" not in fast.encoder.__dict__
+    assert "forward" not in fast.quant_conv.__dict__
+
+
+@torch.no_grad()
 def test_strided_input_and_batch_slicing():
     ref, fast = pair()
     install_wan_vae_encoder_fastpath(fast)

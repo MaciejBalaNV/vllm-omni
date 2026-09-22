@@ -369,7 +369,9 @@ def test_encoder_norm_cache_fusion_adds_no_posterior_drift(monkeypatch, dtype, l
     monkeypatch.setattr(nc, "norm_act_cat_time", record)
     actual = encode_frames(vae, x)
     bits_equal(actual, expected)
-    if level == "channels_last" or dtype in configs[0][1].fused_silu_dtypes:
+    if level == "channels_last" and dtype == torch.bfloat16:
+        assert not hits, "BF16 channels-last encoder must retain reference forwards"
+    elif level == "channels_last" or dtype in configs[0][1].fused_silu_dtypes:
         assert hits, "parity must exercise the fused kernel, not only its fallback"
 
 
