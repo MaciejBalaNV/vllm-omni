@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Replacement forwards shared by the diffusers Wan VAE decoder and encoder.
 
 Each function below is bound per module instance (``types.MethodType``) by
@@ -253,12 +253,21 @@ def _deferred_conv_bias(conv: nn.Module, output: torch.Tensor) -> torch.Tensor |
     return None if conv.bias is None else conv.bias.to(dtype=output.dtype)
 
 
+# Each cache retains at most this many verdicts per live convolution module.
+_MAX_VERDICTS_PER_CONV = 128
 # Per conv module: {(x.shape, cache_frames, dtype, layout): cuDNN padding is bitwise
 # identical to a pre-padded input}. ``False`` routes that shape to the padded path.
 _SPATIAL_PAD_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKeyDictionary()
 # Per conv module: {(x.shape, cache_frames, dtype): the convolution of the channels-last
 # assembled input is bitwise identical to the channels-first one}.
 _CONV_OUT_LAYOUT_VERDICTS: WeakKeyDictionary[nn.Module, dict[tuple, bool]] = WeakKeyDictionary()
+
+
+def _record_verdict(verdicts: dict[tuple, bool], key: tuple, verdict: bool) -> None:
+    """Remember a verdict, evicting the oldest entry when the per-conv cache is full."""
+    verdicts[key] = verdict
+    if len(verdicts) > _MAX_VERDICTS_PER_CONV:
+        del verdicts[next(iter(verdicts))]
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -281,7 +290,7 @@ def _conv_with_spatial_padding(
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
     but is only bit-identical if cuDNN selects the same kernel for both
     formulations, so the first call for each (conv, shape) runs both and
-    compares bitwise; later calls reuse the verdict.
+    compares bitwise; later calls reuse the verdict until it is evicted.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
     fast = F.conv3d(assembled, conv.weight, bias, conv.stride, (0, pad_height, pad_width), conv.dilation, conv.groups)
@@ -289,7 +298,8 @@ def _conv_with_spatial_padding(
         return fast
     padded = F.pad(assembled, (pad_width, pad_width, pad_height, pad_height, 0, 0))
     reference = F.conv3d(padded, conv.weight, bias, conv.stride, 0, conv.dilation, conv.groups)
-    verdicts[key] = verdict = _bitwise_equal(fast, reference)
+    verdict = _bitwise_equal(fast, reference)
+    _record_verdict(verdicts, key, verdict)
     if not verdict:
         logger.info(
             "cuDNN spatial padding is not bitwise identical to pre-padded input for %s %s; "
@@ -483,7 +493,8 @@ def _run_conv_out_channels_last(
     assembly and cuDNN's transpose. The output is made contiguous, so nothing
     downstream sees a layout change. The first call per (conv, shape) also runs
     the channels-first formulation and compares bitwise; a mismatch routes that
-    shape back to the standard path forever.
+    shape back to the standard path while its verdict is cached. Evicted shapes
+    are checked again on their next use.
     """
     cache = cache_list[index]
     payload = cache if isinstance(cache, torch.Tensor) else None
@@ -507,7 +518,8 @@ def _run_conv_out_channels_last(
     reference = F.conv3d(
         assembled.contiguous(), conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
     )
-    verdicts[key] = verdict = _bitwise_equal(out, reference)
+    verdict = _bitwise_equal(out, reference)
+    _record_verdict(verdicts, key, verdict)
     if not verdict:
         logger.info(
             "channels-last conv_out input is not bitwise identical to the channels-first one for %s; "

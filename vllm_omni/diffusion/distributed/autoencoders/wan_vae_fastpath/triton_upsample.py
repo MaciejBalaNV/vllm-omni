@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803
 """Bit-exact nearest-neighbour 2x spatial upsampling for the Wan VAE decoder.
 
@@ -28,14 +28,13 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from ._utils import _pick_block_width
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Input elements loaded per program iteration; each is stored four times, so a
 # 2048-element load tile keeps 8192 stores in flight per program.
 _TILE_ELEMENTS = 2048
 _NUM_WARPS = 4
-# Column block candidates for the channels-first kernel; the wrapper picks the
-# one that pads the row the least (720p stages are 160/320/640 wide).
-_ROW_BLOCK_WIDTHS = (64, 128, 256)
 _MAX_BLOCK_C = 1024
 _HAS_INTERLEAVE = HAS_TRITON and hasattr(tl, "interleave")
 
@@ -121,17 +120,6 @@ if HAS_TRITON:
             tl.store(out_ptr + (first + channels), values, mask=mask)
             tl.store(out_ptr + (first + out_row_stride), values, mask=mask)
             tl.store(out_ptr + (first + out_row_stride + channels), values, mask=mask)
-
-
-def _pick_block_width(width: int) -> int:
-    """The candidate column block that pads ``width`` the least (ties go to the wider block)."""
-    best = _ROW_BLOCK_WIDTHS[0]
-    best_padded = None
-    for block in _ROW_BLOCK_WIDTHS:
-        padded = -(-width // block) * block
-        if best_padded is None or padded <= best_padded:
-            best, best_padded = block, padded
-    return best
 
 
 def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:

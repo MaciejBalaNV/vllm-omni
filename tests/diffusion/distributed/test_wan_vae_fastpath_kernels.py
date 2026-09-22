@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GPU bit-exactness tests for the Wan VAE decoder fast path kernels and forwards."""
 
 from __future__ import annotations
@@ -425,6 +425,35 @@ def test_cat_time_5d_is_bitwise_and_layout_exact(
     assert torch.equal(next_cache, reference[:, :, -CACHE_T:])
     assert next_cache.is_contiguous(memory_format=torch.channels_last_3d) is channels_last
     assert torch.equal(dm.cat_time_5d(x, cache, pad_front), reference)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("cache_frames", [0, 1, 2])
+def test_cat_time_5d_exceeds_grid_y_limit(monkeypatch: pytest.MonkeyPatch, cache_frames: int) -> None:
+    # Smaller blocks reproduce the large-plane launch failure without allocating
+    # 4K feature maps. The final block is partial, exercising the plane boundary.
+    monkeypatch.setattr(dm, "_PLANE_BLOCK", 32)
+    batch, channels, frames, height, width = 2, 8, 1, 257, 1021
+    plane_size = channels * height * width
+    assert dm.triton.cdiv(plane_size, dm._PLANE_BLOCK) > 65_535
+    assert plane_size % dm._PLANE_BLOCK != 0
+
+    x = _dense_5d((batch, channels, frames, height, width), torch.bfloat16, True)
+    cache = _dense_5d((batch, channels, cache_frames, height, width), x.dtype, True) if cache_frames else None
+    parts = [torch.zeros_like(x).expand(-1, -1, 2 - cache_frames, -1, -1)]
+    if cache is not None:
+        parts.append(cache)
+    parts.append(x)
+    reference = torch.cat(parts, dim=2).contiguous(memory_format=torch.channels_last_3d)
+
+    pair = dm.cat_time_5d(x, cache, pad_front=2, keep_cache_frames=CACHE_T)
+    assert pair is not None
+    assembled, next_cache = pair
+    assert _bits_equal(assembled, reference)
+    assert assembled.stride() == reference.stride()
+    assert _bits_equal(next_cache, reference[:, :, -CACHE_T:])
+    assert next_cache.is_contiguous(memory_format=torch.channels_last_3d)
+    assert _bits_equal(dm.cat_time_5d(x, cache, pad_front=2), reference)
 
 
 @torch.no_grad()
