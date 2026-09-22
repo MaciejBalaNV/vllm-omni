@@ -240,7 +240,7 @@ requests should supply `multiview.views[].prompt` explicitly for new checkpoints
 
 HTTP admission validates supplied per-camera captions but has no checkpoint
 metadata to determine whether they are required. The worker enforces
-`separate_view_text_tokenization`; a request missing a required camera prompt
+`per_view_captions`; a request missing a required camera prompt
 can receive HTTP 200 at asynchronous admission and then fail as a job instead
 of returning HTTP 400 at admission.
 

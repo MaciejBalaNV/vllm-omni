@@ -305,10 +305,10 @@ def test_client_expands_legacy_captions_through_upload_validation(
     before = copy.deepcopy(request)
     data, paths = multiview_client.prepare_request(request, tmp_path)
     resolved = contract.resolve_multiview_uploads(json.loads(data["extra_params"]), [str(path) for path in paths])
-    _, views = contract.validate_multiview_request(resolved, separate_view_text_tokenization=True)
+    _, views = contract.validate_multiview_request(resolved, per_view_captions=True)
     assert [view["prompt"] for view in views] == expected
     # Legacy checkpoints still receive their original aggregate top-level text.
-    contract.validate_multiview_request(resolved, separate_view_text_tokenization=False)
+    contract.validate_multiview_request(resolved, per_view_captions=False)
     assert data["prompt"] == request["prompt"]
     assert request == before
 
@@ -535,9 +535,7 @@ def test_request_mode_matrix_preserves_subset_order(mode, vision):
     elif vision != "none":
         for view in views:
             view["vision_path"] = "image.png" if vision == "images" else "prefix.mp4"
-    _, resolved = contract.validate_multiview_request(
-        extra, separate_view_text_tokenization=True, variable_view_count=True
-    )
+    _, resolved = contract.validate_multiview_request(extra, per_view_captions=True, variable_view_count=True)
     assert [view["camera_key"] for view in resolved] == list(keys)
 
 
@@ -561,7 +559,7 @@ def test_joint_request_mode_rejections(failure):
     else:
         view.pop("prompt")
     with pytest.raises(ValueError):
-        contract.validate_multiview_request(extra, separate_view_text_tokenization=True)
+        contract.validate_multiview_request(extra, per_view_captions=True)
 
 
 @pytest.mark.parametrize(
@@ -583,7 +581,7 @@ def test_caption_rejects_runtime_framing(caption):
 def test_per_camera_json_objects_are_rejected_before_prompt_formatting(caption):
     extra = {"multiview": {"views": [{"camera_key": contract.COSMOS3_MADS_CAMERAS[0], "prompt": caption}]}}
     with pytest.raises(ValueError, match="JSON-object camera prompts"):
-        contract.validate_multiview_request(extra, separate_view_text_tokenization=True, variable_view_count=True)
+        contract.validate_multiview_request(extra, per_view_captions=True, variable_view_count=True)
 
 
 @pytest.mark.parametrize("aspect_ratio", ["auto", "16:9"])

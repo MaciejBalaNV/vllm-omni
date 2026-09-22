@@ -479,7 +479,7 @@ def test_pipeline_shares_schedule_preserves_conditions_and_optional_lidar(
     pipeline.multiview_config = {
         "schema_version": 2,
         "variable_view_count": True,
-        "separate_view_text_tokenization": True,
+        "per_view_captions": True,
         "inference_defaults": {"num_steps": 2, "guidance": 1},
     }
     pipeline.multiview_align_temporal_positions_across_views = True

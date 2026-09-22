@@ -153,7 +153,7 @@ python -m cosmos3.scripts.convert_model_to_diffusers \
 Export requires access to the reference V1.2 tokenizer checkpoint and its latent
 statistics. A config-only conversion is not a deployable joint artifact.
 The encoder folder is loaded separately from the transformer's weight index.
-Validate `schema_version=2`, `separate_view_text_tokenization=true`, variable-view
+Validate `schema_version=2`, `per_view_captions=true`, variable-view
 metadata, the production 0.4-second attention window, and the two encoder files.
 
 ## Prepare and run the supplied five records

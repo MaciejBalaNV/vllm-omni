@@ -69,7 +69,7 @@ def _versioned_deployment_config() -> dict:
     return {
         **_deployment_config(),
         "schema_version": 2,
-        "separate_view_text_tokenization": True,
+        "per_view_captions": True,
         "variable_view_count": True,
         "inference_defaults": {
             "resolution": "480",
@@ -835,7 +835,7 @@ def test_versioned_deployment_defaults_are_required_and_legacy_remains_compatibl
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _validated_multiview_deployment_config
 
     config = _deployment_config()
-    config.update(schema_version=2, separate_view_text_tokenization=True, variable_view_count=True)
+    config.update(schema_version=2, per_view_captions=True, variable_view_count=True)
     with pytest.raises(ValueError, match="inference_defaults"):
         _validated_multiview_deployment_config(_deployment_model_config(config))
     defaults = {

@@ -144,7 +144,7 @@ def validate_multiview_request(
     cameras: Sequence[str] = COSMOS3_MADS_CAMERAS,
     *,
     media_kind: Callable[[Any], str] = path_media_kind,
-    separate_view_text_tokenization: bool = False,
+    per_view_captions: bool = False,
     variable_view_count: bool = False,
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
     multiview = _mapping(extra.get("multiview"), "extra_args['multiview']")
@@ -169,7 +169,7 @@ def validate_multiview_request(
         if unknown:
             raise ValueError(f"Unsupported Cosmos3 multiview view {index} fields: {sorted(unknown)}.")
         caption = view.get("prompt")
-        if separate_view_text_tokenization and (not isinstance(caption, str) or not caption.strip()):
+        if per_view_captions and (not isinstance(caption, str) or not caption.strip()):
             raise ValueError(f"Cosmos3 multiview requires one prompt per camera; missing views[{index}].prompt.")
         if caption is not None:
             validate_camera_caption(caption)

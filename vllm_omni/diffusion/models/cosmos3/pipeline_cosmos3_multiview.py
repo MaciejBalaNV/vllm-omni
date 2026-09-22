@@ -397,7 +397,7 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
             raise ValueError("Joint artifacts require versioned deployment metadata.")
         validate_lidar_config(dict(config["lidar"]))
     if version == 2:
-        for field in ("separate_view_text_tokenization", "variable_view_count"):
+        for field in ("per_view_captions", "variable_view_count"):
             if not isinstance(_required_deployment_field(config, field), bool):
                 raise ValueError(f"Cosmos3 multiview {field} must be boolean.")
         defaults = _mapping(_required_deployment_field(config, "inference_defaults"), "inference_defaults")
@@ -541,7 +541,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             extra,
             self.multiview_cameras,
             media_kind=_media_kind,
-            separate_view_text_tokenization=config.get("separate_view_text_tokenization", False),
+            per_view_captions=config.get("per_view_captions", False),
             variable_view_count=config.get("schema_version") == 2 and config.get("variable_view_count") is True,
         )
 
@@ -889,7 +889,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         seconds_per_frame=lidar_config["temporal_compression_factor"] / lidar_config["fps"],
                     )
                 )
-        separate_captions = deployment.get("separate_view_text_tokenization", False)
+        separate_captions = deployment.get("per_view_captions", False)
         layout = MultiviewLayout(
             attention_scope=self.multiview_attention_scope,  # type: ignore[arg-type]
             decomposed_temporal_window_seconds=self.multiview_decomposed_temporal_window_seconds,
