@@ -32,17 +32,20 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from diffusers.utils import export_to_video
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
+from vllm_omni.diffusion.utils.video_encoding import run_ordered_encoding_jobs, write_imageio_video
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras.cosmos3 import normalize_multiview_aspect_ratio
@@ -221,13 +224,11 @@ def _frame_list(video: Any) -> list[Any]:
             tensor = tensor[0]
         if tensor.ndim == 4 and tensor.shape[0] in (3, 4):
             tensor = tensor.permute(1, 2, 3, 0)
-        if tensor.is_floating_point() and tensor.numel() and tensor.min() < 0:
-            tensor = tensor.mul(0.5).add(0.5)
-        return list(tensor.clamp(0, 1).numpy())
+        # Keep normalized floats and uint8 storage as frame views. Clipping and
+        # quantization happen one frame at a time in the writer.
+        return list(tensor.numpy())
     if isinstance(video, np.ndarray):
         array = video[0] if video.ndim == 5 else video
-        if np.issubdtype(array.dtype, np.integer):
-            array = array.astype(np.float32) / 255.0
         return list(array)
     if isinstance(video, list):
         if len(video) == 1 and isinstance(video[0], list):
@@ -247,17 +248,97 @@ def _export_combined_views(
     columns = math.ceil(math.sqrt(num_views))
     rows = math.ceil(num_views / columns)
     height, width = np.asarray(frames[0]).shape[:2]
-    with imageio.get_writer(str(path), fps=fps, macro_block_size=1) as writer:
+    normalize_negative = any(
+        np.issubdtype(np.asarray(frame).dtype, np.floating) and np.asarray(frame).size and np.asarray(frame).min() < 0
+        for frame in frames
+    )
+    with imageio.get_writer(str(path), fps=fps, macro_block_size=1, output_params=["-threads", "1"]) as writer:
         for frame_index in range(frames_per_view):
             grid = np.zeros((rows * height, columns * width, 3), dtype=np.uint8)
             for view_index in range(num_views):
                 frame = np.asarray(frames[view_index * frames_per_view + frame_index])
                 if np.issubdtype(frame.dtype, np.floating):
+                    if normalize_negative:
+                        frame = np.clip(frame, -1, 1) * 0.5 + 0.5
                     frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
                 row, column = divmod(view_index, columns)
                 grid[row * height : (row + 1) * height, column * width : (column + 1) * width] = frame[..., :3]
             writer.append_data(grid)
     return {"file_name": str(path), "rows": rows, "columns": columns, "width": columns * width, "height": rows * height}
+
+
+@dataclass(frozen=True)
+class _CameraEncodingJob:
+    index: int
+    camera: str
+    frames: list[Any]
+    destination: Path
+    temporary: Path
+    normalize_negative: bool
+
+
+def _new_video_temporary_path(destination: Path) -> Path:
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{destination.stem}.", suffix=".tmp.mp4", dir=destination.parent, delete=False
+    )
+    handle.close()
+    return Path(handle.name)
+
+
+def _save_camera_videos(
+    frames: list[Any],
+    cameras: list[str],
+    frames_per_view: int,
+    output_dir: Path,
+    fps: float,
+    *,
+    parallel: bool,
+) -> dict[str, list[str]]:
+    """Encode camera views transactionally and preserve camera order."""
+    jobs: list[_CameraEncodingJob] = []
+    try:
+        normalize_negative = any(
+            np.issubdtype(np.asarray(frame).dtype, np.floating)
+            and np.asarray(frame).size
+            and np.asarray(frame).min() < 0
+            for frame in frames
+        )
+        for index, camera in enumerate(cameras):
+            destination = output_dir / f"vision_view{index:02d}_{_safe_camera_name(camera)}.mp4"
+            jobs.append(
+                _CameraEncodingJob(
+                    index=index,
+                    camera=camera,
+                    frames=frames[index * frames_per_view : (index + 1) * frames_per_view],
+                    destination=destination,
+                    temporary=_new_video_temporary_path(destination),
+                    normalize_negative=normalize_negative,
+                )
+            )
+
+        def encode(job: _CameraEncodingJob, encoder_threads: int) -> _CameraEncodingJob:
+            write_imageio_video(
+                job.frames,
+                job.temporary,
+                fps=fps,
+                encoder_threads=encoder_threads,
+                # Match Diffusers export_to_video's dimension handling.
+                macro_block_size=16,
+                normalize_negative=job.normalize_negative,
+            )
+            return job
+
+        completed, _ = run_ordered_encoding_jobs(jobs, encode, parallel=parallel)
+        for job in completed:
+            os.replace(job.temporary, job.destination)
+        return {job.camera: [str(job.destination)] for job in completed}
+    except BaseException:
+        for job in jobs:
+            try:
+                job.temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 def _run_request(
@@ -272,6 +353,7 @@ def _run_request(
     resolution_override: str | None = None,
     aspect_ratio_override: str | None = None,
     combine_views: bool = False,
+    video_encoding_mode: str = "parallel",
 ) -> dict[str, Any]:
     request = {**request.get("extra_params", {}), **request}
     multiview_value = request.get("multiview")
@@ -401,12 +483,15 @@ def _run_request(
     output_fps = float(metadata.get("multiview", {}).get("fps", sampling_params.fps or 30))
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    files_by_camera = {}
-    for index, camera in enumerate(cameras):
-        camera_frames = frames[index * frames_per_view : (index + 1) * frames_per_view]
-        output_path = output_dir / f"vision_view{index:02d}_{_safe_camera_name(camera)}.mp4"
-        export_to_video(camera_frames, str(output_path), fps=output_fps)
-        files_by_camera[camera] = [str(output_path)]
+    video_save_started = time.perf_counter()
+    files_by_camera = _save_camera_videos(
+        frames,
+        list(cameras),
+        frames_per_view,
+        output_dir,
+        output_fps,
+        parallel=video_encoding_mode == "parallel",
+    )
 
     manifest = {
         "name": request.get("name"),
@@ -424,14 +509,25 @@ def _run_request(
         "generation_seconds": generation_seconds,
     }
     if combine_views:
-        manifest["combined_video"] = _export_combined_views(
-            frames, len(cameras), frames_per_view, output_dir / "combined_views.mp4", output_fps
-        )
+        combined_path = output_dir / "combined_views.mp4"
+        combined_temporary = _new_video_temporary_path(combined_path)
+        try:
+            manifest["combined_video"] = _export_combined_views(
+                frames, len(cameras), frames_per_view, combined_temporary, output_fps
+            )
+            os.replace(combined_temporary, combined_path)
+            manifest["combined_video"]["file_name"] = str(combined_path)
+        except BaseException:
+            combined_temporary.unlink(missing_ok=True)
+            raise
+    manifest["video_save_seconds"] = time.perf_counter() - video_save_started
     if lidar is not None:
         data, details = serialize_lidar_output(lidar, metadata.get("lidar", {}))
         lidar_path = output_dir / "lidar.safetensors"
         lidar_path.write_bytes(data)
         manifest["lidar"] = {**details, "file_name": str(lidar_path), "format": "safetensors"}
+    # This timestamp intentionally precedes the manifest write itself.
+    manifest["total_seconds"] = time.perf_counter() - started
     (output_dir / "sample_outputs.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
 
@@ -454,6 +550,12 @@ def main() -> None:
         "--combine-views",
         action="store_true",
         help="Also save combined_views.mp4 as a synchronized grid in camera order, with unused tiles black",
+    )
+    parser.add_argument(
+        "--video-encoding-mode",
+        choices=("parallel", "serial"),
+        default="parallel",
+        help="Encode camera videos concurrently (default) or one camera at a time for diagnostics",
     )
     parser.add_argument(
         "--seed",
@@ -559,6 +661,7 @@ def main() -> None:
             resolution_override=args.resolution,
             aspect_ratio_override=args.aspect_ratio,
             combine_views=args.combine_views,
+            video_encoding_mode=args.video_encoding_mode,
         )
         manifests.append({**manifest, "output_dir": str(output_dir)})
 

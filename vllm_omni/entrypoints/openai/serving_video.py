@@ -8,12 +8,14 @@ import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import pybase64 as base64
 from fastapi import HTTPException
 from PIL import Image
@@ -23,6 +25,16 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import DiffusionModelMetadata, get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
+from vllm_omni.diffusion.utils.video_encoding import (
+    EncodedSegment,
+    EncodingAllocation,
+    EncodingCancelledError,
+    ScheduledResult,
+    VideoEncodingScheduler,
+    calculate_encoding_allocation,
+    encode_video_segment,
+    remux_video_segments,
+)
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -38,6 +50,7 @@ from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, par
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
+    _prepare_video_frames,
     encode_video_base64,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -117,6 +130,14 @@ class LatentEditInput:
     cleanup_paths: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class MultiviewVideoLayout:
+    """Validated camera-major layout reported by the output pipeline."""
+
+    camera_names: tuple[str, ...]
+    frames_per_view: int
+
+
 @dataclass
 class VideoGenerationArtifacts:
     """Normalized outputs and profiler metadata extracted from one request."""
@@ -131,6 +152,7 @@ class VideoGenerationArtifacts:
     metrics: dict[str, object] | None = None
     lidar: DiffusionPayloadValue | None = None
     lidar_metadata: dict[str, Any] = field(default_factory=dict)
+    multiview_layout: MultiviewVideoLayout | None = None
 
 
 @dataclass
@@ -184,6 +206,7 @@ class OmniOpenAIServingVideo:
         self._model_name = model_name
         self._stage_configs = stage_configs
         self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
+        self._video_encoding_scheduler = VideoEncodingScheduler()
         logger.info(
             "Video response frame conversion pool configured: workers=%d",
             self._video_frame_converter.max_workers,
@@ -295,6 +318,7 @@ class OmniOpenAIServingVideo:
         )
 
     def shutdown(self) -> None:
+        self._video_encoding_scheduler.shutdown()
         self._video_frame_converter.shutdown()
 
     async def abort_request(self, request_id: str) -> None:
@@ -312,6 +336,7 @@ class OmniOpenAIServingVideo:
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
+        self._validate_parallel_multiview_option(request)
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
@@ -480,8 +505,10 @@ class OmniOpenAIServingVideo:
                     normalize_preencode_batch_frames(request.extra_params["preencode_batch_frames"])
                 except ValueError as exc:
                     raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
-            # Merge extra_params into extra_args
-            gen_params.extra_args.update(request.extra_params)
+            # Serving-only encoder controls must not leak into model kwargs.
+            gen_params.extra_args.update(
+                {key: value for key, value in request.extra_params.items() if key != "parallel_multiview_encoding"}
+            )
 
             # Redact inline arrays when logging so RoboLab policy requests do
             # not flood the server log with image/state payloads.
@@ -533,6 +560,7 @@ class OmniOpenAIServingVideo:
         if lidar_output_requested(request.extra_params) and lidar is None:
             raise ValueError("The requested LiDAR output was not returned by the model.")
         lidar_metadata = metadata.get("lidar", {}) if isinstance(metadata, Mapping) else {}
+        multiview_layout = self._multiview_layout_from_metadata(metadata)
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -544,7 +572,387 @@ class OmniOpenAIServingVideo:
             metrics=metrics,
             lidar=lidar,
             lidar_metadata=dict(lidar_metadata),
+            multiview_layout=multiview_layout,
         )
+
+    @staticmethod
+    def _validate_parallel_multiview_option(request: VideoGenerationRequest) -> bool:
+        extra = request.extra_params
+        if not isinstance(extra, dict) or "parallel_multiview_encoding" not in extra:
+            return False
+        value = extra["parallel_multiview_encoding"]
+        if type(value) is not bool:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="parallel_multiview_encoding must be a boolean.",
+            )
+        return value
+
+    @staticmethod
+    def _multiview_layout_from_metadata(metadata: Any) -> MultiviewVideoLayout | None:
+        if not isinstance(metadata, Mapping) or "multiview" not in metadata:
+            return None
+        multiview = metadata["multiview"]
+        if not isinstance(multiview, Mapping):
+            raise ValueError("Cosmos multiview output metadata must be an object.")
+        cameras = multiview.get("cameras")
+        frames_per_view = multiview.get("frames_per_view")
+        if (
+            not isinstance(cameras, list | tuple)
+            or not cameras
+            or not all(isinstance(camera, str) and camera for camera in cameras)
+        ):
+            raise ValueError("Cosmos multiview output metadata requires ordered, nonempty camera names.")
+        if len(cameras) != len(set(cameras)):
+            raise ValueError("Cosmos multiview output camera names must be unique.")
+        if type(frames_per_view) is not int or frames_per_view <= 0:
+            raise ValueError("Cosmos multiview output frames_per_view must be a positive integer.")
+        return MultiviewVideoLayout(tuple(cameras), frames_per_view)
+
+    @staticmethod
+    def _video_codec_options(request: VideoGenerationRequest) -> Any:
+        options: Any = {"preset": "ultrafast", "threads": "0"}
+        if isinstance(request.extra_params, dict) and "video_codec_options" in request.extra_params:
+            options = request.extra_params["video_codec_options"]
+        return options
+
+    @staticmethod
+    def _parallel_codec_options(options: Any) -> tuple[dict[str, Any] | None, str | None]:
+        if options is None:
+            return None, None
+        if not isinstance(options, Mapping):
+            return None, "video_codec_options is not an object"
+        normalized = {str(key): value for key, value in options.items()}
+        unsupported = set(normalized) - {"preset", "crf", "threads"}
+        if unsupported:
+            return None, f"unsupported codec options: {sorted(unsupported)}"
+        threads = normalized.get("threads")
+        if threads is not None and str(threads).lower() not in {"0", "auto"}:
+            return None, "explicit nonzero encoder threads"
+        return normalized, None
+
+    @staticmethod
+    def _video_geometry(video: Any) -> tuple[int, int]:
+        shape = tuple(getattr(video, "shape", ()))
+        if len(shape) == 5:
+            shape = shape[1:]
+        if len(shape) == 4:
+            if shape[-1] in (3, 4):
+                return int(shape[2]), int(shape[1])
+            if shape[0] in (3, 4) or shape[1] in (3, 4):
+                return int(shape[-1]), int(shape[-2])
+        if isinstance(video, list) and video:
+            frame_shape = tuple(getattr(video[0], "shape", ()))
+            if len(frame_shape) == 3:
+                if frame_shape[-1] in (3, 4):
+                    return int(frame_shape[1]), int(frame_shape[0])
+                if frame_shape[0] in (3, 4):
+                    return int(frame_shape[2]), int(frame_shape[1])
+        return 0, 0
+
+    @classmethod
+    def _validate_multiview_video(cls, *, video: Any, layout: MultiviewVideoLayout) -> None:
+        expected_frames = len(layout.camera_names) * layout.frames_per_view
+        if isinstance(video, bytes):
+            actual_frames = count_mp4_frames(video)
+        else:
+            actual_frames = count_video_frames(video)
+        if actual_frames != expected_frames:
+            raise ValueError(
+                f"Cosmos multiview output metadata describes {expected_frames} frames, got {actual_frames}."
+            )
+        width, height = cls._video_geometry(video)
+        if width <= 0 or height <= 0:
+            raise ValueError("Cosmos multiview output has invalid frame geometry.")
+        if isinstance(video, list) and video:
+            first_shape = tuple(getattr(video[0], "shape", ()))
+            if any(tuple(getattr(frame, "shape", ())) != first_shape for frame in video[1:]):
+                raise ValueError("Cosmos multiview output frame geometry is inconsistent.")
+
+    @staticmethod
+    async def _wait_for_scheduled(
+        futures: list[Future[ScheduledResult[Any]]],
+    ) -> list[ScheduledResult[Any] | BaseException]:
+        return await asyncio.gather(
+            *(asyncio.wrap_future(future) for future in futures),
+            return_exceptions=True,
+        )
+
+    async def _cancel_and_drain_encoding(self, request_id: str) -> None:
+        self._video_encoding_scheduler.cancel_request(request_id)
+        await asyncio.to_thread(self._video_encoding_scheduler.wait_request, request_id)
+
+    @staticmethod
+    def _close_segments_when_done(futures: list[Future[ScheduledResult[Any]]]) -> None:
+        # Concurrent-future callbacks also run after the awaiting task (or its
+        # event loop) has gone away. Register before any cancellable drain.
+        def close_segment(future: Future[ScheduledResult[Any]]) -> None:
+            if future.cancelled():
+                return
+            try:
+                value = future.result().value
+            except BaseException:
+                return
+            if isinstance(value, EncodedSegment):
+                value.close()
+
+        for future in futures:
+            future.add_done_callback(close_segment)
+
+    async def _encode_parallel_multiview(
+        self,
+        video: Any,
+        *,
+        request_id: str,
+        layout: MultiviewVideoLayout,
+        fps: float,
+        allocation: EncodingAllocation,
+        video_codec_options: Mapping[str, Any] | None,
+    ) -> bytes:
+        frames, frame_shape, common_dtype, normalization = self._prepare_parallel_video_frames(video)
+        expected_frames = len(layout.camera_names) * layout.frames_per_view
+        if len(frames) != expected_frames:
+            raise ValueError(f"Cosmos multiview output metadata describes {expected_frames} frames, got {len(frames)}.")
+        if len(frame_shape) != 3 or frame_shape[-1] not in (3, 4):
+            raise ValueError(f"Cosmos multiview output has invalid frame geometry: {frame_shape}.")
+        if any(frame.shape != frame_shape for frame in frames):
+            raise ValueError("Cosmos multiview output frame geometry is inconsistent.")
+
+        started = time.perf_counter()
+        camera_futures: list[Future[ScheduledResult[Any]]] = []
+        for camera_index in range(len(layout.camera_names)):
+            frame_start = camera_index * layout.frames_per_view
+            camera_frames = frames[frame_start : frame_start + layout.frames_per_view]
+            camera_futures.append(
+                self._video_encoding_scheduler.submit(
+                    request_id,
+                    lambda cancel_event, source=camera_frames: encode_video_segment(
+                        source,
+                        fps=fps,
+                        encoder_threads=allocation.encoder_threads,
+                        video_codec_options=video_codec_options,
+                        cancel_event=cancel_event,
+                        common_dtype=common_dtype,
+                        normalization=normalization,
+                    ),
+                    tokens=allocation.encoder_threads,
+                )
+            )
+
+        segments: list[EncodedSegment] = []
+        try:
+            try:
+                camera_results = await self._wait_for_scheduled(camera_futures)
+            except asyncio.CancelledError:
+                self._close_segments_when_done(camera_futures)
+                await self._cancel_and_drain_encoding(request_id)
+                raise
+            failures = [result for result in camera_results if isinstance(result, BaseException)]
+            if failures:
+                self._close_segments_when_done(camera_futures)
+                await self._cancel_and_drain_encoding(request_id)
+                failure = next(
+                    (
+                        item
+                        for item in failures
+                        if not isinstance(item, asyncio.CancelledError | EncodingCancelledError)
+                    ),
+                    failures[0],
+                )
+                raise failure
+            scheduled = [cast(ScheduledResult[EncodedSegment], result) for result in camera_results]
+            segments = [result.value for result in scheduled]
+            camera_wall_seconds = time.perf_counter() - started
+            queue_wait_seconds = max((result.queue_wait_seconds for result in scheduled), default=0.0)
+
+            remux_future = self._video_encoding_scheduler.submit(
+                request_id,
+                lambda cancel_event: remux_video_segments(segments, fps=fps, cancel_event=cancel_event),
+                tokens=1,
+            )
+            try:
+                remux_result = await asyncio.wrap_future(remux_future)
+            except asyncio.CancelledError:
+                await self._cancel_and_drain_encoding(request_id)
+                raise
+            remux_seconds = remux_result.run_seconds
+            queue_wait_seconds += remux_result.queue_wait_seconds
+            encoded = remux_result.value
+            total_seconds = time.perf_counter() - started
+            logger.info(
+                "Video response encoding summary: selected_path=parallel_multiview cameras=%d frames=%d "
+                "dimensions=%dx%d fps=%s cpu_budget=%d worker_limit=%d threads_per_encoder=%d "
+                "queue_wait_seconds=%.6f camera_encoding_seconds=%.6f remux_seconds=%.6f "
+                "total_encoding_seconds=%.6f output_bytes=%d",
+                len(layout.camera_names),
+                len(frames),
+                frame_shape[1],
+                frame_shape[0],
+                fps,
+                allocation.cpu_count,
+                allocation.workers,
+                allocation.encoder_threads,
+                queue_wait_seconds,
+                camera_wall_seconds,
+                remux_seconds,
+                total_seconds,
+                len(encoded),
+            )
+            return encoded
+        finally:
+            for segment in segments:
+                segment.close()
+
+    @staticmethod
+    def _prepare_parallel_video_frames(video: Any) -> tuple[list[np.ndarray], tuple[int, ...], np.dtype, str]:
+        """Build frame views while deferring normalization to active workers."""
+        normalization = "identity"
+        if isinstance(video, np.ndarray):
+            array = video
+            if array.ndim == 5:
+                raise ValueError("Batched video arrays are not supported for single-video encoding.")
+            if array.ndim == 4:
+                if array.shape[0] in (3, 4) and array.shape[-1] not in (3, 4):
+                    array = np.transpose(array, (1, 2, 3, 0))
+                elif array.shape[1] in (3, 4) and array.shape[-1] not in (3, 4):
+                    array = np.transpose(array, (0, 2, 3, 1))
+            frames = list(array) if array.ndim == 4 else [array]
+            if np.issubdtype(array.dtype, np.floating):
+                if array.size and (array.min() < 0.0 or array.max() > 1.0):
+                    normalization = "signed"
+            elif array.dtype != np.uint8 and np.issubdtype(array.dtype, np.integer):
+                normalization = "integer"
+        elif hasattr(video, "detach") and hasattr(video, "cpu"):
+            tensor = video.detach().cpu()
+            if tensor.ndim == 5:
+                raise ValueError("Batched video tensors are not supported for single-video encoding.")
+            if tensor.ndim == 4:
+                if tensor.shape[0] in (3, 4) and tensor.shape[-1] not in (3, 4):
+                    tensor = tensor.permute(1, 2, 3, 0)
+                elif tensor.shape[1] in (3, 4) and tensor.shape[-1] not in (3, 4):
+                    tensor = tensor.permute(0, 2, 3, 1)
+            try:
+                array = tensor.numpy()
+            except TypeError as exc:
+                raise ValueError(f"Unsupported tensor dtype for parallel video encoding: {tensor.dtype}") from exc
+            frames = list(array) if array.ndim == 4 else [array]
+            if tensor.is_floating_point():
+                # The existing tensor path always interprets floats as [-1, 1].
+                normalization = "signed"
+            elif array.dtype != np.uint8:
+                normalization = "integer"
+        else:
+            frames, frame_shape, common_dtype = _prepare_video_frames(video)
+            return frames, frame_shape, common_dtype, normalization
+
+        if not frames:
+            raise ValueError("No frames found to encode.")
+        frame_shape = frames[0].shape
+        if any(frame.shape != frame_shape for frame in frames[1:]):
+            raise ValueError("All video frames must have the same shape.")
+        return frames, frame_shape, np.result_type(*(frame.dtype for frame in frames)), normalization
+
+    async def _encode_video_artifact(
+        self,
+        request: VideoGenerationRequest,
+        artifacts: VideoGenerationArtifacts,
+        *,
+        video_index: int,
+        request_id: str,
+        base64_output: bool = False,
+    ) -> bytes | str:
+        video = artifacts.videos[video_index]
+        if isinstance(video, bytes):
+            return base64.b64encode(video).decode("utf-8") if base64_output else video
+        audio = artifacts.audios[video_index]
+        options = self._video_codec_options(request)
+        parallel_requested = self._validate_parallel_multiview_option(request)
+        layout = artifacts.multiview_layout
+        allocation = calculate_encoding_allocation(
+            0 if layout is None else len(layout.camera_names),
+            self._video_encoding_scheduler.cpu_count,
+        )
+        fallback_reason: str | None = None
+        parallel_options: dict[str, Any] | None = None
+        if not parallel_requested:
+            fallback_reason = "parallel_multiview_encoding is disabled"
+        elif layout is None:
+            fallback_reason = "output has no Cosmos multiview metadata"
+        elif len(layout.camera_names) < 2:
+            fallback_reason = "output has fewer than two cameras"
+        elif allocation.workers < 2:
+            fallback_reason = "CPU affinity cannot run two encoders"
+        elif audio is not None:
+            fallback_reason = "output contains audio"
+        elif not isinstance(video, np.ndarray) and not (hasattr(video, "detach") and hasattr(video, "cpu")):
+            fallback_reason = "output frame container requires legacy conversion"
+        elif "bfloat" in str(getattr(video, "dtype", "")):
+            fallback_reason = "output tensor dtype requires legacy conversion"
+        else:
+            parallel_options, fallback_reason = self._parallel_codec_options(options)
+
+        if fallback_reason is None:
+            assert layout is not None
+            self._validate_multiview_video(video=video, layout=layout)
+            encoded = await self._encode_parallel_multiview(
+                video,
+                request_id=request_id,
+                layout=layout,
+                fps=artifacts.output_fps,
+                allocation=allocation,
+                video_codec_options=parallel_options,
+            )
+            return base64.b64encode(encoded).decode("utf-8") if base64_output else encoded
+
+        started = time.perf_counter()
+        legacy_future = self._video_encoding_scheduler.submit(
+            request_id,
+            lambda _cancel_event: (
+                encode_video_base64(
+                    video,
+                    fps=artifacts.output_fps,
+                    **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
+                    video_codec_options=options,
+                    frame_converter=self._video_frame_converter,
+                )
+                if base64_output
+                else _encode_video_bytes(
+                    video,
+                    fps=artifacts.output_fps,
+                    **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
+                    video_codec_options=options,
+                    frame_converter=self._video_frame_converter,
+                )
+            ),
+            tokens=self._video_encoding_scheduler.cpu_count,
+        )
+        try:
+            result = await asyncio.wrap_future(legacy_future)
+        except asyncio.CancelledError:
+            await self._cancel_and_drain_encoding(request_id)
+            raise
+        total_seconds = time.perf_counter() - started
+        camera_count = 0 if layout is None else len(layout.camera_names)
+        total_frames = count_video_frames(video) or 0
+        width, height = self._video_geometry(video)
+        logger.info(
+            "Video response encoding summary: selected_path=legacy fallback_reason=%s cameras=%d frames=%d "
+            "dimensions=%dx%d fps=%s cpu_budget=%d worker_limit=1 threads_per_encoder=automatic "
+            "queue_wait_seconds=%.6f "
+            "camera_encoding_seconds=%.6f remux_seconds=0 total_encoding_seconds=%.6f output_bytes=%d",
+            fallback_reason,
+            camera_count,
+            total_frames,
+            width,
+            height,
+            artifacts.output_fps,
+            self._video_encoding_scheduler.cpu_count,
+            result.queue_wait_seconds,
+            result.run_seconds,
+            total_seconds,
+            len(result.value),
+        )
+        return result.value
 
     async def generate_videos(
         self,
@@ -567,30 +975,22 @@ class OmniOpenAIServingVideo:
             latent_edit_input=latent_edit_input,
         )
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
-
-        def encode_video_result(idx: int, video: Any) -> str:
-            if isinstance(video, bytes):
-                return base64.b64encode(video).decode("utf-8")
-            return encode_video_base64(
-                video,
-                fps=artifacts.output_fps,
-                audio=artifacts.audios[idx],
-                audio_sample_rate=artifacts.audio_sample_rate,
-                video_codec_options=video_codec_options,
-                frame_converter=self._video_frame_converter,
-            )
-
         _t_encode_start = time.perf_counter()
-        video_data = [
-            VideoData(
-                b64_json=encode_video_result(idx, video),
-                action=artifacts.actions[idx],
+        encoded = await asyncio.gather(
+            *(
+                self._encode_video_artifact(
+                    request,
+                    artifacts,
+                    video_index=idx,
+                    request_id=f"{reference_id}:base64",
+                    base64_output=True,
+                )
+                for idx in range(len(artifacts.videos))
             )
-            for idx, video in enumerate(artifacts.videos)
+        )
+        video_data = [
+            VideoData(b64_json=cast(str, video_base64), action=artifacts.actions[idx])
+            for idx, video_base64 in enumerate(encoded)
         ]
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
@@ -628,13 +1028,6 @@ class OmniOpenAIServingVideo:
                 reference_id,
                 len(artifacts.videos),
             )
-        audio = artifacts.audios[0]
-
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
-
         action = artifacts.actions[0]
         video_metadata = _video_metadata_from_artifacts(artifacts)
         if action is not None and isinstance(artifacts.videos[0], dict):
@@ -655,12 +1048,14 @@ class OmniOpenAIServingVideo:
                 artifacts.actions[0],
                 video_metadata,
             )
-        video_bytes = _encode_video_bytes(
-            artifacts.videos[0],
-            fps=artifacts.output_fps,
-            **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
-            video_codec_options=video_codec_options,
-            frame_converter=self._video_frame_converter,
+        video_bytes = cast(
+            bytes,
+            await self._encode_video_artifact(
+                request,
+                artifacts,
+                video_index=0,
+                request_id=f"{reference_id}:raw",
+            ),
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)

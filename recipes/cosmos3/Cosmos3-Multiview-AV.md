@@ -199,6 +199,41 @@ CFG parallelism, TP, and HSDP use the existing engine flags; HSDP and TP cannot
 be combined. See the offline script's usage examples. Cache-DiT, session state,
 LiDAR, camera subsets, and reordered cameras are rejected in v1.
 
+Camera files are encoded concurrently by default. The encoder divides CPUs in
+the process affinity mask across cameras, using at least two and at most four
+FFmpeg threads per camera (one thread on a one-CPU allocation). Use
+`--video-encoding-mode serial` as a diagnostic fallback. Both modes stream one
+frame at a time, so conversion memory scales with active cameras rather than
+the complete output length.
+
+The HTTP API keeps its existing encoder by default. Opt in to camera-parallel
+encoding in the request manifest's existing `extra_params` object:
+
+```json
+{
+  "prompt": "Drive through the intersection safely.",
+  "extra_params": {
+    "parallel_multiview_encoding": true,
+    "multiview": {
+      "views": [
+        {"camera_key": "camera_front_wide_120fov", "control_path": "front.mp4"},
+        {"camera_key": "camera_cross_right_120fov", "control_path": "cross_right.mp4"}
+      ]
+    },
+    "wsm": {}
+  }
+}
+```
+
+The bundled HTTP client forwards this option unchanged. The optimized path
+requires at least two output cameras, no audio, and enough affinity CPUs for
+two encoders. `video_codec_options` may contain `preset`, `crf`, and an omitted
+or automatic (`0`/`"auto"`) `threads` value. Other cases log a reason and use
+the existing monolithic encoder. Concurrent requests share one process-local
+CPU budget fairly at camera boundaries; deployments with multiple API
+processes should partition CPU affinity accordingly. The response remains one
+camera-major MP4, not a synchronized grid.
+
 ## Verification
 
 Run the CPU contract suite:
