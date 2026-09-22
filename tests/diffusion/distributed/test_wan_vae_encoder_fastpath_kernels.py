@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -178,7 +179,38 @@ def test_channels_last_encoder_posterior_and_layout(dtype, tf32):
     assert torch.isfinite(actual).all()
     error = (actual.float() - expected.float()).square().mean().sqrt()
     scale = expected.float().square().mean().sqrt().clamp_min(1e-8)
-    assert error / scale <= 0.01
+    nrmse = (error / scale).item()
+    if nrmse > 0.01:
+        # Run ablations only on failure, with the same weights/input/backend flags.
+        # Weight layout alone can change cuDNN arithmetic; distinguish that from
+        # errors introduced by the replacement forwards and approximate kernels.
+        layout_only = deepcopy(ref)
+        for module in (*layout_only.encoder.modules(), layout_only.quant_conv):
+            if isinstance(module, torch.nn.Conv3d):
+                module.to(memory_format=torch.channels_last_3d)
+            elif isinstance(module, torch.nn.Conv2d):
+                module.to(memory_format=torch.channels_last)
+        with (
+            torch.backends.cudnn.flags(allow_tf32=tf32),
+            torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32),
+        ):
+            layout_expected = layout_only.encode(x).latent_dist.parameters
+            assert install_wan_vae_encoder_fastpath(layout_only, level="lossless").installed
+            layout_lossless = encode_frames(layout_only, x)
+
+        def relative_error(value, reference):
+            rms = reference.float().square().mean().sqrt().clamp_min(1e-8)
+            return ((value.float() - reference.float()).square().mean().sqrt() / rms).item()
+
+        pytest.fail(
+            f"channels_last NRMSE={nrmse:.8f} exceeds 0.01; "
+            f"layout_only_vs_reference={relative_error(layout_expected, expected):.8f}; "
+            f"lossless_with_cl_weights_vs_layout_only={relative_error(layout_lossless, layout_expected):.8f}; "
+            f"fast_vs_layout_only={relative_error(actual, layout_expected):.8f}; "
+            f"GPU={torch.cuda.get_device_name()}, torch={torch.__version__}, "
+            f"CUDA={torch.version.cuda}, cuDNN={torch.backends.cudnn.version()}, dtype={dtype}, tf32={tf32}"
+        )
+    assert nrmse <= 0.01
 
 
 @torch.no_grad()
