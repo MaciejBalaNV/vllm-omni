@@ -182,6 +182,25 @@ def test_channels_last_encoder_posterior_and_layout(dtype, tf32):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("silu", [False, True])
+def test_channels_last_bf16_preserves_normalization_rounding(silu):
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanRMS_norm
+
+    # Ones make the reduction exact regardless of its order. The non-power-of-two
+    # width exposes rounding between normalization, scale, gamma, and SiLU.
+    x = torch.ones(1, 160, 1, 3, 11, device="cuda", dtype=torch.bfloat16)
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    norm = WanRMS_norm(160, images=False).to(device="cuda", dtype=x.dtype)
+    norm.gamma.copy_(torch.linspace(-2, 2, 160, device="cuda", dtype=x.dtype).view_as(norm.gamma))
+    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    expected = F.silu(norm(x)) if silu else norm(x)
+    bits_equal(fp.rms_norm_fastpath(norm, x, silu=silu), expected)
+    actual, cache = nc.norm_act_cat_time(x, norm.gamma, norm.scale, None, 2, channels_last=True, silu=silu)
+    bits_equal(actual, F.pad(expected, (0, 0, 0, 0, 2, 0)))
+    bits_equal(cache, actual[:, :, -2:])
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("channels", [160, 320, 640])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_production_width_normalization(channels, dtype):

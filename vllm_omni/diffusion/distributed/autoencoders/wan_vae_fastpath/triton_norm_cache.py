@@ -119,13 +119,9 @@ if HAS_TRITON:
             if HAS_BIAS:
                 bias = tl.load(BIAS + c, mask=c < C, other=0).to(tl.float32)
                 x = (x + bias[None, :]).to(dtype).to(tl.float32)
-            # Keep the existing channels-last reduction, tile, and fast math.
-            inv_norm = 1.0 / tl.maximum(tl.sqrt(tl.sum(x * x, axis=1)), eps)
-            gamma = tl.load(GAMMA + c, mask=c < C, other=0).to(tl.float32) * scale
-            v = x * inv_norm[:, None] * gamma[None, :]
-            if SILU:
-                v = v / (1.0 + tl.exp(-v))
-            value = v.to(dtype)
+            # Share the standalone epilogue, including BF16 intermediate rounding.
+            gamma = tl.load(GAMMA + c, mask=c < C, other=0).to(tl.float32)
+            value = cl._normalize_channels_last(x, gamma, scale, eps, dtype, SILU)
         elif TC > 0:
             cached_frame = frame - (PAD - TC)
             if cached_frame >= 0:

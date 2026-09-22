@@ -221,12 +221,13 @@ def test_encoder_decoder_installation_is_independent(encode_first):
 
 @torch.no_grad()
 @pytest.mark.parametrize("encode_first", [False, True])
-def test_encoder_installation_with_spatial_shard_decoder(encode_first):
+def test_encoder_installation_with_spatial_shard_decoder(encode_first, monkeypatch):
     from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
 
     ref, vae = pair()
     vae.distributed_executor = SimpleNamespace(parallel_mode="spatial_shard_height")
     group = object()  # Installation is local; collectives start only at decode.
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, 2))
     if encode_first:
         assert install_wan_vae_encoder_fastpath(vae).installed
     wan_spatial_shard.install_wan_spatial_shard_decode(vae, group)
