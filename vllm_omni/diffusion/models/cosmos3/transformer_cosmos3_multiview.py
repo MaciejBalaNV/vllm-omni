@@ -209,15 +209,21 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             project = self.lidar_proj_in if item.is_lidar else self.proj_in
             hidden = project(patchify_sensor(latent.to(camera), self.latent_patch_size))
             if not item.is_control:
+                # Projection outputs are fresh, unaliased tensors, so the
+                # timestep update can mutate them in place.
+                stream_time = time.to(hidden)
                 if not item.is_lidar and noisy_frame_mask is not None:
                     mask = (
                         noisy_frame_mask[:, 0, :, 0, 0]
                         .repeat_interleave(item.token_shape[1] * item.token_shape[2], dim=1)
                         .unsqueeze(-1)
+                        .to(hidden)
                     )
-                    hidden = hidden + time * mask
+                    # addcmul_ also avoids materializing the broadcast
+                    # ``stream_time * mask`` tensor.
+                    hidden.addcmul_(stream_time, mask)
                 else:
-                    hidden = hidden + time
+                    hidden.add_(stream_time)
             embeddings.append(hidden)
         return torch.cat(embeddings, dim=1)
 
