@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -60,6 +61,20 @@ def bits_equal(a, b):
     assert a.dtype == b.dtype and a.shape == b.shape
     integer = torch.int16 if a.element_size() == 2 else torch.int32
     assert torch.equal(a.contiguous().view(integer), b.contiguous().view(integer))
+
+
+def test_wan22_import_preserves_diffusers_encoder_norm():
+    from diffusers.models.autoencoders import autoencoder_kl_wan
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_npu():
+        pytest.skip("Wan 2.2 intentionally replaces WanRMS_norm on NPU")
+
+    importlib.import_module("vllm_omni.diffusion.models.wan2_2")
+    assert autoencoder_kl_wan.WanRMS_norm is WanRMS_norm
+    assert WanRMS_norm.__module__ == "diffusers.models.autoencoders.autoencoder_kl_wan"
+    assert fp.is_diffusers_rms_norm(WanRMS_norm(8, images=False))
 
 
 @torch.no_grad()

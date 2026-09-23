@@ -75,9 +75,9 @@ class FastPathConfig:
 def is_diffusers_rms_norm(module: Any) -> bool:
     """True for a diffusers ``WanRMS_norm`` instance.
 
-    Identified by name because ``vllm_omni.diffusion.models.wan2_2.patch_diffusers``
-    rebinds the name ``WanRMS_norm`` to ``RMSNormVAE`` in diffusers' own module
-    namespace; instances created before that patch keep the original class.
+    Identified by name because the Wan 2.2 NPU patch rebinds ``WanRMS_norm``
+    to ``RMSNormVAE`` in diffusers' module namespace; instances created before
+    that patch keep the original class.
     ``RMSNormVAE`` has different numerics (eps 1e-6, no fp32 upcast) and is
     deliberately not matched.
     """
