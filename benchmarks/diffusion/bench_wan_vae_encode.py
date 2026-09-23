@@ -42,6 +42,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     install_wan_vae_encoder_fastpath,
 )
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import encoder_nrmse_limit
+from vllm_omni.platforms import current_omni_platform
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 MIN_RECONSTRUCTION_PSNR_DB = 50.0
@@ -115,7 +116,7 @@ def distributed_setup(args):
     if world != args.vae_patch_parallel_size:
         raise ValueError("torchrun world size must equal --vae-patch-parallel-size")
     if world == 1:
-        torch.cuda.set_device(0)
+        current_omni_platform.set_device(current_omni_platform.get_torch_device(0))
         return 0
     from vllm_omni.diffusion.distributed.parallel_state import (
         init_distributed_environment,
@@ -123,7 +124,7 @@ def distributed_setup(args):
     )
 
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    current_omni_platform.set_device(current_omni_platform.get_torch_device(local_rank))
     init_distributed_environment(world_size=world, rank=rank, local_rank=local_rank)
     initialize_model_parallel(sequence_parallel_size=world, ulysses_degree=world)
     return rank

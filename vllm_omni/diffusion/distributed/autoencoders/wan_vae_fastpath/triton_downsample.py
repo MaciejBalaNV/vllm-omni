@@ -142,7 +142,7 @@ def spatial_downsample_input(x: torch.Tensor) -> torch.Tensor | None:
         device=x.device,
         memory_format=torch.channels_last if channels_last else torch.contiguous_format,
     )
-    with torch.cuda.device(x.device):
+    with torch.accelerator.device_index(x.device.index):
         _spatial_pad_kernel[(triton.cdiv(out.numel(), _BLOCK),)](
             x,
             out,
@@ -181,7 +181,7 @@ def avg_down3d_add(
         device=main.device,
         memory_format=torch.channels_last_3d if channels_last else torch.contiguous_format,
     )
-    with torch.cuda.device(source.device):
+    with torch.accelerator.device_index(source.device.index):
         _avg_down_add_kernel[(triton.cdiv(out.numel(), _BLOCK),)](
             source,
             main,
