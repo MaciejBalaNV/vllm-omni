@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D, WanCausalConv3d, WanResample
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     encode_frames,
@@ -173,7 +174,9 @@ def test_lossless_encoder_is_bitwise_exact_for_1x1_latents(dtype, frames):
     fast.load_state_dict(ref.state_dict())
     assert install_wan_vae_encoder_fastpath(fast).installed
     x = torch.rand(1, 3, frames, 16, 16, device="cuda", dtype=dtype) * 2 - 1
-    with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
+    # The mid-block attention sees a single spatial position; the fp32
+    # memory-efficient SDPA kernel rejects its stride-1 query for the reference too.
+    with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32), sdpa_kernel(SDPBackend.MATH):
         expected = ref.encode(x).latent_dist
         actual = fast.encode(x).latent_dist
         assert expected.parameters.shape[3:] == (1, 1)

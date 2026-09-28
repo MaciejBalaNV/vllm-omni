@@ -17,6 +17,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanUpsample,
 )
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
     original_wan_rms_norm,
@@ -959,7 +960,10 @@ def test_lossless_decoder_is_bitwise_exact_for_channels_last_and_1x1_latents(
     if latents_kind == "channels_last_3d":
         latents = latents.contiguous(memory_format=torch.channels_last_3d)
     autocast = dtype is not torch.float32
-    with torch.autocast("cuda", dtype=dtype, enabled=autocast):
+    # For a single spatial position the (unpatched) attention block hands SDPA a
+    # query with sequence stride 1, which the fp32 memory-efficient kernel rejects
+    # for the reference too ("query is not correctly aligned (strideM)").
+    with torch.autocast("cuda", dtype=dtype, enabled=autocast), sdpa_kernel(SDPBackend.MATH):
         expected = reference.decode(latents, return_dict=False)[0]
         actual = candidate.decode(latents, return_dict=False)[0]
     assert actual.stride() == expected.stride()
