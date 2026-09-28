@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Three-pass Phase 2.2 attention. Planning is host-side; kernels are opaque to GEN."""
 
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 from itertools import accumulate
 
 import torch
@@ -18,9 +17,8 @@ _INT32_LIMIT = 2**31
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
 def load_maskless_runtime() -> int:
-    """Resolve and retain one FA implementation per serving worker."""
+    """Resolve the worker's FA implementation at load time and log it."""
     from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
 
     fa_version = resolve_vllm_flash_attn_version()
@@ -257,7 +255,6 @@ def maskless_attention_op(
                 max_seqlen_k=maxk,
                 causal=False,
                 fa_version=fa_version,
-                fa_version_is_resolved=True,
             )
             branches.append((out, normalize_varlen_lse(lse, qi.numel(), q.shape[2])[0], inverse))
         for start in range(0, q.shape[1], MERGE_CHUNK_SIZE):
