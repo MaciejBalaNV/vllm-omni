@@ -1071,7 +1071,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         "height": height,
                     },
                 },
-            }
+            },
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
 
