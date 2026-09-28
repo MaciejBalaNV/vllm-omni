@@ -288,21 +288,32 @@ def test_encoder_installation_with_spatial_shard_decoder(encode_first, monkeypat
     assert not is_installed(vae)
 
 
+@torch.no_grad()
 @pytest.mark.parametrize("target", ["norm", "pad", "shortcut", "causal"])
-def test_encoder_rejects_bypassed_hooks(target):
-    _, vae = pair()
-    block = vae.encoder.down_blocks[0]
-    module = {
-        "norm": block.resnets[0].norm1,
-        "pad": block.downsampler.resample[0],
-        "shortcut": block.avg_shortcut,
-        "causal": vae.encoder.conv_in,
-    }[target]
-    handle = module.register_forward_hook(lambda _m, _i, out: out)
-    report = install_wan_vae_encoder_fastpath(vae)
-    handle.remove()
-    assert not report.installed and "hooks" in report.reason
-    assert "forward" not in vae.encoder.__dict__
+def test_encoder_installs_with_hooks_on_inlined_modules(target):
+    ref, fast = pair()
+    calls = []
+
+    def hook(_module, _args, output):
+        calls.append(True)
+        return output + 1
+
+    for vae in (ref, fast):
+        block = vae.encoder.down_blocks[0]
+        module = {
+            "norm": block.resnets[0].norm1,
+            "pad": block.downsampler.resample[0],
+            "shortcut": block.avg_shortcut,
+            "causal": vae.encoder.conv_in,
+        }[target]
+        module.register_forward_hook(hook)
+    assert install_wan_vae_encoder_fastpath(fast).installed
+    x = torch.randn(1, 3, 5, 16, 16)
+    expected = ref.encode(x).latent_dist.parameters
+    reference_calls = len(calls)
+    calls.clear()
+    bits_equal(fast.encode(x).latent_dist.parameters, expected)
+    assert len(calls) == reference_calls > 0
 
 
 @torch.no_grad()
@@ -316,7 +327,6 @@ def test_preserved_mutating_hook_retains_shortcut_clone():
 
         handles.append(vae.encoder.down_blocks[0].resnets[0].register_forward_pre_hook(mutate))
     assert install_wan_vae_encoder_fastpath(fast).installed
-    assert getattr(fast.encoder.down_blocks[0], fp.CFG_ATTR).clone_encoder_shortcuts
     x = torch.randn(1, 3, 5, 16, 16)
     bits_equal(fast.encode(x).latent_dist.parameters, ref.encode(x).latent_dist.parameters)
     for handle in handles:
@@ -595,14 +605,77 @@ def test_norm_cache_fusion_falls_back_in_order(monkeypatch, reason):
     )
 
 
-def test_norm_cache_does_not_skip_global_dropout_hooks():
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "register", [nn.modules.module.register_module_forward_hook, nn.modules.module.register_module_forward_pre_hook]
+)
+def test_global_hooks_disable_only_inlined_module_calls(register):
     dropout = nn.Dropout().eval()
+    norm = WanRMS_norm(8, images=False).eval()
+    x = torch.randn(1, 8, 1, 3, 5)
+    assert not fp._has_forward_hooks(dropout, norm)
     assert fp._can_bypass_dropout(dropout)
-    handle = nn.modules.module.register_module_forward_hook(lambda *_: None)
+    handle = register(lambda *_: None)
     try:
+        assert fp._has_forward_hooks(dropout) and fp._has_forward_hooks(norm)
         assert not fp._can_bypass_dropout(dropout)
+        # A module's own optimized forward still runs: its hooks see the real arguments and output.
+        assert fp._kernels_allowed(SimpleNamespace(is_cuda=True))
+        assert fp.rms_norm_fastpath(norm, x) is not None
     finally:
         handle.remove()
+    assert not fp._has_forward_hooks(dropout, norm)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("kernels", [False, True])
+@pytest.mark.parametrize("scope", ["global", "module"])
+@pytest.mark.parametrize("component", ["encoder", "decoder"])
+def test_forward_hooks_registered_after_install_see_every_module_call(monkeypatch, component, scope, kernels):
+    if kernels:
+        # Reach the CUDA-only inlining sites on CPU; the Triton wrappers still decline.
+        monkeypatch.setattr(fp, "_kernels_allowed", lambda _x: True)
+    ref, fast = pair()
+    install = install_wan_vae_encoder_fastpath if component == "encoder" else install_wan_vae_fastpath
+    assert install(fast).installed
+    pixels = torch.randn(1, 3, 5, 16, 16)
+    latents = torch.randn(1, CONFIG["z_dim"], 2, 2, 2)
+    calls = []
+
+    def run(vae):
+        names = {module: name for name, module in vae.named_modules()}
+
+        def record(module, _args, output):
+            calls.append(names[module])
+            # Changing outputs also makes a skipped dispatch visible in the result.
+            return output + 1 if type(module) is WanCausalConv3d else output
+
+        def mutate(_module, args):
+            args[0].add_(0.125)
+
+        calls.clear()
+        if scope == "global":
+            handles = [nn.modules.module.register_module_forward_hook(record)]
+        else:
+            handles = [module.register_forward_hook(record) for module in vae.modules()]
+            # Upstream's shortcut clone must survive an in-place input mutation.
+            block = vae.encoder.down_blocks[0] if component == "encoder" else vae.decoder.up_blocks[0]
+            handles.append(block.resnets[0].register_forward_pre_hook(mutate))
+        try:
+            if component == "encoder":
+                output = vae.encode(pixels).latent_dist.parameters
+            else:
+                output = vae.decode(latents).sample
+        finally:
+            for handle in handles:
+                handle.remove()
+        return output, list(calls)
+
+    expected, expected_calls = run(ref)
+    actual, actual_calls = run(fast)
+    assert any("norm" in name for name in expected_calls) and any("conv" in name for name in expected_calls)
+    assert actual_calls == expected_calls
+    bits_equal(actual, expected)
 
 
 @torch.no_grad()

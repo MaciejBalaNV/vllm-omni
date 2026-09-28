@@ -191,8 +191,8 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
                 and current_forward.__func__ is type(module).forward
             ):
                 return _skip(level, f"{name} has a custom forward that the fast path would replace or bypass")
-        if module in bypassed and (module._forward_pre_hooks or module._forward_hooks):
-            return _skip(level, f"{name} has forward hooks that the fast path would bypass")
+    # Forward hooks need no check here: every inlined call site checks them at
+    # runtime and then calls the module normally.
 
     return _install_bindings(vae, decoder, bindings, convs, level=level)
 
@@ -391,16 +391,14 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
         standard = (
             isinstance(current, MethodType) and current.__self__ is module and current.__func__ is type(module).forward
         )
-        hooks = bool(module._forward_pre_hooks or module._forward_hooks)
         if module in replaced or module in bypassed:
             if not standard:
                 return skip(f"{name} has a custom forward that the fast path would replace or bypass")
-        if module in bypassed and hooks:
-            return skip(f"{name} has forward hooks that the fast path would bypass")
-        # Normally-called custom modules/hooks may mutate their input. Retain
-        # upstream's shortcut clone in that case rather than assuming purity.
+        # Normally-called custom modules may mutate their input. Retain
+        # upstream's shortcut clone in that case rather than assuming purity;
+        # forward hooks are checked for the same reason on every call.
         if name.startswith("encoder.down_blocks."):
-            if not standard or hooks or (type(module) not in pure_types and not forwards.is_diffusers_rms_norm(module)):
+            if not standard or (type(module) not in pure_types and not forwards.is_diffusers_rms_norm(module)):
                 clone_shortcuts = True
             if type(module) is WanResidualBlock and not forwards.is_diffusers_rms_norm(module.norm1):
                 clone_shortcuts = True

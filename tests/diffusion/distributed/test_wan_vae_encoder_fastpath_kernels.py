@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D, WanResample
+from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D, WanCausalConv3d, WanResample
 
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     encode_frames,
@@ -155,6 +155,61 @@ def test_lossless_encoder_posterior_and_output_assembly(dtype, frames):
         bits_equal(actual.logvar, expected.logvar)
         bits_equal(actual.mode(), expected.mode())
         bits_equal(encode_frames(fast, x), expected.parameters)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("scope", ["global", "module"])
+def test_forward_hooks_registered_after_install_see_every_encoder_module_call(monkeypatch, scope):
+    assembled = []
+    for name in ("cat_time_5d", "cat_pad_5d"):
+
+        def counted(*args, _original=getattr(fp.dm, name), **kwargs):
+            result = _original(*args, **kwargs)
+            assembled.append(result is not None)
+            return result
+
+        monkeypatch.setattr(fp.dm, name, counted)
+    torch.manual_seed(0)
+    ref = AutoencoderKLWan(**CONFIG).eval().to(device="cuda", dtype=torch.bfloat16)
+    fast = AutoencoderKLWan(**CONFIG).eval().to(device="cuda", dtype=torch.bfloat16)
+    fast.load_state_dict(ref.state_dict())
+    assert install_wan_vae_encoder_fastpath(fast).installed
+    x = torch.rand(1, 3, 5, 64, 96, device="cuda", dtype=torch.bfloat16) * 2 - 1
+    calls = []
+
+    def run(vae):
+        names = {module: name for name, module in vae.named_modules()}
+
+        def record(module, _args, output):
+            calls.append(names[module])
+            # Changing outputs also makes a skipped dispatch visible in the result.
+            return output + 1 if type(module) is WanCausalConv3d else output
+
+        def mutate(_module, args):
+            args[0].add_(0.125)
+
+        calls.clear()
+        if scope == "global":
+            handles = [torch.nn.modules.module.register_module_forward_hook(record)]
+        else:
+            handles = [module.register_forward_hook(record) for module in vae.modules()]
+            # Upstream's shortcut clone must survive an in-place input mutation.
+            handles.append(vae.encoder.down_blocks[0].resnets[0].register_forward_pre_hook(mutate))
+        try:
+            output = vae.encode(x).latent_dist.parameters
+        finally:
+            for handle in handles:
+                handle.remove()
+        return output, list(calls)
+
+    expected, expected_calls = run(ref)
+    actual, actual_calls = run(fast)
+    assert actual_calls == expected_calls
+    bits_equal(actual, expected)
+    # Hooked convolutions still assemble their inputs in their own optimized forward.
+    assert any(assembled)
+    # Without global hooks the fast path is used again.
+    bits_equal(fast.encode(x).latent_dist.parameters, ref.encode(x).latent_dist.parameters)
 
 
 @torch.no_grad()

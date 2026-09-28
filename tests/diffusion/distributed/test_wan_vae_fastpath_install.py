@@ -369,22 +369,28 @@ def test_installer_declines_forward_wrappers_it_would_bypass(target: str, level:
 
 @torch.no_grad()
 @pytest.mark.parametrize("pre_hook", [False, True])
-def test_installer_declines_convolution_hooks_it_would_bypass(pre_hook: bool) -> None:
-    _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
-    conv = vae.decoder.conv_in
+def test_installer_keeps_hooks_on_convolutions_it_would_inline(pre_hook: bool) -> None:
+    reference, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     calls = []
 
     def hook(*args):
         calls.append(True)
 
-    handle = conv.register_forward_pre_hook(hook) if pre_hook else conv.register_forward_hook(hook)
+    handles = [
+        conv.register_forward_pre_hook(hook) if pre_hook else conv.register_forward_hook(hook)
+        for conv in (reference.decoder.conv_in, vae.decoder.conv_in)
+    ]
     try:
-        report = install_wan_vae_fastpath(vae, level="channels_last")
-        assert not report.installed and "decoder.conv_in" in report.reason and "forward hooks" in report.reason
-        vae.decode(torch.randn(1, 4, 2, 6, 8))
-        assert calls
+        latents = torch.randn(1, 4, 2, 6, 8)
+        expected = reference.decode(latents).sample
+        reference_calls = len(calls)
+        calls.clear()
+        assert install_wan_vae_fastpath(vae).installed
+        assert torch.equal(vae.decode(latents).sample, expected)
+        assert len(calls) == reference_calls > 0
     finally:
-        handle.remove()
+        for handle in handles:
+            handle.remove()
 
 
 @torch.no_grad()

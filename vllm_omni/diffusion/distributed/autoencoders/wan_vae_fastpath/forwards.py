@@ -91,6 +91,18 @@ def is_diffusers_rms_norm(module: Any) -> bool:
     )
 
 
+def _has_forward_hooks(*modules: nn.Module | None) -> bool:
+    """Whether calling any of ``modules`` would run forward hooks, so the call cannot be inlined.
+
+    Global module hooks count for every module. Checked on every call, so hooks
+    registered after installation are honored. Optimizations inside a module's
+    own forward stay active: its hooks still see the real arguments and output.
+    """
+    if nn.modules.module._global_forward_pre_hooks or nn.modules.module._global_forward_hooks:
+        return True
+    return any(m is not None and (m._forward_pre_hooks or m._forward_hooks) for m in modules)
+
+
 def _kernels_allowed(x: torch.Tensor) -> bool:
     return x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
 
@@ -208,10 +220,15 @@ def _norm_act(
     un-added (see :func:`_run_cached_causal_conv` with ``return_bias=True``).
     """
     cfg = getattr(norm, CFG_ATTR, None)
-    if cfg is not None and is_diffusers_rms_norm(norm):
+    if cfg is not None and is_diffusers_rms_norm(norm) and not _has_forward_hooks(norm):
         # SiLU is folded into the norm kernel when the epilogue was proven exact
         # for this dtype, or always under the (tolerance-based) channels_last level.
-        fuse = type(act) is nn.SiLU and not act.inplace and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        fuse = (
+            type(act) is nn.SiLU
+            and not act.inplace
+            and not _has_forward_hooks(act)
+            and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        )
         out = rms_norm_fastpath(norm, x, silu=fuse, bias=pending_bias)
         if out is not None:
             return out if fuse else act(out)
@@ -232,7 +249,16 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
         # fill + copy. Skipping it is the identity.
         return nn.Conv3d.forward(self, x)
     if _kernels_allowed(x) and (cache_x is None or (cache_x.device == x.device and cache_x.dtype == x.dtype)):
-        assembled = dm.cat_pad_5d(x, cache_x if padding[4] > 0 else None, padding)
+        history = cache_x if padding[4] > 0 else None
+        # Preferred: temporal concat only + cuDNN spatial padding, sharing the
+        # cached call sites' verdicts, so hooked convolutions keep it too.
+        verdicts = _SPATIAL_PAD_VERDICTS.setdefault(self, {})
+        key = _conv_verdict_key(self, x, 0 if history is None else history.shape[2])
+        if verdicts.get(key, True):
+            assembled = dm.cat_time_5d(x, history, padding[4])
+            if assembled is not None:
+                return _conv_with_spatial_padding(self, assembled, self.bias, verdicts, key)
+        assembled = dm.cat_pad_5d(x, history, padding)
         if assembled is not None:
             return nn.Conv3d.forward(self, assembled)
     return WanCausalConv3d.forward(self, x, cache_x)
@@ -277,6 +303,34 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return bool(torch.equal(a.contiguous().view(int_dtype), b.contiguous().view(int_dtype)))
 
 
+_PROBE_SEED = 0
+
+
+def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) -> torch.Tensor:
+    """Gaussian tensor with ``t``'s shape, dtype, device and strides."""
+    return torch.empty_like(t).normal_(0.0, std, generator=generator)
+
+
+def _equal_on_random_operands(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    candidate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> bool:
+    """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
+
+    Agreement on the real operands proves little: all-zero activations or
+    weights give the same bytes under any kernel. Which kernel cuDNN runs
+    depends only on the verdict key's metadata, never on values, so a match on
+    random data is what makes a verdict reusable for every later input and
+    weight update. A private generator leaves the global RNG streams untouched.
+    """
+    generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
+    probe_x = _random_like(x, generator)
+    probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
+    return _bitwise_equal(candidate(probe_x, probe_weight), reference(probe_x, probe_weight))
+
+
 def _conv_with_spatial_padding(
     conv: nn.Conv3d,
     assembled: torch.Tensor,
@@ -289,16 +343,24 @@ def _conv_with_spatial_padding(
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
     but is only bit-identical if cuDNN selects the same kernel for both
-    formulations, so the first call for each (conv, shape) runs both and
-    compares bitwise; later calls reuse the verdict until it is evicted.
+    formulations, so the first call for each (conv, shape) runs both, on the
+    real and on random operands, and compares bitwise; later calls reuse the
+    verdict until it is evicted.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
-    fast = F.conv3d(assembled, conv.weight, bias, conv.stride, (0, pad_height, pad_width), conv.dilation, conv.groups)
+    pads = (pad_width, pad_width, pad_height, pad_height, 0, 0)
+
+    def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x, weight, bias, conv.stride, (0, pad_height, pad_width), conv.dilation, conv.groups)
+
+    def padded(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(F.pad(x, pads), weight, bias, conv.stride, 0, conv.dilation, conv.groups)
+
+    fast = candidate(assembled, conv.weight)
     if key in verdicts:
         return fast
-    padded = F.pad(assembled, (pad_width, pad_width, pad_height, pad_height, 0, 0))
-    reference = F.conv3d(padded, conv.weight, bias, conv.stride, 0, conv.dilation, conv.groups)
-    verdict = _bitwise_equal(fast, reference)
+    reference = padded(assembled, conv.weight)
+    verdict = _bitwise_equal(fast, reference) and _equal_on_random_operands(assembled, conv.weight, candidate, padded)
     _record_verdict(verdicts, key, verdict)
     if not verdict:
         logger.info(
@@ -367,6 +429,7 @@ def _run_cached_causal_conv(
     payload = cache if isinstance(cache, torch.Tensor) else None
     if (
         type(conv) is WanCausalConv3d
+        and not _has_forward_hooks(conv)
         and _kernels_allowed(x)
         and x.dim() == 5
         and (payload is None or (payload.device == x.device and payload.dtype == x.dtype))
@@ -408,10 +471,7 @@ def _can_bypass_dropout(module: nn.Module | None) -> bool:
         type(module) is nn.Dropout
         and (not module.training or module.p == 0)
         and getattr(module.forward, "__func__", None) is nn.Dropout.forward
-        and not module._forward_pre_hooks
-        and not module._forward_hooks
-        and not nn.modules.module._global_forward_pre_hooks
-        and not nn.modules.module._global_forward_hooks
+        and not _has_forward_hooks(module)
     )
 
 
@@ -447,7 +507,7 @@ def _run_norm_act_cached_conv(
         and not act.inplace
         and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
         and type(conv) is WanCausalConv3d
-        and not any(m._forward_pre_hooks or m._forward_hooks for m in (norm, act, conv))
+        and not _has_forward_hooks(norm, act, conv)
         and _can_bypass_dropout(after_norm)
         and conv._padding[0] == conv._padding[1]
         and conv._padding[2] == conv._padding[3]
@@ -492,13 +552,20 @@ def _run_conv_out_channels_last(
     (one fused transpose in the pixels kernel) saves the separate channels-first
     assembly and cuDNN's transpose. The output is made contiguous, so nothing
     downstream sees a layout change. The first call per (conv, shape) also runs
-    the channels-first formulation and compares bitwise; a mismatch routes that
+    the channels-first formulation and compares bitwise, on the real and on
+    random operands (see :func:`_equal_on_random_operands`); a mismatch routes that
     shape back to the standard path while its verdict is cached. Evicted shapes
     are checked again on their next use.
     """
     cache = cache_list[index]
     payload = cache if isinstance(cache, torch.Tensor) else None
-    if type(conv) is not WanCausalConv3d or not _kernels_allowed(x) or x.dim() != 5 or x.stride(1) == 1:
+    if (
+        type(conv) is not WanCausalConv3d
+        or _has_forward_hooks(conv)
+        or not _kernels_allowed(x)
+        or x.dim() != 5
+        or x.stride(1) == 1
+    ):
         return None
     if payload is not None and (payload.device != x.device or payload.dtype != x.dtype):
         return None
@@ -510,15 +577,21 @@ def _run_conv_out_channels_last(
     if pair is None:
         return None
     assembled, cache_list[index] = pair
-    out = F.conv3d(assembled, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
-    out = out.contiguous()
+
+    def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups).contiguous()
+
+    def channels_first(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # The channels-first path convolves exactly this tensor in NCDHW layout.
+        return F.conv3d(x.contiguous(), weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+    out = candidate(assembled, conv.weight)
     if key in verdicts:
         return out
-    # The channels-first path convolves exactly this tensor in NCDHW layout.
-    reference = F.conv3d(
-        assembled.contiguous(), conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
+    reference = channels_first(assembled, conv.weight)
+    verdict = _bitwise_equal(out, reference) and _equal_on_random_operands(
+        assembled, conv.weight, candidate, channels_first
     )
-    verdict = _bitwise_equal(out, reference)
     _record_verdict(verdicts, key, verdict)
     if not verdict:
         logger.info(
@@ -643,7 +716,12 @@ def resample_forward(
     frames = x.shape[2]
     x = _merge_batch_and_frames(x)
     pending_bias = None
-    if return_bias and _is_upsample_conv_pair(self.resample) and _kernels_allowed(x):
+    if (
+        return_bias
+        and _is_upsample_conv_pair(self.resample)
+        and not _has_forward_hooks(self.resample, self.resample[1])
+        and _kernels_allowed(x)
+    ):
         upsample, conv = self.resample[0], self.resample[1]
         x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
         pending_bias = _deferred_conv_bias(conv, x)
@@ -705,6 +783,7 @@ def residual_block_forward(
         type(shortcut) is WanCausalConv3d
         and shortcut.bias is not None
         and not any(shortcut._padding)
+        and not _has_forward_hooks(shortcut)
         and _kernels_allowed(x)
     ):
         residual = _conv_without_bias(shortcut, x)
@@ -767,8 +846,9 @@ def residual_up_block_forward(
 ) -> torch.Tensor:
     if feat_idx is None:
         feat_idx = [0]
-    # Upstream clones ``x`` for the shortcut; nothing below mutates it in place.
-    shortcut_source = x
+    # Upstream clones ``x`` for the shortcut. Nothing below mutates it in place
+    # unless a hook does, so the copy is only needed while one is registered.
+    shortcut_source = x.clone() if _has_forward_hooks(*self.resnets.modules()) else x
     for resnet in self.resnets:
         if feat_cache is None:
             x = resnet(x)
@@ -778,12 +858,22 @@ def residual_up_block_forward(
     shortcut = self.avg_shortcut
     # The upsampler's Conv2d output feeds only ``x + DupUp3D(...)``, so its bias
     # is folded into that kernel (exact: rounded like ATen's ``add_`` first).
-    fuse_shortcut = type(shortcut) is DupUp3D and _kernels_allowed(x) and x.dtype == shortcut_source.dtype
+    fuse_shortcut = (
+        type(shortcut) is DupUp3D
+        and not _has_forward_hooks(shortcut)
+        and _kernels_allowed(x)
+        and x.dtype == shortcut_source.dtype
+    )
     conv_bias = None
     if self.upsampler is not None:
         if feat_cache is None:
             x = self.upsampler(x)
-        elif fuse_shortcut and type(self.upsampler) is WanResample and hasattr(self.upsampler, CFG_ATTR):
+        elif (
+            fuse_shortcut
+            and type(self.upsampler) is WanResample
+            and hasattr(self.upsampler, CFG_ATTR)
+            and not _has_forward_hooks(self.upsampler)
+        ):
             x, conv_bias = resample_forward(self.upsampler, x, feat_cache, feat_idx, return_bias=True)
         else:
             x = self.upsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)

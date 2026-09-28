@@ -39,7 +39,11 @@ def downsample_forward(
 ) -> torch.Tensor:
     if feat_idx is None:
         feat_idx = [0]
-    if not fp._kernels_allowed(x) or not is_spatial_downsample(self):
+    if (
+        not fp._kernels_allowed(x)
+        or not is_spatial_downsample(self)
+        or fp._has_forward_hooks(self.resample, self.resample[0])
+    ):
         return WanResample.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx)
     cfg = getattr(self, fp.CFG_ATTR, None)
     if x.stride(1) == 1 and (cfg is None or not cfg.channels_last):
@@ -91,14 +95,16 @@ def residual_down_block_forward(
     if torch.is_grad_enabled() or torch.compiler.is_compiling():
         return WanResidualDownBlock.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx)
     cfg = getattr(self, fp.CFG_ATTR, None)
-    source = x.clone() if cfg is None or cfg.clone_encoder_shortcuts else x
+    # Hooks registered after installation may mutate the input in place too.
+    clone = cfg is None or cfg.clone_encoder_shortcuts or fp._has_forward_hooks(*self.resnets.modules())
+    source = x.clone() if clone else x
     for resnet in self.resnets:
         x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
     if self.downsampler is not None:
         x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
 
     shortcut = self.avg_shortcut
-    if cfg is not None and cfg.channels_last and type(shortcut) is AvgDown3D:
+    if cfg is not None and cfg.channels_last and type(shortcut) is AvgDown3D and not fp._has_forward_hooks(shortcut):
         out = down.avg_down3d_add(x, source, shortcut.factor_t, shortcut.factor_s, shortcut.group_size)
         if out is not None:
             return out
