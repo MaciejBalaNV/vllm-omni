@@ -56,13 +56,9 @@ _BACKEND_BLOCK_SIZES: dict[str, tuple[int, int]] = {
 
 # The UND stream is padded to a fixed capacity rather than to the nearest block
 # above each prompt's real length.  A pad that tracks the prompt changes the
-# packed key tensor's sequence dimension, and the flex kernel is compiled with
-# dynamic=False, so every distinct prompt-length bucket is a fresh recompile
-# ("tensor 'key' size mismatch at index 2").  Dynamo's default limit of eight is
-# reached after a handful of prompts, after which the frame falls back to eager
-# FlexAttention -- which materializes a ~2.7 TB score matrix at the released
-# 11-view geometry.  A fixed capacity gives one compiled kernel for the life of
-# the process.
+# packed key tensor's sequence dimension, so the block-mask shapes, packing
+# buffers and compiled flex guards would all vary with every prompt.  A fixed
+# capacity keeps them identical across prompts of one request geometry.
 #
 # Padding to the capacity is numerically free: the extra keys carry
 # ``sample_id == -1`` and are therefore already excluded from every real query by
@@ -823,6 +819,25 @@ def _pack_padded_bshd(
 _compiled_flex_attention = None
 
 
+def _compile_flex_attention() -> Callable[..., torch.Tensor]:
+    # The GEN length follows the request's views, clip length and resolution,
+    # so a static compile recompiles per request geometry.  Dynamo's recompile
+    # limit (8 by default) then drops to eager FlexAttention, which materializes
+    # the full fp32 score matrix (~5.4 TB at the released 11-view geometry).
+    # Dynamic shapes serve every geometry from one kernel.  The settings are
+    # patched explicitly because this runs inside a regionally compiled GEN
+    # layer, whose ``dynamic=False`` config stays in effect for nested compiles.
+    # ``fullgraph=True`` turns an exhausted recompile budget into an error
+    # instead of the eager fallback.
+    compiled = torch.compile(torch_flex_attention, dynamic=True, fullgraph=True)
+
+    def run(*args: Any, **kwargs: Any) -> torch.Tensor:
+        with torch._dynamo.config.patch(automatic_dynamic_shapes=True, assume_static_by_default=False):
+            return compiled(*args, **kwargs)
+
+    return run
+
+
 def flex_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -847,7 +862,7 @@ def flex_attention(
     if q.device.type == "cuda":
         global _compiled_flex_attention
         if _compiled_flex_attention is None:
-            _compiled_flex_attention = torch.compile(torch_flex_attention, dynamic=False)
+            _compiled_flex_attention = _compile_flex_attention()
         output = _compiled_flex_attention(
             q,
             k,
@@ -868,6 +883,26 @@ def flex_attention(
             kernel_options=kernel_options,
         )
     return output
+
+
+@torch.compiler.disable
+def padded_multiview_triton_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_und: torch.Tensor,
+    v_und: torch.Tensor,
+    context: MultiviewAttentionContext,
+) -> torch.Tensor:
+    """``padded_multiview_flex_attention`` kept out of the regionally compiled GEN layer.
+
+    Traced inline, the mask plan, packing buffers and kernel specialize on the
+    request geometry and the prompt length, so the layer graph exhausts its
+    recompile budget within a few requests and the attention falls back to
+    eager. Here it always runs through the dedicated dynamic-shape compile in
+    ``flex_attention``.
+    """
+    return padded_multiview_flex_attention(q, k, v, k_und, v_und, context)
 
 
 def padded_multiview_flex_attention(

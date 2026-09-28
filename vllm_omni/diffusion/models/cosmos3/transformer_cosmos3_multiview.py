@@ -293,6 +293,15 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             self.cached_freqs_gen = (cos.unsqueeze(2), sin.unsqueeze(2))
 
         context = MultiviewAttentionContext(layout, self._multiview_mask_cache, self._multiview_buffer_cache)
+        if layout.backend != "fa4":
+            # Compact prompt-dependent dimensions cross the compiled GEN boundary
+            # as dynamic tensors, so neither new prompts nor the two CFG branches
+            # recompile the GEN layers. Maskless carries caption lengths/maxima
+            # as plan tensor data; Triton pads the UND stream outside the graph.
+            # FA4 still builds its plan inside the graph from the static length.
+            for k_und, v_und in self.cached_kv:
+                torch._dynamo.mark_dynamic(k_und, 1)
+                torch._dynamo.mark_dynamic(v_und, 1)
         if layout.backend == "maskless":
             cp = _get_ulysses_state()[0] if _is_sp_active() else 1
             key = self.cached_kv[0][0]
@@ -317,11 +326,6 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                 for index, buffer in enumerate(make_merge_scratch(query_heads, head_dim, key.dtype, key.device)):
                     self._multiview_buffer_cache[(*scratch_key, index)] = buffer
             scratch = [self._multiview_buffer_cache[(*scratch_key, index)] for index in range(6)]
-            # Compact prompt-dependent dimensions cross the compiled GEN boundary
-            # as dynamic tensors; caption lengths/maxima are plan tensor data.
-            for k_und, v_und in self.cached_kv:
-                torch._dynamo.mark_dynamic(k_und, 1)
-                torch._dynamo.mark_dynamic(v_und, 1)
             context = replace(
                 context,
                 maskless_plan=(self._multiview_mask_cache[cache_key], scratch),
