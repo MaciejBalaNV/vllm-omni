@@ -132,8 +132,9 @@ original forwards and tensor layouts while retaining current weight values.
 
 `benchmarks/diffusion/bench_wan_vae_encode.py` loads only the VAE. It compares all
 encoder levels with the same weights, inputs and backend settings, always
-running `off` first. It reports startup/first-call time separately from warmed
-median latency, throughput and peak allocated memory. Reference tensors are
+setting up and validating against `off` first. It reports startup/first-call
+time separately from warmed median latency, throughput and peak allocated
+memory. Reference tensors are
 kept on CPU during candidate timing. Console output includes timing and
 per-tensor quality tables with explicit PASS/FAIL/OOM/NO REF statuses; speedups
 are still shown when numerical validation fails. `--json` saves the full
@@ -162,6 +163,26 @@ The default is BF16, 1280x720, three warmups and ten timed iterations.
 measurements must use real weights. `--tf32 off` controls FP32 convolution math.
 The profiler reports CUDA operator times, including padding, copying,
 normalization, reduction, attention and convolutions.
+
+Power- and thermally-limited GPUs (for example H100 NVL, RTX 5090 and RTX PRO
+6000) run the same kernels more than 2x slower after sustained load, so timing
+the levels one after another favors whichever level runs first. The default
+`--schedule interleaved` keeps every level's VAE resident and runs one encode
+per level in each warmup and timed round, rotating the first level from round
+to round. Peak memory excludes the other levels' resident weights.
+`--schedule sequential` loads and times one level at a time, for GPUs that
+cannot hold all levels at once. During timed encodes, NVML samples the SM
+clock, power, temperature and clock-event (throttle) reasons every
+`--telemetry-interval-ms` (default 50; 0 disables). They are reported per level
+and per iteration. The console warns when median SM clocks differ by more than
+3% across levels or when the GPU throttled. `--lock-sm-clock-mhz` pins the SM
+clock for the run and resets it on exit; this requires administrator rights.
+
+```bash
+# Comparable timings on a power-limited GPU (clock lock needs root)
+python benchmarks/diffusion/bench_wan_vae_encode.py \
+    --model nvidia/Cosmos3-Nano --frames 93 --lock-sm-clock-mhz 1500 --json encode-locked.json
+```
 
 The benchmark exits unsuccessfully for a lossless bitwise mismatch, nonfinite
 outputs, or channels-last normalized RMSE above 1% for posterior parameters,

@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Input, validation and reporting contracts for the standalone encoder benchmark."""
 
+import itertools
 import json
 import math
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +23,16 @@ def test_benchmark_reference_always_runs_first(monkeypatch):
     args = parse_args()
     assert args.levels == ["off", "channels_last", "lossless"]
     assert args.warmup == 3 and args.iters == 10
+    assert args.schedule == "interleaved" and args.telemetry_interval_ms == 50 and args.lock_sm_clock_mhz is None
+
+
+@pytest.mark.parametrize(
+    "extra", [["--telemetry-interval-ms", "-1"], ["--lock-sm-clock-mhz", "0"], ["--schedule", "random"]]
+)
+def test_invalid_schedule_and_telemetry_arguments(monkeypatch, extra):
+    monkeypatch.setattr("sys.argv", ["bench", *extra])
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_seeded_pixels_and_real_input(tmp_path):
@@ -158,7 +171,23 @@ def test_tables_show_timings_quality_statuses_and_optional_reconstruction(capsys
 def cpu_main(monkeypatch, tmp_path):
     """Exercise the real CLI/reporting flow with only GPU execution mocked."""
     output = tmp_path / "results.json"
-    monkeypatch.setattr("sys.argv", ["bench", "--tiny", "--size", "32x16", "--frames", "1", "--json", str(output)])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "bench",
+            "--tiny",
+            "--size",
+            "32x16",
+            "--frames",
+            "1",
+            "--json",
+            str(output),
+            "--schedule",
+            "sequential",
+            "--telemetry-interval-ms",
+            "0",
+        ],
+    )
     monkeypatch.setattr(benchmark, "distributed_setup", lambda _: 0)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "test GPU")
@@ -176,7 +205,7 @@ def test_main_tables_json_and_exit_match_validation(monkeypatch, cpu_main, capsy
     monkeypatch.setattr(
         benchmark,
         "run_level",
-        lambda args, level, pixels, rank: _result(level, 1.02 if level == failed_level else 1.0),
+        lambda args, level, pixels, rank, **_: _result(level, 1.02 if level == failed_level else 1.0),
     )
     if failed_level:
         with pytest.raises(SystemExit) as exc:
@@ -200,7 +229,7 @@ def test_main_tables_json_and_exit_match_validation(monkeypatch, cpu_main, capsy
 
 @pytest.mark.parametrize("oom_levels", [("lossless",), ("off",), ("off", "lossless", "channels_last")])
 def test_main_oom_results_and_missing_reference(monkeypatch, cpu_main, capsys, oom_levels):
-    def run(args, level, pixels, rank):
+    def run(args, level, pixels, rank, **_):
         if level in oom_levels:
             raise torch.OutOfMemoryError(f"[{level}] out of memory during timed encoding: allocation detail")
         return _result(level)
@@ -275,3 +304,270 @@ def test_run_level_oom_identifies_execution_phase(monkeypatch, phase, encode_cal
     if phase == "reference-decoder reconstruction":
         assert "omit --check-reconstruction to benchmark encoding alone" in str(exc.value)
         assert "decode allocation failed" in str(exc.value)
+
+
+class _FakeVae:
+    """Records the global encode order; ``fail_at`` is the 1-based call that runs out of memory."""
+
+    def __init__(self, level, calls, size, fail_at=None):
+        self.level, self.calls, self.size, self.fail_at, self.count = level, calls, size, fail_at, 0
+
+    def encode(self, inputs):
+        self.calls.append(self.level)
+        self.count += 1
+        if self.count == self.fail_at:
+            raise torch.OutOfMemoryError("fake allocation failed")
+        value = torch.tensor([float(len(self.calls))])
+        return SimpleNamespace(latent_dist=SimpleNamespace(parameters=value, logvar=value, mode=lambda: value))
+
+
+@pytest.fixture
+def cpu_rounds(monkeypatch):
+    """Run the real round-robin loop with device synchronization and memory queries mocked."""
+    monkeypatch.setattr(benchmark, "sync", lambda: None)
+    monkeypatch.setattr(benchmark, "max_across_ranks", lambda value: value)
+    monkeypatch.setattr(benchmark, "resident_bytes", lambda vae: vae.size)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 1000)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    calls = []
+
+    def make(fail_at=None):
+        return [
+            benchmark.LevelRun(
+                level=level,
+                input_shape=[1, 3, 5, 16, 32],
+                vae=_FakeVae(level, calls, size, fail_at if level == "lossless" else None),
+                inputs=torch.zeros(1),
+            )
+            for level, size in (("off", 100), ("lossless", 200), ("channels_last", 300))
+        ]
+
+    return calls, make
+
+
+def test_round_robin_rotates_the_first_level_every_round(cpu_rounds):
+    calls, make = cpu_rounds
+    runs = make()
+    assert benchmark.run_rounds(SimpleNamespace(warmup=1, iters=3, dtype="bf16"), runs) == {}
+    off, lossless, channels_last = "off", "lossless", "channels_last"
+    assert calls == [
+        *(off, lossless, channels_last),  # warmup
+        *(lossless, channels_last, off),
+        *(channels_last, off, lossless),
+        *(off, lossless, channels_last),
+    ]
+    for run in runs:
+        assert len(run.times) == 3 and run.phase == "posterior transfer"
+        # The other levels' resident weights are excluded from this level's peak.
+        assert run.peak_bytes == 1000 - (600 - run.vae.size)
+        # Posterior (moments, mean, logvar) of the level's last timed encode.
+        last = len(calls) - calls[::-1].index(run.level)
+        assert all(torch.equal(tensor, torch.tensor([float(last)])) for tensor in run.outputs)
+
+
+@pytest.mark.parametrize("fail_fast", [False, True])
+def test_round_robin_oom_drops_only_the_failing_level(cpu_rounds, fail_fast):
+    calls, make = cpu_rounds
+    runs = make(fail_at=3)  # The warmup and first timed encode succeed.
+    args = SimpleNamespace(warmup=1, iters=3, dtype="bf16")
+    if fail_fast:
+        with pytest.raises(torch.OutOfMemoryError, match=r"\[lossless\] out of memory during timed encoding"):
+            benchmark.run_rounds(args, runs, fail_fast=True)
+        return
+    failures = benchmark.run_rounds(args, runs, fail_fast=False)
+    assert list(failures) == ["lossless"]
+    assert "[lossless] out of memory during timed encoding" in str(failures["lossless"])
+    assert "fake allocation failed" in str(failures["lossless"])
+    assert runs[1].vae is None and runs[1].inputs is None and calls.count("lossless") == 3
+    for run in (runs[0], runs[2]):
+        assert len(run.times) == 3 and run.outputs is not None
+    # Once lossless is released, off's peak only excludes channels_last's weights.
+    assert runs[0].peak_bytes == 1000 - 300 and runs[0].other_resident_bytes == 300
+
+
+class _FakeNvml:
+    NVML_CLOCK_SM, NVML_CLOCK_MEM, NVML_TEMPERATURE_GPU = 1, 2, 0
+
+    def __init__(self, clocks, reasons, power_supported=True):
+        self.clocks, self.reasons, self.power_supported = iter(clocks), iter(reasons), power_supported
+        self.locked, self.reset, self.shut_down = None, False, False
+
+    def nvmlInit(self):
+        pass
+
+    def nvmlShutdown(self):
+        self.shut_down = True
+
+    def nvmlDeviceGetClockInfo(self, handle, clock):
+        return next(self.clocks) if clock == self.NVML_CLOCK_SM else 2600
+
+    def nvmlDeviceGetMaxClockInfo(self, handle, clock):
+        return 1980 if clock == self.NVML_CLOCK_SM else 2619
+
+    def nvmlDeviceGetPowerUsage(self, handle):
+        if not self.power_supported:
+            raise RuntimeError("not supported")
+        return 350_000
+
+    def nvmlDeviceGetEnforcedPowerLimit(self, handle):
+        return 400_000
+
+    def nvmlDeviceGetTemperature(self, handle, sensor):
+        return 80
+
+    def nvmlDeviceGetCurrentClocksEventReasons(self, handle):
+        return next(self.reasons)
+
+    def nvmlDeviceSetGpuLockedClocks(self, handle, low, high):
+        self.locked = (low, high)
+
+    def nvmlDeviceResetGpuLockedClocks(self, handle):
+        self.reset = True
+
+
+def test_telemetry_attributes_samples_to_timed_iterations(monkeypatch):
+    monkeypatch.setattr(benchmark, "_nvml_handle", lambda nvml, index: "handle")
+    nvml = _FakeNvml(clocks=[1980, 1500, 1200], reasons=[0x0, 0x4, 0x4 | 0x40])
+    telemetry = benchmark.GpuTelemetry(0.05, device_index=0, nvml=nvml)
+    assert telemetry.available
+    telemetry.sample()  # Outside a timed encode: not recorded.
+    with telemetry.measure("off", 0):
+        telemetry.sample()
+        telemetry.sample()
+    with telemetry.measure("lossless", 1):
+        telemetry.sample()
+    off, lossless = telemetry.summary("off"), telemetry.summary("lossless")
+    assert off["samples"] == 2 and off["sm_clock_mhz"] == dict(median=1740, min=1500, max=1980)
+    assert off["sm_clock_mhz_per_iter"] == [1740]
+    assert off["clock_event_reasons"] == {"sw_power_cap": 0.5}
+    assert off["power_w"] == dict(mean=350.0, max=350) and off["temperature_c"]["max"] == 80
+    assert lossless["sm_clock_mhz_per_iter"] == [None, 1200]
+    assert lossless["clock_event_reasons"] == {"sw_power_cap": 1.0, "hw_thermal": 1.0}
+    assert telemetry.summary("channels_last") == dict(samples=0, sm_clock_mhz_per_iter=[])
+
+    telemetry.lock_sm_clock(1500)
+    info = telemetry.device_info()
+    assert info["power_limit_w"] == 400 and info["max_sm_clock_mhz"] == 1980
+    assert info["locked_sm_clock_mhz"] == 1500 and nvml.locked == (1500, 1500)
+    telemetry.close()
+    assert nvml.reset and nvml.shut_down and telemetry.locked_sm_clock_mhz is None
+
+
+def test_telemetry_background_thread_samples_only_timed_encodes(monkeypatch):
+    monkeypatch.setattr(benchmark, "_nvml_handle", lambda nvml, index: "handle")
+    telemetry = benchmark.GpuTelemetry(
+        0.001, device_index=0, nvml=_FakeNvml(itertools.repeat(1400), itertools.repeat(0))
+    )
+    telemetry.start()
+    time.sleep(0.02)
+    with telemetry.measure("off", 0):
+        time.sleep(0.05)
+    samples = telemetry.summary("off")["samples"]
+    time.sleep(0.02)
+    telemetry.close()
+    assert samples > 0 and telemetry.summary("off")["samples"] == samples
+
+
+def test_telemetry_skips_unsupported_queries_and_reports_missing_nvml(monkeypatch):
+    monkeypatch.setattr(benchmark, "_nvml_handle", lambda nvml, index: "handle")
+    telemetry = benchmark.GpuTelemetry(0.05, device_index=0, nvml=_FakeNvml([1400], [0], power_supported=False))
+    with telemetry.measure("off", 0):
+        telemetry.sample()
+    summary = telemetry.summary("off")
+    assert "power_w" not in summary and summary["sm_clock_mhz"]["median"] == 1400
+
+    class Broken:
+        def nvmlInit(self):
+            raise RuntimeError("driver not loaded")
+
+    missing = benchmark.GpuTelemetry(0.05, device_index=0, nvml=Broken())
+    assert not missing.available and "driver not loaded" in missing.error
+    assert missing.device_info() == dict(available=False, error="RuntimeError: driver not loaded")
+    with pytest.raises(RuntimeError, match="NVML is unavailable"):
+        missing.lock_sm_clock(1500)
+    missing.close()
+
+
+def test_telemetry_table_flags_clock_spread_and_throttling(capsys):
+    def stats(level, clock, reasons):
+        telemetry = dict(
+            samples=4,
+            sm_clock_mhz=dict(median=clock, min=clock - 100, max=clock),
+            power_w=dict(mean=390.0, max=400.0),
+            temperature_c=dict(mean=80.0, max=85),
+            clock_event_reasons=reasons,
+        )
+        return dict(level=level, status="ok", median_s=1.0, telemetry=telemetry)
+
+    environment = dict(
+        gpu="GPU",
+        dtype="bf16",
+        input_shape=[1, 3, 5, 16, 32],
+        model="m",
+        world_size=1,
+        tiling=False,
+        schedule="sequential",
+        telemetry=dict(available=True, interval_ms=50.0, power_limit_w=400.0, max_sm_clock_mhz=1980),
+    )
+    results = [stats("off", 1755, {"gpu_idle": 0.25}), stats("lossless", 1200, {"sw_power_cap": 0.75})]
+    benchmark.print_results(results, environment)
+    text = capsys.readouterr().out
+    assert "schedule: sequential" in text
+    assert "GPU telemetry during timed encodes (NVML; sampled every 50 ms, power limit 400 W" in text
+    assert "SM MHz (median)" in text and "1755" in text and "sw_power_cap 75%" in text
+    assert "gpu_idle" not in text
+    assert "median SM clocks differ by 32% across levels" in text
+    assert "the GPU throttled during timed encodes (sw_power_cap)" in text
+
+    benchmark.print_results([stats("off", 1500, {}), stats("lossless", 1490, {})], environment)
+    text = capsys.readouterr().out
+    assert "differ by" not in text and "throttled" not in text and "none" in text
+
+
+def test_main_interleaved_reports_every_level_and_isolates_oom(monkeypatch, cpu_main, capsys):
+    argv = list(sys.argv)
+    argv[argv.index("sequential")] = "interleaved"
+    monkeypatch.setattr("sys.argv", argv)
+    seen = {}
+
+    def interleaved(args, pixels, rank, telemetry):
+        seen["levels"] = list(args.levels)
+        oom = torch.OutOfMemoryError("[lossless] out of memory during timed encoding")
+        return {"off": _result("off"), "lossless": oom, "channels_last": _result("channels_last")}
+
+    monkeypatch.setattr(benchmark, "run_interleaved", interleaved)
+    with pytest.raises(SystemExit, match=r"\[lossless\] out of memory during timed encoding"):
+        benchmark.main()
+    report = json.loads(cpu_main.read_text())
+    assert seen["levels"] == ["off", "lossless", "channels_last"]
+    assert report["environment"]["schedule"] == "interleaved"
+    assert [(stats["level"], stats["status"]) for stats in report["results"]] == [
+        ("off", "ok"),
+        ("lossless", "oom"),
+        ("channels_last", "ok"),
+    ]
+    assert "schedule: interleaved" in capsys.readouterr().out
+
+
+def test_main_clock_lock_failure_explains_the_manual_alternative(monkeypatch, cpu_main):
+    monkeypatch.setattr("sys.argv", [*sys.argv, "--lock-sm-clock-mhz", "1500"])
+    closed = []
+
+    class NoPermission:
+        def __init__(self, interval_s):
+            self.interval_s = interval_s
+
+        def lock_sm_clock(self, mhz):
+            raise RuntimeError("Insufficient Permissions")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(benchmark, "GpuTelemetry", NoPermission)
+    with pytest.raises(SystemExit) as exc:
+        benchmark.main()
+    assert "Could not lock the SM clock to 1500 MHz (Insufficient Permissions)" in str(exc.value)
+    assert "sudo nvidia-smi --lock-gpu-clocks=1500,1500" in str(exc.value)
+    assert closed == [True]
