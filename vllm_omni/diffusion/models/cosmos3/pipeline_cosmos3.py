@@ -3290,6 +3290,7 @@ class Cosmos3OmniDiffusersPipeline(
         generator: torch.Generator | None = None,
         normalize_cfg: bool = False,
         open_guidance_interval: bool = False,
+        text_cfg_below_one: bool = False,
     ) -> torch.Tensor:
         if getattr(self, "_use_session_state", False):
             raise NotImplementedError(
@@ -3314,7 +3315,9 @@ class Cosmos3OmniDiffusersPipeline(
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
-                needs_text_cfg = step_guidance != 1.0
+                # Guidance <= 1 disables text CFG, as in diffuse(). Callers that
+                # follow a reference which skips it only at exactly 1 opt in.
+                needs_text_cfg = step_guidance != 1.0 if text_cfg_below_one else step_guidance > 1.0
                 needs_control_cfg = step_control != 1.0
 
                 branches_kwargs = None

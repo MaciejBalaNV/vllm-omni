@@ -1029,6 +1029,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             generator=generator,
             normalize_cfg=as_bool(self._get_sp_param(sp, "normalize_cfg", defaults.get("normalize_cfg", False)), False),
             open_guidance_interval=deployment.get("schema_version") == 2,
+            text_cfg_below_one=True,
         )
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
         del condition_latents, control_latents, lidar_control_latents, shared_kwargs

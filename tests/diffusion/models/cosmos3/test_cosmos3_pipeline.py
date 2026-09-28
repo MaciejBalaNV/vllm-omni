@@ -2501,6 +2501,40 @@ def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline, sequent
     torch.testing.assert_close(text_result, torch.full_like(latents, 104.0))
 
 
+@pytest.mark.parametrize(
+    ("text_cfg_below_one", "expected_calls"),
+    [
+        (False, [(2, True)]),
+        (True, [(2, True), (1, True)]),
+    ],
+)
+def test_diffuse_transfer_guidance_below_one_runs_text_cfg_only_when_opted_in(
+    make_cosmos3_pipeline, sequential_cfg_parallel, text_cfg_below_one, expected_calls
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=0.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+
+
 def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
