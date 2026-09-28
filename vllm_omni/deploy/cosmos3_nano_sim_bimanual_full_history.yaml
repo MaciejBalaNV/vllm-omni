@@ -1,11 +1,9 @@
-# Cosmos3-Nano-Sim-Bimanual distilled forward-dynamics deployment.
+# nvidia/Cosmos3-Nano-Sim-Bimanual@1d95a0b5b19d49a24aceebf578cf5e85db310ac0
 
 pipeline: cosmos3_nano_sim_bimanual
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
-default_resolution: [720, 1280]
-max_pixels: 921600
 
 stages:
   - stage_id: 0
@@ -15,10 +13,18 @@ stages:
     model_class_name: Cosmos3NanoSimBimanualPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
     model_config:
+      default_resolution: [480, 832]
+      max_pixels: 409600
+      inference_overrides:
+        frame_sigma_schedules:
+          - [1.0, 0.9375, 0.8333333333333334, 0.625]
+          - [1.0, 0.8333333333333334]
+        history_mode: full
+        max_num_frames: 901
       action_gen: true
       action_dim: 64
       num_embodiment_domains: 32
-      default_fps: 15.0
+      default_fps: 30.0
       clean_commit_mode: batched  # framewise | batched
       # Fresh full-video requests only; Wan decode starts before clean refresh.
       overlap_vae_decode: true
