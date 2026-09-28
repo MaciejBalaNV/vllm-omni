@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 Multiview-AV pipeline.
 
 Camera-only and joint V1.2 camera/LiDAR inference with independent sensor
@@ -411,7 +411,6 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
             "emphasize_control_in_prompt",
             "guidance_interval",
             "control_guidance_interval",
-            "sigma_max",
             "normalize_cfg",
             "negative_metadata_mode",
         }
@@ -419,7 +418,7 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
             raise ValueError(f"Incomplete inference_defaults metadata: {sorted(missing)}.")
         if defaults["resolution"] not in {"480", "720"}:
             raise ValueError("inference_defaults.resolution must be 480 or 720.")
-        for name in ("fps", "num_steps", "guidance", "shift", "control_guidance", "sigma_max"):
+        for name in ("fps", "num_steps", "guidance", "shift", "control_guidance"):
             value = defaults[name]
             if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"inference_defaults.{name} must be finite and non-negative.")
@@ -986,6 +985,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
         self._set_flow_shift(flow_shift)
+        # As in reference rectified-flow inference, the schedule depends only on
+        # steps and shift. Requests and older exports may carry an EDM-style
+        # sigma_max (e.g. 80); it is accepted for compatibility and ignored.
         self._set_timesteps(num_inference_steps, device=self.device, shift=flow_shift)
 
         video_shape = tuple(int(dim) for dim in latents.shape[2:])

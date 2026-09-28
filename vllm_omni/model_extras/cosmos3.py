@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -70,6 +70,7 @@ COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
         "guidance_interval",
         "control_guidance",
         "control_guidance_interval",
+        # Accepted so reference manifests pass admission; sampling ignores it.
         "sigma_max",
         "normalize_cfg",
         "flow_shift",
