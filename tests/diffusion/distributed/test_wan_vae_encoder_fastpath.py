@@ -98,6 +98,27 @@ def test_encoder_and_chunk_assembly_match_reference(frames, dtype):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("frames", [1, 5])
+def test_encode_frames_assembles_1x1_latents_like_upstream(frames):
+    """A contiguous 1x1-latent chunk also passes the channels_last_3d contiguity check.
+
+    Lossless must still hand ``quant_conv`` the channels-first layout upstream's
+    ``torch.cat`` produces, or cuDNN would run a different (NDHWC) kernel.
+    """
+    ref, fast = pair()
+    assert install_wan_vae_encoder_fastpath(fast).installed
+    seen = {}
+    for name, vae in (("expected", ref), ("actual", fast)):
+        vae.quant_conv.register_forward_pre_hook(lambda _, args, name=name: seen.__setitem__(name, args[0].stride()))
+    x = torch.randn(1, 3, frames, 16, 16)
+    expected = ref.encode(x).latent_dist.parameters
+    actual = encode_frames(fast, x)
+    assert expected.shape[3:] == (1, 1)
+    assert seen["actual"] == seen["expected"]
+    bits_equal(actual, expected)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("autocast", [False, True])
 def test_bf16_channels_last_encoder_uses_replacement_forwards(monkeypatch, autocast):
     dtype = torch.float32 if autocast else torch.bfloat16

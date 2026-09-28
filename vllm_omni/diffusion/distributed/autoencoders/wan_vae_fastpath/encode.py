@@ -7,6 +7,8 @@ from __future__ import annotations
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
 
+from .forwards import CFG_ATTR
+
 
 def can_encode_frames(vae, x: torch.Tensor) -> bool:
     """Select only the supported inference schedule; other inputs use the parent."""
@@ -30,6 +32,8 @@ def encode_frames(vae, x: torch.Tensor) -> torch.Tensor:
     The caller dispatches tiling using raw pixel dimensions. ``quant_conv`` is
     applied once to the assembled encoder features, matching untiled Diffusers.
     """
+    cfg = getattr(vae.encoder, CFG_ATTR, None)
+    channels_last = cfg is not None and cfg.channels_last
     vae.clear_cache()
     try:
         count = 1 + (x.shape[2] - 1) // 4
@@ -42,13 +46,15 @@ def encode_frames(vae, x: torch.Tensor) -> torch.Tensor:
             chunk = vae.encoder(chunk, feat_cache=vae._enc_feat_map, feat_idx=vae._enc_conv_idx)
             if output is None:
                 # Supported encoders produce exactly one latent frame per chunk.
+                # Lossless assembles contiguously like upstream's ``torch.cat``,
+                # also for 1x1 latents, which pass the channels-last check.
                 output = torch.empty(
                     (chunk.shape[0], chunk.shape[1], count, chunk.shape[3], chunk.shape[4]),
                     dtype=chunk.dtype,
                     device=chunk.device,
                     memory_format=(
                         torch.channels_last_3d
-                        if chunk.is_contiguous(memory_format=torch.channels_last_3d)
+                        if channels_last and chunk.is_contiguous(memory_format=torch.channels_last_3d)
                         else torch.contiguous_format
                     ),
                 )

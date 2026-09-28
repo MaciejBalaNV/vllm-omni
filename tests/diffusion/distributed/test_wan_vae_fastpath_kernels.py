@@ -433,6 +433,31 @@ def test_cat_time_5d_is_bitwise_and_layout_exact(
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("cache_frames", [0, 1, 2])
+def test_input_assembly_keeps_aten_layout_for_1x1_activations(dtype: torch.dtype, cache_frames: int) -> None:
+    """A contiguous ``(b, c, 1, 1, 1)`` tensor has ``stride(1) == 1`` but ATen lays it out channels-first."""
+    torch.manual_seed(0)
+    x = torch.randn(1, 16, 1, 1, 1, device="cuda", dtype=dtype)
+    cache = torch.randn(1, 16, cache_frames, 1, 1, device="cuda", dtype=dtype) if cache_frames else None
+    padding = (1, 1, 1, 1, 2, 0)
+    reference = _reference_cat_pad(x, cache, padding)
+    pair = dm.cat_pad_5d(x, cache, padding, keep_cache_frames=CACHE_T)
+    assert pair is not None
+    output, next_cache = pair
+    assert output.stride() == reference.stride()
+    assert torch.equal(output, reference)
+    assert next_cache.is_contiguous()
+    assert torch.equal(next_cache, reference[:, :, -CACHE_T:, 1:2, 1:2])
+
+    temporal = _reference_cat_pad(x, cache, (0, 0, 0, 0, 2, 0))
+    assembled = dm.cat_time_5d(x, cache, pad_front=2)
+    assert assembled is not None
+    assert assembled.stride() == temporal.stride()
+    assert torch.equal(assembled, temporal)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("cache_frames", [0, 1, 2])
 def test_cat_time_5d_exceeds_grid_y_limit(monkeypatch: pytest.MonkeyPatch, cache_frames: int) -> None:
     # Smaller blocks reproduce the large-plane launch failure without allocating
@@ -669,6 +694,28 @@ def test_upsample_nearest_2x_declines_unsupported_inputs() -> None:
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_upsample_nearest_2x_follows_aten_layout_for_ambiguous_strides(dtype: torch.dtype) -> None:
+    """Channels-last contiguous strides that ATen treats as channels-first must not produce NHWC output."""
+    torch.manual_seed(0)
+    frame = torch.randn(1, 16, 1, 6, 10, device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+    # Upstream's merge of one channels-last frame: the size-1 batch keeps a
+    # non-canonical stride, and ``F.interpolate`` writes NCHW for it.
+    merged = frame.permute(0, 2, 1, 3, 4).reshape(1, 16, 6, 10)
+    assert merged.is_contiguous(memory_format=torch.channels_last)
+    assert F.interpolate(merged, scale_factor=(2.0, 2.0), mode="nearest-exact").is_contiguous()
+    assert up.upsample_nearest_2x(merged) is None
+
+    single_pixels = torch.randn(3, 16, 1, 1, device="cuda", dtype=dtype)
+    for x in (single_pixels, single_pixels.contiguous(memory_format=torch.channels_last)):
+        reference = F.interpolate(x, scale_factor=(2.0, 2.0), mode="nearest-exact")
+        output = up.upsample_nearest_2x(x)
+        assert output is not None
+        assert output.stride() == reference.stride()
+        assert torch.equal(output, reference)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 def test_upsample_forward_matches_wan_upsample(dtype: torch.dtype) -> None:
     torch.manual_seed(0)
@@ -879,6 +926,38 @@ def test_lossless_decoder_is_bitwise_exact_on_cuda(config: dict, dtype: torch.dt
     assert report.installed, report
     torch.manual_seed(1)
     latents = torch.randn(1, config["z_dim"], frames, 6, 10, device="cuda").to(dtype)
+    autocast = dtype is not torch.float32
+    with torch.autocast("cuda", dtype=dtype, enabled=autocast):
+        expected = reference.decode(latents, return_dict=False)[0]
+        actual = candidate.decode(latents, return_dict=False)[0]
+    assert actual.stride() == expected.stride()
+    assert _bits_equal(actual, expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("config", [TINY_RESIDUAL, TINY_WAN21], ids=["residual_patch2", "wan21"])
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("frames", [1, 3])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("latents_kind", ["channels_last_3d", "1x1"])
+def test_lossless_decoder_is_bitwise_exact_for_channels_last_and_1x1_latents(
+    config: dict, dtype: torch.dtype, frames: int, batch: int, latents_kind: str
+) -> None:
+    """Both make activations pass channels-last stride checks where upstream may be channels-first.
+
+    Channels-last latents come e.g. from a channels_last encoder; for a single
+    batch element upstream's upsampler reshapes return to channels-first, for
+    larger batches they stay channels-last. With 1x1 latents every contiguous
+    activation also passes ``is_contiguous(channels_last_3d)``.
+    """
+    reference, candidate = _build_pair(config, dtype)
+    report = install_wan_vae_fastpath(candidate, level="lossless")
+    assert report.installed, report
+    torch.manual_seed(1)
+    height, width = (1, 1) if latents_kind == "1x1" else (6, 10)
+    latents = torch.randn(batch, config["z_dim"], frames, height, width, device="cuda").to(dtype)
+    if latents_kind == "channels_last_3d":
+        latents = latents.contiguous(memory_format=torch.channels_last_3d)
     autocast = dtype is not torch.float32
     with torch.autocast("cuda", dtype=dtype, enabled=autocast):
         expected = reference.decode(latents, return_dict=False)[0]

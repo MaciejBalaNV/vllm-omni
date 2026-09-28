@@ -158,6 +158,32 @@ def test_lossless_encoder_posterior_and_output_assembly(dtype, frames):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("frames", [1, 5, 9])
+def test_lossless_encoder_is_bitwise_exact_for_1x1_latents(dtype, frames):
+    """16x16 images (or tiled-encode corner tiles) end in 1x1 activations.
+
+    Their contiguous strides also pass the channels-last contiguity checks; the
+    temporal downsample, the cached convolutions and ``quant_conv`` must still
+    see upstream's channels-first layouts.
+    """
+    torch.manual_seed(0)
+    ref = AutoencoderKLWan(**CONFIG).eval().to(device="cuda", dtype=dtype)
+    fast = AutoencoderKLWan(**CONFIG).eval().to(device="cuda", dtype=dtype)
+    fast.load_state_dict(ref.state_dict())
+    assert install_wan_vae_encoder_fastpath(fast).installed
+    x = torch.rand(1, 3, frames, 16, 16, device="cuda", dtype=dtype) * 2 - 1
+    with torch.autocast("cuda", dtype=dtype, enabled=dtype != torch.float32):
+        expected = ref.encode(x).latent_dist
+        actual = fast.encode(x).latent_dist
+        assert expected.parameters.shape[3:] == (1, 1)
+        bits_equal(actual.parameters, expected.parameters)
+        assembled = encode_frames(fast, x)
+        assert assembled.stride() == expected.parameters.stride()
+        bits_equal(assembled, expected.parameters)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("scope", ["global", "module"])
 def test_forward_hooks_registered_after_install_see_every_encoder_module_call(monkeypatch, scope):
     assembled = []

@@ -46,7 +46,8 @@ def downsample_forward(
     ):
         return WanResample.forward(self, x, feat_cache=feat_cache, feat_idx=feat_idx)
     cfg = getattr(self, fp.CFG_ATTR, None)
-    if x.stride(1) == 1 and (cfg is None or not cfg.channels_last):
+    channels_last = cfg is not None and cfg.channels_last
+    if x.stride(1) == 1 and not channels_last:
         # With singleton batch/time, upstream reshape can stop suggesting NHWC
         # to ZeroPad2d even for channels-last inputs. Canonicalizing that layout
         # is a channels_last optimization; lossless preserves the original call.
@@ -55,11 +56,11 @@ def downsample_forward(
     batch, _, frames, _, _ = x.shape
     padded = down.spatial_downsample_input(x)
     if padded is None:
-        spatial = self.resample(fp._merge_batch_and_frames(x))
+        spatial = self.resample(fp._merge_batch_and_frames(x, channels_last=channels_last))
     else:
         # Call the convolution module normally: its hooks/wrappers are retained.
         spatial = self.resample[1](padded)
-    x = fp._split_batch_and_frames(spatial, batch, frames)
+    x = fp._split_batch_and_frames(spatial, batch, frames, channels_last=channels_last)
 
     if self.mode == "downsample3d" and feat_cache is not None:
         index = feat_idx[0]

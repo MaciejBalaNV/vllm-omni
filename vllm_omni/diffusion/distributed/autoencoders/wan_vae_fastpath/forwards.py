@@ -55,6 +55,7 @@ from . import triton_norm_cache as nc
 from . import triton_rms_norm as rn
 from . import triton_rms_norm_cl as cl
 from . import triton_upsample as up
+from ._utils import suggests_channels_last
 
 logger = init_logger(__name__)
 
@@ -374,7 +375,8 @@ def _conv_with_spatial_padding(
 
 
 def _layout_tag(x: torch.Tensor) -> str:
-    return "channels_last" if x.shape[1] > 1 and x.stride(1) == 1 else "channels_first"
+    # The input assemblies choose their layout the way ATen would, so key on the same test.
+    return "channels_last" if suggests_channels_last(x) else "channels_first"
 
 
 def _conv_verdict_key(conv: nn.Module, x: torch.Tensor, cache_frames: int) -> tuple:
@@ -629,16 +631,30 @@ def _residual_add(
 # --------------------------------------------------------------------------- #
 
 
-def _interleave_time(x: torch.Tensor, batch: int, channels: int, frames: int, height: int, width: int) -> torch.Tensor:
+def _interleave_time(
+    x: torch.Tensor,
+    batch: int,
+    channels: int,
+    frames: int,
+    height: int,
+    width: int,
+    *,
+    channels_last: bool = False,
+) -> torch.Tensor:
     """Upstream ``reshape(b, 2, c, t, h, w)`` + ``stack(..., 3)`` + ``reshape`` as one strided copy.
 
     ``out[:, :, 2i] = x[:, :c, i]`` and ``out[:, :, 2i + 1] = x[:, c:, i]``; pure
-    data movement that also preserves a channels_last_3d layout (``torch.stack``
-    on the 6-D view always produced a contiguous tensor).
+    data movement. Upstream's ``torch.stack`` concatenates the two halves, so
+    its result is channels_last_3d exactly when ATen treats both halves as
+    channels-last; the ``reshape`` can prevent that for a size-1 batch. The
+    ``channels_last`` level keeps any channels_last_3d input's layout instead.
     """
-    memory_format = torch.contiguous_format
-    if channels > 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
-        memory_format = torch.channels_last_3d
+    if channels_last:
+        keep_channels_last = channels > 1 and x.is_contiguous(memory_format=torch.channels_last_3d)
+    else:
+        halves = x.reshape(batch, 2, channels, frames, height, width)
+        keep_channels_last = suggests_channels_last(halves[:, 0]) and suggests_channels_last(halves[:, 1])
+    memory_format = torch.channels_last_3d if keep_channels_last else torch.contiguous_format
     out = torch.empty(
         (batch, channels, frames * 2, height, width),
         dtype=x.dtype,
@@ -650,26 +666,31 @@ def _interleave_time(x: torch.Tensor, batch: int, channels: int, frames: int, he
     return out
 
 
-def _merge_batch_and_frames(x: torch.Tensor) -> torch.Tensor:
-    """``(b, c, t, h, w)`` -> ``(b * t, c, h, w)`` view, keeping a channels-last layout recognizable.
+def _merge_batch_and_frames(x: torch.Tensor, *, channels_last: bool = False) -> torch.Tensor:
+    """``(b, c, t, h, w)`` -> ``(b * t, c, h, w)``: upstream's ``permute().reshape()``.
 
-    For a channels_last_3d tensor with ``b * t == 1``, ``permute().reshape()`` hands
-    the size-1 batch dimension an arbitrary stride that PyTorch's layout heuristic
-    (``suggest_memory_format``) does not accept as channels_last, so ops without a
-    weight to vote for the layout, such as the nearest upsample, would allocate
-    NCHW output and force the next convolution to transpose it. Building the same
-    view with canonical strides avoids that; the values are untouched.
+    At the ``channels_last`` level a channels-last layout is kept recognizable:
+    for a channels_last_3d tensor with ``b * t == 1``, ``permute().reshape()``
+    hands the size-1 batch dimension an arbitrary stride that PyTorch's layout
+    heuristic (``suggest_memory_format``) does not accept as channels_last, so ops
+    without a weight to vote for the layout, such as the nearest upsample, would
+    allocate NCHW output and force the next convolution to transpose it. Building
+    the same view with canonical strides avoids that; the values are untouched.
+
+    The lossless level keeps upstream's strides: the following convolution and
+    normalization pick their kernels from the layout, and a contiguous tensor
+    whose only non-unit dimension is ``c`` also looks channels-last.
     """
     b, c, t, h, w = x.shape
-    if c > 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
+    if channels_last and c > 1 and x.is_contiguous(memory_format=torch.channels_last_3d):
         return x.as_strided((b * t, c, h, w), (h * w * c, 1, w * c, c))
     return x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
 
 
-def _split_batch_and_frames(x: torch.Tensor, batch: int, frames: int) -> torch.Tensor:
+def _split_batch_and_frames(x: torch.Tensor, batch: int, frames: int, *, channels_last: bool = False) -> torch.Tensor:
     """``(b * t, c, h, w)`` -> ``(b, c, t, h, w)`` view; see :func:`_merge_batch_and_frames`."""
     _, c, h, w = x.shape
-    if c > 1 and x.is_contiguous(memory_format=torch.channels_last):
+    if channels_last and c > 1 and x.is_contiguous(memory_format=torch.channels_last):
         return x.as_strided((batch, c, frames, h, w), (frames * h * w * c, 1, h * w * c, w * c, c))
     return x.view(batch, frames, c, h, w).permute(0, 2, 1, 3, 4)
 
@@ -702,6 +723,8 @@ def resample_forward(
     """
     if feat_idx is None:
         feat_idx = [0]
+    cfg = getattr(self, CFG_ATTR, None)
+    channels_last = cfg is not None and cfg.channels_last
     batch, channels, frames, height, width = x.size()
     if self.mode == "upsample3d" and feat_cache is not None:
         index = feat_idx[0]
@@ -711,10 +734,10 @@ def resample_forward(
         else:
             x = _run_cached_causal_conv(self.time_conv, x, feat_cache, index)
             feat_idx[0] += 1
-            x = _interleave_time(x, batch, channels, frames, height, width)
+            x = _interleave_time(x, batch, channels, frames, height, width, channels_last=channels_last)
 
     frames = x.shape[2]
-    x = _merge_batch_and_frames(x)
+    x = _merge_batch_and_frames(x, channels_last=channels_last)
     pending_bias = None
     if (
         return_bias
@@ -727,7 +750,7 @@ def resample_forward(
         pending_bias = _deferred_conv_bias(conv, x)
     else:
         x = self.resample(x)
-    x = _split_batch_and_frames(x, batch, frames)
+    x = _split_batch_and_frames(x, batch, frames, channels_last=channels_last)
 
     if self.mode == "downsample3d" and feat_cache is not None:
         index = feat_idx[0]
