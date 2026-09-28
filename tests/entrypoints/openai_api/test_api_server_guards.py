@@ -47,6 +47,7 @@ from argparse import Namespace
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -564,7 +565,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
     start getting stamped / mutated incorrectly.
     """
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_build_openai_app(args, supported_tasks):
         return FastAPI()
@@ -592,8 +593,8 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
     middleware = captured["served_app"]
 
-    http_scope = {"type": "http", "state": {}}
-    ws_scope = {"type": "websocket"}
+    http_scope: dict[str, Any] = {"type": "http", "state": {}}
+    ws_scope: dict[str, Any] = {"type": "websocket"}
 
     async def _receive():
         return {"type": "http.disconnect"}
@@ -820,6 +821,46 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("modalities", [123], "modalities must be a list of strings"),
+        ("logprobs", "yes", "logprobs must be a boolean"),
+    ],
+)
+def test_chat_completion_raw_body_guards_reject_lax_types(field, value, detail) -> None:
+    """The HTTP boundary rejects values that upstream Pydantic would coerce."""
+    app = FastAPI()
+    app.state.openai_serving_chat = None
+    app.state.serving_tokenization = None
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    client = TestClient(app)
+
+    payload = {
+        "model": "demo-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+        field: value,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert detail in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        {"modalities": None},
+        {"logprobs": None},
+        {"modalities": None, "logprobs": None},
+    ],
+)
+def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
+    """Explicit JSON null keeps the upstream request model's default behavior."""
+    api_server._validate_chat_completion_raw_body(raw_body)
+
+
 @pytest.mark.asyncio
 async def test_multi_api_rejects_runtime_voice_upload() -> None:
     app = FastAPI()
@@ -920,11 +961,10 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     engine = _FakeEngineClient(stage_configs=[stage])
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
@@ -965,13 +1005,11 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     speech_kwargs = {}
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
-    @classmethod
     def _speech_factory(cls, *args, **kwargs):
         speech_kwargs.update(kwargs)
         return _marker("speech")
@@ -985,7 +1023,7 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     )
     monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", classmethod(_speech_factory))
     monkeypatch.setattr(
         api_server.ServingRealtimeRobotOpenPI,
         "create_policy_server",
