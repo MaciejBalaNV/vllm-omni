@@ -645,6 +645,112 @@ def test_pipeline_registered_and_exported() -> None:
         assert pipeline_name in CUSTOM_DIT_ENABLERS
 
 
+def test_multiview_pipeline_registers_guardrail_hooks() -> None:
+    from vllm_omni.diffusion.registry import (
+        _DIFFUSION_POST_PROCESS_FUNCS,
+        _DIFFUSION_PRE_PROCESS_FUNCS,
+    )
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+
+    assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_multiview_pre_process_func"
+    assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_post_process_func"
+    assert "guardrails" in COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+
+
+def _server_and_request_guardrail_gate(od_config: Any, sampling_params: Any = None) -> bool:
+    """Same server/per-request resolution as ``guardrails.is_guardrails_enabled``."""
+    if not od_config.model_config.get("guardrails", True):
+        return False
+    per_request = (sampling_params.extra_args or {}).get("guardrails") if sampling_params is not None else None
+    return True if per_request is None else bool(per_request)
+
+
+def _multiview_guardrail_request(extra_args: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt={"prompt": "Drive through the intersection."},
+        sampling_params=make_sampling_params(
+            extra_args={
+                "multiview": {
+                    "views": [
+                        {"camera_key": "front", "control_path": "front.mp4", "prompt": "The front camera view."},
+                        {"camera_key": "rear", "control_path": "rear.mp4"},
+                        {"camera_key": "left", "control_path": "left.mp4", "prompt": " "},
+                    ]
+                },
+                **extra_args,
+            }
+        ),
+    )
+
+
+def test_multiview_preprocess_checks_shared_prompt_and_camera_captions(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_pre_process_func,
+    )
+
+    initialized = []
+    checked = []
+    fake_cosmos3_guardrails.is_guardrails_enabled = _server_and_request_guardrail_gate
+    fake_cosmos3_guardrails.ensure_initialized = initialized.append
+    fake_cosmos3_guardrails.check_text_safety = checked.append
+    od_config = SimpleNamespace(model_config={}, tf_model_config=None)
+
+    preprocess = get_cosmos3_multiview_pre_process_func(od_config)
+    assert initialized == [od_config]
+
+    request = _multiview_guardrail_request({})
+    assert preprocess(request) is request
+    assert checked == ["Drive through the intersection.", "The front camera view."]
+
+    checked.clear()
+    preprocess(_multiview_guardrail_request({"guardrails": False}))
+    assert checked == []
+
+
+def test_multiview_preprocess_skips_guardrail_load_when_disabled(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_pre_process_func,
+    )
+
+    fake_cosmos3_guardrails.is_guardrails_enabled = _server_and_request_guardrail_gate
+    fake_cosmos3_guardrails.ensure_initialized = Mock()
+    fake_cosmos3_guardrails.check_text_safety = Mock()
+
+    preprocess = get_cosmos3_multiview_pre_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    # Per-request opt-in cannot enable checks the server never loaded.
+    preprocess(_multiview_guardrail_request({"guardrails": True}))
+
+    fake_cosmos3_guardrails.ensure_initialized.assert_not_called()
+    fake_cosmos3_guardrails.check_text_safety.assert_not_called()
+
+
+def test_multiview_postprocess_applies_video_guardrail_per_camera(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+
+    checked_shapes = []
+
+    def check_video_safety(video: torch.Tensor) -> torch.Tensor:
+        checked_shapes.append(tuple(video.shape))
+        return torch.zeros_like(video)
+
+    fake_cosmos3_guardrails.is_guardrails_enabled = lambda od_config, sampling_params=None: True
+    fake_cosmos3_guardrails.check_video_safety = check_video_safety
+    postprocess = get_cosmos3_post_process_func(SimpleNamespace(model_config={}))
+
+    video = torch.ones(1, 3, 2 * 3, 4, 4)
+    result = postprocess(
+        {
+            "payload": {"video": video},
+            "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+        },
+        output_type="np",
+    )
+
+    assert checked_shapes == [(1, 3, 3, 4, 4), (1, 3, 3, 4, 4)]
+    # The guardrail output, not the raw decode, reaches the response.
+    assert np.allclose(result["payload"]["video"], 0.5)
+
+
 @pytest.mark.parametrize(
     "pipeline_name",
     ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"],

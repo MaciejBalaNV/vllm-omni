@@ -76,6 +76,7 @@ COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
         "flow_shift",
         "max_sequence_length",
         "negative_prompt",
+        "guardrails",
         "resolution",
         "aspect_ratio",
         "fps",

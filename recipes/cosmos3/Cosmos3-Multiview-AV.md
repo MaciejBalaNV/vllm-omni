@@ -234,6 +234,24 @@ CPU budget fairly at camera boundaries; deployments with multiple API
 processes should partition CPU affinity accordingly. The response remains one
 camera-major MP4, not a synchronized grid.
 
+## Safety guardrails
+
+As for the other Cosmos3 models, safety guardrails are **on by default**
+(NVIDIA Open Model License). Before generation, the shared prompt and every
+per-camera caption pass the text guardrail; after decoding, each camera clip
+passes the video guardrail (face blur) separately. The guardrails load the
+**gated** `nvidia/Cosmos-1.0-Guardrail` model, so to keep them on you must:
+
+1. `pip install cosmos-guardrail`
+2. Accept the license at <https://huggingface.co/nvidia/Cosmos-1.0-Guardrail>
+3. Export a token with access: `export HF_TOKEN=hf_...`
+
+To run **without** guardrails (you are responsible for license compliance), add
+`--no-guardrails` to the offline script or to `vllm serve`; neither needs
+the token nor `cosmos-guardrail`. When the server loads guardrails, a request
+can skip them with `"guardrails": false` in its `extra_params`; a request cannot
+turn them on for a server started with `--no-guardrails`.
+
 ## Verification
 
 Run the CPU contract suite:

@@ -440,6 +440,53 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
     }
 
 
+def _multiview_request_captions(request: Any) -> list[str]:
+    """Return the per-camera captions a request carries, ignoring malformed fields.
+
+    Structural validation happens in the pipeline; this only collects text the
+    guardrail must see before the request is admitted.
+    """
+    extra = getattr(request.sampling_params, "extra_args", None)
+    multiview = extra.get("multiview") if isinstance(extra, Mapping) else None
+    views = multiview.get("views") if isinstance(multiview, Mapping) else None
+    if not isinstance(views, Sequence) or isinstance(views, str | bytes):
+        return []
+    captions = []
+    for view in views:
+        caption = view.get("prompt") if isinstance(view, Mapping) else None
+        if isinstance(caption, str) and caption.strip():
+            captions.append(caption)
+    return captions
+
+
+def get_cosmos3_multiview_pre_process_func(od_config: OmniDiffusionConfig):
+    """Build the request preprocessor for Cosmos3 Multiview-AV.
+
+    Camera and LiDAR media are decoded by the pipeline, so the only request-time
+    work is the Cosmos3 text guardrail over the shared prompt and every
+    per-camera caption. The shared Cosmos3 postprocessor applies the video
+    guardrail to each camera.
+    """
+    from .guardrails import check_text_safety, ensure_initialized, is_guardrails_enabled
+
+    # Eager-load guardrail models at pipeline build time when the server-level
+    # gate is on. Per-request overrides only decide whether the loaded models
+    # are *invoked* — they cannot turn checks on without a server-side preload.
+    if is_guardrails_enabled(od_config):
+        ensure_initialized(od_config)
+
+    def pre_process_func(request: Any) -> Any:
+        if not is_guardrails_enabled(od_config, request.sampling_params):
+            return request
+        prompt = request.prompt
+        check_text_safety(prompt if isinstance(prompt, str) else str(prompt.get("prompt", "")))
+        for caption in _multiview_request_captions(request):
+            check_text_safety(caption)
+        return request
+
+    return pre_process_func
+
+
 class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     """Joint camera/LiDAR and camera-only generation with checkpoint-owned view layouts."""
 
@@ -1083,5 +1130,6 @@ __all__ = [
     "COSMOS3_MADS_CAMERAS",
     "Cosmos3MultiviewPipeline",
     "get_cosmos3_ir_op_priority_func",
+    "get_cosmos3_multiview_pre_process_func",
     "get_cosmos3_post_process_func",
 ]

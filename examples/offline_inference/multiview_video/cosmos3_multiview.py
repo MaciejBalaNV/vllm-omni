@@ -609,6 +609,14 @@ def main() -> None:
     parser.add_argument("--hsdp-shard-size", type=int, default=-1)
     parser.add_argument("--hsdp-replicate-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true", help="Disable regional transformer compilation")
+    parser.add_argument(
+        "--no-guardrails",
+        action="store_true",
+        help=(
+            "Disable the Cosmos3 text/video safety guardrails (on by default; they require the cosmos-guardrail "
+            "package and access to the gated nvidia/Cosmos-1.0-Guardrail model)"
+        ),
+    )
     args = parser.parse_args()
 
     requests = _load_requests(args.input)
@@ -626,6 +634,11 @@ def main() -> None:
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
     )
+    omni_kwargs: dict[str, Any] = {}
+    # Guardrail models load at build time, so the gate is engine-level
+    # (offline analog of the server's --no-guardrails).
+    if args.no_guardrails:
+        omni_kwargs["model_config"] = {"guardrails": False}
     omni = Omni(
         model=args.model,
         dtype="bfloat16",
@@ -634,6 +647,7 @@ def main() -> None:
         parallel_config=parallel_config,
         diffusion_compile_granularity="regional",
         diffusion_compile_dynamic=False,
+        **omni_kwargs,
     )
 
     sample_names = [
