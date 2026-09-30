@@ -1180,6 +1180,7 @@ class _GenPrepared(NamedTuple):
     use_multi_control_attention: bool
     multi_control_token_sizes: tuple[int, ...] | None
     multi_control_weights: tuple[float, ...] | None
+    freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class Cosmos3VFMTransformer(nn.Module):
@@ -1764,6 +1765,7 @@ class Cosmos3VFMTransformer(nn.Module):
         self,
         hidden_gen: torch.Tensor,
         *,
+        freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
         s_video: int,
         s_control: int,
         s_action: int,
@@ -1776,13 +1778,15 @@ class Cosmos3VFMTransformer(nn.Module):
         multi_control_token_sizes: tuple[int, ...] | None,
         multi_control_weights: tuple[float, ...] | None,
     ) -> torch.Tensor:
-        """Run the complete GEN decoder between full-layout boundaries."""
+        """Run the complete GEN decoder, accepting already-sharded inputs."""
         if self.cached_kv is None or self.cached_freqs_gen is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-        freqs_cos, freqs_sin = self.cached_freqs_gen
-        if not use_multi_control_attention:
-            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-        freqs_gen = (freqs_cos, freqs_sin)
+        if freqs_gen is None:
+            freqs_cos, freqs_sin = self.cached_freqs_gen
+            if not use_multi_control_attention:
+                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+            freqs_gen = (freqs_cos, freqs_sin)
+        freqs_cos, freqs_sin = freqs_gen
 
         if len(self.gen_layers) == len(self.cached_kv):
             for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
@@ -1858,6 +1862,13 @@ class Cosmos3VFMTransformer(nn.Module):
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
         )
+        if not prep.use_multi_control_attention:
+            assert self.cached_freqs_gen is not None
+            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(prep.hidden_gen, *self.cached_freqs_gen)
+            # Replace the caller's prepared state before entering the stack.
+            # Keeping the original prep would pin the full embedding even
+            # though the sharded hidden_gen owns separate storage.
+            prep = prep._replace(hidden_gen=hidden_gen, freqs_gen=(freqs_cos, freqs_sin))
         return self._gen_postprocess(self._run_gen_stack(prep), prep)
 
     def _gen_preprocess(
@@ -2130,6 +2141,7 @@ class Cosmos3VFMTransformer(nn.Module):
         """Execute the cacheable full-layout GEN stack, including final norm."""
         hidden_gen = self._run_gen_layers(
             prep.hidden_gen,
+            freqs_gen=prep.freqs_gen,
             s_video=prep.s_video,
             s_control=prep.s_control,
             s_action=prep.s_action,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -822,6 +823,95 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
     assert torch.equal(cached_output, full_output)
     for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
         assert not hasattr(model, name)
+
+
+@pytest.mark.parametrize("sequence_length", [16, 17])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("rank", [0, 3])
+@torch.inference_mode()
+def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_length, batch, rank) -> None:
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.distributed import parallel_state, sp_sharding
+    from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+    from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+    from vllm_omni.diffusion.hooks import sequence_parallel
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    full_refs = []
+    full_pointers = []
+    layer_calls = 0
+
+    class CheckingLayer(nn.Module):
+        def forward(self, hidden, **kwargs):
+            nonlocal layer_calls
+            layer_calls += 1
+            if full_refs:
+                # Inspect lifetime inside the production stack while the
+                # caller's prepared state is still live.
+                assert full_refs[-1]() is None
+                if layer_calls % 2 == 1:
+                    assert hidden.untyped_storage().data_ptr() != full_pointers[-1]
+                assert hidden.shape == (batch, (sequence_length + 3) // 4, 8)
+                assert hidden.untyped_storage().nbytes() == hidden.numel() * hidden.element_size()
+            return hidden + 1
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    model.gen_layers = nn.ModuleList([CheckingLayer(), CheckingLayer()])
+    model.cached_kv = [(torch.empty(0), torch.empty(0)) for _ in model.gen_layers]
+    inputs = {
+        "hidden_states": torch.zeros(batch, 2, 1, 1, sequence_length),
+        "timestep": torch.ones(batch),
+        "text_ids": torch.ones(batch, 2, dtype=torch.long),
+        "text_mask": torch.ones(batch, 2, dtype=torch.long),
+        "video_shape": (1, 1, sequence_length),
+    }
+    gathered_reference = []
+    handle = model.gen_sp_gather.register_forward_pre_hook(
+        lambda module, args: gathered_reference.append(args[0].clone())
+    )
+    expected = model(**inputs)
+    handle.remove()
+
+    class MaskBackend:
+        @staticmethod
+        def supports_attention_mask(spec):
+            return True
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (4, rank, None))
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: rank)
+    monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_sharding, "get_sequence_parallel_rank", lambda: rank)
+    monkeypatch.setattr(selector, "get_attn_backend_for_capability", lambda **kwargs: MaskBackend())
+
+    def gather(hidden, dim, validate):
+        shard_length = hidden.shape[1]
+        start = rank * shard_length
+        valid_length = min(shard_length, sequence_length - start)
+        torch.testing.assert_close(hidden[:, :valid_length], gathered_reference[0][:, start : start + valid_length])
+        # Supply the other ranks' outputs without retaining the original input.
+        return torch.nn.functional.pad(gathered_reference[0], (0, 0, 0, -sequence_length % 4))
+
+    monkeypatch.setattr(sequence_parallel, "sp_gather", gather)
+    sequence_parallel.apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=4), model._sp_plan)
+
+    def record_full_embedding(module, args):
+        full_refs.append(weakref.ref(args[0]))
+        full_pointers.append(args[0].untyped_storage().data_ptr())
+
+    model.gen_sp_prepare.register_forward_pre_hook(record_full_embedding)
+    layer_calls = 0
+    for _ in range(2):
+        with set_forward_context():
+            output = model(**inputs)
+            torch.testing.assert_close(output, expected)
+            assert get_forward_context()._sp_shard_depth == 0
+    assert layer_calls == 4
+    assert len(full_refs) == 2  # Prepare exactly once per forward.
 
 
 def test_no_cache_still_runs_final_gen_norm_once(monkeypatch: pytest.MonkeyPatch) -> None:
