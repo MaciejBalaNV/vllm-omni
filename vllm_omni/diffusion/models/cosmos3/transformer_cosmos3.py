@@ -1181,6 +1181,7 @@ class _GenPrepared(NamedTuple):
     multi_control_token_sizes: tuple[int, ...] | None
     multi_control_weights: tuple[float, ...] | None
     freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+    defer_gen_gather: bool = False
 
 
 class Cosmos3VFMTransformer(nn.Module):
@@ -1766,6 +1767,7 @@ class Cosmos3VFMTransformer(nn.Module):
         hidden_gen: torch.Tensor,
         *,
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        gather_output: bool = True,
         s_video: int,
         s_control: int,
         s_action: int,
@@ -1815,7 +1817,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
 
-        if not use_multi_control_attention:
+        if gather_output and not use_multi_control_attention:
             hidden_gen = self.gen_sp_gather(hidden_gen)
         return hidden_gen
 
@@ -2138,10 +2140,11 @@ class Cosmos3VFMTransformer(nn.Module):
             )
 
     def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
-        """Execute the cacheable full-layout GEN stack, including final norm."""
+        """Execute the cacheable GEN stack, including final norm."""
         hidden_gen = self._run_gen_layers(
             prep.hidden_gen,
             freqs_gen=prep.freqs_gen,
+            gather_output=not prep.defer_gen_gather,
             s_video=prep.s_video,
             s_control=prep.s_control,
             s_action=prep.s_action,
@@ -2162,6 +2165,8 @@ class Cosmos3VFMTransformer(nn.Module):
         prep: _GenPrepared,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Project an already-normalized packed GEN state to model outputs."""
+        if prep.defer_gen_gather:
+            hidden_gen = self.gen_sp_gather(hidden_gen)
         if not prep.has_action and not prep.has_sound and not prep.has_control:
             return self.unpatchify(self.proj_out(hidden_gen), prep.t, prep.h, prep.w)
 

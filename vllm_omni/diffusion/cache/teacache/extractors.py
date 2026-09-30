@@ -1487,6 +1487,8 @@ def extract_cosmos3_context(
     control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
     control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
     transfer_share_vision_temporal_positions: bool = True,
+    *,
+    _rank_local_gen: bool = False,
     **kwargs: Any,
 ) -> CacheContext:
     """Build the shared cache execution context for Cosmos3's GEN pathway."""
@@ -1511,6 +1513,17 @@ def extract_cosmos3_context(
         control_weights=control_weights,
         transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
     )
+    if _rank_local_gen and not prep.use_multi_control_attention:
+        # SeaCache stores residuals in the execution layout. Split before the
+        # context and its closures retain prep, then gather in postprocessing
+        # on both cache misses and hits. TeaCache keeps its full-layout default.
+        assert module.cached_freqs_gen is not None
+        hidden_gen, freqs_cos, freqs_sin = module.gen_sp_prepare(prep.hidden_gen, *module.cached_freqs_gen)
+        prep = prep._replace(
+            hidden_gen=hidden_gen,
+            freqs_gen=(freqs_cos, freqs_sin),
+            defer_gen_gather=True,
+        )
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
         return (module._run_gen_stack(prep),)

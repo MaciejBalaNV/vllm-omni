@@ -756,7 +756,8 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
-def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("rank_local_gen", [False, True])
+def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch, rank_local_gen: bool) -> None:
     from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -797,7 +798,7 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
     assert norm.calls == 1
     norm.calls = 0
 
-    ctx = extract_cosmos3_context(model, **forward_kwargs)
+    ctx = extract_cosmos3_context(model, _rank_local_gen=rank_local_gen, **forward_kwargs)
     execution_input = ctx.hidden_states.detach().clone()
     execution_output = ctx.run_transformer_blocks()[0]
     residual = execution_output - execution_input
@@ -816,7 +817,7 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(model, "_run_gen_layers", fail_if_gen_layers_run)
 
-    cached_ctx = extract_cosmos3_context(model, **forward_kwargs)
+    cached_ctx = extract_cosmos3_context(model, _rank_local_gen=rank_local_gen, **forward_kwargs)
     cached_output = cached_ctx.postprocess(cached_ctx.hidden_states + residual)
 
     assert norm.calls == 0
@@ -828,9 +829,14 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
 @pytest.mark.parametrize("sequence_length", [16, 17])
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("rank", [0, 3])
+@pytest.mark.parametrize("seacache", [False, True])
+@pytest.mark.parametrize("control_count", [0, 1, 2])
 @torch.inference_mode()
-def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_length, batch, rank) -> None:
+def test_sp_releases_full_gen_embedding_during_stack(
+    monkeypatch, sequence_length, batch, rank, seacache, control_count
+) -> None:
     from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.cache.seacache import SeaCacheConfig, apply_sea_cache_hook
     from vllm_omni.diffusion.distributed import parallel_state, sp_sharding
     from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
     from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
@@ -840,6 +846,8 @@ def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_lengt
     full_refs = []
     full_pointers = []
     layer_calls = 0
+    total_length = sequence_length * (control_count + 1)
+    uses_sp = control_count <= 1
 
     class CheckingLayer(nn.Module):
         def forward(self, hidden, **kwargs):
@@ -851,8 +859,11 @@ def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_lengt
                 assert full_refs[-1]() is None
                 if layer_calls % 2 == 1:
                     assert hidden.untyped_storage().data_ptr() != full_pointers[-1]
-                assert hidden.shape == (batch, (sequence_length + 3) // 4, 8)
+                assert hidden.shape == (batch, (total_length + 3) // 4, 8)
                 assert hidden.untyped_storage().nbytes() == hidden.numel() * hidden.element_size()
+                assert kwargs["freqs_cos"].shape[1] == kwargs["freqs_sin"].shape[1] == hidden.shape[1]
+            elif not uses_sp:
+                assert hidden.shape == (batch, total_length, 8)
             return hidden + 1
 
     monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
@@ -862,18 +873,24 @@ def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_lengt
     model.gen_layers = nn.ModuleList([CheckingLayer(), CheckingLayer()])
     model.cached_kv = [(torch.empty(0), torch.empty(0)) for _ in model.gen_layers]
     inputs = {
-        "hidden_states": torch.zeros(batch, 2, 1, 1, sequence_length),
+        "hidden_states": torch.randn(batch, 2, 1, 1, sequence_length),
         "timestep": torch.ones(batch),
         "text_ids": torch.ones(batch, 2, dtype=torch.long),
         "text_mask": torch.ones(batch, 2, dtype=torch.long),
         "video_shape": (1, 1, sequence_length),
+        "control_latents": [torch.randn(batch, 2, 1, 1, sequence_length) for _ in range(control_count)],
     }
     gathered_reference = []
+    normalized_reference = []
     handle = model.gen_sp_gather.register_forward_pre_hook(
         lambda module, args: gathered_reference.append(args[0].clone())
     )
+    norm_handle = model.norm_moe_gen.register_forward_hook(
+        lambda module, args, output: normalized_reference.append(output.clone())
+    )
     expected = model(**inputs)
     handle.remove()
+    norm_handle.remove()
 
     class MaskBackend:
         @staticmethod
@@ -891,10 +908,11 @@ def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_lengt
     def gather(hidden, dim, validate):
         shard_length = hidden.shape[1]
         start = rank * shard_length
-        valid_length = min(shard_length, sequence_length - start)
-        torch.testing.assert_close(hidden[:, :valid_length], gathered_reference[0][:, start : start + valid_length])
+        valid_length = min(shard_length, total_length - start)
+        reference = normalized_reference[0] if seacache else gathered_reference[0]
+        torch.testing.assert_close(hidden[:, :valid_length], reference[:, start : start + valid_length])
         # Supply the other ranks' outputs without retaining the original input.
-        return torch.nn.functional.pad(gathered_reference[0], (0, 0, 0, -sequence_length % 4))
+        return torch.nn.functional.pad(reference, (0, 0, 0, -total_length % 4))
 
     monkeypatch.setattr(sequence_parallel, "sp_gather", gather)
     sequence_parallel.apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=4), model._sp_plan)
@@ -904,14 +922,35 @@ def test_sp_releases_full_gen_embedding_during_stack(monkeypatch, sequence_lengt
         full_pointers.append(args[0].untyped_storage().data_ptr())
 
     model.gen_sp_prepare.register_forward_pre_hook(record_full_embedding)
+    metadata = SimpleNamespace(step=0)
+    if seacache:
+        sea_hook = apply_sea_cache_hook(
+            model,
+            SeaCacheConfig(threshold=100.0, residual_order=0),
+            current_step_callback=lambda: metadata.step,
+            current_sigma_callback=lambda: 1.0,
+            num_inference_steps_callback=lambda: 4,
+        )
+        sea_hook.state_manager.set_context("cond")
     layer_calls = 0
-    for _ in range(2):
+    for step in range(4 if seacache else 2):
+        metadata.step = step
         with set_forward_context():
             output = model(**inputs)
             torch.testing.assert_close(output, expected)
             assert get_forward_context()._sp_shard_depth == 0
+            if seacache:
+                if uses_sp:
+                    assert full_refs[-1]() is None
+                history = sea_hook.state_manager.get_state().history
+                assert history
+                residual = history[-1][1]
+                assert residual.shape == (batch, (total_length + 3) // 4 if uses_sp else total_length, 8)
+                assert residual.untyped_storage().nbytes() == residual.numel() * residual.element_size()
     assert layer_calls == 4
-    assert len(full_refs) == 2  # Prepare exactly once per forward.
+    assert len(full_refs) == ((4 if seacache else 2) if uses_sp else 0)
+    if seacache:
+        assert sea_hook.full_count == sea_hook.skip_count == 2
 
 
 def test_no_cache_still_runs_final_gen_norm_once(monkeypatch: pytest.MonkeyPatch) -> None:
