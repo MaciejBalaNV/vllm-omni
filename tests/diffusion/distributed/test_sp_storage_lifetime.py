@@ -12,11 +12,11 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelPartialInput,
 )
-from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.diffusion.hooks.base import HookRegistry
 from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook, apply_sequence_parallel
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion, pytest.mark.parallel]
 
 
 @pytest.fixture
@@ -105,14 +105,69 @@ def test_shard_storage_policy_is_opt_in_and_skips_single_rank(parallel_state, cl
 
 
 def test_owned_shard_preserves_gradients(parallel_state):
+    parallel_state(rank=1)
     hook = SequenceParallelSplitHook({}, SequenceParallelConfig(ulysses_degree=4))
     tensor = torch.randn(2, 16, 8, requires_grad=True)
     with set_forward_context():
         shard = hook._prepare_sp_input(tensor, SequenceParallelInput(split_dim=1, clone_shard=True))
+        assert shard.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
+        assert shard.untyped_storage().nbytes() == shard.numel() * shard.element_size()
         shard.sum().backward()
     expected = torch.zeros_like(tensor)
     expected[:, 4:8] = 1
     torch.testing.assert_close(tensor.grad, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sequence_length", [16, 17])
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("keyword", [False, True])
+@pytest.mark.parametrize("shard_group", [None, "video"])
+@torch.inference_mode()
+def test_pre_forward_clone_owns_storage_and_preserves_shard_metadata(
+    parallel_state, sequence_length, batch, keyword, shard_group
+):
+    parallel_state(rank=1)
+    full_refs = []
+    full_pointers = []
+
+    class Module(nn.Module):
+        def forward(self, x):
+            assert x.untyped_storage().data_ptr() != full_pointers[-1]
+            assert x.untyped_storage().nbytes() == x.numel() * x.element_size()
+            assert x.is_contiguous()
+            return x
+
+    module = Module()
+    spec = SequenceParallelInput(
+        split_dim=1,
+        split_output=False,
+        auto_pad=True,
+        clone_shard=True,
+        shard_group=shard_group,
+    )
+    apply_sequence_parallel(module, SequenceParallelConfig(ulysses_degree=4), {"": {"x": spec}})
+
+    def run():
+        tensor = torch.arange(batch * sequence_length * 8, dtype=torch.bfloat16).reshape(batch, sequence_length, 8)
+        full_refs.append(weakref.ref(tensor))
+        full_pointers.append(tensor.untyped_storage().data_ptr())
+        return module(x=tensor) if keyword else module(tensor)
+
+    for _ in range(2):
+        with set_forward_context():
+            ctx = get_forward_context()
+            if shard_group is not None:
+                ctx.sp_shard_metadata[shard_group] = 999  # Stale metadata must be replaced.
+            shard = run()
+            assert all(ref() is None for ref in full_refs)
+            expected = torch.arange(batch * sequence_length * 8, dtype=torch.bfloat16).reshape(
+                batch, sequence_length, 8
+            )
+            padding = -sequence_length % 4
+            expected = torch.nn.functional.pad(expected, (0, 0, 0, padding)).chunk(4, dim=1)[1]
+            torch.testing.assert_close(shard, expected, rtol=0, atol=0)
+            assert ctx.sp_shard_metadata == ({} if shard_group is None else {shard_group: sequence_length})
+            assert ctx.sp_original_seq_len == (sequence_length if padding and shard_group is None else None)
 
 
 @pytest.mark.parametrize("phase", ["success", "non_tensor", "forward_error", "split_error"])
@@ -153,6 +208,8 @@ def test_split_hook_does_not_retain_arguments_on_any_exit(parallel_state, phase,
 @pytest.mark.parametrize("tensor_source", [False, True])
 @torch.inference_mode()
 def test_partial_output_split_keeps_only_lengths_across_calls(parallel_state, keyword, tensor_source):
+    parallel_state(rank=1)
+
     class Module(nn.Module):
         def forward(self, x, text):
             return x

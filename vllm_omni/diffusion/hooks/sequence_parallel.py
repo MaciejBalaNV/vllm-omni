@@ -405,8 +405,11 @@ class SequenceParallelSplitHook(ModelHook):
                 shard = sp_shard(x, sp_input.split_dim, validate=False)
             # contiguous() may be a no-op for a single-batch sequence slice;
             # clone explicitly to release its full (possibly padded) backing.
-            if sp_input.clone_shard and shard is not x:
-                return shard.clone(memory_format=torch.contiguous_format)
+            if sp_input.clone_shard:
+                from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+
+                if get_sequence_parallel_world_size() > 1:
+                    return shard.clone(memory_format=torch.contiguous_format)
             return shard
         elif isinstance(sp_input, SequenceParallelPartialInput):
             # Partial split: keep text portion, split image portion

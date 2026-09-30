@@ -831,6 +831,7 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
 @pytest.mark.parametrize("rank", [0, 3])
 @pytest.mark.parametrize("seacache", [False, True])
 @pytest.mark.parametrize("control_count", [0, 1, 2])
+@pytest.mark.parallel
 @torch.inference_mode()
 def test_sp_releases_full_gen_embedding_during_stack(
     monkeypatch, sequence_length, batch, rank, seacache, control_count

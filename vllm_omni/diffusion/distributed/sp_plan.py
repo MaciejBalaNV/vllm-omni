@@ -228,6 +228,8 @@ class SequenceParallelInput:
         clone_shard: If True, give a sharded tensor its own contiguous storage
             so it does not retain the full input allocation. Applies to both
             padded and unpadded splits; a single-rank input is returned unchanged.
+            Memory savings require the caller to drop its reference to the full
+            tensor; any other references to its storage also keep it allocated.
         shard_group: Optional key shared by tensors representing the same global
             sequence. Keyed groups track independent padding metadata; omitting
             it preserves the legacy single-sequence padding behavior.
