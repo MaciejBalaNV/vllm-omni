@@ -1477,6 +1477,29 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert "preprocessed_video" not in additional
 
 
+def test_transfer_resize_antialiases_downscales_like_reference() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # One-pixel stripes shrunk 3x. The reference's torchvision resize (and the
+    # training loader) averages them; plain bilinear samples single columns,
+    # which would return the stripes as alternating 0 and 255.
+    stripes = torch.zeros(3, 2, 6, 18, dtype=torch.uint8)
+    stripes[..., 1::2] = 255
+    resized = transfer.resize_center_crop_uint8_cthw(stripes, 2, 6)
+    assert tuple(resized.shape) == (3, 2, 2, 6)
+    assert resized.min() >= 100 and resized.max() <= 155
+
+
+def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # Cropping 7 rows to 4 leaves 3. torchvision rounds the 1.5-row offset to 2,
+    # as for 1720x1080 fisheye inputs at 480p (43 spare rows, offset 22).
+    rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1).expand(3, 1, 7, 4).contiguous()
+    cropped = transfer.resize_center_crop_uint8_cthw(rows, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
+
+
 def test_transfer_control_weight_validation_and_normalization() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 
@@ -3832,11 +3855,12 @@ def test_multiview_encode_lidar_condition_bounds_and_shape(tmp_path) -> None:
     pipeline = object.__new__(Cosmos3MultiviewPipeline)
     pipeline.lidar_encoder = FakeEncoder()
     pipeline.device = torch.device("cpu")
-    pipeline.dtype = torch.float32
+    pipeline.dtype = torch.bfloat16
     target = (1, 128, 5, 8, 113)
 
     latents = pipeline._encode_lidar_condition({"condition_path": str(path)}, 5, target)
     assert tuple(latents.shape) == (1, 128, 1, 8, 113)  # reference default: one measured sweep
+    assert latents.dtype == torch.float32  # part of the float32 denoising state
     latents = pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 3}, 5, target)
     assert tuple(latents.shape) == (1, 128, 3, 8, 113)
     # Zero-padded to the chunk boundary, capped at the request's 5 sweeps.
@@ -3846,6 +3870,81 @@ def test_multiview_encode_lidar_condition_bounds_and_shape(tmp_path) -> None:
         pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 5, target)
     with pytest.raises(ValueError, match="requires 5 sweeps, but contains 4"):
         pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 6, target)
+
+
+def test_multiview_denoising_state_is_float32_with_bf16_model() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.bfloat16
+    pipeline.transformer = SimpleNamespace(latent_channel_size=2)
+    pipeline.vae_scale_factor_temporal = 4
+    pipeline.vae_scale_factor_spatial = 8
+    # Two cameras with two latent frames each; latent frame 0 of each camera is conditioned.
+    encoded = torch.full((1, 2, 4, 2, 2), 0.3, dtype=torch.bfloat16)
+    pipeline._encode_multiview_video = lambda video, **kwargs: encoded
+    # 1 + 2**-12 rounds to 1 in BF16; injected reference noise must survive unrounded.
+    injected = torch.full((1, 2, 4, 2, 2), 1.0 + 2**-12)
+    prepare = dict(
+        target_pixels=torch.zeros(1),
+        condition_indexes=[0, 2],
+        num_views=2,
+        num_frames=5,
+        height=16,
+        width=16,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    latents, velocity_mask, condition = pipeline._prepare_multiview_latents(injected_latents=injected, **prepare)
+    assert latents.dtype == velocity_mask.dtype == condition.dtype == torch.float32
+    assert velocity_mask.flatten().tolist() == [0.0, 1.0, 0.0, 1.0]
+    assert latents[:, :, [0, 2]].eq(encoded[:, :, [0, 2]].float()).all()
+    assert latents[:, :, [1, 3]].eq(1.0 + 2**-12).all()
+    sampled, _, _ = pipeline._prepare_multiview_latents(injected_latents=None, **prepare)
+    assert sampled.dtype == torch.float32
+
+    # The transformer's BF16 velocity is masked in place by the float32 mask.
+    pipeline, packed, velocity_mask, shared_kwargs = _multiview_pipeline_with_packed_camera_and_lidar()
+    noise = pipeline._mask_transfer_noise(packed.to(torch.bfloat16), velocity_mask, shared_kwargs)
+    assert noise.dtype == torch.bfloat16
+
+
+def test_diffuse_transfer_runs_model_dtype_transformer_on_float32_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    transformer_input_dtypes: list[torch.dtype] = []
+    stub_forward = pipeline.transformer.forward
+
+    def recording_forward(*, hidden_states: torch.Tensor, **kwargs: Any):
+        transformer_input_dtypes.append(hidden_states.dtype)
+        return stub_forward(hidden_states=hidden_states, **kwargs)
+
+    pipeline.transformer.forward = recording_forward
+    # 1 + 2**-12 rounds to 1 in BF16; the float32 sampler state must keep it.
+    latents = torch.full((1, 2, 1, 1, 1), 1.0 + 2**-12)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert transformer_input_dtypes == [torch.bfloat16]
+    assert result.dtype == torch.float32
+    # The stub velocity is its cond token plus the control bonus: 2 + 100.
+    assert torch.equal(result, latents + 102.0)
 
 
 def _chunked_lidar_encoder(chunk: int, context: int):

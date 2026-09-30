@@ -3331,10 +3331,13 @@ class Cosmos3OmniDiffusersPipeline(
                 needs_text_cfg = step_guidance != 1.0 if text_cfg_below_one else step_guidance > 1.0
                 needs_control_cfg = step_control != 1.0
 
+                # The sampler state may be float32 (multiview, as in the
+                # reference); the transformer always runs in the model dtype.
+                model_latents = latents.to(self.dtype)
                 branches_kwargs = None
                 cond_full_kwargs = dict(
                     _cache_context="cond",
-                    hidden_states=latents,
+                    hidden_states=model_latents,
                     timestep=timestep,
                     text_ids=cond_ids,
                     text_mask=cond_mask,
@@ -3348,7 +3351,7 @@ class Cosmos3OmniDiffusersPipeline(
                         cond_full_kwargs,
                         dict(
                             _cache_context="cond_no_control",
-                            hidden_states=latents,
+                            hidden_states=model_latents,
                             timestep=timestep,
                             text_ids=cond_ids,
                             text_mask=cond_mask,
@@ -3358,7 +3361,7 @@ class Cosmos3OmniDiffusersPipeline(
                         ),
                         dict(
                             _cache_context="uncond",
-                            hidden_states=latents,
+                            hidden_states=model_latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
                             text_mask=uncond_mask,
@@ -3384,7 +3387,7 @@ class Cosmos3OmniDiffusersPipeline(
                         cond_full_kwargs,
                         dict(
                             _cache_context="cond_no_control",
-                            hidden_states=latents,
+                            hidden_states=model_latents,
                             timestep=timestep,
                             text_ids=cond_ids,
                             text_mask=cond_mask,
@@ -3408,7 +3411,7 @@ class Cosmos3OmniDiffusersPipeline(
                         cond_full_kwargs,
                         dict(
                             _cache_context="uncond",
-                            hidden_states=latents,
+                            hidden_states=model_latents,
                             timestep=timestep,
                             text_ids=uncond_ids,
                             text_mask=uncond_mask,
@@ -3432,7 +3435,7 @@ class Cosmos3OmniDiffusersPipeline(
                     noise_pred = self.predict_noise(**cond_full_kwargs)
                 # CFG argument dictionaries otherwise retain the previous
                 # sample during the next transformer call.
-                del cond_full_kwargs, branches_kwargs
+                del cond_full_kwargs, branches_kwargs, model_latents
                 if isinstance(noise_pred, tuple):
                     raise ValueError("Cosmos3 transfer diffusion expects video-only tensor predictions.")
                 noise_pred = self._mask_transfer_noise(noise_pred, velocity_mask, shared_kwargs)

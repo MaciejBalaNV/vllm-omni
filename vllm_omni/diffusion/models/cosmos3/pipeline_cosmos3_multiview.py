@@ -89,6 +89,9 @@ COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # The negative prompt carries the same duration/FPS and resolution sentences as
 # the positive prompt. Requests may override this through sampling params.
 COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE = "same"
+# Denoising state (noise, clean condition latents and the solver's samples and
+# history). The reference keeps it float32 and runs the transformer in BF16.
+COSMOS3_MULTIVIEW_STATE_DTYPE = torch.float32
 
 # The tokenizer appends eos and vision_start after truncating. Derive the
 # request ceiling from the sparse attention's single fixed UND capacity so the
@@ -880,16 +883,18 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
+        # Only the transformer input is cast to the model dtype (diffuse_transfer);
+        # a BF16 state would be re-rounded on every solver step.
         if injected_latents is None:
-            noise = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+            noise = randn_tensor(shape, generator=generator, device=self.device, dtype=COSMOS3_MULTIVIEW_STATE_DTYPE)
         else:
-            noise = injected_latents.to(device=self.device, dtype=self.dtype)
+            noise = injected_latents.to(device=self.device, dtype=COSMOS3_MULTIVIEW_STATE_DTYPE)
             if tuple(noise.shape) != shape:
                 raise ValueError(
                     "Cosmos3 multiview injected latents have the wrong shape: "
                     f"expected={shape}, got={tuple(noise.shape)}."
                 )
-        condition_mask = torch.zeros(1, 1, shape[2], 1, 1, device=self.device, dtype=self.dtype)
+        condition_mask = torch.zeros(1, 1, shape[2], 1, 1, device=self.device, dtype=COSMOS3_MULTIVIEW_STATE_DTYPE)
         condition_latents = torch.zeros_like(noise)
         if condition_indexes:
             if target_pixels is None:
@@ -933,7 +938,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         padded = min(math.ceil(count / chunk) * chunk, num_sweeps)
         if padded > count:
             frames = torch.cat([frames, frames.new_zeros(frames.shape[0], padded - count, *frames.shape[2:])], dim=1)
-        latents = self.lidar_encoder(frames)[:, :, :count].to(device=self.device, dtype=self.dtype)
+        latents = self.lidar_encoder(frames)[:, :, :count].to(device=self.device, dtype=COSMOS3_MULTIVIEW_STATE_DTYPE)
         expected = (*target_shape[:2], count, *target_shape[3:])
         if tuple(latents.shape) != expected:
             raise ValueError(f"Cosmos3 LiDAR condition latents must have shape {expected}, got {tuple(latents.shape)}.")
@@ -1101,7 +1106,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 lidar_control_latents.shape,
                 generator=generator,
                 device=self.device,
-                dtype=self.dtype,
+                dtype=COSMOS3_MULTIVIEW_STATE_DTYPE,
             )
             if lidar_request.get("condition_path") is not None:
                 lidar_condition_latents = self._encode_lidar_condition(lidar_request, sweeps, lidar_noise.shape)
