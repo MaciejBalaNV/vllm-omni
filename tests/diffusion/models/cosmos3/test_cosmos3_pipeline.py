@@ -3594,6 +3594,142 @@ def test_multiview_system_prompt_matches_reference_selection(
     assert actual == prompts[expected]
 
 
+# -- Explicit per-view negative captions --------------------------------------
+
+
+@pytest.mark.parametrize("model", ["baseline", "v2", "v3"])
+@pytest.mark.parametrize(
+    ("source", "explicit", "separate", "expected"),
+    [
+        ("extra_args", "Textures crawl.", True, "Textures crawl."),
+        ("prompt", "Textures crawl.", True, "Textures crawl."),
+        ("attribute", "Textures crawl.", True, "Textures crawl."),
+        ("prompt", "", True, ""),
+        ("extra_args", "", True, ""),
+        ("extra_args", None, True, ""),
+        ("extra_args", "Textures crawl.", False, "Legacy negative."),
+    ],
+)
+def test_multiview_forward_per_view_negative_captions(
+    make_cosmos3_pipeline, model, source, explicit, separate, expected
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.__class__ = Cosmos3MultiviewPipeline
+    pipeline.multiview_config = _multiview_contract(model)
+    pipeline.multiview_config["per_view_captions"] = separate
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    pipeline.multiview_align_temporal_positions_across_views = True
+    pipeline.multiview_attention_scope = "decomposed"
+    pipeline.multiview_decomposed_temporal_window_seconds = None
+    pipeline.multiview_control_attends_sensor = True
+    pipeline.multiview_backend = "triton"
+    pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
+    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
+    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    pipeline._prepare_multiview_latents = lambda **kwargs: (
+        torch.zeros(1, 2, 150, 1, 1),
+        torch.ones(1, 1, 150, 1, 1),
+        torch.zeros(1, 2, 150, 1, 1),
+    )
+    diffuse_calls = []
+
+    def diffuse(**kwargs):
+        diffuse_calls.append(kwargs)
+        return kwargs["latents"]
+
+    pipeline.diffuse_transfer = diffuse
+    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(1)
+    tokenizations = _capture_tokenize_calls(pipeline)
+    views = [
+        {"camera_key": COSMOS3_MADS_CAMERAS[1], "prompt": "A truck passes.", "control_path": "right.mp4"},
+        {"camera_key": COSMOS3_MADS_CAMERAS[0], "prompt": "A car drives.", "control_path": "front.mp4"},
+    ]
+    extra = {"multiview": {"views": views}, "wsm": {}, "aspect_ratio": "16,9"}
+    prompt = {"prompt": "Driving.", "negative_prompt": "Legacy negative."}
+    sp = make_sampling_params(num_frames=297, num_inference_steps=1, latents=None, extra_args=extra)
+    if explicit is not None:
+        if source == "prompt":
+            prompt["per_view_negative_prompt"] = explicit
+            extra["per_view_negative_prompt"] = "Must lose to the prompt value."
+        elif source == "attribute":
+            sp.per_view_negative_prompt = explicit
+        else:
+            extra["per_view_negative_prompt"] = explicit
+    pipeline.forward(make_request_batch(prompt, sp))
+
+    # Capture the real formatter's input to the tokenizer, and the separate
+    # unconditional segments delivered to CFG, rather than just its options.
+    negatives = tokenizations[1::2]
+    assert len(negatives) == (2 if separate else 1)
+    formatted = (
+        f"{expected} The video is 9.0 seconds long and is of 30 FPS. This video is of 480x832 resolution."
+        if separate and expected
+        else expected
+    )
+    assert all(call["text"] == formatted for call in negatives)
+    assert all(call["system_prompt"] == tokenizations[0]["system_prompt"] for call in negatives)
+    assert diffuse_calls[0]["uncond_mask"].tolist() == ([[1, 2]] if separate else [[1]])
+
+
+@pytest.mark.parametrize("negative", [[], {}, 42, True])
+def test_multiview_admission_rejects_non_string_per_view_negative_prompt(negative) -> None:
+    from vllm_omni.model_extras.cosmos3 import validate_multiview_request
+
+    with pytest.raises(ValueError, match="per_view_negative_prompt must be a string"):
+        validate_multiview_request({**_joint_multiview_extra(), "per_view_negative_prompt": negative})
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_multiview_clients_forward_per_view_negative_prompt(tmp_path, monkeypatch, nested) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+
+    assert "per_view_negative_prompt" in COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+    root = Path(__file__).resolve().parents[4]
+
+    def load_client(name, relative):
+        spec = importlib.util.spec_from_file_location(name, root / relative)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    # The example's engine is replaced at its public generate boundary; the
+    # request preparation code still uses real sampling params.
+    engine_module = types.ModuleType("vllm_omni.entrypoints.omni")
+    engine_module.Omni = SimpleNamespace
+    monkeypatch.setitem(sys.modules, engine_module.__name__, engine_module)
+    online = load_client(
+        "negative_online_client", "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
+    )
+    offline = load_client("negative_offline_client", "examples/offline_inference/multiview_video/cosmos3_multiview.py")
+    params = {
+        "per_view_negative_prompt": "Textures crawl.",
+        "multiview": {"views": [{"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."}]},
+    }
+    manifest = {"prompt": "Driving.", **({"extra_params": params} if nested else params)}
+    form, paths = online.prepare_request(manifest, tmp_path)
+    assert json.loads(form["extra_params"])["per_view_negative_prompt"] == "Textures crawl."
+    assert paths == []
+
+    class GeneratedError(Exception):
+        pass
+
+    def generate(prompt, sampling_params):
+        assert sampling_params.extra_args["per_view_negative_prompt"] == "Textures crawl."
+        raise GeneratedError
+
+    with pytest.raises(GeneratedError):
+        offline._run_request(
+            SimpleNamespace(generate=generate), manifest, output_dir=tmp_path, seed=0, fallback_negative_prompt=None
+        )
+
+
 # -- Multiview LiDAR prefix conditioning ---------------------------------------
 
 

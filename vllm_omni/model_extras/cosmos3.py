@@ -76,6 +76,7 @@ COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
         "flow_shift",
         "max_sequence_length",
         "negative_prompt",
+        "per_view_negative_prompt",
         "guardrails",
         "resolution",
         "aspect_ratio",
@@ -155,6 +156,9 @@ def validate_multiview_request(
     per_view_captions: bool = False,
     variable_view_count: bool = False,
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
+    negative = extra.get("per_view_negative_prompt")
+    if negative is not None and not isinstance(negative, str):
+        raise ValueError("Cosmos3 per_view_negative_prompt must be a string.")
     multiview = _mapping(extra.get("multiview"), "extra_args['multiview']")
     unknown = set(multiview) - {
         "views",

@@ -418,6 +418,7 @@ def _run_request(
         "control_guidance_interval",
         "sigma_max",
         "normalize_cfg",
+        "per_view_negative_prompt",
     ):
         if key in request:
             extra_args[key] = request[key]

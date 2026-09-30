@@ -946,9 +946,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         if isinstance(prompt_data, str):
             prompt = prompt_data
             request_negative_prompt = None
+            request_per_view_negative_prompt = None
         elif isinstance(prompt_data, Mapping):
             prompt = str(prompt_data.get("prompt", ""))
             request_negative_prompt = prompt_data.get("negative_prompt")
+            request_per_view_negative_prompt = prompt_data.get("per_view_negative_prompt")
         else:
             raise TypeError(f"Unsupported Cosmos3 multiview prompt type: {type(prompt_data).__name__}.")
 
@@ -1134,17 +1136,20 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate_captions else 1),
         )
 
-        # Same contract as the other Cosmos3 pipelines: no packaged default, an
-        # unsupplied negative prompt is empty. Reference-parity runs must pass
-        # the reference negative prompt explicitly (see the recipe); serializing
-        # it with default json separators is the caller's job, exactly as it is
-        # for Cosmos3-Nano and Cosmos3-Super.
+        # Legacy checkpoints use negative_prompt. Separate-view checkpoints
+        # ignore it, matching training's caption dropout, unless the caller
+        # explicitly opts into a shared per-camera negative caption.
         negative_prompt = request_negative_prompt
         if negative_prompt is None:
             negative_prompt = self._get_sp_param(sp, "negative_prompt", None)
         if negative_prompt is None:
             negative_prompt = ""
         negative_prompt = str(negative_prompt)
+        per_view_negative_prompt = request_per_view_negative_prompt
+        if per_view_negative_prompt is None:
+            per_view_negative_prompt = self._get_sp_param(sp, "per_view_negative_prompt", None)
+        if per_view_negative_prompt is not None and not isinstance(per_view_negative_prompt, str):
+            raise ValueError("Cosmos3 per_view_negative_prompt must be a string.")
         emphasis = as_bool(
             self._get_sp_param(sp, "emphasize_control_in_prompt", defaults.get("emphasize_control_in_prompt", True)),
             True,
@@ -1173,7 +1178,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             branches.append(
                 self._format_and_tokenize_prompts(
                     caption,
-                    "" if separate_captions else negative_prompt,
+                    (per_view_negative_prompt or "") if separate_captions else negative_prompt,
                     num_frames,
                     frame_rate,
                     height,
@@ -1185,7 +1190,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     prompt_suffix=suffix,
                     use_duration_template=True,
                     use_resolution_template=True,
-                    negative_metadata_mode="none"
+                    negative_metadata_mode=("same" if per_view_negative_prompt else "none")
                     if separate_captions
                     else str(
                         self._get_sp_param(
