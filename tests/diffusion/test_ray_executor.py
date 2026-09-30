@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests of Ray placement, rank assignment, RPC output, and cleanup."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -36,7 +37,7 @@ def test_cross_node_workers_get_global_rank_and_explicit_rendezvous(monkeypatch)
     executor.workers = []
     executor._init_workers(object())
     assert fake_ray.remote.call_args.kwargs["max_concurrency"] == 1
-    assert fake_ray.remote.call_args.kwargs["concurrency_groups"] == {"health": 1}
+    assert fake_ray.remote.call_args.kwargs["concurrency_groups"] == {"health": 1, "monitor": 1}
     worker_env = fake_ray.remote.call_args.kwargs["runtime_env"]["env_vars"]
     assert worker_env["NCCL_SOCKET_IFNAME"] == "eth-test"
     assert worker_env["CUSTOM_PLUGIN_SETTING"] == "enabled"
@@ -98,7 +99,7 @@ def test_collective_executes_all_ranks_but_only_output_rank_returns_tensors(rank
         assert result["result"] is None
 
 
-def test_shutdown_kills_workers_without_waiting_and_releases_owned_group(monkeypatch):
+def test_finalizer_kills_workers_without_waiting_and_releases_owned_group(monkeypatch):
     events = []
     fake_ray = Mock()
     fake_ray.get.side_effect = lambda futures, **kw: events.append("wait")
@@ -116,6 +117,78 @@ def test_shutdown_kills_workers_without_waiting_and_releases_owned_group(monkeyp
     resources()
     assert events == ["kill", "remove"]
     assert resources.workers == []
+
+
+def test_wrapper_shutdown_releases_worker_once():
+    actor = ray_module.RayDiffusionWorkerWrapper(0)
+    worker = Mock()
+    actor.worker = worker
+    actor.shutdown()
+    actor.shutdown()
+    worker.shutdown.assert_called_once_with()
+    assert not actor.check_alive()
+
+
+def _make_executor(fake_ray, actors, group=None, owns_group=True):
+    executor = object.__new__(ray_module.RayDiffusionExecutor)
+    executor._closed = False
+    executor._is_failed = False
+    executor._state_lock = threading.Lock()
+    executor._failure_callbacks = []
+    executor.workers = [ray_module._RayWorkerMetadata(actor, rank=rank) for rank, actor in enumerate(actors)]
+    executor._resources = ray_module._RayExecutorResources(executor.workers, group, owns_group)
+    executor._finalizer = executor._resources
+    return executor
+
+
+@pytest.mark.parametrize("stuck_rank", [None, 1])
+def test_shutdown_drains_workers_before_killing_them(monkeypatch, stuck_rank):
+    events = []
+    actors = [Mock(), Mock()]
+    refs = []
+    for rank, actor in enumerate(actors):
+        ref = f"shutdown-{rank}"
+        refs.append(ref)
+        actor.shutdown.remote.side_effect = lambda ref=ref: events.append(ref) or ref
+    fake_ray = Mock()
+
+    def wait(pending, num_returns, timeout):
+        events.append("wait")
+        assert num_returns == len(pending)
+        assert timeout == ray_module._WORKER_SHUTDOWN_TIMEOUT_S
+        return [ref for ref in pending if ref != f"shutdown-{stuck_rank}"], [
+            ref for ref in pending if ref == f"shutdown-{stuck_rank}"
+        ]
+
+    fake_ray.wait.side_effect = wait
+    fake_ray.kill.side_effect = lambda worker, **kw: events.append("kill")
+    fake_ray.util.remove_placement_group.side_effect = lambda group: events.append("remove")
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    executor = _make_executor(fake_ray, actors, group=object())
+    callback = Mock()
+    executor._failure_callbacks = [callback]
+
+    executor.shutdown()
+
+    assert events == [*refs, "wait", "kill", "kill", "remove"]
+    assert [call.args[0] for call in fake_ray.get.call_args_list] == [
+        ref for ref in refs if ref != f"shutdown-{stuck_rank}"
+    ]
+    assert executor._closed
+    assert not executor._is_failed
+    callback.assert_not_called()
+    executor.shutdown()
+    assert fake_ray.kill.call_count == len(actors)
+
+
+def test_shutdown_kills_workers_when_drain_fails(monkeypatch):
+    fake_ray = Mock()
+    fake_ray.wait.side_effect = RuntimeError("Ray is shutting down")
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    executor = _make_executor(fake_ray, actors)
+    executor.shutdown()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
 
 
 def test_shutdown_preserves_borrowed_placement_group(monkeypatch):
@@ -137,13 +210,9 @@ def test_rpc_failure_kills_peers_and_rejects_subsequent_work(monkeypatch, failur
     monkeypatch.setattr(ray_module, "ray", fake_ray)
     actors = [Mock(), Mock()]
     group = object()
-    executor = object.__new__(ray_module.RayDiffusionExecutor)
-    executor._closed = False
-    executor._is_failed = False
+    executor = _make_executor(fake_ray, actors, group=group)
     callback = Mock()
     executor._failure_callbacks = [callback]
-    executor.workers = [ray_module._RayWorkerMetadata(actor, rank=rank) for rank, actor in enumerate(actors)]
-    executor._finalizer = ray_module._RayExecutorResources(executor.workers, group, True)
 
     expected_error = TimeoutError if failure_kind == "GetTimeoutError" else ray_module.EngineDeadError
     with pytest.raises(expected_error) as raised:
@@ -156,6 +225,10 @@ def test_rpc_failure_kills_peers_and_rejects_subsequent_work(monkeypatch, failur
     callback.assert_called_once_with()
     assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
     fake_ray.util.remove_placement_group.assert_called_once_with(group)
+    # Peers may be stuck in a collective, so failure skips the graceful drain.
+    fake_ray.wait.assert_not_called()
+    for actor in actors:
+        actor.shutdown.remote.assert_not_called()
 
     with pytest.raises(RuntimeError, match="closed"):
         executor.collective_rpc("execute_model", unique_reply_rank=output_rank, exec_all_ranks=True)
@@ -171,11 +244,82 @@ def test_actor_death_during_shutdown_does_not_report_failure():
     executor = object.__new__(ray_module.RayDiffusionExecutor)
     executor._closed = True
     executor._is_failed = False
+    executor._state_lock = threading.Lock()
+    executor._finalizer = Mock()
     callback = Mock()
     executor._failure_callbacks = [callback]
-    executor._mark_failed(RuntimeError("actor terminated"))
+    executor._fail(RuntimeError("actor terminated"))
     assert not executor._is_failed
     callback.assert_not_called()
+    executor._finalizer.assert_not_called()
+
+
+class _InlineThread:
+    """Run the monitor synchronously so tests observe its effects."""
+
+    def __init__(self, target, **kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+@pytest.mark.parametrize("closed_first", [False, True])
+def test_worker_monitor_fails_executor_when_idle_actor_dies(monkeypatch, closed_first):
+    fake_ray = Mock()
+    death = RuntimeError("actor died")
+    actors = [Mock(), Mock()]
+    sentinels = [actor.wait_for_exit.options.return_value.remote.return_value for actor in actors]
+
+    def wait(refs, num_returns):
+        assert refs == sentinels
+        assert num_returns == 1
+        if closed_first:
+            executor._closed = True
+        return [sentinels[1]], [sentinels[0]]
+
+    fake_ray.wait.side_effect = wait
+    fake_ray.get.side_effect = death
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    monkeypatch.setattr(ray_module.threading, "Thread", _InlineThread)
+    group = object()
+    executor = _make_executor(fake_ray, actors, group=group)
+    callback = Mock()
+    executor.register_failure_callback(callback)
+
+    executor._start_worker_monitor()
+
+    for actor in actors:
+        actor.wait_for_exit.options.assert_called_once_with(concurrency_group="monitor")
+    if closed_first:
+        assert not executor._is_failed
+        callback.assert_not_called()
+        fake_ray.kill.assert_not_called()
+        return
+    fake_ray.get.assert_called_once_with(sentinels[1])
+    assert executor._is_failed
+    assert executor._closed
+    callback.assert_called_once_with()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+    fake_ray.wait.assert_called_once()
+    with pytest.raises(RuntimeError, match="closed"):
+        executor.check_health()
+
+
+def test_worker_monitor_does_not_keep_executor_alive(monkeypatch):
+    fake_ray = Mock()
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    started = []
+    monkeypatch.setattr(
+        ray_module.threading,
+        "Thread",
+        lambda target, **kwargs: started.append(target) or SimpleNamespace(start=lambda: None),
+    )
+    executor = _make_executor(fake_ray, [Mock()])
+    executor._start_worker_monitor()
+    (monitor,) = started
+    assert all(executor is not cell.cell_contents for cell in monitor.__closure__ or ())
 
 
 @pytest.mark.parametrize(
@@ -248,6 +392,9 @@ def test_worker_startup_failure_cleans_up_registered_actors(monkeypatch, failure
 
     expected = actors[:1] if failure_phase == "creation" else actors
     assert [call.args[0] for call in fake_ray.kill.call_args_list] == expected
+    for actor in expected:
+        actor.shutdown.remote.assert_not_called()
+        actor.wait_for_exit.options.assert_not_called()
     fake_ray.util.remove_placement_group.assert_called_once_with(group)
     assert executor.workers == []
     assert executor._closed
@@ -285,10 +432,7 @@ def test_health_probes_use_separate_concurrency_group(monkeypatch):
     fake_ray.get.return_value = [True, True]
     monkeypatch.setattr(ray_module, "ray", fake_ray)
     actors = [Mock(), Mock()]
-    executor = object.__new__(ray_module.RayDiffusionExecutor)
-    executor._closed = False
-    executor._is_failed = False
-    executor.workers = [ray_module._RayWorkerMetadata(actor, rank=rank) for rank, actor in enumerate(actors)]
+    executor = _make_executor(fake_ray, actors)
 
     executor.check_health()
 
@@ -303,10 +447,35 @@ def test_health_probes_use_separate_concurrency_group(monkeypatch):
     assert not executor._is_failed
 
 
+@pytest.mark.parametrize("probe_result", ["error", "not_alive"])
+def test_health_failure_releases_actors_and_notifies(monkeypatch, probe_result):
+    fake_ray = Mock()
+    if probe_result == "error":
+        fake_ray.get.side_effect = RuntimeError("actor died")
+    else:
+        fake_ray.get.return_value = [True, False]
+    monkeypatch.setattr(ray_module, "ray", fake_ray)
+    actors = [Mock(), Mock()]
+    group = object()
+    executor = _make_executor(fake_ray, actors, group=group)
+    callback = Mock()
+    executor.register_failure_callback(callback)
+
+    with pytest.raises(ray_module.EngineDeadError):
+        executor.check_health()
+
+    assert executor._is_failed
+    assert executor._closed
+    callback.assert_called_once_with()
+    assert [call.args[0] for call in fake_ray.kill.call_args_list] == actors
+    fake_ray.util.remove_placement_group.assert_called_once_with(group)
+
+
 def _make_request_executor(monkeypatch, prompts, component="text_encoder", allgather=True):
     executor = object.__new__(ray_module.RayDiffusionExecutor)
     executor._closed = False
     executor._is_failed = False
+    executor._state_lock = threading.Lock()
     executor._failure_callbacks = []
     executor._finalizer = Mock()
     executor.od_config = SimpleNamespace(

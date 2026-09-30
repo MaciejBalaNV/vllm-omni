@@ -130,6 +130,25 @@ class StageDiffusionProc:
         )
         self._fatal_event.set()
 
+    def _watch_executor_failure(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Tear down when the executor fails between requests.
+
+        Executor monitors fire failure callbacks from their own threads, so
+        the signal is marshalled onto ``run_loop``'s event loop.
+        """
+        executor: DiffusionExecutor | None = getattr(self._engine, "executor", None)
+        if executor is None:
+            return
+
+        def _on_executor_failure() -> None:
+            # The loop is closed once run_loop has exited; nothing to signal.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._signal_fatal_engine_failure, "diffusion executor failed")
+
+        executor.register_failure_callback(_on_executor_failure)
+        if executor.is_dead:
+            self._signal_fatal_engine_failure("diffusion executor failed before run_loop started")
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -357,6 +376,7 @@ class StageDiffusionProc:
         # "DiffusionExecutor is closed" on every subsequent request.
         fatal_event = asyncio.Event()
         self._fatal_event = fatal_event
+        self._watch_executor_failure(asyncio.get_running_loop())
 
         async def _dispatch_request(
             request_id: str,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import weakref
 from collections import defaultdict
 from collections.abc import Callable
@@ -49,6 +50,8 @@ logger = init_logger(__name__)
 _PLACEMENT_GROUP_WAIT_TIMEOUT_S = 1800
 _WORKER_INIT_TIMEOUT_S = 7200
 _HEALTH_CHECK_TIMEOUT_S = 10
+# Must stay below StageDiffusionClient's wait for the Ray subprocess to exit.
+_WORKER_SHUTDOWN_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
 
 try:
@@ -179,11 +182,43 @@ class _RayExecutorResources:
     placement_group: PlacementGroup | None = None
     owns_placement_group: bool = False
 
+    def drain(self, timeout_s: float) -> None:
+        """Run worker shutdown on every actor, waiting at most ``timeout_s``.
+
+        Shutdown RPCs queue behind in-flight inference, so actors that do not
+        finish in time are left for ``__call__`` to kill.
+        """
+        if ray is None or not self.workers:
+            return
+
+        pending: dict[Any, int] = {}
+        for metadata in self.workers:
+            try:
+                pending[metadata.worker.shutdown.remote()] = metadata.rank
+            except Exception as exc:
+                logger.warning("Failed to request shutdown of Ray diffusion worker rank %d: %s", metadata.rank, exc)
+        if not pending:
+            return
+
+        done, not_done = ray.wait(list(pending), num_returns=len(pending), timeout=timeout_s)
+        for ref in done:
+            try:
+                ray.get(ref)
+            except Exception as exc:
+                logger.warning("Ray diffusion worker rank %d did not shut down cleanly: %s", pending[ref], exc)
+        if not_done:
+            logger.warning(
+                "Ray diffusion worker rank(s) %s did not shut down within %.1fs; killing them",
+                sorted(pending[ref] for ref in not_done),
+                timeout_s,
+            )
+
     def __call__(self) -> None:
         if ray is None:
             return
 
-        # Actor shutdown RPCs queue behind inference; kill actors to interrupt it.
+        # Actors that were drained have already released their resources. The
+        # rest may be blocked in inference or a collective, so kill them all.
         for metadata in self.workers:
             try:
                 ray.kill(metadata.worker, no_restart=True)
@@ -277,6 +312,15 @@ class RayDiffusionWorkerWrapper:
     def check_alive(self) -> bool:
         return self.worker is not None
 
+    def wait_for_exit(self) -> None:
+        """Block until the actor dies; the executor monitor waits on this call."""
+        threading.Event().wait()
+
+    def shutdown(self) -> None:
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            worker.shutdown()
+
 
 class RayDiffusionExecutor(DiffusionExecutor):
     """Execute one diffusion worker per Ray GPU actor."""
@@ -290,6 +334,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
 
         self._closed = False
         self._is_failed = False
+        self._state_lock = threading.Lock()
         self._failure_callbacks: list[Callable[[], None]] = []
         self.workers: list[_RayWorkerMetadata] = []
 
@@ -308,8 +353,9 @@ class RayDiffusionExecutor(DiffusionExecutor):
         try:
             self._init_workers(placement_group)
         except Exception:
-            self.shutdown()
+            self._shutdown(graceful=False)
             raise
+        self._start_worker_monitor()
 
     @property
     def is_dead(self) -> bool:
@@ -361,7 +407,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
             num_gpus=1,
             runtime_env={"env_vars": _worker_env(self.od_config)},
             max_concurrency=1,
-            concurrency_groups={"health": 1},
+            concurrency_groups={"health": 1, "monitor": 1},
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=placement_group,
                 placement_group_capture_child_tasks=True,
@@ -406,11 +452,43 @@ class RayDiffusionExecutor(DiffusionExecutor):
         ray.get(futures, timeout=_WORKER_INIT_TIMEOUT_S)
         logger.info("All %d Ray diffusion workers initialized", num_gpus)
 
-    def _mark_failed(self, exc: BaseException) -> None:
-        if self._closed or self._is_failed:
+    def _start_worker_monitor(self) -> None:
+        """Fail the executor as soon as any actor dies, even while idle."""
+        sentinels = {
+            item.worker.wait_for_exit.options(concurrency_group="monitor").remote(): item.rank for item in self.workers
+        }
+        if not sentinels:
             return
-        self._is_failed = True
+        # Keep the thread from holding the executor alive; its finalizer kills
+        # the actors, which releases the wait below.
+        self_ref = weakref.ref(self)
+
+        def _monitor() -> None:
+            try:
+                done, _ = ray.wait(list(sentinels), num_returns=1)
+            except Exception:
+                return
+            executor = self_ref()
+            if executor is None or executor._closed:
+                return
+            ref = done[0]
+            try:
+                ray.get(ref)
+                exc: BaseException = RuntimeError(f"Ray diffusion worker rank {sentinels[ref]} exited unexpectedly")
+            except Exception as actor_exc:
+                exc = actor_exc
+            executor._fail(exc)
+
+        threading.Thread(target=_monitor, daemon=True, name="ray-diffusion-worker-monitor").start()
+
+    def _fail(self, exc: BaseException) -> None:
+        """Mark the executor dead, release every actor, then notify listeners."""
+        with self._state_lock:
+            if self._closed or self._is_failed:
+                return
+            self._is_failed = True
         logger.error("Ray diffusion executor failed: %s", exc)
+        self._shutdown(graceful=False)
         for callback in self._failure_callbacks:
             try:
                 callback()
@@ -450,19 +528,16 @@ class RayDiffusionExecutor(DiffusionExecutor):
             ]
             envelopes = ray.get(futures, timeout=timeout)
         except ray.exceptions.GetTimeoutError as exc:
-            self._mark_failed(exc)
-            self.shutdown()
+            self._fail(exc)
             raise TimeoutError(f"RPC call to {method} timed out") from exc
         except ray.exceptions.RayActorError as exc:
-            self._mark_failed(exc)
-            self.shutdown()
+            self._fail(exc)
             raise EngineDeadError() from exc
         except ray.exceptions.RayTaskError as exc:
             # ray.get raises on the first failed rank without waiting for its
             # peers. They may still be blocked in a collective, so no worker
             # can safely accept another RPC from this executor.
-            self._mark_failed(exc)
-            self.shutdown()
+            self._fail(exc)
             raise EngineDeadError() from exc
 
         replies = sorted(
@@ -537,8 +612,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 return BatchRunnerOutput.from_list(outputs)
             except Exception as exc:
                 if isinstance(exc, TimeoutError):
-                    self._mark_failed(exc)
-                    self.shutdown()
+                    self._fail(exc)
                 return BatchRunnerOutput.from_list(
                     [
                         RunnerOutput(
@@ -571,8 +645,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
                     raise RuntimeError(f"Unexpected response type: {type(result)!r}")
             except Exception as exc:
                 if isinstance(exc, TimeoutError):
-                    self._mark_failed(exc)
-                    self.shutdown()
+                    self._fail(exc)
                 result = DiffusionOutput.from_exception(exc)
             outputs.append(
                 RunnerOutput(
@@ -625,16 +698,26 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 timeout=_HEALTH_CHECK_TIMEOUT_S,
             )
         except Exception as exc:
-            self._mark_failed(exc)
+            self._fail(exc)
             raise EngineDeadError() from exc
         dead_ranks = [item.rank for item, is_alive in zip(self.workers, alive) if not is_alive]
         if dead_ranks:
             exc = RuntimeError(f"Ray diffusion worker ranks are not healthy: {dead_ranks}")
-            self._mark_failed(exc)
+            self._fail(exc)
             raise EngineDeadError() from exc
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._finalizer()
+        self._shutdown(graceful=True)
+
+    def _shutdown(self, graceful: bool) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            if graceful:
+                self._resources.drain(_WORKER_SHUTDOWN_TIMEOUT_S)
+        except Exception as exc:
+            logger.warning("Failed to drain Ray diffusion workers: %s", exc)
+        finally:
+            self._finalizer()
