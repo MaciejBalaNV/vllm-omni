@@ -6,7 +6,6 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from functools import partial
 from typing import Any
 
 import torch
@@ -19,7 +18,7 @@ from vllm_omni.diffusion.cache.seacache.sea_filter import (
     indicator_distance,
 )
 from vllm_omni.diffusion.cache.seacache.state import SeaCacheState
-from vllm_omni.diffusion.cache.teacache.extractors import CacheContext, extract_cosmos3_context, get_extractor
+from vllm_omni.diffusion.cache.teacache.extractors import CacheContext, get_extractor
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
 
 logger = init_logger(__name__)
@@ -78,8 +77,6 @@ class SeaCacheRootHook(ModelHook):
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         if self.extractor_fn is None:
             self.extractor_fn = get_extractor(type(module))
-            if self.extractor_fn is extract_cosmos3_context:
-                self.extractor_fn = partial(self.extractor_fn, _rank_local_gen=True)
         self._parameter_sharded = _is_parameter_sharded(module)
         seen_groups: set[int] = set()
         for block in getattr(module, "gen_layers", ()):

@@ -1180,6 +1180,7 @@ class _GenPrepared(NamedTuple):
     use_multi_control_attention: bool
     multi_control_token_sizes: tuple[int, ...] | None
     multi_control_weights: tuple[float, ...] | None
+    # Execution-layout state; set only by Cosmos3VFMTransformer._shard_gen_prep.
     freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
     defer_gen_gather: bool = False
 
@@ -1766,8 +1767,8 @@ class Cosmos3VFMTransformer(nn.Module):
         self,
         hidden_gen: torch.Tensor,
         *,
-        freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
-        gather_output: bool = True,
+        freqs_gen: tuple[torch.Tensor, torch.Tensor],
+        gather_output: bool,
         s_video: int,
         s_control: int,
         s_action: int,
@@ -1780,14 +1781,9 @@ class Cosmos3VFMTransformer(nn.Module):
         multi_control_token_sizes: tuple[int, ...] | None,
         multi_control_weights: tuple[float, ...] | None,
     ) -> torch.Tensor:
-        """Run the complete GEN decoder, accepting already-sharded inputs."""
-        if self.cached_kv is None or self.cached_freqs_gen is None:
+        """Run the complete GEN decoder on inputs already in the execution layout."""
+        if self.cached_kv is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-        if freqs_gen is None:
-            freqs_cos, freqs_sin = self.cached_freqs_gen
-            if not use_multi_control_attention:
-                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-            freqs_gen = (freqs_cos, freqs_sin)
         freqs_cos, freqs_sin = freqs_gen
 
         if len(self.gen_layers) == len(self.cached_kv):
@@ -1864,14 +1860,32 @@ class Cosmos3VFMTransformer(nn.Module):
             control_weights=control_weights,
             transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
         )
-        if not prep.use_multi_control_attention:
-            assert self.cached_freqs_gen is not None
-            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(prep.hidden_gen, *self.cached_freqs_gen)
-            # Replace the caller's prepared state before entering the stack.
-            # Keeping the original prep would pin the full embedding even
-            # though the sharded hidden_gen owns separate storage.
-            prep = prep._replace(hidden_gen=hidden_gen, freqs_gen=(freqs_cos, freqs_sin))
+        prep = self._shard_gen_prep(prep)
         return self._gen_postprocess(self._run_gen_stack(prep), prep)
+
+    def _shard_gen_prep(self, prep: _GenPrepared, *, defer_gather: bool = False) -> _GenPrepared:
+        """Move prepared GEN inputs into the execution layout.
+
+        Callers must rebind their ``prep`` to the result before running the
+        stack: keeping the original would pin the full embedding even though
+        the sharded ``hidden_gen`` owns separate storage.
+
+        ``defer_gather`` keeps the stack output rank-local and moves the SP
+        gather into ``_gen_postprocess``, so cache residuals stay sharded.
+        """
+        if prep.freqs_gen is not None or prep.defer_gen_gather:
+            raise RuntimeError("Cosmos3 GEN inputs are already in the execution layout.")
+        if self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        if prep.use_multi_control_attention:
+            # Multi-control attention runs unsharded, so there is nothing to gather.
+            return prep._replace(freqs_gen=self.cached_freqs_gen)
+        hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(prep.hidden_gen, *self.cached_freqs_gen)
+        return prep._replace(
+            hidden_gen=hidden_gen,
+            freqs_gen=(freqs_cos, freqs_sin),
+            defer_gen_gather=defer_gather,
+        )
 
     def _gen_preprocess(
         self,
@@ -2141,6 +2155,8 @@ class Cosmos3VFMTransformer(nn.Module):
 
     def _run_gen_stack(self, prep: _GenPrepared) -> torch.Tensor:
         """Execute the cacheable GEN stack, including final norm."""
+        if prep.freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN inputs must go through _shard_gen_prep before the stack.")
         hidden_gen = self._run_gen_layers(
             prep.hidden_gen,
             freqs_gen=prep.freqs_gen,

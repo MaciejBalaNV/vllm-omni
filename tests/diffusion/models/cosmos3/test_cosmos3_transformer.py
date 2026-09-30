@@ -756,8 +756,7 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
 
-@pytest.mark.parametrize("rank_local_gen", [False, True])
-def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch, rank_local_gen: bool) -> None:
+def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -798,7 +797,7 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
     assert norm.calls == 1
     norm.calls = 0
 
-    ctx = extract_cosmos3_context(model, _rank_local_gen=rank_local_gen, **forward_kwargs)
+    ctx = extract_cosmos3_context(model, **forward_kwargs)
     execution_input = ctx.hidden_states.detach().clone()
     execution_output = ctx.run_transformer_blocks()[0]
     residual = execution_output - execution_input
@@ -817,7 +816,7 @@ def test_cache_execution_residual_spans_final_gen_norm(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(model, "_run_gen_layers", fail_if_gen_layers_run)
 
-    cached_ctx = extract_cosmos3_context(model, _rank_local_gen=rank_local_gen, **forward_kwargs)
+    cached_ctx = extract_cosmos3_context(model, **forward_kwargs)
     cached_output = cached_ctx.postprocess(cached_ctx.hidden_states + residual)
 
     assert norm.calls == 0
@@ -1437,3 +1436,28 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
+
+
+def test_shard_gen_prep_rejects_inputs_already_in_execution_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    prep = model._gen_preprocess(
+        torch.zeros(1, 2, 1, 2, 2),
+        torch.tensor([1.0]),
+        torch.tensor([[1, 2]], dtype=torch.long),
+        torch.ones(1, 2, dtype=torch.long),
+        (1, 2, 2),
+    )
+
+    sharded = model._shard_gen_prep(prep, defer_gather=True)
+    assert sharded.freqs_gen is not None
+    assert sharded.defer_gen_gather
+    with pytest.raises(RuntimeError, match="already in the execution layout"):
+        model._shard_gen_prep(sharded)
+    # A deferred gather without sharding would gather a full-layout tensor.
+    with pytest.raises(RuntimeError, match="_shard_gen_prep"):
+        model._run_gen_stack(prep._replace(defer_gen_gather=True))
