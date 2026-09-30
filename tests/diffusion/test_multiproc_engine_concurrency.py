@@ -1835,7 +1835,7 @@ def test_engine_close_interrupts_only_ray_before_join(backend):
     interrupted = threading.Event()
     engine.executor = MagicMock()
     engine.executor.shutdown.side_effect = interrupted.set
-    engine.scheduler = MagicMock()
+    engine.scheduler = MagicMock(_native_prefetch_enabled=False)
     engine.worker_thread = MagicMock()
     engine.worker_thread.is_alive.side_effect = [True, False]
 
