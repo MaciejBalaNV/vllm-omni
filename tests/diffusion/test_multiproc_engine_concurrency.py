@@ -1469,7 +1469,7 @@ class TestStageDiffusionClientErrorPropagation:
         )
 
         assert result is None
-        client._request_socket.send.assert_called_once_with(b"encoded-rpc")
+        client._request_socket.send.assert_called_once_with(b"encoded-rpc", flags=zmq.NOBLOCK)
         assert rpc_id not in client._pending_rpcs
 
 

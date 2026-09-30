@@ -117,6 +117,19 @@ RAY_ADDRESS=10.0.0.1:6379 vllm serve MODEL --omni --deploy-config my_deploy.yaml
 Omni creates actors on the resources of that cluster; it does not start Ray
 on additional machines.
 
+### Stage-level runner selection
+
+`model_runner: v1` or `v2` at the deploy level sets the default runner.
+A `model_runner` on an individual stage overrides that default, allowing
+one stage to migrate or roll back independently. This does not change
+`PipelineConfig` topology, input adapters, or the connector payload contract.
+An omitted stage override preserves the deploy-level selection.
+
+MRv2 native downstream receivers currently support turn-based requests only;
+streaming sessions and resumable input require the V1 prompt-replacement path.
+Selecting a runner does not add the session capabilities it lacks. Platform
+fallbacks and stage overrides are validated after configuration resolution.
+
 ### Stage fields
 
 Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:` and are forwarded to the engine. Frequently used fields are listed below; the source-of-truth schema is `StageDeployConfig` in `vllm_omni/config/stage_config.py`.
