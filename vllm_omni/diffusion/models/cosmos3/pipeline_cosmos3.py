@@ -1254,6 +1254,7 @@ class Cosmos3OmniDiffusersPipeline(
                 "proj_out.",
                 "lidar_proj_in.",
                 "lidar_proj_out.",
+                "rig_view_embed.",
                 "time_embedder.",
                 "audio_proj_in.",
                 "audio_proj_out.",
@@ -2048,9 +2049,14 @@ class Cosmos3OmniDiffusersPipeline(
         duration_template: str | None = COSMOS3_DURATION_TEMPLATE,
         resolution_template: str | None = COSMOS3_RESOLUTION_TEMPLATE,
         force_duration_template: bool = False,
+        truncate_duration: bool = False,
     ) -> str:
         """
         Append duration and resolution metadata to a prompt.
+
+        ``truncate_duration`` writes whole seconds, as multiview per-camera
+        caption training and reference inference do (201 frames at 30 FPS is
+        "6.0", not "6.7").
         """
         prompt = prompt.strip()
         if duration_template is None and resolution_template is None:
@@ -2062,6 +2068,8 @@ class Cosmos3OmniDiffusersPipeline(
             parts.append(head)
         if duration_template is not None and (num_frames > 1 or force_duration_template):
             duration = num_frames / frame_rate
+            if truncate_duration:
+                duration = int(duration)
             parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
         if resolution_template is not None:
             parts.append(resolution_template.format(height=height, width=width).rstrip("."))
@@ -2319,6 +2327,7 @@ class Cosmos3OmniDiffusersPipeline(
         use_resolution_template: bool | None = None,
         negative_metadata_mode: str | None = None,
         aspect_ratio_override: str | None = None,
+        truncate_duration: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Format prompts with metadata templates and tokenize.
 
@@ -2399,6 +2408,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 duration_template=dur_tmpl,
                 resolution_template=res_tmpl,
+                truncate_duration=truncate_duration,
             )
         if prompt_suffix:
             prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
@@ -2428,6 +2438,7 @@ class Cosmos3OmniDiffusersPipeline(
             duration_template=negative_dur_tmpl,
             resolution_template=negative_res_tmpl,
             force_duration_template=negative_metadata_mode == "inverse",
+            truncate_duration=truncate_duration,
         )
 
         if system_prompt is None:

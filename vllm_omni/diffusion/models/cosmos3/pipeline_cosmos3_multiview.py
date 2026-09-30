@@ -39,9 +39,14 @@ from .multiview_flex_attention import (
     validate_maskless_semantics,
     validate_multiview_backend,
 )
-from .multiview_packing import pack_state, unpack_state
+from .multiview_packing import pack_state, patch_grid, unpack_state
 from .multiview_parallel import validate_multiview_parallel_config
-from .multiview_prompts import control_emphasis, format_camera_caption
+from .multiview_prompts import (
+    COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
+    COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
+    control_emphasis,
+    format_rig_view_captions,
+)
 from .pipeline_cosmos3 import (
     COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE,
     COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS,
@@ -78,6 +83,9 @@ COSMOS3_MULTIVIEW_DEFAULT_FPS = 30.0
 # Rates and frame counts outside these bounds are allowed with a warning.
 COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE = (10.0, 30.0)
 COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE = (24, 400)
+# Measured LiDAR sweeps conditioned when lidar.condition_path omits a count,
+# as in the reference inference.
+COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # The negative prompt carries the same duration/FPS and resolution sentences as
 # the positive prompt. Requests may override this through sampling params.
 COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE = "same"
@@ -90,6 +98,37 @@ COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVI
 COSMOS3_MULTIVIEW_EMPHASIS = (
     "Follow the wsm control videos precisely for every camera view: shape, contour, position, and motion must "
     "align with the wsm signal at every frame."
+)
+
+# Versioned deployment contracts. Version 3 adds fields a version-2 reader
+# would silently ignore: ``rig_view_embedding`` and a LiDAR patch that differs
+# from the camera patch.
+COSMOS3_MULTIVIEW_SCHEMA_VERSIONS = (2, 3)
+# Every top-level field the imaginaire4 exporter writes for a servable
+# (non-teacher-forcing) artifact. Versioned contracts carrying anything else
+# are rejected, so a future field fails loudly instead of being ignored.
+COSMOS3_MULTIVIEW_CONTRACT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "causal_training_strategy",
+        "attention_scope",
+        "backend",
+        "decomposed_temporal_window_seconds",
+        "control_attends_sensor",
+        "lidar_attends_captions",
+        "align_temporal_positions_across_views",
+        "share_vision_temporal_positions",
+        "cameras",
+        "max_views",
+        "per_view_captions",
+        "variable_view_count",
+        "inference_defaults",
+        "lidar",
+        "lidar_patch_spatial_hw",
+        "rig_view_embedding",
+        # Written by 2026-09 exporters before per_view_captions replaced it.
+        "separate_view_text_tokenization",
+    }
 )
 
 
@@ -308,6 +347,71 @@ def _required_deployment_field(config: Mapping[str, Any], name: str) -> Any:
     return config[name]
 
 
+def _positive_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
+
+
+def _validated_lidar_patch(config: Mapping[str, Any], version: int | None, camera_patch: int) -> list[int] | None:
+    """Return the LiDAR stream's ``[height, width]`` patch, defaulting to the camera patch."""
+    patch = config.get("lidar_patch_spatial_hw")
+    if config.get("lidar") is None:
+        if patch is not None:
+            raise ValueError("Cosmos3 multiview lidar_patch_spatial_hw requires a lidar block.")
+        return None
+    if patch is None:
+        return [camera_patch, camera_patch]
+    if not isinstance(patch, list | tuple) or len(patch) != 2 or not all(_positive_int(side) for side in patch):
+        raise ValueError(f"Cosmos3 multiview lidar_patch_spatial_hw must be two positive integers, got {patch!r}.")
+    patch = list(patch)
+    if version == 2 and patch != [camera_patch, camera_patch]:
+        raise ValueError(
+            f"Cosmos3 multiview schema_version=2 requires the LiDAR patch to equal the camera patch "
+            f"{camera_patch}, got {patch}; a different LiDAR patch requires schema_version=3."
+        )
+    return patch
+
+
+def _validated_rig_view_embedding(
+    config: Mapping[str, Any], version: int | None, cameras: Sequence[str]
+) -> dict[str, Any] | None:
+    """Validate the physical rig-ID table: one row per MADS camera ID plus a final LiDAR row."""
+    raw = config.get("rig_view_embedding")
+    if raw is None:
+        return None
+    if version != 3:
+        raise ValueError("Cosmos3 multiview rig_view_embedding requires schema_version=3.")
+    if hasattr(raw, "to_dict"):
+        raw = raw.to_dict()
+    rig = _mapping(raw, "rig_view_embedding")
+    if unknown := set(rig) - {"num_embeddings", "camera_ids", "lidar_id"}:
+        raise ValueError(f"Unknown Cosmos3 multiview rig_view_embedding fields: {sorted(unknown)}.")
+    num_embeddings = rig.get("num_embeddings")
+    if not _positive_int(num_embeddings) or num_embeddings < 2:
+        raise ValueError(
+            f"Cosmos3 multiview rig_view_embedding.num_embeddings must be an integer >= 2, got {num_embeddings!r}."
+        )
+    camera_ids = _mapping(rig.get("camera_ids"), "rig_view_embedding.camera_ids")
+    if set(camera_ids) != set(cameras):
+        raise ValueError(
+            "Cosmos3 multiview rig_view_embedding.camera_ids must name exactly the exported cameras: "
+            f"expected={sorted(cameras)}, got={sorted(camera_ids)}."
+        )
+    for camera, row in camera_ids.items():
+        # Row N-1 is reserved for LiDAR.
+        if isinstance(row, bool) or not isinstance(row, int) or not 0 <= row <= num_embeddings - 2:
+            raise ValueError(
+                f"Cosmos3 multiview rig_view_embedding.camera_ids[{camera!r}] must be an integer in "
+                f"[0, {num_embeddings - 2}], got {row!r}."
+            )
+    lidar_id = rig.get("lidar_id")
+    if isinstance(lidar_id, bool) or not isinstance(lidar_id, int) or lidar_id != num_embeddings - 1:
+        raise ValueError(
+            f"Cosmos3 multiview rig_view_embedding.lidar_id must be the final row {num_embeddings - 1}, "
+            f"got {lidar_id!r}."
+        )
+    return {"num_embeddings": num_embeddings, "camera_ids": dict(camera_ids), "lidar_id": lidar_id}
+
+
 def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
     """Validate the flat exported contract before model initialization.
 
@@ -388,15 +492,34 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
         )
 
     version = config.get("schema_version")
-    if version is not None and version != 2:
-        raise ValueError(f"Unsupported Cosmos3 multiview schema_version={version}.")
+    if version is not None and (isinstance(version, bool) or version not in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS):
+        raise ValueError(
+            f"Unsupported Cosmos3 multiview schema_version={version!r}; this vLLM-Omni build reads "
+            f"{list(COSMOS3_MULTIVIEW_SCHEMA_VERSIONS)}."
+        )
+    versioned = version is not None
+    # Unversioned artifacts predate the exporter's field list and keep their
+    # historical pass-through behaviour.
+    if versioned and (unknown := set(config) - COSMOS3_MULTIVIEW_CONTRACT_FIELDS):
+        raise ValueError(
+            f"Unknown Cosmos3 multiview contract fields {sorted(unknown)} (schema_version={version}); "
+            "this vLLM-Omni build cannot honour them."
+        )
     if version is None and tuple(cameras) != COSMOS3_MADS_CAMERAS:
         raise ValueError("Unversioned Cosmos3 multiview artifacts require the canonical MADS camera order.")
     if config.get("lidar") is not None:
-        if version != 2:
+        if not versioned:
             raise ValueError("Joint artifacts require versioned deployment metadata.")
         validate_lidar_config(dict(config["lidar"]))
-    if version == 2:
+    camera_patch = int(_tf_config_get(model_config, "latent_patch_size", 2))
+    lidar_patch = _validated_lidar_patch(config, version, camera_patch)
+    rig_view_embedding = _validated_rig_view_embedding(config, version, cameras)
+    if version == 3 and rig_view_embedding is None and lidar_patch in (None, [camera_patch, camera_patch]):
+        raise ValueError(
+            "Cosmos3 multiview schema_version=3 requires rig_view_embedding or a LiDAR patch that differs "
+            "from the camera patch; export version 2 otherwise."
+        )
+    if versioned:
         for field in ("per_view_captions", "variable_view_count"):
             if not isinstance(_required_deployment_field(config, field), bool):
                 raise ValueError(f"Cosmos3 multiview {field} must be boolean.")
@@ -429,15 +552,36 @@ def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
         raise TypeError("Cosmos3 multiview backend must be a string.")
     validate_multiview_backend(backend)
     if backend == "maskless":
-        if version != 2:
-            raise ValueError("Maskless artifacts require multiview.schema_version=2; re-export the checkpoint.")
+        if not versioned:
+            raise ValueError(
+                "Maskless artifacts require a versioned multiview.schema_version; re-export the checkpoint."
+            )
         validate_maskless_semantics(attention_scope, temporal_window, config["control_attends_sensor"])
     if not isinstance(config.get("lidar_attends_captions", True), bool):
         raise TypeError("Cosmos3 multiview lidar_attends_captions must be boolean.")
-    return {
+    validated = {
         **config,
         "decomposed_temporal_window_seconds": temporal_window,
+        "rig_view_embedding": rig_view_embedding,
     }
+    if lidar_patch is not None:
+        validated["lidar_patch_spatial_hw"] = lidar_patch
+    return validated
+
+
+def _multiview_system_prompt(*, per_view_captions: bool, transfer: bool, joint: bool) -> str:
+    """Select the system prompt the reference inference sends for this request.
+
+    Per-camera-caption checkpoints were trained under AV task prompts: the joint
+    camera+LiDAR prompt for joint requests (reference ``transfer.py``) and the AV
+    multiview prompt for camera-only transfer (reference ``inference.py``).
+    Merged-caption checkpoints keep the generic transfer prompt.
+    """
+    if per_view_captions and joint:
+        return COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT
+    if per_view_captions and transfer:
+        return COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT
+    return COSMOS3_TRANSFER_SYSTEM_PROMPT
 
 
 def _multiview_request_captions(request: Any) -> list[str]:
@@ -588,7 +732,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             self.multiview_cameras,
             media_kind=_media_kind,
             per_view_captions=config.get("per_view_captions", False),
-            variable_view_count=config.get("schema_version") == 2 and config.get("variable_view_count") is True,
+            variable_view_count=config.get("schema_version") in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS
+            and config.get("variable_view_count") is True,
         )
 
     @staticmethod
@@ -692,10 +837,12 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _mask_transfer_noise(
         self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
     ) -> torch.Tensor:
-        # Only camera frames are conditioned. Broadcast the compact temporal
-        # mask on a view of the packed prediction; LiDAR needs no mask tensor.
-        camera = unpack_state(noise, shared_kwargs["packed_shapes"])[0]
-        camera.mul_(velocity_mask)
+        # Broadcast the compact camera temporal mask on a view of the packed
+        # prediction. A LiDAR condition is always a prefix, so no mask tensor.
+        streams = unpack_state(noise, shared_kwargs["packed_shapes"])
+        streams[0].mul_(velocity_mask)
+        if condition_frames := shared_kwargs.get("lidar_condition_frames", 0):
+            streams[1][:, :, :condition_frames].zero_()
         return noise
 
     def _apply_transfer_condition(
@@ -706,9 +853,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         shared_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         # UniPC and Euler return a new sample, separate from solver history.
-        # Restore camera conditions there without repacking the LiDAR target.
-        camera = unpack_state(latents, shared_kwargs["packed_shapes"])[0]
-        camera.mul_(velocity_mask).add_((1.0 - velocity_mask) * condition_latents)
+        # Restore the conditions there without repacking either stream.
+        streams = unpack_state(latents, shared_kwargs["packed_shapes"])
+        streams[0].mul_(velocity_mask).add_((1.0 - velocity_mask) * condition_latents)
+        if condition_frames := shared_kwargs.get("lidar_condition_frames", 0):
+            streams[1][:, :, :condition_frames].copy_(shared_kwargs["lidar_condition_latents"])
         return latents
 
     def _prepare_multiview_latents(
@@ -759,6 +908,28 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 condition_latents[:, :, index : index + 1] = encoded[:, :, index : index + 1]
         latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
         return latents, 1.0 - condition_mask, condition_latents
+
+    def _encode_lidar_condition(
+        self, lidar_request: Mapping[str, Any], num_sweeps: int, target_shape: Sequence[int]
+    ) -> torch.Tensor:
+        """Encode the measured sweeps that condition the start of the generated LiDAR.
+
+        With temporal compression 1 and a temporally causal tokenizer, encoding
+        only the prefix yields the latents the reference obtains by encoding the
+        prefix inside an otherwise empty target clip.
+        """
+        count = lidar_request.get("num_conditional_sweeps", COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS)
+        if not 0 < count < num_sweeps:
+            raise ValueError(
+                f"Cosmos3 lidar.num_conditional_sweeps={count} must leave at least one of the request's "
+                f"{num_sweeps} LiDAR sweeps to generate."
+            )
+        frames = load_lidar_frames(lidar_request["condition_path"], num_sweeps=count)
+        latents = self.lidar_encoder(frames).to(device=self.device, dtype=self.dtype)
+        expected = (*target_shape[:2], count, *target_shape[3:])
+        if tuple(latents.shape) != expected:
+            raise ValueError(f"Cosmos3 LiDAR condition latents must have shape {expected}, got {tuple(latents.shape)}.")
+        return latents
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) != 1:
@@ -906,6 +1077,8 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         items.append(MaskItem(camera_shape, num_views, seconds_per_frame=camera_rate))
         targets = [latents]
         lidar_control_latents = None
+        lidar_condition_latents = None
+        lidar_condition_frames = 0
         if lidar_request is not None:
             lidar_config = deployment["lidar"]
             sweeps = required_lidar_sweeps(num_frames, frame_rate, lidar_config["fps"])
@@ -920,10 +1093,17 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 device=self.device,
                 dtype=self.dtype,
             )
+            if lidar_request.get("condition_path") is not None:
+                lidar_condition_latents = self._encode_lidar_condition(lidar_request, sweeps, lidar_noise.shape)
+                lidar_condition_frames = int(lidar_condition_latents.shape[2])
+                # As in the reference, the sample starts clean on the measured prefix.
+                lidar_noise[:, :, :lidar_condition_frames] = lidar_condition_latents
             targets.append(lidar_noise)
             lt, lh, lw = lidar_noise.shape[2:]
             del lidar_noise
-            lhp, lwp, _, _ = self.transformer._pad_to_patch_size(lh, lw)
+            # LiDAR has its own patch size (1x1 on Phase-2 checkpoints), so
+            # its token grid and mRoPE positions do not follow the camera's.
+            lhp, lwp = patch_grid(lh, lw, self.transformer.lidar_patch_hw)
             for is_control in (True, False):
                 items.append(
                     MaskItem(
@@ -968,10 +1148,17 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if deployment.get("schema_version") is None and selected_hints == ["wsm"] and emphasis:
             suffix = COSMOS3_MULTIVIEW_EMPHASIS
+        # Per-camera captions carry the sampled-rig and current-camera headers
+        # and whole-second durations, exactly as in training and the reference.
         captions = (
-            [format_camera_caption(view["prompt"], view["camera_key"]) for view in views]
+            format_rig_view_captions([view["prompt"] for view in views], [view["camera_key"] for view in views])
             if separate_captions
             else [prompt]
+        )
+        system_prompt = _multiview_system_prompt(
+            per_view_captions=separate_captions,
+            transfer=bool(selected_hints),
+            joint=lidar_request is not None,
         )
         branches = []
         for caption in captions:
@@ -986,7 +1173,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     max_sequence_length,
                     sp,
                     use_system_prompt=True,
-                    system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     prompt_suffix=suffix,
                     use_duration_template=True,
                     use_resolution_template=True,
@@ -1000,6 +1187,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         )
                     ),
                     aspect_ratio_override=aspect_ratio,
+                    truncate_duration=separate_captions,
                 )
             )
 
@@ -1037,6 +1225,18 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         # sigma_max (e.g. 80); it is accepted for compatibility and ignored.
         self._set_timesteps(num_inference_steps, device=self.device, shift=flow_shift)
 
+        rig_view_embedding = deployment.get("rig_view_embedding")
+        # Physical rig IDs, not request positions: subsets and reordered views
+        # keep each camera's trained row. LiDAR uses the table's final row.
+        rig_view_ids = (
+            torch.tensor(
+                [rig_view_embedding["camera_ids"][view["camera_key"]] for view in views],
+                dtype=torch.long,
+                device=self.device,
+            )
+            if rig_view_embedding is not None
+            else None
+        )
         video_shape = tuple(int(dim) for dim in latents.shape[2:])
         shared_kwargs = {
             "_multiview_caption_lengths": {
@@ -1051,6 +1251,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             "transfer_share_vision_temporal_positions": True,
             "temporal_position_period": temporal_position_period,
             "multiview_layout": layout,
+            "rig_view_ids": rig_view_ids,
+            "lidar_condition_frames": lidar_condition_frames,
+            "lidar_condition_latents": lidar_condition_latents,
         }
         # Transfer ownership of the initial state to the denoising loop. The
         # caller must not retain either source tensors or the packed sample.
@@ -1075,11 +1278,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             condition_latents=condition_latents,
             generator=generator,
             normalize_cfg=as_bool(self._get_sp_param(sp, "normalize_cfg", defaults.get("normalize_cfg", False)), False),
-            open_guidance_interval=deployment.get("schema_version") == 2,
+            open_guidance_interval=deployment.get("schema_version") in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS,
             text_cfg_below_one=True,
         )
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])
-        del condition_latents, control_latents, lidar_control_latents, shared_kwargs
+        del condition_latents, control_latents, lidar_control_latents, lidar_condition_latents, shared_kwargs
         latents = final_targets[0]
         video = self._decode_multiview_latents(
             latents,

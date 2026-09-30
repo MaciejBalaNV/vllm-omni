@@ -74,7 +74,7 @@ def _resolve_input_paths(request: dict[str, Any], base_dir: Path) -> dict[str, A
         if container.get("lidar") is not None:
             media.append(container["lidar"])
         for item in media:
-            for field in ("vision_path", "control_path", "vision", "control"):
+            for field in ("vision_path", "control_path", "condition_path", "vision", "control"):
                 value = item.get(field)
                 if isinstance(value, str) and "://" not in value:
                     path = Path(value).expanduser()

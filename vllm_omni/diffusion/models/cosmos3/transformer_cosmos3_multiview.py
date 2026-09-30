@@ -18,7 +18,15 @@ from .multiview_flex_attention import (
     MultiviewLayout,
 )
 from .multiview_maskless_attention import build_maskless_plan, load_maskless_runtime, make_merge_scratch
-from .multiview_packing import pack_state, packed_position_ids, patchify_sensor, unpack_state, unpatchify_sensor
+from .multiview_packing import (
+    add_rig_view_embedding,
+    pack_state,
+    packed_position_ids,
+    patchify_sensor,
+    spatial_patch_hw,
+    unpack_state,
+    unpatchify_sensor,
+)
 from .multiview_parallel import multiview_ulysses_attention
 from .transformer_cosmos3 import (
     COSMOS3_MULTIVIEW_BACKBONE_TYPE,
@@ -164,14 +172,25 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         ) // _tf_config_get(od_config.tf_model_config, "num_key_value_heads", 8)
         super().__init__(*args, **kwargs)
         self.lidar_config = _tf_config_get(deployment, "lidar", None)
+        # Absent in schema-2 exports, where LiDAR shares the camera patch.
+        lidar_patch = _tf_config_get(deployment, "lidar_patch_spatial_hw", None)
+        self.lidar_patch_hw = spatial_patch_hw(self.latent_patch_size if lidar_patch is None else lidar_patch)
         if self.lidar_config is not None:
             from .lidar import validate_lidar_config
 
             self.lidar_config = dict(self.lidar_config)
             validate_lidar_config(self.lidar_config)
-            width = self.latent_patch_size**2 * self.lidar_config["latent_channels"]
+            width = self.lidar_patch_hw[0] * self.lidar_patch_hw[1] * self.lidar_config["latent_channels"]
             self.lidar_proj_in = nn.Linear(width, self.hidden_size)
             self.lidar_proj_out = nn.Linear(self.hidden_size, width)
+        # Physical rig identity: one trained row per MADS camera ID plus a
+        # final LiDAR row, added to control and target tokens alike.
+        rig = _tf_config_get(deployment, "rig_view_embedding", None)
+        self.rig_view_embed = None
+        self.rig_lidar_id = None
+        if rig is not None:
+            self.rig_view_embed = nn.Embedding(int(_tf_config_get(rig, "num_embeddings", None)), self.hidden_size)
+            self.rig_lidar_id = int(_tf_config_get(rig, "lidar_id", None))
         self._multiview_mask_cache: dict[tuple[Any, ...], Any] = {}
         # Padded q/k/v packing buffers, keyed by shape/dtype/device. Held on the
         # transformer rather than the per-forward context so the ~2.5 GiB of
@@ -192,6 +211,11 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             missing = [name for name in sorted(required) if not any(key.endswith(name) for key in loaded)]
             if missing:
                 raise ValueError(f"Incomplete joint checkpoint: missing LiDAR projection weights {missing}.")
+        if self.rig_view_embed is not None and not any(key.endswith("rig_view_embed.weight") for key in loaded):
+            raise ValueError(
+                "Incomplete multiview checkpoint: the contract declares rig_view_embedding but "
+                "rig_view_embed.weight was not loaded."
+            )
 
     def _embed_packed_streams(
         self,
@@ -200,14 +224,29 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         timestep: torch.Tensor,
         camera: torch.Tensor,
         noisy_frame_mask: torch.Tensor | None,
+        rig_view_ids: torch.Tensor | None = None,
+        lidar_condition_frames: int = 0,
     ) -> torch.Tensor:
         # Both targets get the same timestep. Controls never receive it;
-        # camera condition frames receive zero.
+        # camera condition frames and the LiDAR condition prefix receive zero.
         time = self._embed_timestep(timestep, camera.dtype).unsqueeze(1)
+        if self.rig_view_embed is None:
+            if rig_view_ids is not None:
+                raise ValueError("Rig view IDs were supplied, but the checkpoint has no rig view embedding.")
+        elif rig_view_ids is None:
+            raise ValueError("Checkpoints with a rig view embedding require the request's physical camera IDs.")
         embeddings = []
         for item, latent in zip(items, streams, strict=True):
             project = self.lidar_proj_in if item.is_lidar else self.proj_in
-            hidden = project(patchify_sensor(latent.to(camera), self.latent_patch_size))
+            patch = self.lidar_patch_hw if item.is_lidar else self.latent_patch_size
+            hidden = project(patchify_sensor(latent.to(camera), patch))
+            if self.rig_view_embed is not None:
+                # Reference order: projection, then rig identity, then timestep.
+                if item.is_lidar:
+                    rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+                else:
+                    rows = self.rig_view_embed(rig_view_ids)
+                add_rig_view_embedding(hidden, rows, item.num_views)
             if not item.is_control:
                 # Projection outputs are fresh, unaliased tensors, so the
                 # timestep update can mutate them in place.
@@ -222,6 +261,8 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                     # addcmul_ also avoids materializing the broadcast
                     # ``stream_time * mask`` tensor.
                     hidden.addcmul_(stream_time, mask)
+                elif item.is_lidar and lidar_condition_frames:
+                    hidden[:, lidar_condition_frames * item.token_shape[1] * item.token_shape[2] :].add_(stream_time)
                 else:
                     hidden.add_(stream_time)
             embeddings.append(hidden)
@@ -239,6 +280,8 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         control_latents=None,
         lidar_control_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
+        rig_view_ids: torch.Tensor | None = None,
+        lidar_condition_frames: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         """Pack sensor-specific embeddings around the base transformer's shared GEN execution.
@@ -350,7 +393,9 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             # Pass a temporary: retaining the packed embedding in this frame
             # would keep it alive after SP sharding and throughout every layer.
             hidden = self._run_gen_layers(
-                self._embed_packed_streams(items, streams, timestep, camera, noisy_frame_mask),
+                self._embed_packed_streams(
+                    items, streams, timestep, camera, noisy_frame_mask, rig_view_ids, lidar_condition_frames
+                ),
                 multiview_layout=context,
             )
             outputs = []
@@ -363,7 +408,8 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                     projected = self.lidar_proj_out(self.norm_moe_gen(part))
                 else:
                     projected = self._project_video_tokens(part)
-                outputs.append(unpatchify_sensor(projected, tuple(latent.shape[1:]), self.latent_patch_size))
+                patch = self.lidar_patch_hw if item.is_lidar else self.latent_patch_size
+                outputs.append(unpatchify_sensor(projected, tuple(latent.shape[1:]), patch))
             return pack_state(outputs)
 
     def forward(

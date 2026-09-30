@@ -24,25 +24,59 @@ def unpack_state(state: torch.Tensor, shapes: Sequence[tuple[int, ...]]) -> tupl
     return tuple(part.reshape(state.shape[0], *shape) for part, shape in zip(state.split(sizes, dim=1), shapes))
 
 
-def patchify_sensor(latent: torch.Tensor, patch: int) -> torch.Tensor:
+def spatial_patch_hw(patch: int | Sequence[int]) -> tuple[int, int]:
+    """Normalize a square or ``(height, width)`` spatial patch size."""
+    hw = (patch, patch) if isinstance(patch, int) else tuple(patch) if isinstance(patch, Sequence) else ()
+    if len(hw) != 2 or any(isinstance(side, bool) or not isinstance(side, int) or side <= 0 for side in hw):
+        raise ValueError(f"Spatial patch size must be a positive int or (height, width), got {patch!r}.")
+    return hw
+
+
+def patch_grid(height: int, width: int, patch: int | Sequence[int]) -> tuple[int, int]:
+    """Token grid of a latent after zero-padding each side to its patch size."""
+    ph, pw = spatial_patch_hw(patch)
+    return math.ceil(height / ph), math.ceil(width / pw)
+
+
+def patchify_sensor(latent: torch.Tensor, patch: int | Sequence[int]) -> torch.Tensor:
     batch, channels, time, height, width = latent.shape
-    hp, wp = math.ceil(height / patch), math.ceil(width / patch)
-    latent = F.pad(latent, (0, wp * patch - width, 0, hp * patch - height))
+    ph, pw = spatial_patch_hw(patch)
+    hp, wp = patch_grid(height, width, (ph, pw))
+    latent = F.pad(latent, (0, wp * pw - width, 0, hp * ph - height))
     return (
-        latent.reshape(batch, channels, time, hp, patch, wp, patch)
+        latent.reshape(batch, channels, time, hp, ph, wp, pw)
         .permute(0, 2, 3, 5, 4, 6, 1)
-        .reshape(batch, time * hp * wp, patch * patch * channels)
+        .reshape(batch, time * hp * wp, ph * pw * channels)
     )
 
 
-def unpatchify_sensor(tokens: torch.Tensor, shape: tuple[int, ...], patch: int) -> torch.Tensor:
+def unpatchify_sensor(tokens: torch.Tensor, shape: tuple[int, ...], patch: int | Sequence[int]) -> torch.Tensor:
     channels, time, height, width = shape
-    hp, wp = math.ceil(height / patch), math.ceil(width / patch)
+    ph, pw = spatial_patch_hw(patch)
+    hp, wp = patch_grid(height, width, (ph, pw))
     return (
-        tokens.reshape(tokens.shape[0], time, hp, wp, patch, patch, channels)
+        tokens.reshape(tokens.shape[0], time, hp, wp, ph, pw, channels)
         .permute(0, 6, 1, 2, 4, 3, 5)
-        .reshape(tokens.shape[0], channels, time, hp * patch, wp * patch)[..., :height, :width]
+        .reshape(tokens.shape[0], channels, time, hp * ph, wp * pw)[..., :height, :width]
     )
+
+
+def add_rig_view_embedding(hidden: torch.Tensor, rows: torch.Tensor, num_views: int) -> torch.Tensor:
+    """Add one rig-identity row to each camera-major view block of ``hidden`` in place.
+
+    ``hidden`` is ``[B, N, D]`` with the ``N`` tokens of an item ordered view by
+    view; ``rows`` is ``[num_views, D]``, or ``[1, D]`` for a single row shared
+    by every token (LiDAR). The per-view blocks are broadcast views, so no
+    ``[N, D]`` offset tensor is materialized.
+    """
+    batch, tokens, dim = hidden.shape
+    if rows.ndim != 2 or rows.shape[-1] != dim or rows.shape[0] not in (1, num_views):
+        raise ValueError(f"Rig view embedding rows must be [1 or {num_views}, {dim}], got {tuple(rows.shape)}.")
+    blocks = rows.shape[0]
+    if tokens % blocks:
+        raise ValueError(f"{tokens} tokens cannot be split into {blocks} camera-major view blocks.")
+    hidden.view(batch, blocks, tokens // blocks, dim).add_(rows.to(hidden.dtype).view(1, blocks, 1, dim))
+    return hidden
 
 
 def packed_position_ids(

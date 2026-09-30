@@ -206,12 +206,27 @@ def validate_multiview_request(
     joint = extra.get("lidar") is not None
     if joint:
         lidar = _mapping(extra["lidar"], "lidar")
-        if set(lidar) - {"control_path", "return_output"} or not isinstance(lidar.get("control_path"), str | Path):
+        if unknown := set(lidar) - {"control_path", "return_output", "condition_path", "num_conditional_sweeps"}:
+            raise ValueError(f"Unsupported Cosmos3 lidar fields: {sorted(unknown)}.")
+        if not isinstance(lidar.get("control_path"), str | Path):
             raise ValueError("Cosmos3 lidar requires exactly one numeric control_path.")
         if "return_output" in lidar and type(lidar["return_output"]) is not bool:
             raise ValueError("Cosmos3 lidar.return_output must be boolean.")
         if Path(lidar["control_path"]).suffix.lower() != ".safetensors":
             raise ValueError("Cosmos3 lidar.control_path must be a .safetensors file.")
+        # Optional measured sweeps that condition the start of the generated LiDAR,
+        # as the reference ``lidar.condition_path`` does; same numeric format as the control.
+        condition = lidar.get("condition_path")
+        if condition is not None and (
+            not isinstance(condition, str | Path) or Path(condition).suffix.lower() != ".safetensors"
+        ):
+            raise ValueError("Cosmos3 lidar.condition_path must be a .safetensors file.")
+        if "num_conditional_sweeps" in lidar:
+            count = lidar["num_conditional_sweeps"]
+            if condition is None:
+                raise ValueError("Cosmos3 lidar.num_conditional_sweeps requires lidar.condition_path.")
+            if type(count) is not int or count < 1:
+                raise ValueError("Cosmos3 lidar.num_conditional_sweeps must be a positive integer.")
     selected_hints = [key for key in COSMOS3_TRANSFER_HINT_KEYS if extra.get(key) is not None]
     controls = [view.get("control_path", view.get("control")) is not None for view in views]
     vision = [view.get("vision_path", view.get("vision")) is not None for view in views]
