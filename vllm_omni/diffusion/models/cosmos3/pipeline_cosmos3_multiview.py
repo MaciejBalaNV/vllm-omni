@@ -914,9 +914,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> torch.Tensor:
         """Encode the measured sweeps that condition the start of the generated LiDAR.
 
-        With temporal compression 1 and a temporally causal tokenizer, encoding
-        only the prefix yields the latents the reference obtains by encoding the
-        prefix inside an otherwise empty target clip.
+        The reference encodes the prefix inside an otherwise empty (zero) target
+        clip. The streaming tokenizer is frame-causal within a chunk, but how much
+        history a chunk keeps depends on that chunk's length, so encoding the bare
+        prefix would change the latents of a trailing partial chunk. Zero-padding
+        the prefix to the target's chunk boundary reproduces the full clip's chunk
+        lengths for every chunk holding prefix sweeps; the causal padding cannot
+        affect the prefix latents.
         """
         count = lidar_request.get("num_conditional_sweeps", COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS)
         if not 0 < count < num_sweeps:
@@ -925,7 +929,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 f"{num_sweeps} LiDAR sweeps to generate."
             )
         frames = load_lidar_frames(lidar_request["condition_path"], num_sweeps=count)
-        latents = self.lidar_encoder(frames).to(device=self.device, dtype=self.dtype)
+        chunk = self.lidar_encoder.config["streaming_chunk_frames"]
+        padded = min(math.ceil(count / chunk) * chunk, num_sweeps)
+        if padded > count:
+            frames = torch.cat([frames, frames.new_zeros(frames.shape[0], padded - count, *frames.shape[2:])], dim=1)
+        latents = self.lidar_encoder(frames)[:, :, :count].to(device=self.device, dtype=self.dtype)
         expected = (*target_shape[:2], count, *target_shape[3:])
         if tuple(latents.shape) != expected:
             raise ValueError(f"Cosmos3 LiDAR condition latents must have shape {expected}, got {tuple(latents.shape)}.")

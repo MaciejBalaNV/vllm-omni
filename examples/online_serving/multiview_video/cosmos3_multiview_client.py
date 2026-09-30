@@ -195,19 +195,32 @@ def prepare_request(
             paths.append(path)
     if extra.get("lidar") is not None:
         lidar = extra["lidar"]
-        if set(lidar) - {"control_path", "return_output"} or "control_path" not in lidar:
-            raise ValueError("The client expects lidar.control_path pointing to one local .safetensors file.")
+        if (
+            set(lidar) - {"control_path", "condition_path", "num_conditional_sweeps", "return_output"}
+            or "control_path" not in lidar
+        ):
+            raise ValueError(
+                "The client expects lidar.control_path (and optionally condition_path) pointing to local "
+                ".safetensors files."
+            )
         if "return_output" in lidar and type(lidar["return_output"]) is not bool:
             raise ValueError("lidar.return_output must be boolean.")
-        path = Path(lidar.pop("control_path")).expanduser()
-        if not path.is_absolute():
-            path = base_dir / path
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        if path.suffix.lower() != ".safetensors":
-            raise ValueError("LiDAR controls must use the numeric .safetensors format.")
-        lidar["control_reference_index"] = len(paths)
-        paths.append(path)
+        # The HD-map control and the optional measured sweeps are both uploaded.
+        for field, index_field in (
+            ("control_path", "control_reference_index"),
+            ("condition_path", "condition_reference_index"),
+        ):
+            if field not in lidar:
+                continue
+            path = Path(lidar.pop(field)).expanduser()
+            if not path.is_absolute():
+                path = base_dir / path
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            if path.suffix.lower() != ".safetensors":
+                raise ValueError(f"lidar.{field} must use the numeric .safetensors format.")
+            lidar[index_field] = len(paths)
+            paths.append(path)
     data = {
         "prompt": str(manifest.get("prompt", "")),
         "extra_params": json.dumps(extra),

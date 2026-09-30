@@ -77,6 +77,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_extras.cosmos3 import (
     has_multiview_upload_indexes,
+    multiview_lidar_upload_indexes,
     resolve_multiview_uploads,
 )
 
@@ -744,7 +745,11 @@ def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -
     suffix = Path(upload.filename or "").suffix.lower()
     if numeric_lidar:
         if suffix != ".safetensors":
-            raise HTTPException(400, detail="lidar.control_reference_index must reference a .safetensors file.")
+            raise HTTPException(
+                400,
+                detail="lidar.control_reference_index and lidar.condition_reference_index must reference "
+                ".safetensors files.",
+            )
         return suffix
     kind = _uploaded_media_kind(upload)
     supported_suffixes = CONTROL_REFERENCE_IMAGE_SUFFIXES | CONTROL_REFERENCE_VIDEO_SUFFIXES
@@ -1162,24 +1167,24 @@ async def _parse_video_form(
             raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
         try:
             # Validate all camera/role mappings and media kinds before creating files.
-            lidar_manifest = (request.extra_params or {}).get("lidar")
-            lidar_index = lidar_manifest.get("control_reference_index") if isinstance(lidar_manifest, dict) else None
+            # The LiDAR control and the measured LiDAR condition are numeric uploads.
+            lidar_indexes = multiview_lidar_upload_indexes(request.extra_params or {})
             resolve_multiview_uploads(
                 request.extra_params or {},
                 [
-                    "reference" + _control_upload_suffix(upload, numeric_lidar=index == lidar_index)
+                    "reference" + _control_upload_suffix(upload, numeric_lidar=index in lidar_indexes)
                     for index, upload in enumerate(input_references)
                 ],
             )
             for index, upload in enumerate(input_references):
                 try:
                     path = await _persist_uploaded_control_reference(
-                        upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=index == lidar_index
+                        upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=index in lidar_indexes
                     )
                 except HTTPException as exc:
                     raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
                 upload_resources.paths.append(path)
-                if index == lidar_index:
+                if index in lidar_indexes:
                     from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
 
                     validate_lidar_header(path)

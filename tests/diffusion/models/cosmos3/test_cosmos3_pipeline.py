@@ -3686,12 +3686,15 @@ def test_multiview_encode_lidar_condition_bounds_and_shape(tmp_path) -> None:
     save_file({"frames": frames}, str(path))
     encoded: list[tuple[int, ...]] = []
 
-    def fake_encoder(sweeps: torch.Tensor) -> torch.Tensor:
-        encoded.append(tuple(sweeps.shape))
-        return torch.ones(1, 128, sweeps.shape[1], 8, 113)
+    class FakeEncoder:
+        config = {"streaming_chunk_frames": 20}
+
+        def __call__(self, sweeps: torch.Tensor) -> torch.Tensor:
+            encoded.append(tuple(sweeps.shape))
+            return torch.ones(1, 128, sweeps.shape[1], 8, 113)
 
     pipeline = object.__new__(Cosmos3MultiviewPipeline)
-    pipeline.lidar_encoder = fake_encoder
+    pipeline.lidar_encoder = FakeEncoder()
     pipeline.device = torch.device("cpu")
     pipeline.dtype = torch.float32
     target = (1, 128, 5, 8, 113)
@@ -3700,9 +3703,163 @@ def test_multiview_encode_lidar_condition_bounds_and_shape(tmp_path) -> None:
     assert tuple(latents.shape) == (1, 128, 1, 8, 113)  # reference default: one measured sweep
     latents = pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 3}, 5, target)
     assert tuple(latents.shape) == (1, 128, 3, 8, 113)
-    assert encoded == [(3, 1, 128, 1800), (3, 3, 128, 1800)]
+    # Zero-padded to the chunk boundary, capped at the request's 5 sweeps.
+    assert encoded == [(3, 5, 128, 1800), (3, 5, 128, 1800)]
 
     with pytest.raises(ValueError, match="must leave at least one"):
         pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 5, target)
     with pytest.raises(ValueError, match="requires 5 sweeps, but contains 4"):
         pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 6, target)
+
+
+def _chunked_lidar_encoder(chunk: int, context: int):
+    """The real streaming loop of Cosmos3LidarEncoder.forward around a toy frame-causal block.
+
+    Each output frame is the mean of every input frame the block can see (the
+    kept cache plus the causal part of its chunk), so latents change whenever
+    the retained history does.
+    """
+    from vllm_omni.diffusion.models.cosmos3.lidar import Cosmos3LidarEncoder
+
+    class CausalMean:
+        def forward_stream(self, pixels, coords, cache):
+            history = pixels if cache is None else torch.cat([cache["x"][0], pixels], dim=2)
+            total, new = history.shape[2], pixels.shape[2]
+            running = history.mean(dim=(1, 3, 4), keepdim=True).cumsum(2)
+            running = running / torch.arange(1, total + 1).view(1, 1, total, 1, 1)
+            return running[:, :, total - new :].expand(-1, 6, -1, -1, -1), {"x": (history, history)}
+
+    encoder = object.__new__(Cosmos3LidarEncoder)
+    nn.Module.__init__(encoder)
+    encoder.config = {
+        "streaming_chunk_frames": chunk,
+        "streaming_context_frames": context,
+        "range_projection": {"semantic_width": 1800, "model_width": 1808, "min_range_m": 0.0, "max_range_m": 100.0},
+    }
+    encoder.encoder = CausalMean()
+    encoder.quant_conv = nn.Identity()
+    encoder.coords = torch.zeros(1)
+    encoder.latent_mean = torch.zeros(1, 3, 1, 1, 1)
+    encoder.latent_std = torch.ones(1, 3, 1, 1, 1)
+    return encoder
+
+
+@pytest.mark.parametrize("count", [3, 4, 5, 9, 10])
+def test_multiview_lidar_condition_matches_reference_full_clip_encoding(tmp_path, count: int) -> None:
+    """The reference encodes the prefix inside an empty full-length target clip."""
+    from safetensors.torch import save_file
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    num_sweeps, chunk, context = 11, 4, 5  # the 20/21 streaming geometry, scaled down
+    generator = torch.Generator().manual_seed(0)
+    measured = torch.rand(3, count, 128, 1800, generator=generator)
+    measured[0] *= 50.0
+    path = tmp_path / "measured.safetensors"
+    save_file({"frames": measured}, str(path))
+    encoder = _chunked_lidar_encoder(chunk, context)
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.lidar_encoder = encoder
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.float32
+
+    actual = pipeline._encode_lidar_condition(
+        {"condition_path": str(path), "num_conditional_sweeps": count}, num_sweeps, (1, 3, num_sweeps, 1, 1)
+    )
+
+    full_target = torch.zeros(3, num_sweeps, 128, 1800)
+    full_target[:, :count] = measured
+    torch.testing.assert_close(actual, encoder(full_target)[:, :, :count], rtol=0, atol=0)
+    if count > chunk and count % chunk:
+        # Encoding the bare prefix keeps a different history for its trailing partial chunk.
+        assert not torch.equal(encoder(measured)[:, :, :count], actual)
+
+
+# -- Multiview LiDAR condition uploads -----------------------------------------
+
+
+def _uploaded_joint_manifest(**lidar) -> dict[str, Any]:
+    return {
+        "multiview": {
+            "views": [{"camera_key": "camera_front_wide_120fov", "control_reference_index": 0, "prompt": "A car."}]
+        },
+        "wsm": True,
+        "lidar": {"control_reference_index": 1, **lidar},
+    }
+
+
+def test_multiview_uploads_resolve_lidar_condition_reference() -> None:
+    from vllm_omni.model_extras.cosmos3 import (
+        has_multiview_upload_indexes,
+        multiview_lidar_upload_indexes,
+        resolve_multiview_uploads,
+    )
+
+    extra = _uploaded_joint_manifest(condition_reference_index=2, num_conditional_sweeps=3, return_output=True)
+    assert multiview_lidar_upload_indexes(extra) == {1, 2}
+    assert has_multiview_upload_indexes({"lidar": {"condition_reference_index": 0}})
+
+    resolved = resolve_multiview_uploads(extra, ["front.mp4", "hdmap.safetensors", "measured.safetensors"])
+
+    assert resolved["lidar"] == {
+        "control_path": "hdmap.safetensors",
+        "condition_path": "measured.safetensors",
+        "num_conditional_sweeps": 3,
+        "return_output": True,
+    }
+    assert resolved["multiview"]["views"][0]["control_path"] == "front.mp4"
+    assert "condition_reference_index" in extra["lidar"]  # the caller's manifest is not mutated
+
+
+@pytest.mark.parametrize(
+    ("lidar", "paths", "match"),
+    [
+        ({"condition_reference_index": 1}, 2, "referenced more than once"),
+        ({"condition_reference_index": 2, "condition_path": "x.safetensors"}, 3, "cannot be combined"),
+        ({"condition_reference_index": 5}, 3, "condition_reference_index must be an integer index"),
+        ({"condition_reference_index": "2"}, 3, "condition_reference_index must be an integer index"),
+        ({"condition_reference_index": 2}, 3 + 1, "must be referenced exactly once"),
+    ],
+)
+def test_multiview_uploads_reject_invalid_lidar_condition_reference(lidar, paths: int, match: str) -> None:
+    from vllm_omni.model_extras.cosmos3 import multiview_lidar_upload_indexes, resolve_multiview_uploads
+
+    extra = _uploaded_joint_manifest(**lidar)
+    multiview_lidar_upload_indexes(extra)  # malformed indexes never raise here
+    upload_paths = ["front.mp4", "hdmap.safetensors", "measured.safetensors", "extra.safetensors"][:paths]
+
+    with pytest.raises(ValueError, match=match):
+        resolve_multiview_uploads(extra, upload_paths)
+
+
+def test_multiview_client_uploads_lidar_condition(tmp_path) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    client_path = (
+        Path(__file__).resolve().parents[4] / "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
+    )
+    spec = importlib.util.spec_from_file_location("cosmos3_multiview_client", client_path)
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    for name in ("front.mp4", "hdmap.safetensors", "measured.safetensors"):
+        (tmp_path / name).write_bytes(b"x")
+    manifest = {
+        "prompt": "",
+        "multiview": {
+            "views": [{"camera_key": "camera_front_wide_120fov", "control_path": "front.mp4", "prompt": "A car."}]
+        },
+        "wsm": True,
+        "lidar": {
+            "control_path": "hdmap.safetensors",
+            "condition_path": "measured.safetensors",
+            "num_conditional_sweeps": 2,
+        },
+    }
+
+    data, paths = client.prepare_request(manifest, tmp_path, resolution_override="480", aspect_ratio_override="16,9")
+
+    lidar = json.loads(data["extra_params"])["lidar"]
+    assert lidar == {"control_reference_index": 1, "condition_reference_index": 2, "num_conditional_sweeps": 2}
+    assert [path.name for path in paths] == ["front.mp4", "hdmap.safetensors", "measured.safetensors"]

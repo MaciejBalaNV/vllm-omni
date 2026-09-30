@@ -122,7 +122,13 @@ COSMOS3_MADS_CAMERAS = (
     "camera_right_fisheye_200fov",
     "camera_rear_fisheye_200fov",
 )
-MULTIVIEW_MAX_UPLOADS = 2 * len(COSMOS3_MADS_CAMERAS) + 1
+# Control and vision per camera, plus the LiDAR control and measured LiDAR condition.
+MULTIVIEW_MAX_UPLOADS = 2 * len(COSMOS3_MADS_CAMERAS) + 2
+# LiDAR upload index field -> the path field it resolves to.
+MULTIVIEW_LIDAR_UPLOAD_FIELDS = {
+    "control_reference_index": "control_path",
+    "condition_reference_index": "condition_path",
+}
 MULTIVIEW_IMAGE_EXTENSIONS = frozenset({".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"})
 COSMOS3_TRANSFER_HINT_KEYS = ("edge", "blur", "depth", "seg", "wsm")
 
@@ -294,11 +300,20 @@ def validate_camera_caption(caption: Any) -> None:
         )
 
 
+def multiview_lidar_upload_indexes(extra: Mapping[str, Any]) -> set[Any]:
+    """Upload indexes that carry numeric LiDAR files; validated by resolve_multiview_uploads."""
+    lidar = extra.get("lidar")
+    if not isinstance(lidar, Mapping):
+        return set()
+    # Malformed values are rejected by resolve_multiview_uploads with a precise message.
+    return {lidar[field] for field in MULTIVIEW_LIDAR_UPLOAD_FIELDS if type(lidar.get(field)) is int}
+
+
 def has_multiview_upload_indexes(extra: Mapping[str, Any]) -> bool:
     multiview = extra.get("multiview")
     views = multiview.get("views") if isinstance(multiview, Mapping) else None
     lidar = extra.get("lidar")
-    return (isinstance(lidar, Mapping) and "control_reference_index" in lidar) or (
+    return (isinstance(lidar, Mapping) and any(field in lidar for field in MULTIVIEW_LIDAR_UPLOAD_FIELDS)) or (
         isinstance(views, list)
         and any(
             isinstance(view, Mapping) and any(f"{role}_reference_index" in view for role in ("control", "vision"))
@@ -337,16 +352,18 @@ def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[s
     resolved = {**extra, "multiview": multiview}
     if extra.get("lidar") is not None:
         lidar = dict(_mapping(extra["lidar"], "lidar"))
-        if "control_reference_index" in lidar:
-            index = lidar.pop("control_reference_index")
+        for key, path_field in MULTIVIEW_LIDAR_UPLOAD_FIELDS.items():
+            if key not in lidar:
+                continue
+            index = lidar.pop(key)
             if type(index) is not int or not 0 <= index < len(upload_paths):
-                raise ValueError("lidar.control_reference_index must be an integer index into input_references.")
+                raise ValueError(f"lidar.{key} must be an integer index into input_references.")
             if index in used:
                 raise ValueError(f"input_references index {index} is referenced more than once.")
-            if "control_path" in lidar:
-                raise ValueError("lidar.control_reference_index cannot be combined with control_path.")
+            if path_field in lidar:
+                raise ValueError(f"lidar.{key} cannot be combined with {path_field}.")
             used.add(index)
-            lidar["control_path"] = upload_paths[index]
+            lidar[path_field] = upload_paths[index]
         resolved["lidar"] = lidar
     if used != set(range(len(upload_paths))):
         raise ValueError("Every input_references upload must be referenced exactly once in multiview.views or lidar.")
