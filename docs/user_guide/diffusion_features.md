@@ -204,10 +204,10 @@ The following tables show which models support each feature:
 
 > Notes:
 > Cosmos3 Multiview-AV supports CFGP, strict Ulysses CP, HSDP, and TP;
-> see the [multiview serving guide](examples/online_serving/cosmos3_multiview.md).
+> see the [Cosmos3 Multiview-AV recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Multiview-AV.md).
 > HSDP and TP are alternative memory modes and cannot be combined.
 >
-> 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
+> 5\. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
 > recurrence carries state across frames, so a rank cannot denoise a slice of
 > the token sequence in isolation. Doing so would need a distributed scan or
 > an all-gather before every GDN block. The remaining ❌ columns are simply

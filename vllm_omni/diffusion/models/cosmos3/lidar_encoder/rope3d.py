@@ -31,8 +31,10 @@ class VideoRopePosition3DEmb(nn.Module):
     Args:
         head_dim: Per-head channel count. Must satisfy
             ``head_dim - 2 * (head_dim // 6 * 2) > 0``.
-        len_t, len_h, len_w: Maximum supported grid sizes (frequencies are
-            cached for these). ``forward`` accepts any smaller ``(T, H, W)``.
+        len_t: Maximum supported temporal grid size.
+        len_h: Maximum supported grid height.
+        len_w: Maximum supported grid width. Frequencies are cached for these
+            maxima; ``forward`` accepts any smaller ``(T, H, W)``.
         base_theta: RoPE base (``10000.0`` matches LLaMA/Cosmos).
     """
 

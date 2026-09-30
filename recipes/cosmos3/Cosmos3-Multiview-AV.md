@@ -1,24 +1,98 @@
 # Cosmos3 Multiview-AV
 
-Cosmos3 Multiview-AV generates the eleven fixed MADS camera views in one
-bidirectional denoising pass. It uses the regular Cosmos3 Nano architecture and
-weights plus camera-major VAE processing and a weight-free sparse attention
-mask. The runtime defaults to single-GPU and sequential-CFG execution and PyTorch
-FlexAttention's Triton backend, with an opt-in FlashAttention-4 backend on
-Blackwell (see [Sparse attention backend](#sparse-attention-backend)).
+## Summary
 
-## Export contract
+- Vendor: NVIDIA
+- Model: Cosmos3 Nano multiview AV exports, e.g.
+  `wsm_transfer_nano_480p_11view_decomposed_attn_16n` (camera-only) and the
+  versioned joint camera+LiDAR exports
+- Task: multiview driving video generation (T2V, I2V, video prefix, WSM
+  transfer, view completion), optionally joint with numeric LiDAR
+- Mode: offline (`Omni`) and online (`vllm serve --omni`, `/v1/videos`)
+- Hardware: NVIDIA CUDA GPUs; the optional FA4 backend needs SM100 (Blackwell)
+- Maintainer: Maciej Bala
 
-Export the `wsm_transfer_nano_480p_11view_decomposed_attn_16n` checkpoint with
-the normal Cosmos3 EMA-to-Diffusers conversion. No multiview-only weight keys
-are expected. Update `model_index.json` to use:
+## When to use this recipe
+
+Use it to generate up to eleven synchronized MADS camera views, and optionally a
+LiDAR range sequence, in one bidirectional denoising pass. The model reuses the
+Cosmos3 Nano architecture and weights, adds camera-major VAE processing and a
+weight-free sparse attention mask, and, for versioned exports, a few small
+projection and embedding tables (see [Checkpoint](#checkpoint)).
+
+## Supported model contract
+
+### Tasks
+
+| Mode | Controls | RGB conditions |
+| --- | --- | --- |
+| Ordinary camera generation | None, and no hint | None (T2V), images (I2V), or a video prefix |
+| Camera transfer | One control per selected camera, plus exactly one hint | Every selected camera, or none |
+| View completion | One control per selected camera, plus exactly one hint | Complete videos for the known cameras; unknown cameras omit `vision_path` |
+| Joint camera + LiDAR | WSM for every camera, exactly the `wsm` hint, and a numeric LiDAR control | Every selected camera, or none |
+
+WSM is the only control hint any released checkpoint was trained on. Within a
+role (control or vision), use all images or all videos.
+
+### Cameras
+
+| Checkpoint contract | Camera selection |
+| --- | --- |
+| Unversioned, or versioned with `variable_view_count: false` | All exported cameras, in exported order |
+| Versioned (`schema_version` 2 or 3) with `variable_view_count: true` | Any non-empty subset of the exported cameras, in any order |
+
+Request order sets caption association and output order. Version-3
+checkpoints with `rig_view_embedding` embed each camera by its physical rig ID,
+so subsets and reordered views keep the trained per-camera identity.
+
+### Inputs
+
+| Input | Format and limits |
+| --- | --- |
+| Prompt | One shared prompt. Checkpoints with `per_view_captions: true` also require a plain-text `prompt` per view; runtime camera labels and metadata sentences are rejected. |
+| Camera control / vision | Local paths (offline, or server-local over HTTP) or multipart uploads. MP4, MOV, MKV, WebM, or BMP, GIF, JPEG, PNG, TIFF, WebP. |
+| LiDAR control | `lidar.control_path`: a `.safetensors` file holding one float32 tensor `frames` of shape `[3, T, 128, 1800]` (range in metres, intensity and validity in `[0, 1]`) |
+| LiDAR condition (optional) | `lidar.condition_path`, same format; `lidar.num_conditional_sweeps` (default 1) measured sweeps condition the start of the generated LiDAR |
+| Prompt length | `max_sequence_length` may be lowered but not raised above 4096 (see [Prompt length](#prompt-length)) |
+
+### Outputs
+
+| Output | Contract |
+| --- | --- |
+| Video | One camera-major clip per request; all cameras share one size. The offline example writes one MP4 per camera. |
+| Frames and rate | `num_frames` per camera (default 201) is rounded up to the VAE's `4k+1` grid. fps defaults to 30, the training rate. Other rates are accepted, with a warning outside [10, 30]. |
+| Geometry | `resolution` `"480"` or `"720"` and `aspect_ratio` (see [Resolution and aspect ratio](#resolution-and-aspect-ratio)) |
+| LiDAR (joint checkpoints, opt-in) | `lidar.return_output: true` returns float32 `[3, T, 128, 1800]` sweeps at the checkpoint's LiDAR rate, starting at the camera clip's time origin |
+
+Sampling defaults come from the checkpoint's `inference_defaults` for versioned
+exports. Unversioned exports use the Cosmos3 video defaults (35 steps,
+guidance 6.0, flow shift 10, 480p) and cap guidance at 7.0.
+
+## References
+
+- Offline example: [`examples/offline_inference/multiview_video/cosmos3_multiview.py`](../../examples/offline_inference/multiview_video/cosmos3_multiview.py)
+- Online client: [`examples/online_serving/multiview_video/cosmos3_multiview_client.py`](../../examples/online_serving/multiview_video/cosmos3_multiview_client.py)
+- [Video API](../../docs/serving/videos_api.md)
+- [Supported models](../../docs/models/supported_models.md) and the
+  [diffusion feature matrix](../../docs/user_guide/diffusion_features.md)
+- Base model recipe: [Cosmos3-Nano](Cosmos3-Nano.md)
+
+## Checkpoint
+
+Export with the normal Cosmos3 EMA-to-Diffusers conversion, then set
+`model_index.json` to:
 
 ```json
 {"_class_name": "Cosmos3MultiviewPipeline"}
 ```
 
-Add the following fields to `transformer/config.json` (preserve all existing
-Cosmos3 Nano fields):
+`transformer/config.json` keeps all Cosmos3 Nano fields and adds
+`"backbone_type": "cosmos3_multiview"` plus a `multiview` object. The
+imaginaire4 exporter writes versioned objects (`schema_version` 2 or 3) that
+also carry `per_view_captions`, `variable_view_count`, `inference_defaults`
+and, for joint checkpoints, `lidar`. A versioned object with an unknown field is
+rejected at load time. The minimal unversioned form for the camera-only WSM
+checkpoint is:
 
 ```json
 {
@@ -49,126 +123,65 @@ Cosmos3 Nano fields):
 }
 ```
 
-The scheduler directory must describe the regular FlowUniPC scheduler. The
-request defaults to 35 steps, guidance 6.0, flow shift 10, and the 480p resolution bucket.
-Resolution, frame rate, and per-camera frame count are request-driven. When
-omitted, fps defaults to 30 and num_frames to 201.
+Unversioned artifacts require the canonical camera order above and cannot be
+joint or maskless.
 
-30 FPS is the training rate: the MADS WSM transfer recipes read their clips at
-native 30 FPS and stamp "30 FPS" into the training captions, so the
-fps-modulated temporal mRoPE and the prompt metadata are on-distribution only
-there. Other rates are accepted with a warning outside [10, 30], and frame
-counts are rounded up to the VAE's `4k+1` grid (200 becomes 201) instead of
-being rejected.
+Weights beyond Cosmos3 Nano, checked at load time:
 
-## Resolution and aspect ratio
+| Contract | Extra transformer weights | Extra directory |
+| --- | --- | --- |
+| Unversioned / version 2, camera-only | None | None |
+| `rig_view_embedding` declared (version 3) | `rig_view_embed.weight` | None |
+| Joint (`multiview.lidar` present) | `lidar_proj_in.{weight,bias}`, `lidar_proj_out.{weight,bias}` | `lidar_vae/` (`config.json`, `diffusion_pytorch_model.safetensors`) |
 
-All eleven cameras share one output size. `resolution` selects the `"480"`
-(default) or `"720"` bucket; it is independent of the input's pixel count.
-`aspect_ratio` defaults to `"auto"`, which uses the original dimensions of the
-first camera's WSM input (`camera_front_wide_120fov`). Images use their spatial
-size and videos use their first frame. The nearest bucket is selected using
-Cosmos3's existing target-size matching. Other cameras and vision inputs do
-not affect the selection; all inputs are resized and center-cropped to it.
-An unreadable first WSM input fails generation rather than selecting a fallback.
+The scheduler directory must describe the regular FlowUniPC scheduler.
 
-| `aspect_ratio` | 480p output (width × height) | 720p output (width × height) |
-|---|---|---|
-| `1:1` | 640 × 640 | 960 × 960 |
-| `4:3` | 736 × 544 | 1104 × 832 |
-| `3:4` | 544 × 736 | 832 × 1104 |
-| `16:9` | 832 × 480 | 1280 × 720 |
-| `9:16` | 480 × 832 | 720 × 1280 |
+### Sparse attention backend
 
-These are canonical buckets, so their dimensions need not form the exact
-mathematical ratio. 256p, 704p, and arbitrary dimensions are unsupported.
-Explicit ratios override detection; comma spellings such as `"9,16"` are also
-accepted. To retain the previous fixed landscape behavior, specify `"16:9"`.
-
-Offline JSON/JSONL records accept `resolution` and `aspect_ratio` at the top
-level or inside `multiview`. Integer resolutions `480` and `720` are accepted.
-Duplicate declarations must agree after normalization. Each CLI flag overrides
-its own setting for every record; a geometry override clears stale width/height
-constraints without editing the input file:
-
-```bash
-# Automatically select an aspect ratio from the first WSM input at 720p.
-python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-  --model /models/cosmos3-multiview-av --input /data/mv_i2v_wsm.json \
-  --resolution 720 --aspect-ratio auto --num-frames 29 --output-dir outputs/mv_auto
-
-# Explicitly generate portrait views.
-python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-  --model /models/cosmos3-multiview-av --input /data/mv_i2v_wsm.json \
-  --resolution 720 --aspect-ratio 9:16 --num-frames 29 --output-dir outputs/mv_portrait
-```
-
-Direct pipeline requests prefer `extra_args.multiview.resolution` and
-`extra_args.multiview.aspect_ratio` over their top-level `extra_args` equivalents,
-then default to `"480"` and `"auto"`. The generic image resolution field is not
-used. Explicit sampling width/height must match the resolved bucket, including
-in automatic mode. Output dimensions and prompt metadata use that same bucket.
-
-Detection runs in the pipeline for both offline and online requests; clients do
-not decode media or inject landscape dimensions in automatic mode. See the
-[online client guide](../../docs/user_guide/examples/online_serving/cosmos3_multiview.md).
-
-The existing transformer pads either spatial axis and crops back before VAE
-decode, preserving exact output dimensions. With spatial compression 16 and
-patch size 2, the buckets use 390–400 spatial tokens at 480p and 900–920 at 720p,
-per latent frame and item. Memory and latency also depend on clip length,
-attention backend, and execution topology.
-
-## Sparse attention backend
-
-`multiview.backend` selects the kernel that consumes the sparse block map. Both
-backends are built from the same run-level projection of the visibility
-predicate, so they agree on which token pairs are visible; they differ only in
-block geometry and floating-point rounding.
+`multiview.backend` selects how the visibility mask is executed:
 
 | `backend` | Kernel | Sparse block `(q, kv)` | Requirements |
-|---|---|---|---|
-| `"triton"` (default) | PyTorch FlexAttention, Triton template | 64 × 64 | Any CUDA GPU |
+| --- | --- | --- | --- |
+| `"triton"` | PyTorch FlexAttention, Triton template | 64 × 64 | Any CUDA GPU |
 | `"fa4"` | FlashAttention-4 CuTe | 256 × 128 | SM100 (Blackwell), CUDA 13, `pip install 'vllm-omni[fa4]'` |
+| `"maskless"` | Dense FlashAttention over per-branch key folds | — | Versioned checkpoint trained with maskless semantics (the v2 AV model) |
 
-Because the backend changes only how the mask is executed, it can be overridden
-per run without editing the checkpoint — useful for A/B measurement:
+Triton and FA4 implement the same visibility predicate and differ only in block
+geometry and rounding. Maskless has different semantics: overlapping branch
+keys count twice, so it cannot be swapped with the sparse backends. Set
+`VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to switch between the sparse
+backends without editing the checkpoint; an unknown name, or a switch to or from
+`maskless`, fails at load time. Goldens taken on Triton must be re-calibrated
+before they gate FA4.
 
-```bash
-VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=fa4 \
-  python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-  --model /models/cosmos3-multiview-av --input /data/mv_i2v_wsm.json
+## Hardware
+
+- Accelerator: NVIDIA CUDA GPU; FA4 requires SM100 (Blackwell).
+- Devices: 1 by default. CFG parallelism (2-way), strict Ulysses CP, TP and HSDP
+  are supported through the engine flags (see [Supported features](#supported-features)).
+- Qualification scope: no memory or latency profile is recorded in this
+  repository yet. Record one per the [Verification](#verification) section
+  before claiming a hardware profile.
+
+## Software environment
+
+- vLLM-Omni: this branch; FA4 additionally needs the `fa4` extra and CUDA 13.
+- Guardrails: `cosmos-guardrail` and access to the gated
+  `nvidia/Cosmos-1.0-Guardrail` model (see [Safety guardrails](#safety-guardrails)).
+
+## Command
+
+### Offline
+
+The input JSON carries the prompt, one hint (`"wsm": {}`), and
+`multiview.views`, one entry per camera with `camera_key`, `control_path` and,
+for I2V or prefix conditioning, `vision_path`. Set
+`multiview.condition_video_as_image: true` to condition on the first frame only.
+Add a top-level `lidar` object for joint requests:
+
+```json
+"lidar": {"control_path": "lidar_control.safetensors", "return_output": true}
 ```
-
-The environment variable wins over `transformer/config.json`; an unset or empty
-value falls back to the checkpoint. An unknown name fails at load time rather
-than on the first generated frame. Parity thresholds are backend-specific:
-goldens taken on Triton must be re-calibrated before they are used to gate the
-FA4 path.
-
-### Prompt length is capped by the variant, not the request
-
-The sparse attention pads its text (UND) stream to a fixed capacity so the
-compiled kernel sees one input shape for the life of the process. A pad that
-tracked each prompt's length would resize the packed key tensor, and the kernel
-is compiled with `dynamic=False`, so every distinct prompt length would cost a
-recompile — and past Dynamo's default limit of eight the whole attention falls
-back to eager FlexAttention, which cannot fit its score matrix at this
-sequence length.
-
-Requests may therefore *lower* `max_sequence_length` but not raise it past
-`COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH` (4096); a larger value is rejected at
-admission. Raise that constant if a golden fixture ever shows the reference
-negative prompt being truncated. The padding itself is numerically free: pad
-keys are excluded from every real query by the visibility predicate.
-
-## Input and run
-
-The input JSON needs to have the following structure: Each view must appear in
-the exact exported camera order and provide `control_path`. For i2v_wsm, every
-view also provides `vision_path`; set `condition_video_as_image: true` to use
-only its first frame. A top-level empty `wsm` object selects the only supported
-control hint.
 
 ```bash
 python examples/offline_inference/multiview_video/cosmos3_multiview.py \
@@ -179,60 +192,90 @@ python examples/offline_inference/multiview_video/cosmos3_multiview.py \
   --seed 42 --fps 30 --num-frames 200
 ```
 
-`--negative-prompt-json` applies the required serialization for you; a
-`negative_prompt` string in the input JSON takes precedence over it. Omit both
-only for runs where reference parity does not matter.
+The script writes `vision_viewNN_<camera>.mp4` per camera (plus
+`combined_views.mp4` with `--combine-views`), `lidar.safetensors` when LiDAR
+output was requested, and `sample_outputs.json` with the resolved geometry and
+metadata. `--negative-prompt-json` applies the required serialization; a
+`negative_prompt` string in the input wins over it. `--fps`, `--num-frames`,
+`--resolution` and `--aspect-ratio` override every record. Records may use
+`guidance`, `num_steps` and `shift` as aliases for `guidance_scale`,
+`num_inference_steps` and `flow_shift`; the vLLM-Omni names win when both are
+present. The negative prompt carries the same duration/FPS and resolution
+sentences as the positive prompt; set `negative_metadata_mode` to change that.
 
-`--fps` and `--num-frames` override every record, so one input file can be run
-at several rates or lengths without editing it. Records may also use the field
-names `guidance`, `num_steps`, and `shift` as aliases for `guidance_scale`,
-`num_inference_steps`, and `flow_shift`; the vLLM-Omni names win when both are
-present.
+Camera files are encoded concurrently by default (at least two, at most four
+FFmpeg threads per camera, bounded by the CPU affinity mask);
+`--video-encoding-mode serial` is a diagnostic fallback.
 
-By default the negative prompt carries the same duration/FPS and resolution
-sentences as the positive prompt; set `negative_metadata_mode` in the request's
-extra args to change it.
+### Online
 
-The example writes `vision_viewNN_<camera>.mp4` for all eleven cameras plus
-`sample_outputs.json`, including the resolved resolution, aspect ratio, width, and height. Strict Ulysses CP,
-CFG parallelism, TP, and HSDP use the existing engine flags; HSDP and TP cannot
-be combined. See the offline script's usage examples. Cache-DiT, session state,
-LiDAR, camera subsets, and reordered cameras are rejected in v1.
-
-Camera files are encoded concurrently by default. The encoder divides CPUs in
-the process affinity mask across cameras, using at least two and at most four
-FFmpeg threads per camera (one thread on a one-CPU allocation). Use
-`--video-encoding-mode serial` as a diagnostic fallback. Both modes stream one
-frame at a time, so conversion memory scales with active cameras rather than
-the complete output length.
-
-The HTTP API keeps its existing encoder by default. Opt in to camera-parallel
-encoding in the request manifest's existing `extra_params` object:
-
-```json
-{
-  "prompt": "Drive through the intersection safely.",
-  "extra_params": {
-    "parallel_multiview_encoding": true,
-    "multiview": {
-      "views": [
-        {"camera_key": "camera_front_wide_120fov", "control_path": "front.mp4"},
-        {"camera_key": "camera_cross_right_120fov", "control_path": "cross_right.mp4"}
-      ]
-    },
-    "wsm": {}
-  }
-}
+```bash
+vllm serve /models/cosmos3-multiview-av --omni \
+  --model-class-name Cosmos3MultiviewPipeline --port 8091
 ```
 
-The bundled HTTP client forwards this option unchanged. The optimized path
-requires at least two output cameras, no audio, and enough affinity CPUs for
-two encoders. `video_codec_options` may contain `preset`, `crf`, and an omitted
-or automatic (`0`/`"auto"`) `threads` value. Other cases log a reason and use
-the existing monolithic encoder. Concurrent requests share one process-local
-CPU budget fairly at camera boundaries; deployments with multiple API
-processes should partition CPU affinity accordingly. The response remains one
-camera-major MP4, not a synchronized grid.
+`POST /v1/videos` and `POST /v1/videos/sync` take the request manifest as the
+JSON-encoded `extra_params` form field. Media may be server-local
+`control_path`/`vision_path` entries or multipart `input_references` parts
+referenced by zero-based `control_reference_index`/`vision_reference_index`
+(LiDAR: `control_reference_index`/`condition_reference_index`). Every upload
+must be referenced exactly once, and one camera role cannot have both a path and
+an index. The client uploads the local paths of an offline manifest:
+
+```bash
+python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
+  request.json --server http://localhost:8091 --output multiview.mp4
+```
+
+`/content` returns one camera-major MP4. For joint jobs with
+`lidar.return_output: true`, the completed job carries a `lidar` descriptor and
+`GET /v1/videos/{video_id}/lidar` returns the numeric file; the client saves
+`<output-stem>.lidar.safetensors` and `.lidar.json`. LiDAR output requires the
+asynchronous endpoint; `/v1/videos/sync` rejects it.
+
+Setting `extra_params.parallel_multiview_encoding: true` opts in to
+camera-parallel MP4 encoding on the server. It needs at least two cameras, no
+audio, and enough affinity CPUs; otherwise the server logs why and uses the
+regular encoder.
+
+## Resolution and aspect ratio
+
+`resolution` selects the `"480"` or `"720"` bucket (default: the checkpoint's
+`inference_defaults.resolution`, else `"480"`), independent of the input's pixel
+count. `aspect_ratio` defaults to `"auto"`, which picks the nearest bucket from
+the first view's control input, or its vision input when it has no control
+(first frame for videos). An unreadable input fails generation; requests with
+no camera media (T2V) use `16:9`. All other inputs are resized and
+center-cropped to the selected size.
+
+| `aspect_ratio` | 480p (width × height) | 720p (width × height) |
+| --- | --- | --- |
+| `1:1` | 640 × 640 | 960 × 960 |
+| `4:3` | 736 × 544 | 1104 × 832 |
+| `3:4` | 544 × 736 | 832 × 1104 |
+| `16:9` | 832 × 480 | 1280 × 720 |
+| `9:16` | 480 × 832 | 720 × 1280 |
+
+These are canonical buckets, so their dimensions need not form the exact ratio.
+Other resolutions and arbitrary sizes are unsupported. Comma spellings such as
+`"9,16"` are accepted. Requests may set both fields at the top level of
+`extra_args`/`extra_params` or inside `multiview`; the `multiview` value wins.
+Explicit sampling width/height must match the resolved bucket.
+
+## Prompt length
+
+The sparse attention pads the text (UND) stream to one fixed capacity, 4096
+prompt tokens plus the two framing tokens. The pad is numerically free: pad
+keys are excluded from every real query by the visibility predicate. Requests
+may lower `max_sequence_length` but not raise it above 4096; a larger value is
+rejected at admission, and longer prompts are truncated.
+
+The fixed capacity keeps the mask plan and packing buffers identical across
+prompts. The Triton attention call runs outside the regionally compiled GEN
+layers, through FlexAttention's own dynamic-shape compile, and the cached UND
+keys/values are marked dynamic in their sequence dimension. New prompts and the
+two CFG branches therefore do not recompile the GEN layers. The GEN layers
+themselves are compiled statically and specialize per output geometry.
 
 ## Safety guardrails
 
@@ -254,28 +297,60 @@ turn them on for a server started with `--no-guardrails`.
 
 ## Verification
 
-Run the CPU contract suite:
+Run the CPU contract tests:
 
 ```bash
 pytest -q \
-  tests/diffusion/models/cosmos3/test_multiview_flex_attention.py \
-  tests/diffusion/models/cosmos3/test_cosmos3_multiview_pipeline.py \
+  tests/diffusion/models/cosmos3/test_cosmos3_pipeline.py \
   tests/diffusion/models/cosmos3/test_cosmos3_transformer.py \
-  tests/examples/offline_inference/test_cosmos3_multiview.py \
-  tests/model_extras/test_cosmos3_multiview_uploads.py \
-  tests/model_extras/test_model_extras.py \
-  tests/model_tests/diffusion/test_alignment.py
+  -k "multiview or lidar or rig"
 ```
 
-On CUDA, run `test_multiview_recompile.py` and, on supported Blackwell hardware,
-`test_multiview_fa4.py` from the same model test directory. These cover all ten warmed
-aspect-ratio/resolution geometries and backend parity. Run the existing distributed
-multiview tests for the deployment's parallel configuration.
+These cover checkpoint contract validation, camera selection, per-camera
+captions, LiDAR admission and conditioning, rig-view embedding, and the
+guardrail hooks. The dedicated attention, LiDAR decoder, parallelism,
+recompilation and HTTP upload suites are not in the tree; run a CUDA generation
+to cover those paths.
 
 For checkpoint validation, generate 29-frame clips in WSM-only and
 vision-conditioned modes for all five ratios at both resolutions with the same
-seed and settings. Include explicit overrides as well as automatic detection.
-Check all eleven exported videos for camera order, frame count, and exact
-dimensions. Follow with a 201-frame 720p portrait generation on sufficient
-hardware. Record the backend, GPU topology, steps, cold/warm latency, and peak
-memory; no fixed memory or latency target is implied by resolution support.
+seed and settings, including explicit overrides as well as automatic detection.
+Check every exported video for camera order, frame count and exact dimensions,
+then run one 201-frame 720p portrait generation. Record the checkpoint, backend,
+GPU model and count, parallel topology, steps, cold/warm latency and peak
+memory.
+
+## Supported features
+
+| Feature | Status | Guide |
+| --- | --- | --- |
+| CFG parallelism | ✅ 2-way (`--cfg-parallel-size 2`) | [CFG parallel](../../docs/user_guide/diffusion/parallelism/cfg_parallel.md) |
+| Sequence parallelism | ✅ strict Ulysses only (`--ulysses-degree`) | [Sequence parallel](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) |
+| Tensor parallelism | ✅ (`--tensor-parallel-size`); not with HSDP | [Tensor parallel](../../docs/user_guide/diffusion/parallelism/tensor_parallel.md) |
+| HSDP | ✅ (`--use-hsdp --hsdp-shard-size N`); not with TP | [HSDP](../../docs/user_guide/diffusion/parallelism/hsdp.md) |
+| Regional compilation | ✅ static GEN layers; `--enforce-eager` disables it | [Regional compilation](../../docs/user_guide/diffusion/regional_compilation.md) |
+| Cache-DiT / TeaCache | ❌ disabled at startup with a warning | [Cache-DiT](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md) |
+| Session state | ❌ rejected at load time | — |
+| LiDAR decoder parallelism | ❌ the decoder runs eager FP32 on every rank | — |
+
+Example: four GPUs with CFG parallelism and Ulysses CP:
+
+```bash
+vllm serve /models/cosmos3-multiview-av --omni \
+  --model-class-name Cosmos3MultiviewPipeline --num-gpus 4 \
+  --cfg-parallel-size 2 --ulysses-degree 2 --port 8091
+```
+
+For HSDP on the same four GPUs, add `--use-hsdp --hsdp-shard-size 4`. For
+TP2 × CP2, replace `--cfg-parallel-size 2` with `--tensor-parallel-size 2`.
+
+## Notes
+
+- Memory and latency depend on clip length, camera count, resolution, backend
+  and topology. The transformer pads spatial axes and crops back before VAE
+  decode; the buckets use 390–400 spatial tokens per latent frame and camera at
+  480p and 900–920 at 720p.
+- Joint checkpoints load the LiDAR decoder even when a request does not ask for
+  LiDAR output; such requests skip decoder execution.
+- LiDAR CUDA parity, memory and latency have not been qualified in this
+  repository.

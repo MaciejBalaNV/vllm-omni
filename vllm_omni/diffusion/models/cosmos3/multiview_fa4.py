@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """FlashAttention-4 backend for Cosmos3 multiview sparse attention.
 
 FA4 expresses a sparse mask the same way FlexAttention does: a block map that
