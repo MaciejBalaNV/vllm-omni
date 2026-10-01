@@ -71,7 +71,8 @@ from .utils import VIDEO_RES_SIZE_INFO
 logger = init_logger(__name__)
 
 # Overrides transformer config multiview.backend, so the Triton and FA4 sparse
-# attention paths can be compared without editing the checkpoint.
+# attention paths can be compared without editing the checkpoint. Without it, a
+# Triton checkpoint runs on FA4 wherever the sparse FA4 path is available.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 
 # Per-camera frame count when the request supplies none.
@@ -701,10 +702,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
     @staticmethod
     def _resolve_attention_backend(multiview_config: Mapping[str, Any]) -> str:
-        """Allow sparse kernel overrides, but never change checkpoint attention semantics.
+        """Pick the sparse kernel, but never change checkpoint attention semantics.
 
-        Triton and FA4 implement the same sparse predicate. Maskless intentionally
-        counts overlapping branch keys twice and requires a matching checkpoint.
+        Triton and FA4 implement the same sparse predicate, so a checkpoint that
+        declares Triton runs on FA4 whenever this worker supports it, just as
+        maskless resolves to FA4 through its FlashAttention version. The env
+        override still selects either sparse kernel explicitly. Maskless
+        intentionally counts overlapping branch keys twice and requires a
+        matching checkpoint.
         """
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
         backend = override if override else _required_deployment_field(multiview_config, "backend")
@@ -715,12 +720,21 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             source_backend = _required_deployment_field(multiview_config, "backend")
             if (backend == "maskless") != (source_backend == "maskless"):
                 raise ValueError("Cannot override sparse attention with maskless or maskless with sparse attention.")
-            return backend
         except ValueError as exc:
             source = (
                 f"{COSMOS3_MULTIVIEW_BACKEND_ENV}={override!r}" if override else "transformer config multiview.backend"
             )
             raise ValueError(f"{exc} (from {source})") from exc
+        if not override and backend == "triton":
+            from .multiview_fa4 import multiview_fa4_available
+
+            if multiview_fa4_available():
+                logger.info(
+                    "Cosmos3 multiview sparse attention defaults to FA4 on this GPU; set %s=triton to keep Triton.",
+                    COSMOS3_MULTIVIEW_BACKEND_ENV,
+                )
+                return "fa4"
+        return backend
 
     def _parse_multiview_request(self, sp: Any) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
         extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}

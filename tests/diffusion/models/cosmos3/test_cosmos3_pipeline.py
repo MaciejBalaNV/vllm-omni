@@ -3457,6 +3457,71 @@ def test_multiview_contract_accepts_exported_av_models(model: str) -> None:
     assert validated["backend"] == ("maskless" if model == "v2" else "triton")
 
 
+@pytest.mark.parametrize(
+    ("source", "override", "fa4_available", "expected"),
+    [
+        ("triton", None, True, "fa4"),
+        ("triton", None, False, "triton"),
+        ("triton", "triton", True, "triton"),
+        ("triton", "fa4", False, "fa4"),
+        ("fa4", None, False, "fa4"),
+        ("maskless", None, True, "maskless"),
+    ],
+)
+def test_multiview_sparse_backend_defaults_to_fa4_when_available(
+    monkeypatch: pytest.MonkeyPatch, source: str, override: str | None, fa4_available: bool, expected: str
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKEND_ENV,
+        Cosmos3MultiviewPipeline,
+    )
+
+    if override is None:
+        monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
+    else:
+        monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, override)
+    monkeypatch.setattr(multiview_fa4, "multiview_fa4_available", lambda: fa4_available)
+
+    assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": source}) == expected
+
+
+@pytest.mark.parametrize(
+    ("capability", "loads", "expected"),
+    [
+        ((10, 0), True, True),
+        ((10, 3), True, True),
+        ((10, 0), False, False),
+        ((9, 0), True, False),
+        ((12, 0), True, False),
+    ],
+)
+def test_multiview_fa4_available_requires_sm100_and_fa4(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], loads: bool, expected: bool
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+
+    def load_fa4():
+        if not loads:
+            raise RuntimeError("flash_attn.cute missing")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(multiview_fa4, "_load_fa4", load_fa4)
+
+    assert multiview_fa4.multiview_fa4_available() is expected
+
+
+def test_multiview_fa4_unavailable_without_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(multiview_fa4, "_load_fa4", Mock(side_effect=AssertionError("must not import FA4")))
+
+    assert multiview_fa4.multiview_fa4_available() is False
+
+
 def test_multiview_contract_defaults_legacy_lidar_patch_to_camera_patch() -> None:
     contract = _multiview_contract("baseline")
     del contract["lidar_patch_spatial_hw"]

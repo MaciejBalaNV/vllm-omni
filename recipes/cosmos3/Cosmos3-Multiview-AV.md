@@ -147,12 +147,15 @@ The scheduler directory must describe the regular FlowUniPC scheduler.
 | `"maskless"` | Dense FlashAttention over per-branch key folds | — | Versioned checkpoint trained with maskless semantics (the v2 AV model) |
 
 Triton and FA4 implement the same visibility predicate and differ only in block
-geometry and rounding. Maskless has different semantics: overlapping branch
-keys count twice, so it cannot be swapped with the sparse backends. Set
-`VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to switch between the sparse
-backends without editing the checkpoint; an unknown name, or a switch to or from
-`maskless`, fails at load time. Goldens taken on Triton must be re-calibrated
-before they gate FA4.
+geometry and rounding. A `"triton"` checkpoint therefore runs on FA4 by default
+when the worker is an SM100 GPU with FA4 installed, and on Triton otherwise, the
+same way maskless picks FA4 for its dense kernels. Maskless has different
+semantics: overlapping branch keys count twice, so it cannot be swapped with the
+sparse backends. Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin a
+sparse backend without editing the checkpoint; an unknown name, or a switch to
+or from `maskless`, fails at load time. Goldens taken on Triton must be
+re-calibrated before they gate FA4, or pinned with
+`VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton`.
 
 ## Hardware
 

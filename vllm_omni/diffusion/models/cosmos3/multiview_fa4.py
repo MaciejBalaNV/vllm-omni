@@ -146,6 +146,24 @@ def _load_fa4() -> _Fa4Entry:
     return _entry
 
 
+def multiview_fa4_available() -> bool:
+    """Whether this worker can run the sparse FA4 path, used to pick the default sparse backend.
+
+    The (256, 128) block map is fixed by FA4's SM100 forward tile, so only
+    datacenter Blackwell (compute capability 10.x) qualifies.
+    """
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return False
+    if torch.cuda.get_device_capability()[0] != 10:
+        return False
+    try:
+        _load_fa4()
+    except RuntimeError as exc:
+        logger.info("Cosmos3 multiview FA4 is unavailable, keeping Triton: %s", exc)
+        return False
+    return True
+
+
 def _validate(
     q: torch.Tensor,
     k: torch.Tensor,
