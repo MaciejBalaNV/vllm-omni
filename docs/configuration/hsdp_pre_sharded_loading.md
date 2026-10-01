@@ -17,5 +17,6 @@ Encoders and VAEs follow their existing loading paths.
 This strategy requires the default diffusion pipeline loader, complete dedicated
 transformer checkpoint sources, and supported checkpoint key mappings. Tensor
 layouts must match the runtime layout; tensor transforms are unsupported.
+Checkpoint tensor dtypes must match runtime tensor dtypes at preflight; dtype conversion is unsupported.
 Quantization and LoRA are unsupported. Every worker needs checkpoint access.
 `num_weight_load_threads` controls the safetensors reader's threads per rank.

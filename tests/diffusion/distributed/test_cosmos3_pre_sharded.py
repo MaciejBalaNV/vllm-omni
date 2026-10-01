@@ -14,6 +14,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.core_model, pytest.mark.gpu]
 
 
@@ -184,6 +186,7 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
 
 
 @pytest.mark.parametrize("edge", [False, True], ids=["cosmos3", "cosmos3_edge"])
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.accelerator.device_count() < 2 or not dist.is_nccl_available(),
     reason="requires two CUDA GPUs and NCCL",
