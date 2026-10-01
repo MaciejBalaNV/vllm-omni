@@ -11,8 +11,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DeviceMesh, DTensor
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed import hsdp as hsdp_module
 from vllm_omni.diffusion.distributed.hsdp import (
@@ -46,7 +46,7 @@ def cpu_process_group():
         yield
         return
 
-    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_file_store_init_method())
     try:
         yield
     finally:
