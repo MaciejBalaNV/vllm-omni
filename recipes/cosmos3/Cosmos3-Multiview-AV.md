@@ -9,7 +9,8 @@
 - Task: multiview driving video generation (T2V, I2V, video prefix, WSM
   transfer, view completion), optionally joint with numeric LiDAR
 - Mode: offline (`Omni`) and online (`vllm serve --omni`, `/v1/videos`)
-- Hardware: NVIDIA CUDA GPUs; the FA4 backend needs SM100/SM110 (Blackwell)
+- Hardware: NVIDIA CUDA GPUs; sparse FA4 defaults on supported SM100/SM110
+  (Blackwell), with an explicit, unverified SM90 (Hopper) option
 - Maintainer: Maciej Bala
 
 ## When to use this recipe
@@ -143,23 +144,43 @@ The scheduler directory must describe the regular FlowUniPC scheduler.
 | `backend` | Kernel | Sparse block `(q, kv)` | Requirements |
 | --- | --- | --- | --- |
 | `"triton"` | PyTorch FlexAttention, Triton template | 64 × 64 | Any CUDA GPU |
-| `"fa4"` | vLLM's bundled FlashAttention-4 CuTe (`vllm.vllm_flash_attn.cute`) | 256 × 128 | SM100/SM110 (Blackwell), CUDA build of vLLM |
+| `"fa4"` | vLLM's bundled FlashAttention-4 CuTe (`vllm.vllm_flash_attn.cute`) | 256 × 128 | CUDA build of vLLM; SM100/SM110 (Blackwell), or explicit SM90 (Hopper) pending GPU verification |
 | `"maskless"` | Dense FlashAttention over per-branch key folds | — | Versioned checkpoint trained with maskless semantics (the v2 AV model) |
 
-Triton and FA4 implement the same visibility predicate and differ only in block
-geometry and rounding. A `"triton"` checkpoint therefore runs on FA4 by default
-whenever vLLM's FlashAttention resolves to version 4 (SM100/SM110), and on
-Triton otherwise; maskless uses the same resolution for its dense kernels.
-Maskless has different semantics: overlapping branch keys count twice, so it
-cannot be swapped with the sparse backends. Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin a
-sparse backend without editing the checkpoint; an unknown name, or a switch to
-or from `maskless`, fails at load time. Goldens taken on Triton must be
-re-calibrated before they gate FA4, or pinned with
-`VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton`.
+Triton and FA4 implement the same visibility predicate and differ in block
+geometry and rounding. For a checkpoint declaring `"triton"`, Cosmos3 selects
+sparse FA4 automatically when its shared version resolver returns FA4. This
+happens on SM100/SM110 when vLLM reports FA4 support. On Hopper (SM90), the
+resolver prefers FA3, or FA2 when FA3 is unavailable, so the sparse checkpoint
+stays on Triton. If the version resolver raises an import or availability error,
+automatic selection also keeps Triton. Maskless uses the resolved FlashAttention
+version for its dense kernels; overlapping branch keys count twice, so it
+requires a matching checkpoint.
+
+Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin a sparse backend
+without editing the checkpoint. An unknown name, or a switch to or from
+`maskless`, fails at load time. To request FA4 explicitly on Hopper, set this
+before starting the offline process or server:
+
+```bash
+export VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=fa4
+```
+
+vLLM supports FA4 on Hopper, and the Cosmos3 adapter uses a scalar mask callback
+there. Its vector mask callback is specific to SM100/SM110. For Cosmos3's usual
+`head_dim=128`, source inspection indicates that the 256 × 128 sparse block map
+is compatible with Hopper's 128 × 128 compute tile. Actual Hopper FA4
+correctness and performance have not been verified; run the CUDA checks in
+[Verification](#verification) before qualifying an H100/H200 deployment.
+
+Goldens taken on Triton must be re-calibrated before they gate FA4, or pinned
+with `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton`.
 
 ## Hardware
 
-- Accelerator: NVIDIA CUDA GPU; FA4 requires SM100/SM110 (Blackwell).
+- Accelerator: NVIDIA CUDA GPU. vLLM's bundled FA4 supports SM90 (Hopper) and
+  SM100/SM110 (Blackwell); see [Sparse attention backend](#sparse-attention-backend)
+  for Cosmos3's selection policy and qualification status.
 - Devices: 1 by default. CFG parallelism (2-way), strict Ulysses CP, TP and HSDP
   are supported through the engine flags (see [Supported features](#supported-features)).
 - Qualification scope: no memory or latency profile is recorded in this
@@ -310,10 +331,12 @@ pytest -q \
 ```
 
 These cover checkpoint contract validation, camera selection, per-camera
-captions, LiDAR admission and conditioning, rig-view embedding, and the
-guardrail hooks. The dedicated attention, LiDAR decoder, parallelism,
-recompilation and HTTP upload suites are not in the tree; run a CUDA generation
-to cover those paths.
+captions, LiDAR admission and conditioning, rig-view embedding, guardrail hooks,
+and FA4 backend selection, mask metadata validation and full-graph custom-op
+capture with mocked kernels. The FA4 tests do not verify CUDA kernel
+correctness or performance. The dedicated GPU attention, LiDAR decoder,
+parallelism, recompilation and HTTP upload suites are not in the tree; run a
+CUDA generation to cover those paths.
 
 For checkpoint validation, generate 29-frame clips in WSM-only and
 vision-conditioned modes for all five ratios at both resolutions with the same
@@ -321,7 +344,10 @@ seed and settings, including explicit overrides as well as automatic detection.
 Check every exported video for camera order, frame count and exact dimensions,
 then run one 201-frame 720p portrait generation. Record the checkpoint, backend,
 GPU model and count, parallel topology, steps, cold/warm latency and peak
-memory.
+memory. To qualify Hopper FA4, repeat these checks with
+`VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=fa4` and
+`VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton`, using identical checkpoints,
+seeds and sampling settings, and compare outputs, latency and peak memory.
 
 ## Supported features
 
