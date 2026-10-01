@@ -3458,68 +3458,82 @@ def test_multiview_contract_accepts_exported_av_models(model: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("source", "override", "fa4_available", "expected"),
+    ("source", "override", "fa_version", "expected"),
     [
-        ("triton", None, True, "fa4"),
-        ("triton", None, False, "triton"),
-        ("triton", "triton", True, "triton"),
-        ("triton", "fa4", False, "fa4"),
-        ("fa4", None, False, "fa4"),
-        ("maskless", None, True, "maskless"),
+        ("triton", None, 4, "fa4"),
+        ("triton", None, 3, "triton"),
+        ("triton", None, None, "triton"),
+        ("triton", "triton", 4, "triton"),
+        ("triton", "fa4", 3, "fa4"),
+        ("fa4", None, 3, "fa4"),
+        ("maskless", None, 4, "maskless"),
     ],
 )
-def test_multiview_sparse_backend_defaults_to_fa4_when_available(
-    monkeypatch: pytest.MonkeyPatch, source: str, override: str | None, fa4_available: bool, expected: str
+def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
+    monkeypatch: pytest.MonkeyPatch, source: str, override: str | None, fa_version: int | None, expected: str
 ) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+    from vllm_omni.diffusion.attention.backends.utils import fa
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
         COSMOS3_MULTIVIEW_BACKEND_ENV,
         Cosmos3MultiviewPipeline,
     )
 
+    def resolve_vllm_flash_attn_version() -> int:
+        if fa_version is None:
+            raise RuntimeError("vLLM-bundled versioned FlashAttention requires CUDA")
+        return fa_version
+
     if override is None:
         monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
     else:
         monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, override)
-    monkeypatch.setattr(multiview_fa4, "multiview_fa4_available", lambda: fa4_available)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", resolve_vllm_flash_attn_version)
 
     assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": source}) == expected
 
 
-@pytest.mark.parametrize(
-    ("capability", "loads", "expected"),
-    [
-        ((10, 0), True, True),
-        ((10, 3), True, True),
-        ((10, 0), False, False),
-        ((9, 0), True, False),
-        ((12, 0), True, False),
-    ],
-)
-def test_multiview_fa4_available_requires_sm100_and_fa4(
-    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], loads: bool, expected: bool
+@pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+def test_multiview_sparse_backend_keeps_triton_when_flash_attn_import_fails(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[ImportError]
 ) -> None:
+    from vllm_omni.diffusion.attention.backends.utils import fa
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKEND_ENV,
+        Cosmos3MultiviewPipeline,
+    )
+
+    monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(
+        fa, "resolve_vllm_flash_attn_version", Mock(side_effect=error_type("CUDA FlashAttention extensions unavailable"))
+    )
+
+    assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": "triton"}) == "triton"
+
+
+def test_multiview_fa4_loads_vllm_bundled_flash_attn(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
 
-    def load_fa4():
-        if not loads:
-            raise RuntimeError("flash_attn.cute missing")
+    cute = types.ModuleType("cutlass.cute")
+    cute.jit = lambda fn: fn
+    cutlass = types.ModuleType("cutlass")
+    cutlass.cute = cute
+    fa_cute = types.ModuleType("vllm.vllm_flash_attn.cute")
+    fa_cute.flash_attn_func = object()
+    fa_cute.utils = types.ModuleType("vllm.vllm_flash_attn.cute.utils")
+    block_sparsity = types.ModuleType("vllm.vllm_flash_attn.cute.block_sparsity")
+    block_sparsity.BlockSparseTensorsTorch = object()
+    for module in (cutlass, cute, fa_cute, fa_cute.utils, block_sparsity):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    # The standalone flash-attn-4 package is no longer needed.
+    monkeypatch.setitem(sys.modules, "flash_attn", None)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", None)
+    monkeypatch.setattr(multiview_fa4, "_entry", None)
 
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.version, "hip", None)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
-    monkeypatch.setattr(multiview_fa4, "_load_fa4", load_fa4)
+    entry = multiview_fa4._load_fa4()
 
-    assert multiview_fa4.multiview_fa4_available() is expected
-
-
-def test_multiview_fa4_unavailable_without_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(multiview_fa4, "_load_fa4", Mock(side_effect=AssertionError("must not import FA4")))
-
-    assert multiview_fa4.multiview_fa4_available() is False
+    assert entry.flash_attn_func is fa_cute.flash_attn_func
+    assert entry.block_sparse_cls is block_sparsity.BlockSparseTensorsTorch
+    assert (entry.mask_mod.__vec_size__, entry.vector_mask_mod.__vec_size__) == (1, 32)
 
 
 def test_multiview_contract_defaults_legacy_lidar_patch_to_camera_patch() -> None:

@@ -9,7 +9,7 @@
 - Task: multiview driving video generation (T2V, I2V, video prefix, WSM
   transfer, view completion), optionally joint with numeric LiDAR
 - Mode: offline (`Omni`) and online (`vllm serve --omni`, `/v1/videos`)
-- Hardware: NVIDIA CUDA GPUs; the optional FA4 backend needs SM100 (Blackwell)
+- Hardware: NVIDIA CUDA GPUs; the FA4 backend needs SM100/SM110 (Blackwell)
 - Maintainer: Maciej Bala
 
 ## When to use this recipe
@@ -143,15 +143,15 @@ The scheduler directory must describe the regular FlowUniPC scheduler.
 | `backend` | Kernel | Sparse block `(q, kv)` | Requirements |
 | --- | --- | --- | --- |
 | `"triton"` | PyTorch FlexAttention, Triton template | 64 × 64 | Any CUDA GPU |
-| `"fa4"` | FlashAttention-4 CuTe | 256 × 128 | SM100 (Blackwell), CUDA 13, `pip install 'vllm-omni[fa4]'` |
+| `"fa4"` | vLLM's bundled FlashAttention-4 CuTe (`vllm.vllm_flash_attn.cute`) | 256 × 128 | SM100/SM110 (Blackwell), CUDA build of vLLM |
 | `"maskless"` | Dense FlashAttention over per-branch key folds | — | Versioned checkpoint trained with maskless semantics (the v2 AV model) |
 
 Triton and FA4 implement the same visibility predicate and differ only in block
 geometry and rounding. A `"triton"` checkpoint therefore runs on FA4 by default
-when the worker is an SM100 GPU with FA4 installed, and on Triton otherwise, the
-same way maskless picks FA4 for its dense kernels. Maskless has different
-semantics: overlapping branch keys count twice, so it cannot be swapped with the
-sparse backends. Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin a
+whenever vLLM's FlashAttention resolves to version 4 (SM100/SM110), and on
+Triton otherwise; maskless uses the same resolution for its dense kernels.
+Maskless has different semantics: overlapping branch keys count twice, so it
+cannot be swapped with the sparse backends. Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin a
 sparse backend without editing the checkpoint; an unknown name, or a switch to
 or from `maskless`, fails at load time. Goldens taken on Triton must be
 re-calibrated before they gate FA4, or pinned with
@@ -159,7 +159,7 @@ re-calibrated before they gate FA4, or pinned with
 
 ## Hardware
 
-- Accelerator: NVIDIA CUDA GPU; FA4 requires SM100 (Blackwell).
+- Accelerator: NVIDIA CUDA GPU; FA4 requires SM100/SM110 (Blackwell).
 - Devices: 1 by default. CFG parallelism (2-way), strict Ulysses CP, TP and HSDP
   are supported through the engine flags (see [Supported features](#supported-features)).
 - Qualification scope: no memory or latency profile is recorded in this
@@ -168,7 +168,7 @@ re-calibrated before they gate FA4, or pinned with
 
 ## Software environment
 
-- vLLM-Omni: this branch; FA4 additionally needs the `fa4` extra and CUDA 13.
+- vLLM-Omni: this branch; FA4 uses the copy bundled with vLLM's CUDA build, so no extra is needed.
 - Guardrails: `cosmos-guardrail` and access to the gated
   `nvidia/Cosmos-1.0-Guardrail` model (see [Safety guardrails](#safety-guardrails)).
 

@@ -35,12 +35,13 @@ TRITON_KV_BLOCK_SIZE = 64
 TRITON_NUM_STAGES = 1
 TRITON_NUM_WARPS = 4
 
-# FlashAttention-4 runs a fixed 128x128 forward tile on SM100 and stages two Q
-# tiles per CTA whenever the query length exceeds one tile, so the sparse block
-# map it consumes must be (2 * tile_m, tile_n).  These are not tunable: the
+# FlashAttention-4 runs a fixed 128x128 forward tile on SM100/SM110 and stages
+# two Q tiles per CTA whenever the query length exceeds one tile, so the sparse
+# block map it consumes must be (2 * tile_m, tile_n).  These are not tunable: the
 # kernel derives the same numbers from its own heuristic and rejects metadata
-# that disagrees.  See flash_attn/cute/interface.py::_get_fwd_config and
-# flash_attn/cute/block_sparsity.py::normalize_block_sparse_config.
+# that disagrees.  See vLLM's bundled copy,
+# vllm/vllm_flash_attn/cute/interface.py::_get_fwd_config and
+# vllm/vllm_flash_attn/cute/block_sparsity.py::normalize_block_sparse_config.
 FA4_SPARSE_Q_BLOCK_SIZE = 256
 FA4_SPARSE_KV_BLOCK_SIZE = 128
 

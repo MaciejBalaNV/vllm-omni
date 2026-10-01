@@ -17,9 +17,11 @@ run; the answer for a pair is one bit at ``(q_run, k_run)``.  The rules
 themselves stay in Python, and this kernel never learns what a view or a frame
 is.
 
-Everything CuTe/CUTLASS is imported lazily: ``flash-attn-4`` is an optional
-extra (``pip install vllm-omni[fa4]``), and the multiview module must stay
-importable on CPU-only hosts.
+The kernel is vLLM's bundled FA4 (``vllm.vllm_flash_attn.cute``), the same
+FlashAttention build maskless attention resolves through, so it needs no extra
+package.  Everything CuTe/CUTLASS is still imported lazily: vLLM ships that copy
+only in CUDA builds, and the multiview module must stay importable on CPU-only
+hosts.
 """
 
 from __future__ import annotations
@@ -115,11 +117,11 @@ def _build_mask_mod(cutlass, cute, fa_utils, *, vec_size: int = 1):
 
 
 def _load_fa4() -> _Fa4Entry:
-    """Import FA4 and build both mask callbacks once per process.
+    """Import vLLM's bundled FA4 and build both mask callbacks once per process.
 
-    Raises rather than falling back: ``backend='fa4'`` is an explicit request,
-    and silently running a different kernel would invalidate any comparison
-    against the Triton path.
+    Raises rather than falling back: ``backend='fa4'`` is either an explicit
+    request or was chosen because vLLM reported FA4, and silently running a
+    different kernel would invalidate any comparison against the Triton path.
     """
     global _entry
     if _entry is not None:
@@ -127,13 +129,13 @@ def _load_fa4() -> _Fa4Entry:
     try:
         import cutlass
         import cutlass.cute as cute
-        from flash_attn.cute import flash_attn_func
-        from flash_attn.cute import utils as fa_utils
-        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+        from vllm.vllm_flash_attn.cute import flash_attn_func
+        from vllm.vllm_flash_attn.cute import utils as fa_utils
+        from vllm.vllm_flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
-            "Cosmos3 multiview backend='fa4' requires the optional FlashAttention-4 "
-            f"CuTe package (pip install 'vllm-omni[fa4]'). Import failed: {exc}"
+            "Cosmos3 multiview backend='fa4' requires vLLM's bundled FlashAttention-4 "
+            f"(vllm.vllm_flash_attn.cute, CUDA builds only). Import failed: {exc}"
         ) from exc
 
     _entry = _Fa4Entry(
@@ -144,24 +146,6 @@ def _load_fa4() -> _Fa4Entry:
     )
     logger.info("Cosmos3 multiview attention using the FlashAttention-4 CuTe backend.")
     return _entry
-
-
-def multiview_fa4_available() -> bool:
-    """Whether this worker can run the sparse FA4 path, used to pick the default sparse backend.
-
-    The (256, 128) block map is fixed by FA4's SM100 forward tile, so only
-    datacenter Blackwell (compute capability 10.x) qualifies.
-    """
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        return False
-    if torch.cuda.get_device_capability()[0] != 10:
-        return False
-    try:
-        _load_fa4()
-    except RuntimeError as exc:
-        logger.info("Cosmos3 multiview FA4 is unavailable, keeping Triton: %s", exc)
-        return False
-    return True
 
 
 def _validate(
@@ -203,7 +187,7 @@ def _validate(
 # Wrapping the FA4 launch as a torch.library custom op keeps it opaque to
 # torch.compile, mirroring the SageAttention3 and FastVideo VSA backends.  FA4's
 # Python entry point is a JIT compile-cache lookup, so a raw call lets Dynamo
-# trace flash_attn/cute/interface.py, cache_utils.py and the CUTLASS DSL and
+# trace vllm/vllm_flash_attn/cute/interface.py, cache_utils.py and the CUTLASS DSL and
 # then guard on the *contents* of FA4's own kernel cache
 # (``___dict_contains(..., _flash_attn_fwd.compile_cache.cache)``).  Those
 # guards fail as FA4 compiles more kernels, and the CUTLASS ``arith.const``
