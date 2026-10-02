@@ -180,17 +180,28 @@ def test_nested_stage_override_deep_merges_structured_model_config() -> None:
 
 
 def test_global_model_config_override_deep_merges_structured_model_config() -> None:
+    pipeline = _resolve_pipeline_or_skip("cosmos3_omni_deploy")
+    # cosmos3_omni.yaml already ships ``guardrails: false``; flip it back to True
+    # (plus a nested key) so the CLI override is observable.
+    deploy = load_deploy_config(_DEPLOY_DIR / "cosmos3_omni.yaml")
+    deploy.stages[0].engine_extras["model_config"] = {
+        "guardrails": True,
+        "inference_overrides": {"history_mode": "full"},
+    }
+
+    baseline = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert baseline.stage_by_id(0).diffusion_config.model_config["guardrails"] is True
+
     # --no-guardrails emits a global (not stage-scoped) model_config override.
-    config = _from_pipeline_key(
-        "cosmos3_nano_sim_bimanual",
-        deploy_config_path=get_deploy_config_path("cosmos3_nano_sim_bimanual_full_history.yaml"),
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
         cli_overrides={"model_config": {"guardrails": False}},
     )
 
     model_config = config.stage_by_id(0).diffusion_config.model_config
     assert model_config["guardrails"] is False
     assert model_config["inference_overrides"]["history_mode"] == "full"
-    assert model_config["action_gen"] is True
 
 
 def test_global_model_config_override_skips_llm_stages() -> None:
