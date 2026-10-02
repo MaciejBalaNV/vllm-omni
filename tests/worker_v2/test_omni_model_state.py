@@ -36,6 +36,7 @@ class _DummyInputBatch:
 def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, have_multimodal_outputs=False):
     state = object.__new__(OmniModelState)
     model = MagicMock()
+    model.stream_decoder = None
     model.has_preprocess = has_preprocess
     model.has_postprocess = has_postprocess
     model.have_multimodal_outputs = have_multimodal_outputs
@@ -62,6 +63,10 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
 
     state.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
     state._static_inputs_embeds = None
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    state._eager_state = EagerMTPState(state)
+    state._stream_pos = {}
     state._mtp_generators = {}
     state._mtp_runner = None
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step", "_mtp_offsets"):
@@ -264,6 +269,7 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     # vLLM sampling seed must not produce a talker generator.
     cpu = torch.device("cpu")
     assert state._get_mtp_generator("r1", SimpleNamespace(extra_args={}, seed=42), cpu) is None
+    state._mtp_generators.clear()  # The following rows are new requests.
     # Same model-local seed reproduces identical uniforms regardless of batch makeup.
     state._mtp_sample_uniforms = torch.empty((2, 2, 4))
     assert torch.equal(
