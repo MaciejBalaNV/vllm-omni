@@ -77,6 +77,7 @@ class _PipelineBackedEngine:
     def __init__(self, pipeline: _StepStreamingPipeline | _FailingStreamingPipeline) -> None:
         self.pipeline = pipeline
         self.executor = SimpleNamespace(
+            is_dead=False,
             register_failure_callback=MagicMock(),
             check_health=MagicMock(),
         )
