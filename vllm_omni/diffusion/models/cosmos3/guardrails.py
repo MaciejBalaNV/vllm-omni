@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
 from vllm_omni.errors import GuardrailViolationError
@@ -170,11 +169,7 @@ def ensure_video_guardrail_initialized(od_config: OmniDiffusionConfig) -> None:
         return
     model_config = od_config.model_config or {}
     offload_to_cpu = bool(model_config.get("offload_guardrail_models", False))
-    # Workers build the pipeline under the model's default dtype (e.g. bf16);
-    # build the checker in fp32 like the engine does, or RetinaFace loads its
-    # weights in bf16 and its numpy postprocess fails.
-    with set_default_torch_dtype(torch.float32), torch.device("cpu"):
-        checker = CosmosSafetyChecker()
+    checker = CosmosSafetyChecker()
     checker.text_guardrail = None
     idle_device = "cpu" if offload_to_cpu else current_omni_platform.device_type
     for m in _nn_models(checker.video_guardrail):
