@@ -124,6 +124,17 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.data_parallel_size == 1
         assert od.parallel_config.world_size == 4
 
+    def test_hsdp_data_parallel_exposes_world_as_request_lanes(self):
+        pc = DiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=4,
+        )
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.parallel_config.data_parallel_size == 4
+        assert od.parallel_config.world_size == 4
+
 
 class TestCreateDefaultDiffusion:
     """Verify engine_args structure from create_default_diffusion."""

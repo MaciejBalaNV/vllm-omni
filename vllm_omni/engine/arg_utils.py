@@ -578,6 +578,7 @@ class OrchestratorArgs:
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
+    hsdp_data_parallel: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None

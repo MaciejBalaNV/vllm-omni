@@ -264,6 +264,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     vae_parallel_mode: str
     text_encoder_tp_size: int
     use_hsdp: bool
+    hsdp_data_parallel: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
     hsdp_replicate_size: int
@@ -708,6 +709,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     text_encoder_tp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
+    hsdp_data_parallel: bool = False
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
@@ -727,9 +729,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 f"but got {self.vae_parallel_mode!r}."
             )
 
+        world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else self.data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * self.data_parallel_size
+            * world_size_dp_factor
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -738,7 +741,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             incompatible = []
             if self.tensor_parallel_size > 1:
                 incompatible.append("TP")
-            if self.data_parallel_size > 1:
+            if self.data_parallel_size > 1 and not self.hsdp_data_parallel:
                 incompatible.append("DP")
             if self.pipeline_parallel_size > 1:
                 incompatible.append("PP")
@@ -746,6 +749,16 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 incompatible.append("EP")
             if incompatible:
                 raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
+            if self.hsdp_data_parallel and (
+                self.tensor_parallel_size
+                * self.sequence_parallel_size
+                * self.pipeline_parallel_size
+                * self.cfg_parallel_size
+                != 1
+            ):
+                raise ValueError(
+                    "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
             if self.hsdp_shard_size == -1:
                 if other_parallel_world_size == 1:
                     raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")
@@ -770,7 +783,16 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                             f"({other_parallel_world_size})"
                         )
                     self.world_size = other_parallel_world_size
+            if self.hsdp_data_parallel:
+                if self.data_parallel_size not in (1, self.world_size):
+                    raise ValueError(
+                        f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
+                        f"({self.world_size}), but got {self.data_parallel_size}"
+                    )
+                self.data_parallel_size = self.world_size
         else:
+            if self.hsdp_data_parallel:
+                raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
 
 

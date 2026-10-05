@@ -48,6 +48,18 @@ logger = init_logger(__name__)
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
 
+def uses_rank_local_dp_concurrency(od_config: object) -> bool:
+    """Whether sharded weights serve different requests on each rank."""
+    from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+        return False
+    return bool(
+        getattr(parallel_config, "hsdp_data_parallel", False) or any_selected_component_uses_allgather(od_config)
+    )
+
+
 def _move_diffusion_alias(
     normalized: dict[str, Any],
     legacy_name: str,
@@ -330,6 +342,14 @@ class DiffusionParallelConfig:
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
 
+    hsdp_data_parallel: bool = False
+    """Run one independent request per HSDP rank.
+
+    HSDP still gathers sharded parameters collectively, but each rank computes
+    different activations. This requires all other model-parallel dimensions
+    to be one and compatible requests to execute in lockstep.
+    """
+
     mask_sp_padding: bool = False
     """If True, generate a boolean attention mask for zero-padded SP tokens
     when sequence length is not divisible by the SP world size. The mask
@@ -392,9 +412,10 @@ class DiffusionParallelConfig:
         # Until the runtime WORLD size is known, an omitted DP dimension means
         # one replica. OmniDiffusionConfig resolves it against num_gpus below.
         data_parallel_size = self.data_parallel_size or 1
+        world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * data_parallel_size
+            * world_size_dp_factor
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -408,7 +429,7 @@ class DiffusionParallelConfig:
             incompatible = []
             if self.tensor_parallel_size > 1:
                 incompatible.append("TP")
-            if data_parallel_size > 1:
+            if data_parallel_size > 1 and not self.hsdp_data_parallel:
                 incompatible.append("DP")
             if self.pipeline_parallel_size > 1:
                 incompatible.append("PP")
@@ -416,6 +437,16 @@ class DiffusionParallelConfig:
                 incompatible.append("EP")
             if incompatible:
                 raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
+            if self.hsdp_data_parallel and (
+                self.tensor_parallel_size
+                * self.sequence_parallel_size
+                * self.pipeline_parallel_size
+                * self.cfg_parallel_size
+                != 1
+            ):
+                raise ValueError(
+                    "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
                 if self.hsdp_replicate_size <= 0:
@@ -447,7 +478,16 @@ class DiffusionParallelConfig:
                             f"must equal world_size from other parallelism ({other_parallel_world_size})"
                         )
                     self.world_size = other_parallel_world_size
+            if self.hsdp_data_parallel:
+                if data_parallel_size not in (1, self.world_size):
+                    raise ValueError(
+                        f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
+                        f"({self.world_size}), but got {data_parallel_size}"
+                    )
+                self.data_parallel_size = self.world_size
         else:
+            if self.hsdp_data_parallel:
+                raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
 
     def resolve_data_parallel_size(self, world_size: int) -> int:
@@ -456,17 +496,19 @@ class DiffusionParallelConfig:
             raise ValueError(f"WORLD size must be > 0, but got {world_size}")
 
         if self.use_hsdp:
-            if self.data_parallel_size not in (None, 1):
-                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            allowed_dp_sizes = (None, 1, world_size) if self.hsdp_data_parallel else (None, 1)
+            if self.data_parallel_size not in allowed_dp_sizes:
+                expected = f"1 or WORLD size ({world_size})" if self.hsdp_data_parallel else "1"
+                raise ValueError(f"HSDP (FSDP2) requires data_parallel_size to be {expected}")
             expected_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
             if world_size != expected_world_size:
                 raise ValueError(
                     f"WORLD size ({world_size}) must equal HSDP size "
                     f"({self.hsdp_replicate_size} x {self.hsdp_shard_size} = {expected_world_size})"
                 )
-            self.data_parallel_size = 1
+            self.data_parallel_size = world_size if self.hsdp_data_parallel else 1
             self.world_size = world_size
-            return 1
+            return self.data_parallel_size
 
         assert self.sequence_parallel_size is not None
         non_dp_size = (

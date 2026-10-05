@@ -737,6 +737,15 @@ class OmniServeCommand(CLISubcommand):
             help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
         )
         omni_config_group.add_argument(
+            "--hsdp-data-parallel",
+            action="store_true",
+            help=(
+                "Process one independent compatible request per HSDP rank while "
+                "retaining collective parameter sharding. Requires all other "
+                "parallel sizes to be 1."
+            ),
+        )
+        omni_config_group.add_argument(
             "--hsdp-replicate-size",
             type=int,
             default=1,

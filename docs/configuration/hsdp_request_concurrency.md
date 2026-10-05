@@ -1,0 +1,21 @@
+# HSDP request concurrency
+
+Enable `--use-hsdp --hsdp-shard-size 8 --hsdp-data-parallel` to process one
+independent compatible request per HSDP rank. Set the shard size to match your
+GPU allocation. The Python/stage parallel configuration flag is
+`hsdp_data_parallel: true`.
+
+Weights remain sharded and are gathered collectively. Each rank computes its
+own activations. The scheduler admits up to the HSDP world size in one wave;
+`request_batch_max_wait_ms` controls the wait for compatible requests.
+Request metadata and KV state stay bound to the request assigned to each rank.
+Short waves repeat requests on surplus ranks to keep collective execution
+aligned; only the requested results are returned.
+
+Tensor, sequence, pipeline, and CFG parallel sizes must all be one; expert
+parallelism is unsupported with HSDP. Requests in a wave must have compatible
+shapes, guidance, denoising schedules, output counts, and LoRA settings, with
+identical extra arguments and nonempty prompts. Step execution is unsupported.
+
+This feature works with the existing `full` HSDP loader and multiprocessing
+executor. It does not require pre-sharded loading or compact video transport.

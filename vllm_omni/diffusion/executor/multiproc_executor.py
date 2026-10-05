@@ -24,7 +24,13 @@ from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
-from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
+from vllm_omni.diffusion.data import (
+    SHUTDOWN_MESSAGE,
+    AsyncDiffusionOutput,
+    AsyncOutputKind,
+    DiffusionOutput,
+    uses_rank_local_dp_concurrency,
+)
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.offloader.config import (
@@ -541,21 +547,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             validate_new_request_data_identity(new_req)
 
-        # DP multi-concurrency: when DLO+AllGather is active and multiple
-        # requests are scheduled, send every complete NewRequestData envelope
-        # in one broadcast RPC. Each rank picks one envelope, keeping its
-        # request and Diffusion KV metadata inseparable.
+        # Rank-local DP concurrency: when a supported sharded-weight mode is
+        # active and multiple requests are scheduled, send every complete
+        # NewRequestData envelope in one broadcast RPC. Each rank picks one
+        # envelope, keeping its request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
-        if len(new_reqs) > 1 and any_selected_component_uses_allgather(self.od_config):
-            # Reuse the request scheduler's complete compatibility key. DLO
-            # AllGather requires every DP rank to execute the same collective
-            # schedule, including shape, CFG, denoise steps, output count,
-            # and LoRA settings.
+        if len(new_reqs) > 1 and uses_rank_local_dp_concurrency(self.od_config):
+            # Reuse the request scheduler's complete compatibility key.
+            # Sharded-weight collectives require every DP rank to execute the
+            # same collective schedule, including shape, CFG, denoise steps,
+            # output count, and LoRA settings. Two default (None) step counts
+            # are valid and resolve identically inside the same pipeline.
             compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
-                    "DLO DP multi-concurrency requires compatible shape, CFG, "
+                    "Rank-local DP concurrency requires compatible shape, CFG, "
                     "denoise schedule, output count, and LoRA settings for all "
                     "requests in one collective wave."
                 )
@@ -687,8 +694,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         dp_size = getattr(parallel_config, "data_parallel_size", 1)
-        if dp_size > 1 and any_selected_component_uses_allgather(self.od_config):
-            # DLO DP uses one independent request per DP replica.  It is not a
+        if dp_size > 1 and uses_rank_local_dp_concurrency(self.od_config):
+            # Sharded-weight DP uses one independent request per rank. It is not a
             # fused pipeline request batch, so models such as MiniMax-H3 do not
             # need to advertise supports_request_batch=True.
             return self.execute_request(scheduler_output)
