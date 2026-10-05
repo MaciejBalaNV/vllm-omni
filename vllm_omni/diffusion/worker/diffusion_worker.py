@@ -19,7 +19,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -88,9 +88,6 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
-
-if TYPE_CHECKING:
-    from vllm.config.logging import LoggingConfig
 
 logger = init_logger(__name__)
 
@@ -1619,13 +1616,10 @@ class WorkerProc:
         wake_event: mp.Event,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
-        logging_config: "LoggingConfig | None" = None,
     ) -> None:
         """Worker initialization and execution loops."""
-        from vllm_omni.logger import configure_omni_logging
         from vllm_omni.plugins import load_omni_general_plugins
 
-        configure_omni_logging(logging_config)
         shutdown_triggered = False
 
         def signal_handler(signum: int, frame) -> None:

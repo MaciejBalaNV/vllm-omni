@@ -47,13 +47,10 @@ from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.logger import child_logging_config, configure_omni_logging
 from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
-    from vllm.config.logging import LoggingConfig
-
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 
@@ -640,7 +637,6 @@ class StageDiffusionProc:
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
-        logging_config: LoggingConfig | None = None,
     ) -> None:
         """Entry point for the diffusion subprocess.
 
@@ -652,12 +648,9 @@ class StageDiffusionProc:
             ``omni_coordinator_address`` is set.
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (logging / metrics only).
-          - ``logging_config``: the parent's logging config, applied first so
-            this process and its workers log like the API server.
         """
         from vllm_omni.plugins import load_omni_general_plugins
 
-        configure_omni_logging(logging_config)
         shutdown_requested = False
 
         set_death_signal(signal.SIGTERM)
@@ -783,7 +776,6 @@ class StageDiffusionProcManager:
                 "omni_coordinator_address": omni_coordinator_address,
                 "omni_stage_id": omni_stage_id,
                 "omni_replica_id": omni_replica_id,
-                "logging_config": child_logging_config(),
             },
         )
         proc.start()
@@ -822,7 +814,6 @@ class StageDiffusionProcManager:
                 "omni_coordinator_address": omni_coordinator_address,
                 "omni_stage_id": omni_stage_id,
                 "omni_replica_id": omni_replica_id,
-                "logging_config": child_logging_config(),
             },
         )
         proc.start()

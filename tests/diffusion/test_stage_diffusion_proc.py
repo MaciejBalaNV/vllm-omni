@@ -56,36 +56,6 @@ def test_run_diffusion_proc_sets_lifecycle_before_loading_plugins(monkeypatch: p
     assert events == ["death_signal", "signal_handler", "signal_handler", "plugins", "proc"]
 
 
-def test_run_diffusion_proc_applies_parent_logging_config_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    events: list[object] = []
-    logging_config = object()
-
-    class StopProcessError(Exception):
-        pass
-
-    class TestStageDiffusionProc(StageDiffusionProc):
-        def __init__(self, model, od_config):
-            events.append("proc")
-            raise StopProcessError
-
-    monkeypatch.setattr(stage_diffusion_proc, "configure_omni_logging", lambda config: events.append(config))
-    monkeypatch.setattr(omni_plugins, "load_omni_general_plugins", lambda: events.append("plugins"))
-    monkeypatch.setattr(stage_diffusion_proc, "set_death_signal", lambda _: None)
-    monkeypatch.setattr(stage_diffusion_proc.signal, "signal", lambda *_: None)
-
-    with pytest.raises(StopProcessError):
-        TestStageDiffusionProc.run_diffusion_proc(
-            model="test-model",
-            od_config=None,
-            handshake_address="test-address",
-            local_client=True,
-            headless=False,
-            logging_config=logging_config,
-        )
-
-    assert events == [logging_config, "plugins", "proc"]
-
-
 class MockDiffusionEngine:
     async def step_streaming(self, request):
         def simulate_step_delay(height, width, num_inference_steps) -> float:

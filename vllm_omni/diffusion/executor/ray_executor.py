@@ -38,12 +38,10 @@ from vllm_omni.diffusion.offloader.config import (
     resolve_offload,
 )
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
-from vllm_omni.logger import child_logging_config
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
     from ray.util.placement_group import PlacementGroup
-    from vllm.config.logging import LoggingConfig
 
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -242,18 +240,10 @@ class RayDiffusionWorkerWrapper:
     def get_open_port(self) -> int:
         return get_open_port()
 
-    def init_worker(
-        self,
-        od_config: OmniDiffusionConfig,
-        rank: int,
-        distributed_init_method: str,
-        logging_config: LoggingConfig | None = None,
-    ) -> None:
-        from vllm_omni.logger import configure_omni_logging
+    def init_worker(self, od_config: OmniDiffusionConfig, rank: int, distributed_init_method: str) -> None:
         from vllm_omni.platforms import current_omni_platform
         from vllm_omni.plugins import load_omni_general_plugins
 
-        configure_omni_logging(logging_config)
         load_omni_general_plugins()
 
         from vllm_omni.diffusion.worker.diffusion_worker import WorkerWrapperBase
@@ -449,10 +439,8 @@ class RayDiffusionExecutor(DiffusionExecutor):
             num_gpus,
             len(unique_ips),
         )
-        logging_config = child_logging_config()
         futures = [
-            item.worker.init_worker.remote(self.od_config, item.rank, distributed_init_method, logging_config)
-            for item in self.workers
+            item.worker.init_worker.remote(self.od_config, item.rank, distributed_init_method) for item in self.workers
         ]
         ray.get(futures, timeout=_WORKER_INIT_TIMEOUT_S)
         logger.info("All %d Ray diffusion workers initialized", num_gpus)
