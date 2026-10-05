@@ -28,6 +28,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
+    uses_rank_local_dp_concurrency,
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.media import DiffusionMediaOutput
@@ -99,14 +100,6 @@ def _worker_env(od_config: OmniDiffusionConfig) -> dict[str, str]:
         "WORLD_SIZE",
     }
     return {key: value for key, value in env.items() if key not in worker_specific and not key.startswith("RAY_")}
-
-
-def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
-    parallel_config = getattr(od_config, "parallel_config", None)
-    return bool(
-        (getattr(parallel_config, "data_parallel_size", 1) or 1) > 1
-        and any_selected_component_uses_allgather(od_config)
-    )
 
 
 def _is_empty_dp_prompt(prompt: object) -> bool:
@@ -560,7 +553,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             validate_new_request_data_identity(new_req)
 
-        if len(new_reqs) > 1 and _uses_dlo_dp_concurrency(self.od_config):
+        if len(new_reqs) > 1 and uses_rank_local_dp_concurrency(self.od_config):
             compatibility_keys = [build_request_batch_sampling_params_key(item.req) for item in new_reqs]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
@@ -663,7 +656,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         if len(scheduler_output.scheduled_new_reqs) <= 1:
             return self.execute_request(scheduler_output)
-        if _uses_dlo_dp_concurrency(self.od_config):
+        if uses_rank_local_dp_concurrency(self.od_config):
             return self.execute_request(scheduler_output)
 
         result = self.collective_rpc(
