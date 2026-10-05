@@ -452,6 +452,10 @@ class DiffusionParallelConfig:
                 raise ValueError(
                     "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
                 )
+            if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
+                # Patch-parallel VAE decode splits and stitches tiles across WORLD,
+                # which would mix latents from the different requests on each rank.
+                raise ValueError("hsdp_data_parallel requires vae_patch_parallel_size to be 1")
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
                 if self.hsdp_replicate_size <= 0:

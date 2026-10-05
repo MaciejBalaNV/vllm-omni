@@ -1287,6 +1287,16 @@ def test_diffusion_parallel_config_supports_hsdp_rank_local_requests():
     assert cfg.data_parallel_size == 8
 
 
+def test_diffusion_parallel_config_rejects_hsdp_rank_local_requests_with_vae_patch_parallel():
+    with pytest.raises(ValueError, match="vae_patch_parallel_size to be 1"):
+        OmniStageDiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=8,
+            vae_patch_parallel_size=8,
+        )
+
+
 def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():
     with pytest.raises(ValueError, match="not compatible with TP"):
         OmniStageDiffusionParallelConfig(tensor_parallel_size=2, use_hsdp=True, hsdp_shard_size=2)

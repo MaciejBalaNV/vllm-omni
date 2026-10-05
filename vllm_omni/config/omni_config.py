@@ -759,6 +759,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 raise ValueError(
                     "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
                 )
+            if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
+                # Patch-parallel VAE decode splits and stitches tiles across WORLD,
+                # which would mix latents from the different requests on each rank.
+                raise ValueError("hsdp_data_parallel requires vae_patch_parallel_size to be 1")
             if self.hsdp_shard_size == -1:
                 if other_parallel_world_size == 1:
                     raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")
