@@ -1590,6 +1590,135 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
         func({"image": video, "video": video})
 
 
+def _enable_fake_video_guardrail(fake_guardrails: Any, blurred: torch.Tensor) -> list[Any]:
+    """Turn guardrails on in the fake module; record each video check."""
+    calls: list[Any] = []
+
+    def check_video_safety(video, output_device=None):
+        calls.append(output_device)
+        return blurred
+
+    fake_guardrails.is_guardrails_enabled = lambda od_config, sampling_params=None: True
+    fake_guardrails.is_video_guardrail_loaded = lambda: True
+    fake_guardrails.check_video_safety = check_video_safety
+    return calls
+
+
+def test_postprocess_skips_video_guardrail_applied_by_worker(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY,
+        get_cosmos3_post_process_func,
+    )
+
+    video = torch.zeros(1, 3, 2, 4, 4)
+    calls = _enable_fake_video_guardrail(fake_cosmos3_guardrails, video)
+    func = get_cosmos3_post_process_func(SimpleNamespace())
+    marker = {"internal": {COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY: True}}
+
+    # Internal-only metadata keeps the bare processed-video return shape.
+    assert not isinstance(func({"payload": {"video": video}, "metadata": marker}), dict)
+    assert func({"payload": {"image": torch.zeros(1, 3, 1, 4, 4)}, "metadata": marker})[0].size == (4, 4)
+    assert calls == []
+
+    func({"video": video})
+    func({"payload": {"video": video}, "metadata": {"video": {"fps": 24}}})
+    assert len(calls) == 2
+
+
+def test_worker_video_guardrail_blurs_and_marks_output(
+    make_cosmos3_pipeline, fake_cosmos3_guardrails, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY,
+        get_cosmos3_post_process_func,
+    )
+
+    blurred = torch.full((1, 3, 2, 4, 4), 0.5)
+    calls = _enable_fake_video_guardrail(fake_cosmos3_guardrails, blurred)
+    pipeline = make_cosmos3_pipeline()
+    monkeypatch.setattr(pipeline, "_is_output_replica_rank", lambda: True)
+    audio = torch.ones(1, 2, 16)
+
+    output = pipeline._apply_worker_video_guardrail(
+        DiffusionOutput(output={"video": torch.zeros(1, 3, 2, 4, 4), "audio": audio, "audio_sample_rate": 48000}),
+        SimpleNamespace(extra_args={}),
+    )
+
+    assert calls == ["cpu"]
+    assert output.output["payload"]["video"] is blurred
+    assert output.output["payload"]["audio"] is audio
+    assert output.output["payload"]["audio_sample_rate"] == 48000
+    assert output.output["metadata"] == {"internal": {COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY: True}}
+
+    # The engine postprocess must not blur again and must return the same
+    # shape as for an unmarked sound output.
+    result = get_cosmos3_post_process_func(SimpleNamespace())(output.output)
+    assert calls == ["cpu"]
+    assert set(result) == {"video", "audio", "fps", "audio_sample_rate"}
+
+    action = torch.zeros(1, 2, 3)
+    envelope = pipeline._apply_worker_video_guardrail(
+        DiffusionOutput(
+            output={
+                "payload": {"video": torch.zeros(1, 3, 2, 4, 4), "actions": action},
+                "metadata": {"actions": {"raw_action_dim": 3}},
+            }
+        ),
+        SimpleNamespace(extra_args={}),
+    )
+    assert envelope.output["payload"]["video"] is blurred
+    assert envelope.output["payload"]["actions"] is action
+    assert envelope.output["metadata"] == {
+        "actions": {"raw_action_dim": 3},
+        "internal": {COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY: True},
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["not_output_rank", "not_loaded", "disabled_for_request", "action_only", "not_5d", "image_and_video"],
+)
+def test_worker_video_guardrail_leaves_unhandled_outputs_for_engine(
+    make_cosmos3_pipeline, fake_cosmos3_guardrails, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from vllm_omni.diffusion.data import DiffusionOutput
+
+    calls = _enable_fake_video_guardrail(fake_cosmos3_guardrails, torch.zeros(1, 3, 2, 4, 4))
+    pipeline = make_cosmos3_pipeline()
+    monkeypatch.setattr(pipeline, "_is_output_replica_rank", lambda: case != "not_output_rank")
+    if case == "not_loaded":
+        fake_cosmos3_guardrails.is_video_guardrail_loaded = lambda: False
+    if case == "disabled_for_request":
+        fake_cosmos3_guardrails.is_guardrails_enabled = lambda od_config, sampling_params=None: False
+    video = torch.zeros(1, 3, 4, 4) if case == "not_5d" else torch.zeros(1, 3, 2, 4, 4)
+    raw: dict[str, Any] = {"video": video}
+    if case == "action_only":
+        raw = {"payload": {"actions": torch.zeros(1, 2, 3)}, "metadata": {}}
+    if case == "image_and_video":
+        raw = {"image": video, "video": video}
+
+    output = pipeline._apply_worker_video_guardrail(DiffusionOutput(output=raw), SimpleNamespace(extra_args={}))
+
+    assert output.output is raw
+    assert calls == []
+
+
+def test_forward_applies_worker_video_guardrail_only_when_enabled(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    generated = object()
+    guarded = object()
+    monkeypatch.setattr(pipeline, "_generate", lambda req: generated)
+    monkeypatch.setattr(pipeline, "_apply_worker_video_guardrail", lambda output, sp: guarded)
+    req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={}))
+
+    assert pipeline.forward(req) is generated
+    pipeline._worker_video_guardrail = True
+    assert pipeline.forward(req) is guarded
+
+
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         RoboLabPolicyInputs,
