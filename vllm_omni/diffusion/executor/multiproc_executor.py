@@ -35,7 +35,6 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
-    any_selected_component_uses_allgather,
     resolve_offload,
 )
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
