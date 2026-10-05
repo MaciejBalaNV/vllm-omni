@@ -158,39 +158,12 @@ def ensure_initialized(od_config: OmniDiffusionConfig) -> None:
     _init_default_guardrails(offload_to_cpu=bool(model_config.get("offload_guardrail_models", False)))
 
 
-def ensure_video_guardrail_initialized(od_config: OmniDiffusionConfig) -> None:
-    """Load only the video guardrail, for diffusion workers that face-blur their own output.
-
-    The text models are dropped after construction; the engine keeps running
-    the text check before admission.
-    """
-    global _video_guardrail
-    if _video_guardrail is not None or not is_guardrails_enabled(od_config):
-        return
-    model_config = od_config.model_config or {}
-    offload_to_cpu = bool(model_config.get("offload_guardrail_models", False))
-    checker = CosmosSafetyChecker()
-    checker.text_guardrail = None
-    idle_device = "cpu" if offload_to_cpu else current_omni_platform.device_type
-    for m in _nn_models(checker.video_guardrail):
-        m.to(idle_device)
-    _video_guardrail = _build_video_guardrail(checker, offload_to_cpu)
-
-
-def is_video_guardrail_loaded() -> bool:
-    return _video_guardrail is not None
-
-
 def check_text_safety(prompt: str) -> None:
     if _text_guardrail is not None:
         _text_guardrail(prompt)
 
 
-def check_video_safety(video_tensor: torch.Tensor, output_device: torch.device | str | None = None) -> torch.Tensor:
-    """Face-blur ``video_tensor`` and return it as float32 in [-1, 1].
-
-    The result lands on ``output_device`` (default: the input's device).
-    """
+def check_video_safety(video_tensor: torch.Tensor) -> torch.Tensor:
     if _video_guardrail is None:
         return video_tensor
 
@@ -207,7 +180,7 @@ def check_video_safety(video_tensor: torch.Tensor, output_device: torch.device |
     result = result.permute(3, 0, 1, 2)
     if video_tensor.dim() == 5:
         result = result.unsqueeze(0)
-    return result.to(video_tensor.device if output_device is None else output_device)
+    return result.to(video_tensor.device)
 
 
 def is_guardrails_enabled(

@@ -45,18 +45,15 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoTokenizer
-from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, uses_rank_local_dp_concurrency
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
-    get_pipeline_parallel_rank,
-    get_sequence_parallel_rank,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -168,9 +165,6 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 COSMOS3_INVERSE_DURATION_TEMPLATE = "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
 COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
 COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
-# Internal-metadata flag set by a worker that already face-blurred its output.
-COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY = "video_guardrail_applied"
-
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
 COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
@@ -695,9 +689,6 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     payloads as ``{"video": tensor}``. Sound-enabled video returns the same
     video payload plus ``audio`` and ``audio_sample_rate``. Image output with
     audio is rejected because Cosmos3 sound generation is video-only.
-
-    The video guardrail is skipped when the worker already applied it (see
-    ``Cosmos3OmniDiffusersPipeline._apply_worker_video_guardrail``).
     """
     from .guardrails import check_video_safety, is_guardrails_enabled
 
@@ -745,16 +736,11 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         pending_action = None
         pending_action_metadata: dict[str, Any] = {}
         envelope_public_metadata: dict[str, Any] = {}
-        video_guardrail_applied = False
         if isinstance(output, dict) and isinstance(output.get("payload"), dict):
             envelope_payload = dict(output.get("payload") or {})
             metadata = output.get("metadata") or {}
             envelope_metadata = metadata if isinstance(metadata, dict) else {}
             envelope_public_metadata = {key: value for key, value in envelope_metadata.items() if key != "internal"}
-            internal_metadata = envelope_metadata.get("internal")
-            video_guardrail_applied = isinstance(internal_metadata, dict) and bool(
-                internal_metadata.get(COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY)
-            )
             action = envelope_payload.pop("actions", None)
             if action is not None:
                 pending_action = _postprocess_action(action, envelope_metadata)
@@ -803,7 +789,7 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                     f"with shape [B, C, 1, H, W], got {tuple(video.shape)}."
                 )
             image = video.squeeze(2)  # [B, 3, H, W]
-            if is_guardrails_enabled(od_config, sampling_params) and not video_guardrail_applied:
+            if is_guardrails_enabled(od_config, sampling_params):
                 # check_video_safety expects a 5D tensor; re-add T axis.
                 checked = check_video_safety(image.unsqueeze(2))
                 image = checked.squeeze(2)
@@ -814,7 +800,8 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                     "metadata": envelope_public_metadata,
                 }
             return processed_image
-        if is_guardrails_enabled(od_config, sampling_params) and not video_guardrail_applied:
+        guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
+        if guardrails_enabled:
             video = check_video_safety(video)
         processed_video = video_processor.postprocess_video(video, output_type=output_type)
         if audio is None:
@@ -946,8 +933,6 @@ class Cosmos3OmniDiffusersPipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
     _resident_modules: ClassVar[list[str]] = []
     sampling_dtype: ClassVar[torch.dtype] = torch.float32
-    # Whether this worker face-blurs its own output (see _apply_worker_video_guardrail).
-    _worker_video_guardrail: bool = False
 
     @classmethod
     def reference_video_decode_spec(
@@ -1106,16 +1091,6 @@ class Cosmos3OmniDiffusersPipeline(
 
         # --- Video processor for post-decode ---
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-
-        # With rank-local DP concurrency every rank returns its own video, so
-        # face-blurring here runs the video guardrail on all ranks in parallel
-        # instead of serially in the engine's postprocess.
-        if uses_rank_local_dp_concurrency(od_config):
-            from .guardrails import ensure_video_guardrail_initialized, is_guardrails_enabled
-
-            if is_guardrails_enabled(od_config):
-                ensure_video_guardrail_initialized(od_config)
-                self._worker_video_guardrail = True
 
         # --- Weight sources for DiffusersPipelineLoader ---
         self.weights_sources = [
@@ -3738,65 +3713,6 @@ class Cosmos3OmniDiffusersPipeline(
     # -- Forward (main generation entry point) -------------------------------
 
     def forward(
-        self,
-        req: DiffusionRequestBatch,
-    ) -> DiffusionOutput:
-        output = self._generate(req)
-        if self._worker_video_guardrail:
-            output = self._apply_worker_video_guardrail(output, req.sampling_params)
-        return output
-
-    def _is_output_replica_rank(self) -> bool:
-        """Whether this rank holds the full decoded output of its DP replica."""
-        vae_executor = self._transfer_vae_executor()
-        return (
-            get_sequence_parallel_rank() == 0
-            and get_classifier_free_guidance_rank() == 0
-            and get_tensor_model_parallel_rank() == 0
-            and get_pipeline_parallel_rank() == 0
-            and (vae_executor is None or vae_executor.rank == 0)
-        )
-
-    def _apply_worker_video_guardrail(
-        self,
-        output: DiffusionOutput,
-        sampling_params: OmniDiffusionSamplingParams,
-    ) -> DiffusionOutput:
-        """Face-blur this rank's video and mark it so the engine postprocess skips its check.
-
-        Unmarked outputs (other ranks, action-only payloads, unexpected
-        shapes) still get the engine-side check, so a skipped case here can
-        only cost time, never drop the guardrail.
-        """
-        from .guardrails import check_video_safety, is_guardrails_enabled, is_video_guardrail_loaded
-
-        raw = output.output
-        if (
-            not isinstance(raw, dict)
-            or not is_video_guardrail_loaded()
-            or not is_guardrails_enabled(self.od_config, sampling_params)
-            or not self._is_output_replica_rank()
-        ):
-            return output
-
-        is_envelope = isinstance(raw.get("payload"), dict)
-        payload = dict(raw["payload"]) if is_envelope else dict(raw)
-        keys = [key for key in ("image", "video") if key in payload]
-        if len(keys) != 1:
-            return output
-        video = payload[keys[0]]
-        if not isinstance(video, torch.Tensor) or video.ndim != 5:
-            return output
-
-        # Return on CPU: the guardrail already copied the frames to host, so
-        # this avoids an upload here and a second download for IPC.
-        payload[keys[0]] = check_video_safety(video, output_device="cpu")
-        metadata = dict(raw.get("metadata") or {}) if is_envelope else {}
-        metadata["internal"] = {**(metadata.get("internal") or {}), COSMOS3_VIDEO_GUARDRAIL_APPLIED_KEY: True}
-        output.output = {"payload": payload, "metadata": metadata}
-        return output
-
-    def _generate(
         self,
         req: DiffusionRequestBatch,
     ) -> DiffusionOutput:
