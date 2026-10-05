@@ -149,6 +149,24 @@ class TestParallelConfigPropagation:
 
         assert od.cache_backend == cache_backend
 
+    def test_hsdp_data_parallel_defaults_request_batch_wait(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.request_batch_max_wait_ms == 500.0
+
+    def test_hsdp_data_parallel_keeps_explicit_zero_request_batch_wait(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, request_batch_max_wait_ms=0)
+
+        assert od.request_batch_max_wait_ms == 0.0
+
+    def test_hsdp_without_data_parallel_disables_request_batch_wait_by_default(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+
+        assert od.request_batch_max_wait_ms == 0.0
+
     def test_hsdp_without_data_parallel_keeps_cache_backends(self):
         pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
         od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend="tea_cache")

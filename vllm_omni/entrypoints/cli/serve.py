@@ -828,10 +828,10 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=_nonneg_finite_float,
-            default=0.0,
+            default=None,
             help="Request-mode batch admission: max milliseconds to wait for compatible "
             "requests to accumulate before scheduling a fused forward wave. "
-            "0 disables admission (default).",
+            "0 disables admission. Defaults to 500 with --hsdp-data-parallel, else 0.",
         )
 
         # VAE memory optimization parameters

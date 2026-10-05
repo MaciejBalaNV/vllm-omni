@@ -52,6 +52,11 @@ VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 # group, so ranks serving different requests still issue identical collectives.
 HSDP_DATA_PARALLEL_CACHE_BACKENDS: frozenset[str] = frozenset({"sea_cache"})
 
+# Default admission wait for hsdp_data_parallel. Without it, the first request
+# of a burst is dispatched alone and the rest wait a full generation for the
+# next wave.
+HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS = 500.0
+
 
 def uses_rank_local_dp_concurrency(od_config: object) -> bool:
     """Whether sharded weights serve different requests on each rank."""
@@ -1179,8 +1184,9 @@ class OmniDiffusionConfig:
     # Request-mode batch admission: wait briefly for compatible requests to
     # accumulate in the scheduler waiting queue before the first schedule() of
     # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
-    # 0 disables admission (default; no added latency).
-    request_batch_max_wait_ms: float = 0.0
+    # 0 disables admission. None resolves to
+    # HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS with hsdp_data_parallel, else 0.
+    request_batch_max_wait_ms: float | None = None
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = Field(default_factory=dict)
@@ -1339,11 +1345,13 @@ class OmniDiffusionConfig:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
         self.master_port = self._resolve_master_port()
-        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
-        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
-            raise ValueError(
-                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
-            )
+        if self.request_batch_max_wait_ms is not None:
+            self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms)
+            if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+                raise ValueError(
+                    "request_batch_max_wait_ms must be a finite non-negative number, "
+                    f"got {self.request_batch_max_wait_ms}."
+                )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -1380,6 +1388,10 @@ class OmniDiffusionConfig:
                 f"cache_backend={self.cache_backend!r} cannot be combined with hsdp_data_parallel: "
                 "rank-local cache decisions can skip different FSDP weight collectives. "
                 f"Use one of {sorted(HSDP_DATA_PARALLEL_CACHE_BACKENDS)} or disable cache_backend."
+            )
+        if self.request_batch_max_wait_ms is None:
+            self.request_batch_max_wait_ms = (
+                HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS if self.parallel_config.hsdp_data_parallel else 0.0
             )
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.

@@ -7,7 +7,9 @@ GPU allocation. The Python/stage parallel configuration flag is
 
 Weights remain sharded and are gathered collectively. Each rank computes its
 own activations. The scheduler admits up to the HSDP world size in one wave;
-`request_batch_max_wait_ms` controls the wait for compatible requests.
+`request_batch_max_wait_ms` controls the wait for compatible requests. It
+defaults to 500 ms in this mode, so a burst of requests forms one wave instead
+of dispatching the first arrival alone. Set it to 0 to disable the wait.
 Request metadata and KV state stay bound to the request assigned to each rank.
 Short waves repeat requests on surplus ranks to keep collective execution
 aligned; only the requested results are returned.

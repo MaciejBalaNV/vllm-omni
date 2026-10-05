@@ -220,7 +220,7 @@ class OmniEngineArgs(EngineArgs):
     enable_sleep_mode: bool = False
     omni: bool = False
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
-    request_batch_max_wait_ms: float = 0.0
+    request_batch_max_wait_ms: float | None = None
     fa_deterministic: bool = False
     # Tensor-parallel degree for the diffusion text encoder (forwarded to
     # DiffusionParallelConfig via the generic diffusion fallback). Declared

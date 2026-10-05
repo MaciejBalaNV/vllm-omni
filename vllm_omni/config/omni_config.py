@@ -815,7 +815,7 @@ class _DiffusionConfigProjection:
     model_class_name: str | None = None
     engine_backend: str | type = "default"
     diffusion_model_runner_cls: str | type | None = None
-    request_batch_max_wait_ms: float = 0.0
+    request_batch_max_wait_ms: float | None = None
     streaming_output: bool = False
     model_arch: str | None = None
     task_type: str | None = None

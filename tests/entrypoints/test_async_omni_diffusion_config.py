@@ -472,6 +472,9 @@ def test_serve_cli_accepts_hsdp_data_parallel():
     assert args.hsdp_data_parallel is True
     assert parallel_config["hsdp_data_parallel"] is True
     assert parallel_config["data_parallel_size"] == 8
+    # Unset, so OmniDiffusionConfig can apply the HSDP data-parallel default.
+    assert args.request_batch_max_wait_ms is None
+    assert stage_cfg["engine_args"].get("request_batch_max_wait_ms") is None
 
 
 def test_serve_cli_accepts_text_encoder_tp_size():
