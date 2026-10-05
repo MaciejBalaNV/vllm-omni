@@ -17,5 +17,12 @@ parallelism is unsupported with HSDP. Requests in a wave must have compatible
 shapes, guidance, denoising schedules, output counts, and LoRA settings, with
 identical extra arguments and nonempty prompts. Step execution is unsupported.
 
+`cache_backend` must be `none` or `sea_cache`. SeaCache synchronizes its skip
+decision across the HSDP shard group, so a rank that needs a full forward makes
+every rank run one; the other cache backends decide per rank and can skip
+different weight collectives, so they are rejected at config time. Expect fewer
+cache hits than with a single request because a step is skipped only when all
+requests in the wave agree.
+
 This feature works with the existing `full` HSDP loader and multiprocessing
 executor. It does not require pre-sharded loading or compact video transport.

@@ -48,6 +48,11 @@ logger = init_logger(__name__)
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
 
+# Cache backends that synchronize their skip decision across the FSDP shard
+# group, so ranks serving different requests still issue identical collectives.
+HSDP_DATA_PARALLEL_CACHE_BACKENDS: frozenset[str] = frozenset({"sea_cache"})
+
+
 def uses_rank_local_dp_concurrency(od_config: object) -> bool:
     """Whether sharded weights serve different requests on each rank."""
     from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
@@ -1362,6 +1367,16 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if (
+            self.parallel_config.hsdp_data_parallel
+            and self.cache_backend not in (None, "none")
+            and self.cache_backend not in HSDP_DATA_PARALLEL_CACHE_BACKENDS
+        ):
+            raise ValueError(
+                f"cache_backend={self.cache_backend!r} cannot be combined with hsdp_data_parallel: "
+                "rank-local cache decisions can skip different FSDP weight collectives. "
+                f"Use one of {sorted(HSDP_DATA_PARALLEL_CACHE_BACKENDS)} or disable cache_backend."
+            )
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)

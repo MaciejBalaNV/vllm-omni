@@ -135,6 +135,26 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.data_parallel_size == 4
         assert od.parallel_config.world_size == 4
 
+    @pytest.mark.parametrize("cache_backend", ["tea_cache", "cache_dit", "mag_cache", "step_cache"])
+    def test_hsdp_data_parallel_rejects_rank_local_cache_backends(self, cache_backend):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+
+        with pytest.raises(ValueError, match="cannot be combined with hsdp_data_parallel"):
+            OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend=cache_backend)
+
+    @pytest.mark.parametrize("cache_backend", ["none", "sea_cache"])
+    def test_hsdp_data_parallel_allows_synchronized_cache_backends(self, cache_backend):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_data_parallel=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend=cache_backend)
+
+        assert od.cache_backend == cache_backend
+
+    def test_hsdp_without_data_parallel_keeps_cache_backends(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4, cache_backend="tea_cache")
+
+        assert od.cache_backend == "tea_cache"
+
 
 class TestCreateDefaultDiffusion:
     """Verify engine_args structure from create_default_diffusion."""
