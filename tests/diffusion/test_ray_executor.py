@@ -45,8 +45,11 @@ def test_cross_node_workers_get_global_rank_and_explicit_rendezvous(monkeypatch)
     assert len(fake_ray.get.call_args_list) == 3
     assert all(call.kwargs["timeout"] == ray_module._WORKER_INIT_TIMEOUT_S for call in fake_ray.get.call_args_list)
     assert [worker.ip for worker in executor.workers] == ["10.0.0.1", "10.0.0.2", "10.0.0.2"]
+    logging_config = ray_module.child_logging_config()
     for rank, metadata in enumerate(executor.workers):
-        metadata.worker.init_worker.remote.assert_called_once_with(executor.od_config, rank, "tcp://10.0.0.1:23456")
+        metadata.worker.init_worker.remote.assert_called_once_with(
+            executor.od_config, rank, "tcp://10.0.0.1:23456", logging_config
+        )
 
 
 def test_worker_env_forwards_stage_overrides_without_driver_identity(monkeypatch):

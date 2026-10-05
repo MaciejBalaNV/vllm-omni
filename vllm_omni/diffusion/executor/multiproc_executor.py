@@ -35,12 +35,12 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
-    any_selected_component_uses_allgather,
     resolve_offload,
 )
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.logger import child_logging_config
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -406,6 +406,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
+                    child_logging_config(),
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,

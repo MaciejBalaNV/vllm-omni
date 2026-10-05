@@ -66,6 +66,11 @@ def main():
                 cmds[cmd.name] = cmd
         args = parser.parse_args()
         if args.subparser in cmds:
+            # vLLM's CLI main configures logging here; vLLM no longer does it
+            # on import, so without this every log record below WARNING is lost.
+            from vllm_omni.logger import configure_omni_logging_from_args
+
+            configure_omni_logging_from_args(args)
             cmds[args.subparser].validate(args)
 
         if hasattr(args, "dispatch_function"):
