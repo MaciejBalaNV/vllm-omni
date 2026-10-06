@@ -776,7 +776,7 @@ def flex_attention(
 ) -> torch.Tensor:
     """Run pinned Triton FlexAttention on contiguous ``[B, H, S, D]`` tensors."""
     if backend != "triton":
-        raise ValueError(f"Cosmos3 Multiview-AV supports only backend='triton', got {backend!r}.")
+        raise ValueError(f"Cosmos3-Nano-Transfer-Auto supports only backend='triton', got {backend!r}.")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Cosmos3 multiview FlexAttention requires contiguous [B, H, S, D] inputs.")
     kernel_options = {

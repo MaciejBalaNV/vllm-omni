@@ -197,15 +197,15 @@ The following tables show which models support each feature:
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
-| **Cosmos3 Multiview-AV**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ✅ | ❌ | ✅ | ❓ | ❌ | ❓ | ❌ |
+| **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ✅ | ❌ | ✅ | ❓ | ❌ | ❓ | ❌ |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 
 > Notes:
-> Cosmos3 Multiview-AV supports CFGP, strict Ulysses CP, HSDP, and TP;
-> see the [Cosmos3 Multiview-AV recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Multiview-AV.md).
+> Cosmos3-Nano-Transfer-Auto supports CFGP, strict Ulysses CP, HSDP, and TP;
+> see the [Cosmos3-Nano-Transfer-Auto recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto.md).
 > HSDP and TP are alternative memory modes and cannot be combined.
 >
 > 5\. SANA-WM cannot support sequence parallelism: its bidirectional gated delta

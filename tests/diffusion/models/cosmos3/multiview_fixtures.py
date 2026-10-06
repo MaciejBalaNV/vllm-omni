@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Canonical deployment fixtures for Cosmos3 Multiview-AV tests."""
+"""Canonical deployment fixtures for Cosmos3-Nano-Transfer-Auto tests."""
 
 from typing import Any
 
@@ -37,7 +37,7 @@ def multiview_lidar_contract(chunk: int = 9, context: int | None = 9) -> dict[st
 
 
 def multiview_contract() -> dict[str, Any]:
-    """The canonical contract emitted by imaginaire4 for Cosmos3 Multiview-AV."""
+    """The canonical contract emitted by imaginaire4 for Cosmos3-Nano-Transfer-Auto."""
     from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
 
     return {

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Cosmos3 Multiview-AV transformer with runtime-selected sparse attention."""
+"""Cosmos3-Nano-Transfer-Auto transformer with runtime-selected sparse attention."""
 
 from __future__ import annotations
 
@@ -215,7 +215,7 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         # camera condition frames and the LiDAR condition prefix receive zero.
         time = self._embed_timestep(timestep, camera.dtype).unsqueeze(1)
         if rig_view_ids is None:
-            raise ValueError("Cosmos3 Multiview-AV requires the request's physical camera IDs.")
+            raise ValueError("Cosmos3-Nano-Transfer-Auto requires the request's physical camera IDs.")
         embeddings = []
         for item, latent in zip(items, streams, strict=True):
             project = self.lidar_proj_in if item.is_lidar else self.proj_in

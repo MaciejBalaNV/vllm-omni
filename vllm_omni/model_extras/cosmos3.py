@@ -97,11 +97,11 @@ COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS = ("negative_prompt", "negative_me
 
 
 def reject_multiview_negative_fields(source: Mapping[str, Any], location: str) -> None:
-    """Reject negative-prompt controls that Cosmos3 Multiview-AV would otherwise ignore."""
+    """Reject negative-prompt controls that Cosmos3-Nano-Transfer-Auto would otherwise ignore."""
     for field in COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS:
         if source.get(field) is not None:
             raise ValueError(
-                f"Cosmos3 Multiview-AV does not support {location}.{field}; set per_view_negative_prompt "
+                f"Cosmos3-Nano-Transfer-Auto does not support {location}.{field}; set per_view_negative_prompt "
                 "to apply one negative caption to every camera."
             )
 

@@ -1,27 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-r"""Cosmos3 Multiview-AV inference with an exported checkpoint and request JSON/JSONL.
+r"""Cosmos3-Nano-Transfer-Auto inference with an exported checkpoint and request JSON/JSONL.
 
 Usage examples (run from the repository root):
 
     # Single GPU
     python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-        --model /models/cosmos3-multiview --input request.json
+        --model /models/Cosmos3-Nano-Transfer-Auto --input request.json
 
     # Four GPUs: CFGP2 x Ulysses CP2
     python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-        --model /models/cosmos3-multiview --input request.json \
+        --model /models/Cosmos3-Nano-Transfer-Auto --input request.json \
         --cfg-parallel-size 2 --ulysses-degree 2
 
     # Two GPUs: HSDP weight sharding
     python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-        --model /models/cosmos3-multiview --input request.json \
+        --model /models/Cosmos3-Nano-Transfer-Auto --input request.json \
         --use-hsdp --hsdp-shard-size 2
 
     # Two GPUs: tensor parallelism
     python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-        --model /models/cosmos3-multiview --input request.json \
+        --model /models/Cosmos3-Nano-Transfer-Auto --input request.json \
         --tensor-parallel-size 2
 
 CP uses strict Ulysses. HSDP and TP cannot be combined.
@@ -540,7 +540,7 @@ def _first_present(record: dict[str, Any], *keys: str, default: Any = None) -> A
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Exported Cosmos3 Multiview-AV Diffusers directory")
+    parser.add_argument("--model", required=True, help="Exported Cosmos3-Nano-Transfer-Auto Diffusers directory")
     parser.add_argument("--input", required=True, type=Path, help="Multiview JSON or JSONL file")
     parser.add_argument("--output-dir", type=Path, default=Path("cosmos3_multiview_output"))
     parser.add_argument(

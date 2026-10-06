@@ -3343,7 +3343,7 @@ class TestForwardRouting:
             pipeline.forward(make_request_batch(prompt, sampling_params))
 
 
-# -- Cosmos3 Multiview-AV deployment contract ---------------------------------
+# -- Cosmos3-Nano-Transfer-Auto deployment contract ---------------------------------
 
 
 @pytest.mark.parametrize(

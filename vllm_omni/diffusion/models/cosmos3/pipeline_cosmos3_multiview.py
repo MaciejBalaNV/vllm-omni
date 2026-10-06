@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Cosmos3 Multiview-AV pipeline.
+"""Cosmos3-Nano-Transfer-Auto pipeline.
 
 Camera-only and joint V1.2 camera/LiDAR inference with independent sensor
 geometries and per-camera captions. Only camera targets are decoded.
@@ -321,7 +321,7 @@ def _multiview_request_captions(request: Any) -> list[str]:
 
 
 def get_cosmos3_multiview_pre_process_func(od_config: OmniDiffusionConfig):
-    """Build the request preprocessor for Cosmos3 Multiview-AV.
+    """Build the request preprocessor for Cosmos3-Nano-Transfer-Auto.
 
     Camera and LiDAR media are decoded by the pipeline, so the only request-time
     work is the Cosmos3 text guardrail over the shared prompt and every
@@ -386,10 +386,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             intermediate_size=int(_tf_config_get(od_config.tf_model_config, "intermediate_size", 12288)),
         )
         if od_config.enable_session_state_manager:
-            raise ValueError("Cosmos3 Multiview-AV does not support enable_session_state_manager.")
+            raise ValueError("Cosmos3-Nano-Transfer-Auto does not support enable_session_state_manager.")
         super().__init__(od_config=od_config, prefix=prefix)
         if self.device.type != "cuda":
-            raise ValueError("Cosmos3 Multiview-AV requires CUDA for multiview attention.")
+            raise ValueError("Cosmos3-Nano-Transfer-Auto requires CUDA for multiview attention.")
         if not isinstance(self.transformer, Cosmos3MultiviewVFMTransformer):
             raise ValueError(
                 "Cosmos3MultiviewPipeline requires transformer/config.json backbone_type='cosmos3_multiview'."

@@ -1,9 +1,9 @@
-# Cosmos3 Multiview-AV
+# Cosmos3-Nano-Transfer-Auto
 
 ## Summary
 
 - Vendor: NVIDIA
-- Model: Cosmos3 Multiview-AV with exact key counting and a 0.4-second
+- Model: Cosmos3-Nano-Transfer-Auto with exact key counting and a 0.4-second
   cross-view lookback
 - Task: multiview driving video generation (T2V, I2V, video prefix, WSM
   transfer, view completion), optionally joint with numeric LiDAR
@@ -145,7 +145,7 @@ Joint exports additionally require complete `lidar` tokenizer metadata and
 LiDAR latents. The current checkpoint uses `[1, 1]`, independently of the camera
 patch. The maximum camera count is the length of `cameras`.
 
-Attention is intrinsic to Cosmos3 Multiview-AV: same-view target and control
+Attention is intrinsic to Cosmos3-Nano-Transfer-Auto: same-view target and control
 attention spans the full clip, in both temporal directions. Cross-view target
 keys are visible in `[query_time - cross_view_past_window_seconds, query_time]`,
 including both boundaries with `1e-4` tolerance. Targets and controls read their
@@ -228,7 +228,7 @@ Add a top-level `lidar` object for joint requests:
 
 ```bash
 python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-  --model /models/cosmos3-multiview-av \
+  --model /models/Cosmos3-Nano-Transfer-Auto \
   --input /data/mv_i2v_wsm.json \
   --output-dir outputs/mv_i2v_wsm \
   --seed 42 --fps 30 --num-frames 200
@@ -250,7 +250,7 @@ FFmpeg threads per camera, bounded by the CPU affinity mask);
 ### Online
 
 ```bash
-vllm serve /models/cosmos3-multiview-av --omni \
+vllm serve /models/Cosmos3-Nano-Transfer-Auto --omni \
   --model-class-name Cosmos3MultiviewPipeline --port 8091
 ```
 
@@ -407,7 +407,7 @@ seeds and sampling settings, and compare outputs, latency and peak memory.
 Example: four GPUs with CFG parallelism and Ulysses CP:
 
 ```bash
-vllm serve /models/cosmos3-multiview-av --omni \
+vllm serve /models/Cosmos3-Nano-Transfer-Auto --omni \
   --model-class-name Cosmos3MultiviewPipeline --num-gpus 4 \
   --cfg-parallel-size 2 --ulysses-degree 2 --port 8091
 ```

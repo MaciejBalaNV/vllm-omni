@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Strict Cosmos3 Multiview-AV deployment metadata, shared by pipeline and transformer."""
+"""Strict Cosmos3-Nano-Transfer-Auto deployment metadata, shared by pipeline and transformer."""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def _validated_rig_view_embedding(config: Mapping[str, Any], cameras: Sequence[s
 
 
 def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
-    """Validate the sole Cosmos3 Multiview-AV deployment contract before initialization."""
+    """Validate the sole Cosmos3-Nano-Transfer-Auto deployment contract before initialization."""
     backbone_type = _tf_config_get(model_config, "backbone_type", None)
     if backbone_type != COSMOS3_MULTIVIEW_BACKBONE_TYPE:
         raise ValueError(
