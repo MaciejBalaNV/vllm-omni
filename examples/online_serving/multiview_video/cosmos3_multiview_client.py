@@ -107,7 +107,9 @@ def prepare_request(
     for source in (manifest, extra):
         for key in ("negative_prompt", "negative_metadata_mode"):
             if source.get(key) is not None:
-                raise ValueError(f"Cosmos3-Nano-Transfer-Auto does not support {key}; use per_view_negative_prompt instead.")
+                raise ValueError(
+                    f"Cosmos3-Nano-Transfer-Auto does not support {key}; use per_view_negative_prompt instead."
+                )
     if "multiview" not in extra:
         extra["multiview"] = copy.deepcopy(manifest["multiview"])
     _populate_legacy_view_prompts(manifest.get("prompt"), extra["multiview"]["views"])

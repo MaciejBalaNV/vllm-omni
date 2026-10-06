@@ -12,7 +12,6 @@ from functools import cache
 from typing import Any, NamedTuple
 
 import torch
-
 from vllm.logger import init_logger
 
 from .multiview_flex_attention import FA4_SPARSE_KV_BLOCK_SIZE, FA4_SPARSE_Q_BLOCK_SIZE, MultiviewBlockSparsity
@@ -85,7 +84,6 @@ def _load_fa4() -> _Fa4Entry:
     try:
         import cutlass
         import cutlass.cute as cute
-
         from vllm.vllm_flash_attn.cute import flash_attn_func
         from vllm.vllm_flash_attn.cute import utils as fa_utils
         from vllm.vllm_flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
