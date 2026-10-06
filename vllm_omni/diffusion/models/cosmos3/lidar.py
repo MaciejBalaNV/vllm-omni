@@ -32,6 +32,8 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
+
 _LIDAR_VAE_SUBFOLDER = "lidar_vae"
 _LIDAR_VAE_WEIGHTS = "diffusion_pytorch_model.safetensors"
 _LIDAR_CONFIG_FIELDS = frozenset(
@@ -131,8 +133,6 @@ class _LidarComponent(nn.Module):
     @classmethod
     def from_pretrained(cls, model_path: str, config: dict[str, Any], device: torch.device) -> Self:
         from safetensors import safe_open
-
-        from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 
         checkpoint_path = Path(
             resolve_model_to_local_path(
