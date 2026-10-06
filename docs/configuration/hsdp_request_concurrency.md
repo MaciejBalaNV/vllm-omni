@@ -20,6 +20,8 @@ one, because patch-parallel VAE decode stitches tiles across all ranks and would
 mix the different requests' latents. Requests in a wave must have compatible
 shapes, guidance, denoising schedules, output counts, and LoRA settings, with
 identical extra arguments and nonempty prompts. Step execution is unsupported.
+MiniMax-H3 is unsupported because conditioning and output ownership are not
+request-local.
 
 `cache_backend` must be `none` or `sea_cache`. SeaCache synchronizes its skip
 decision across the HSDP shard group, so a rank that needs a full forward makes

@@ -324,6 +324,14 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
+        if getattr(getattr(od_config, "parallel_config", None), "hsdp_data_parallel", False) and getattr(
+            od_config, "model_class_name", None
+        ) in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+            # H3 shares conditioning across WORLD and assumes one output owner.
+            raise ValueError(
+                "hsdp_data_parallel is unsupported for MiniMax-H3: "
+                "conditioning and output ownership are not request-local."
+            )
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if od_config.streaming_output and not self.step_execution:
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")

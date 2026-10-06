@@ -694,9 +694,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         parallel_config = getattr(self.od_config, "parallel_config", None)
         dp_size = getattr(parallel_config, "data_parallel_size", 1)
         if dp_size > 1 and uses_rank_local_dp_concurrency(self.od_config):
-            # Sharded-weight DP uses one independent request per rank. It is not a
-            # fused pipeline request batch, so models such as MiniMax-H3 do not
-            # need to advertise supports_request_batch=True.
+            # Each rank runs one request; fused pipeline batching is unnecessary.
             return self.execute_request(scheduler_output)
 
         try:
