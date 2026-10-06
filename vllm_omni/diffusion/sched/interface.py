@@ -149,6 +149,12 @@ class RequestBatchSamplingParamsKey:
     sample_solver: str | None = None
     flow_shift: float | None = None
 
+    # Names of non-None ``negative_*`` prompt fields. Negative text,
+    # embeddings, masks, and pooled embeddings can select a pipeline's CFG
+    # branches independently of do_classifier_free_guidance. Compare their
+    # presence conservatively alongside guidance fields to align forward counts.
+    negative_conditioning: frozenset[str] = frozenset()
+
     # Pipeline-specific condition structure populated during preprocessing.
     # It prevents independently valid requests with incompatible conditions
     # from being admitted to the same request batch.

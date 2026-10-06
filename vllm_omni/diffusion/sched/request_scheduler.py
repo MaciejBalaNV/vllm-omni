@@ -19,11 +19,11 @@ from vllm_omni.diffusion.sched.interface import (
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
-# LoRA identity is derived from `sampling.lora_request`, not a same-named field
-# on sampling params, so it must be resolved separately from the bulk lookup.
+# Request-owned fields and LoRA identity must be resolved separately from the
+# bulk sampling-param lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
+) - {"condition_key", "flow_shift", "lora_int_id", "negative_conditioning", "sample_solver"}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -52,6 +52,15 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     # inferred while building the request-batch key.
     key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
+    prompt = request.prompt
+    if isinstance(prompt, dict):
+        # Pipelines can enable true CFG from negative inputs even when the
+        # generic CFG flag is false. Empty negative text is still present.
+        # Compare field presence without inspecting tensor values or inferring
+        # model-specific guidance defaults here.
+        key_kwargs["negative_conditioning"] = frozenset(
+            name for name, value in prompt.items() if name.startswith("negative_") and value is not None
+        )
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
     return RequestBatchSamplingParamsKey(**key_kwargs)
