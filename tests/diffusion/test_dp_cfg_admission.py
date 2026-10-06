@@ -70,19 +70,25 @@ def executor(request):
     return executor
 
 
-@pytest.fixture(params=["hsdp", "dlo"])
-def wave_config(request):
+def _make_wave_config(mode):
     config = SimpleNamespace(
+        max_num_seqs=2,
         step_execution=False,
-        parallel_config=SimpleNamespace(data_parallel_size=2, hsdp_data_parallel=request.param == "hsdp"),
+        parallel_config=SimpleNamespace(data_parallel_size=2, hsdp_data_parallel=mode == "hsdp"),
     )
-    if request.param == "dlo":
+    if mode != "hsdp":
+        component = "text_encoder" if mode == "dlo_text_encoder" else "dit"
         config.diffusion_offload_config = {
             "mode": "layer",
-            "components": ["dit"],
-            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            "components": [component],
+            "layer_options": {component: {"weight_transfer": "allgather"}},
         }
     return config
+
+
+@pytest.fixture(params=["hsdp", "dlo", "dlo_text_encoder"])
+def wave_config(request):
+    return _make_wave_config(request.param)
 
 
 @pytest.mark.parametrize("true_cfg_scale", [None, 4.0])
@@ -340,5 +346,156 @@ def test_ordinary_batching_does_not_serialize_extra_args(unserializable_extra_ar
         request = _make_request(request_id)
         request.sampling_params.extra_args = unserializable_extra_args[0]
         scheduler.add_request(request)
+
+    assert scheduler.schedule().scheduled_request_ids == ["first", "second"]
+
+
+def _make_encoded_request(request_id, *, positive_embeds, negative_embeds=False):
+    request = _make_request(request_id)
+    if positive_embeds:
+        request.prompt = {
+            "prompt_embeds": torch.zeros(1, 2, 4),
+            "prompt_embeds_mask": torch.ones(1, 2, dtype=torch.bool),
+        }
+    if negative_embeds:
+        request.prompt.update(
+            negative_prompt_embeds=torch.zeros(1, 2, 4),
+            negative_prompt_embeds_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+    return request
+
+
+def _complete_scheduled_wave(scheduler, executor, wave):
+    request_ids = wave.scheduled_request_ids
+    results = [DiffusionOutput(output=request_id) for request_id in request_ids]
+    if len(results) == 1:
+        executor.collective_rpc.return_value = results[0]
+    elif isinstance(executor, RayDiffusionExecutor):
+        executor.collective_rpc.return_value = [{"dp_rank": rank, "output": out} for rank, out in enumerate(results)]
+    else:
+        executor.collective_rpc.return_value = results
+    output = executor.execute_batch(wave)
+    assert [item.result.output for item in output.runner_outputs] == request_ids
+    assert scheduler.update_from_output(wave, output) == set(request_ids)
+    for request_id in request_ids:
+        assert scheduler.get_request_state(request_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+        scheduler.pop_request_state(request_id)
+
+
+@pytest.mark.parametrize("embeddings_first", [False, True])
+def test_text_encoder_allgather_schedules_mixed_inputs_separately(executor, embeddings_first):
+    config = _make_wave_config("dlo_text_encoder")
+    executor.od_config = config
+    scheduler = RequestScheduler()
+    scheduler.initialize(config)
+    first = _make_encoded_request("first", positive_embeds=embeddings_first)
+    second = _make_encoded_request("second", positive_embeds=not embeddings_first)
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    with pytest.raises(ValueError, match="same positive/negative prompt embedding fields"):
+        executor.execute_batch(_make_wave(first, second))
+    executor.collective_rpc.assert_not_called()
+
+    for request_id, waiting in (("first", 1), ("second", 0)):
+        wave = scheduler.schedule()
+        assert wave.scheduled_request_ids == [request_id]
+        assert wave.num_waiting_reqs == waiting
+        _complete_scheduled_wave(scheduler, executor, wave)
+    assert executor.collective_rpc.call_count == 2
+
+
+@pytest.mark.parametrize("positive_embeds", [False, True])
+@pytest.mark.parametrize("negative_embeds", [False, True])
+def test_text_encoder_allgather_batches_matching_input_paths(executor, positive_embeds, negative_embeds):
+    config = _make_wave_config("dlo_text_encoder")
+    executor.od_config = config
+    scheduler = RequestScheduler()
+    scheduler.initialize(config)
+    for request_id in ("first", "second"):
+        scheduler.add_request(
+            _make_encoded_request(request_id, positive_embeds=positive_embeds, negative_embeds=negative_embeds)
+        )
+
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == ["first", "second"]
+    _complete_scheduled_wave(scheduler, executor, wave)
+    executor.collective_rpc.assert_called_once()
+
+
+@pytest.mark.parametrize("mode", ["hsdp", "dlo"])
+def test_dp_without_text_encoder_allgather_batches_mixed_inputs(executor, mode):
+    config = _make_wave_config(mode)
+    executor.od_config = config
+    scheduler = RequestScheduler()
+    scheduler.initialize(config)
+    scheduler.add_request(_make_encoded_request("text", positive_embeds=False))
+    scheduler.add_request(_make_encoded_request("embeds", positive_embeds=True))
+
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == ["text", "embeds"]
+    _complete_scheduled_wave(scheduler, executor, wave)
+    executor.collective_rpc.assert_called_once()
+
+
+@pytest.mark.parametrize("empty_prompt", [None, "", [], (), {}, {"prompt": ""}])
+@pytest.mark.parametrize("order", ["empty_first", "empty_last", "both_empty"])
+def test_dp_empty_prompts_run_alone(executor, wave_config, empty_prompt, order):
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    first, second = _make_request("first"), _make_request("second")
+    if order in {"empty_first", "both_empty"}:
+        first.prompt = empty_prompt
+    if order in {"empty_last", "both_empty"}:
+        second.prompt = empty_prompt
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    with pytest.raises(ValueError, match="non-empty prompt"):
+        executor.execute_batch(_make_wave(first, second))
+    executor.collective_rpc.assert_not_called()
+
+    for request_id, waiting in (("first", 1), ("second", 0)):
+        wave = scheduler.schedule()
+        assert wave.scheduled_request_ids == [request_id]
+        assert wave.num_waiting_reqs == waiting
+        _complete_scheduled_wave(scheduler, executor, wave)
+    assert executor.collective_rpc.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        [1, 2],
+        {"prompt_token_ids": [1, 2]},
+        {"prompt_ids": [1, 2]},
+        {"prompt": "", "prompt_embeds": torch.zeros(1, 2, 4)},
+    ],
+)
+def test_dp_batches_nonempty_token_and_embedding_inputs(executor, wave_config, prompt):
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    for request_id in ("first", "second"):
+        request = _make_request(request_id)
+        request.prompt = prompt
+        scheduler.add_request(request)
+
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == ["first", "second"]
+    _complete_scheduled_wave(scheduler, executor, wave)
+    executor.collective_rpc.assert_called_once()
+
+
+@pytest.mark.parametrize("input_kind", ["empty", "embeddings"])
+def test_ordinary_batching_keeps_prompt_paths_request_local(input_kind):
+    scheduler = RequestScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2, parallel_config=SimpleNamespace(data_parallel_size=2)))
+    first = _make_encoded_request("first", positive_embeds=input_kind == "embeddings")
+    if input_kind == "empty":
+        first.prompt = ""
+    scheduler.add_request(first)
+    scheduler.add_request(_make_request("second"))
 
     assert scheduler.schedule().scheduled_request_ids == ["first", "second"]

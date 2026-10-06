@@ -31,14 +31,13 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.media import DiffusionMediaOutput
-from vllm_omni.diffusion.offloader.config import (
-    TEXT_ENCODER_COMPONENT,
-    any_selected_component_uses_allgather,
-    resolve_offload,
-)
+from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
 from vllm_omni.diffusion.sched.request_scheduler import (
     build_rank_local_dp_extra_args_signature,
     build_request_batch_sampling_params_key,
+    is_empty_dp_prompt,
+    text_encoder_input_signature,
+    uses_text_encoder_allgather,
 )
 
 if TYPE_CHECKING:
@@ -102,34 +101,6 @@ def _worker_env(od_config: OmniDiffusionConfig) -> dict[str, str]:
         "WORLD_SIZE",
     }
     return {key: value for key, value in env.items() if key not in worker_specific and not key.startswith("RAY_")}
-
-
-def _is_empty_dp_prompt(prompt: object) -> bool:
-    """Return whether a DP request has no usable text prompt."""
-    if prompt is None:
-        return True
-    if isinstance(prompt, (str, list, tuple)):
-        return not prompt
-    if isinstance(prompt, dict):
-        return (
-            not prompt.get("prompt")
-            and not prompt.get("prompt_token_ids")
-            and not prompt.get("prompt_ids")
-            and prompt.get("prompt_embeds") is None
-        )
-    return False
-
-
-def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
-    """Describe precomputed embeddings that change encoder forward counts."""
-    if not isinstance(prompt, dict):
-        return False, False
-    return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
-
-
-def _uses_text_encoder_allgather(config: object) -> bool:
-    resolved = resolve_offload(config)
-    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
 def _move_to_cpu(value: Any) -> Any:
@@ -565,14 +536,14 @@ class RayDiffusionExecutor(DiffusionExecutor):
             extra_args_signatures = {build_rank_local_dp_extra_args_signature(item.req) for item in new_reqs}
             if len(extra_args_signatures) > 1:
                 raise ValueError("DP multi-concurrency requires identical extra_args for every request")
-            if _uses_text_encoder_allgather(self.od_config):
-                encoder_signatures = {_text_encoder_input_signature(item.req.prompt) for item in new_reqs}
+            if uses_text_encoder_allgather(self.od_config):
+                encoder_signatures = {text_encoder_input_signature(item.req.prompt) for item in new_reqs}
                 if len(encoder_signatures) > 1:
                     raise ValueError(
                         "DLO text_encoder AllGather requires every concurrent request "
                         "to provide the same positive/negative prompt embedding fields."
                     )
-            empty_prompt_ids = [item.request_id for item in new_reqs if _is_empty_dp_prompt(item.req.prompt)]
+            empty_prompt_ids = [item.request_id for item in new_reqs if is_empty_dp_prompt(item.req.prompt)]
             if empty_prompt_ids:
                 raise ValueError(
                     "DP multi-concurrency requires a non-empty prompt for every request; "

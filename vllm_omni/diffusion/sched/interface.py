@@ -169,6 +169,10 @@ class RequestBatchSamplingParamsKey:
     # ordinary request batching leaves it unset to allow request-local values.
     rank_local_dp_extra_args_signature: str | None = None
 
+    # Text-encoder AllGather requires matching encoder forward counts across
+    # DP ranks. Cached only when that mode is active.
+    text_encoder_input_signature: tuple[bool, bool] | None = None
+
 
 @dataclass
 class SchedulerRequestState:
@@ -181,6 +185,8 @@ class SchedulerRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
     queued_at: float = 0.0
+    # Request-mode admission must leave this request alone in its wave.
+    requires_single_request: bool = False
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)

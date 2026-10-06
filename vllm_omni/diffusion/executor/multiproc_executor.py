@@ -32,13 +32,12 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
-from vllm_omni.diffusion.offloader.config import (
-    TEXT_ENCODER_COMPONENT,
-    resolve_offload,
-)
 from vllm_omni.diffusion.sched.request_scheduler import (
     build_rank_local_dp_extra_args_signature,
     build_request_batch_sampling_params_key,
+    is_empty_dp_prompt,
+    text_encoder_input_signature,
+    uses_text_encoder_allgather,
 )
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
@@ -73,34 +72,6 @@ def _dropped_output_error(async_output_id: str) -> RuntimeError:
         f"async output {async_output_id} was dropped: the request was aborted "
         "before its output was claimed; retry with a new request."
     )
-
-
-def _is_empty_dp_prompt(prompt: object) -> bool:
-    """Return whether a DP request has no usable text prompt."""
-    if prompt is None:
-        return True
-    if isinstance(prompt, (str, list, tuple)):
-        return not prompt
-    if isinstance(prompt, dict):
-        return (
-            not prompt.get("prompt")
-            and not prompt.get("prompt_token_ids")
-            and not prompt.get("prompt_ids")
-            and prompt.get("prompt_embeds") is None
-        )
-    return False
-
-
-def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
-    """Describe precomputed embeddings that change encoder forward counts."""
-    if not isinstance(prompt, dict):
-        return False, False
-    return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
-
-
-def _uses_text_encoder_allgather(config: object) -> bool:
-    resolved = resolve_offload(config)
-    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
 @dataclass
@@ -574,14 +545,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     "share identical extra_args. Different extra_args can change "
                     "the forward schedule and cause AllGather deadlock."
                 )
-            if _uses_text_encoder_allgather(self.od_config):
-                encoder_signatures = {_text_encoder_input_signature(nr.req.prompt) for nr in new_reqs}
+            if uses_text_encoder_allgather(self.od_config):
+                encoder_signatures = {text_encoder_input_signature(nr.req.prompt) for nr in new_reqs}
                 if len(encoder_signatures) > 1:
                     raise ValueError(
                         "DLO text_encoder AllGather requires every concurrent request "
                         "to provide the same positive/negative prompt embedding fields."
                     )
-            empty_prompt_ids = [nr.request_id for nr in new_reqs if _is_empty_dp_prompt(nr.req.prompt)]
+            empty_prompt_ids = [nr.request_id for nr in new_reqs if is_empty_dp_prompt(nr.req.prompt)]
             if empty_prompt_ids:
                 raise ValueError(
                     "DP multi-concurrency requires a non-empty prompt for every request; "
