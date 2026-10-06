@@ -48,7 +48,7 @@ from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
 from vllm_omni.diffusion.utils.video_encoding import run_ordered_encoding_jobs, write_imageio_video
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_extras.cosmos3 import normalize_multiview_aspect_ratio
+from vllm_omni.model_extras.cosmos3 import normalize_multiview_aspect_ratio, reject_multiview_negative_fields
 from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested, serialize_lidar_output
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -347,7 +347,6 @@ def _run_request(
     *,
     output_dir: Path,
     seed: int,
-    fallback_negative_prompt: str | None,
     fps_override: float | None = None,
     num_frames_override: int | None = None,
     resolution_override: str | None = None,
@@ -356,6 +355,7 @@ def _run_request(
     video_encoding_mode: str = "parallel",
 ) -> dict[str, Any]:
     request = {**request.get("extra_params", {}), **request}
+    reject_multiview_negative_fields(request, "input record")
     multiview_value = request.get("multiview")
     if not isinstance(multiview_value, dict):
         raise ValueError("Input JSON must contain a multiview object.")
@@ -448,10 +448,6 @@ def _run_request(
         "prompt": str(request.get("prompt", "")),
         "modalities": ["video"],
     }
-    if request.get("negative_prompt") is not None:
-        prompt["negative_prompt"] = request["negative_prompt"]
-    elif fallback_negative_prompt is not None:
-        prompt["negative_prompt"] = fallback_negative_prompt
 
     started = time.perf_counter()
     result = omni.generate(prompt, sampling_params)
@@ -565,20 +561,12 @@ def main() -> None:
         help="Base seed; JSONL records use seed + record index unless the record provides seed",
     )
     parser.add_argument(
-        "--negative-prompt-json",
-        type=Path,
-        help=(
-            "Structured negative prompt to serialize with json.dumps defaults. The pipeline ships no default "
-            "negative prompt, so reference-parity runs must supply the reference one here."
-        ),
-    )
-    parser.add_argument(
         "--fps",
         type=float,
         default=None,
         help=(
             "Frame rate for every record, overriding any record value. "
-            "Unset: the record's fps, else the checkpoint default (30 FPS for unversioned artifacts)."
+            "Unset: the record's fps, else the checkpoint default (30 FPS)."
         ),
     )
     parser.add_argument(
@@ -595,7 +583,7 @@ def main() -> None:
         choices=tuple(SUPPORTED_RESOLUTIONS),
         help=(
             "Video resolution bucket (480 or 720) for every record, overriding any record value. "
-            "Unset: the record's resolution, else the checkpoint default (480 for unversioned artifacts)."
+            "Unset: the record's resolution, else the checkpoint default (480)."
         ),
     )
     parser.add_argument(
@@ -621,11 +609,6 @@ def main() -> None:
     args = parser.parse_args()
 
     requests = _load_requests(args.input)
-    fallback_negative_prompt = None
-    if args.negative_prompt_json is not None:
-        # Default separators (", " and ": ") and the file's key order are part
-        # of the reference's serialization, so keep json.dumps unconfigured.
-        fallback_negative_prompt = json.dumps(json.loads(args.negative_prompt_json.read_text()))
 
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
@@ -670,7 +653,6 @@ def main() -> None:
             request,
             output_dir=output_dir,
             seed=seed,
-            fallback_negative_prompt=fallback_negative_prompt,
             fps_override=args.fps,
             num_frames_override=args.num_frames,
             resolution_override=args.resolution,

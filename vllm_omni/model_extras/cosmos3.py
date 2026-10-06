@@ -75,7 +75,9 @@ COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
         "normalize_cfg",
         "flow_shift",
         "max_sequence_length",
+        # Declared so admission rejects them instead of dropping them silently.
         "negative_prompt",
+        "negative_metadata_mode",
         "per_view_negative_prompt",
         "guardrails",
         "resolution",
@@ -87,6 +89,21 @@ COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
 )
 
 COSMOS3_MULTIVIEW_ASPECT_RATIOS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+# Per-camera captions replace the shared negative prompt. The only negative
+# control is per_view_negative_prompt, whose metadata always matches the
+# positive caption.
+COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS = ("negative_prompt", "negative_metadata_mode")
+
+
+def reject_multiview_negative_fields(source: Mapping[str, Any], location: str) -> None:
+    """Reject negative-prompt controls that Cosmos3 Multiview-AV would otherwise ignore."""
+    for field in COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS:
+        if source.get(field) is not None:
+            raise ValueError(
+                f"Cosmos3 Multiview-AV does not support {location}.{field}; set per_view_negative_prompt "
+                "to apply one negative caption to every camera."
+            )
 
 
 def normalize_multiview_aspect_ratio(value: Any) -> str:
@@ -153,9 +170,8 @@ def validate_multiview_request(
     cameras: Sequence[str] = COSMOS3_MADS_CAMERAS,
     *,
     media_kind: Callable[[Any], str] = path_media_kind,
-    per_view_captions: bool = False,
-    variable_view_count: bool = False,
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
+    reject_multiview_negative_fields(extra, "extra_args")
     negative = extra.get("per_view_negative_prompt")
     if negative is not None and not isinstance(negative, str):
         raise ValueError("Cosmos3 per_view_negative_prompt must be a string.")
@@ -181,10 +197,9 @@ def validate_multiview_request(
         if unknown:
             raise ValueError(f"Unsupported Cosmos3 multiview view {index} fields: {sorted(unknown)}.")
         caption = view.get("prompt")
-        if per_view_captions and (not isinstance(caption, str) or not caption.strip()):
+        if not isinstance(caption, str) or not caption.strip():
             raise ValueError(f"Cosmos3 multiview requires one prompt per camera; missing views[{index}].prompt.")
-        if caption is not None:
-            validate_camera_caption(caption)
+        validate_camera_caption(caption)
     camera_keys = [str(view.get("camera_key", "")) for view in views]
     if any(not key for key in camera_keys) or len(set(camera_keys)) != len(camera_keys):
         raise ValueError(f"Cosmos3 multiview camera_key values must be non-empty and unique: {camera_keys}.")
@@ -192,11 +207,6 @@ def validate_multiview_request(
         raise ValueError(
             "Cosmos3 multiview cameras must be a subset of the exported checkpoint cameras: "
             f"expected={list(cameras)}, got={camera_keys}."
-        )
-    if not variable_view_count and tuple(camera_keys) != tuple(cameras):
-        raise ValueError(
-            "Cosmos3 multiview requires the full exported camera order unless the checkpoint enables "
-            f"variable_view_count: expected={list(cameras)}, got={camera_keys}."
         )
     for field in ("guidance_interval", "control_guidance_interval"):
         interval = extra.get(field)
@@ -372,8 +382,7 @@ def resolve_multiview_uploads(extra: Mapping[str, Any], upload_paths: Sequence[s
     if used != set(range(len(upload_paths))):
         raise ValueError("Every input_references upload must be referenced exactly once in multiview.views or lidar.")
     # Upload admission has no deployment metadata. The pipeline enforces the
-    # checkpoint's fixed/variable camera policy and per-camera caption requirements
-    # after references are resolved. Missing required captions can therefore fail
-    # an asynchronous job after admission; supplied captions are still validated.
-    validate_multiview_request(resolved, variable_view_count=True)
+    # checkpoint's exported camera set after references are resolved. Per-camera
+    # captions are required here, before the asynchronous generation job begins.
+    validate_multiview_request(resolved)
     return resolved

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Cosmos3 transformer variant with sparse and maskless multiview attention."""
+"""Cosmos3 Multiview-AV transformer with runtime-selected sparse attention."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from .multiview_attention import multiview_attention
+from .multiview_config import _validated_multiview_deployment_config
 from .multiview_flex_attention import (
     MaskItem,
     MultiviewAttentionContext,
     MultiviewLayout,
 )
-from .multiview_maskless_attention import build_maskless_plan, load_maskless_runtime, make_merge_scratch
 from .multiview_packing import (
     add_rig_view_embedding,
     pack_state,
@@ -29,7 +29,6 @@ from .multiview_packing import (
 )
 from .multiview_parallel import multiview_ulysses_attention
 from .transformer_cosmos3 import (
-    COSMOS3_MULTIVIEW_BACKBONE_TYPE,
     Cosmos3CrossAttention,
     Cosmos3GenDecoderLayer,
     Cosmos3VFMTransformer,
@@ -154,43 +153,28 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
     @staticmethod
     def _validate_supported_config(model_config: Any) -> None:
         Cosmos3VFMTransformer._validate_supported_config(model_config)
-        backbone_type = _tf_config_get(model_config, "backbone_type", None)
-        if backbone_type != COSMOS3_MULTIVIEW_BACKBONE_TYPE:
-            raise ValueError(
-                "Cosmos3MultiviewVFMTransformer requires transformer/config.json "
-                f"backbone_type={COSMOS3_MULTIVIEW_BACKBONE_TYPE!r}, got {backbone_type!r}."
-            )
+        _validated_multiview_deployment_config(model_config)
 
     def __init__(self, *args, **kwargs) -> None:
         od_config = kwargs.get("od_config", args[0] if args else None)
         deployment = _tf_config_get(od_config.tf_model_config, "multiview", {})
-        self._maskless_fa_version = (
-            load_maskless_runtime() if _tf_config_get(deployment, "backend", "triton") == "maskless" else 0
-        )
-        self._maskless_gqa_ratio = _tf_config_get(
-            od_config.tf_model_config, "num_attention_heads", 32
-        ) // _tf_config_get(od_config.tf_model_config, "num_key_value_heads", 8)
         super().__init__(*args, **kwargs)
         self.lidar_config = _tf_config_get(deployment, "lidar", None)
-        # Absent in schema-2 exports, where LiDAR shares the camera patch.
-        lidar_patch = _tf_config_get(deployment, "lidar_patch_spatial_hw", None)
-        self.lidar_patch_hw = spatial_patch_hw(self.latent_patch_size if lidar_patch is None else lidar_patch)
+        self.lidar_patch_hw: tuple[int, int]
         if self.lidar_config is not None:
             from .lidar import validate_lidar_config
 
             self.lidar_config = dict(self.lidar_config)
             validate_lidar_config(self.lidar_config)
+            self.lidar_patch_hw = spatial_patch_hw(_tf_config_get(deployment, "lidar_latent_patch_size_hw", None))
             width = self.lidar_patch_hw[0] * self.lidar_patch_hw[1] * self.lidar_config["latent_channels"]
             self.lidar_proj_in = nn.Linear(width, self.hidden_size)
             self.lidar_proj_out = nn.Linear(self.hidden_size, width)
         # Physical rig identity: one trained row per MADS camera ID plus a
         # final LiDAR row, added to control and target tokens alike.
         rig = _tf_config_get(deployment, "rig_view_embedding", None)
-        self.rig_view_embed = None
-        self.rig_lidar_id = None
-        if rig is not None:
-            self.rig_view_embed = nn.Embedding(int(_tf_config_get(rig, "num_embeddings", None)), self.hidden_size)
-            self.rig_lidar_id = int(_tf_config_get(rig, "lidar_id", None))
+        self.rig_view_embed = nn.Embedding(int(_tf_config_get(rig, "num_embeddings", None)), self.hidden_size)
+        self.rig_lidar_id = int(_tf_config_get(rig, "lidar_id", None))
         self._multiview_mask_cache: dict[tuple[Any, ...], Any] = {}
         # Padded q/k/v packing buffers, keyed by shape/dtype/device. Held on the
         # transformer rather than the per-forward context so the ~2.5 GiB of
@@ -211,7 +195,7 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             missing = [name for name in sorted(required) if not any(key.endswith(name) for key in loaded)]
             if missing:
                 raise ValueError(f"Incomplete joint checkpoint: missing LiDAR projection weights {missing}.")
-        if self.rig_view_embed is not None and not any(key.endswith("rig_view_embed.weight") for key in loaded):
+        if not any(key.endswith("rig_view_embed.weight") for key in loaded):
             raise ValueError(
                 "Incomplete multiview checkpoint: the contract declares rig_view_embedding but "
                 "rig_view_embed.weight was not loaded."
@@ -230,23 +214,19 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         # Both targets get the same timestep. Controls never receive it;
         # camera condition frames and the LiDAR condition prefix receive zero.
         time = self._embed_timestep(timestep, camera.dtype).unsqueeze(1)
-        if self.rig_view_embed is None:
-            if rig_view_ids is not None:
-                raise ValueError("Rig view IDs were supplied, but the checkpoint has no rig view embedding.")
-        elif rig_view_ids is None:
-            raise ValueError("Checkpoints with a rig view embedding require the request's physical camera IDs.")
+        if rig_view_ids is None:
+            raise ValueError("Cosmos3 Multiview-AV requires the request's physical camera IDs.")
         embeddings = []
         for item, latent in zip(items, streams, strict=True):
             project = self.lidar_proj_in if item.is_lidar else self.proj_in
             patch = self.lidar_patch_hw if item.is_lidar else self.latent_patch_size
             hidden = project(patchify_sensor(latent.to(camera), patch))
-            if self.rig_view_embed is not None:
-                # Reference order: projection, then rig identity, then timestep.
-                if item.is_lidar:
-                    rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
-                else:
-                    rows = self.rig_view_embed(rig_view_ids)
-                add_rig_view_embedding(hidden, rows, item.num_views)
+            # Reference order: projection, then rig identity, then timestep.
+            if item.is_lidar:
+                rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+            else:
+                rows = self.rig_view_embed(rig_view_ids)
+            add_rig_view_embedding(hidden, rows, item.num_views)
             if not item.is_control:
                 # Projection outputs are fresh, unaliased tensors, so the
                 # timestep update can mutate them in place.
@@ -291,8 +271,6 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         """
         if kwargs.get("action_latents") is not None or kwargs.get("sound_latents") is not None:
             raise ValueError("Multiview generation cannot be combined with action or sound.")
-        if multiview_layout.backend == "maskless" and hidden_states.shape[0] != 1:
-            raise ValueError("Maskless multiview transformer requires B == 1 (including each CFG branch).")
         targets = unpack_state(hidden_states, packed_shapes)
         camera = targets[0]
         has_control = control_latents is not None and len(control_latents) > 0
@@ -300,7 +278,7 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         lengths = caption_lengths
         if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != text_ids.shape[1]:
             raise ValueError("Packed caption lengths must cover the compacted text tokens with nonempty segments.")
-        layout = replace(multiview_layout, items=items, caption_lengths=lengths if len(lengths) > 1 else ())
+        layout = replace(multiview_layout, items=items, caption_lengths=lengths)
         if self.cached_kv is None or self.cached_freqs_gen is None:
             dummy = camera.new_empty(0)
             rotary = self.language_model.rotary_emb
@@ -330,7 +308,6 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                 camera_compression=self.temporal_compression_factor,
                 lidar_compression=1 if self.lidar_config is None else self.lidar_config["temporal_compression_factor"],
                 enable_fps_modulation=self.enable_fps_modulation,
-                align_views=kwargs.get("temporal_position_period") is not None,
             )
             cos, sin = rotary(dummy, position_ids=positions.unsqueeze(1).to(camera.device))
             self.cached_freqs_gen = (cos.unsqueeze(2), sin.unsqueeze(2))
@@ -339,42 +316,11 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
         if layout.backend != "fa4":
             # Compact prompt-dependent dimensions cross the compiled GEN boundary
             # as dynamic tensors, so neither new prompts nor the two CFG branches
-            # recompile the GEN layers. Maskless carries caption lengths/maxima
-            # as plan tensor data; Triton pads the UND stream outside the graph.
+            # recompile the GEN layers. Triton pads the UND stream outside the graph.
             # FA4 still builds its plan inside the graph from the static length.
             for k_und, v_und in self.cached_kv:
                 torch._dynamo.mark_dynamic(k_und, 1)
                 torch._dynamo.mark_dynamic(v_und, 1)
-        if layout.backend == "maskless":
-            cp = _get_ulysses_state()[0] if _is_sp_active() else 1
-            key = self.cached_kv[0][0]
-            kv_heads, head_dim = key.shape[2] // cp, key.shape[3]
-            query_heads = kv_heads * self._maskless_gqa_ratio
-            cache_key = (
-                "maskless",
-                layout,
-                text_ids.data_ptr(),
-                text_ids.shape[1],
-                key.device,
-                key.dtype,
-                query_heads,
-                kv_heads,
-                head_dim,
-            )
-            if cache_key not in self._multiview_mask_cache:
-                plan = build_maskless_plan(layout, text_ids.shape[1], key.device, query_heads, kv_heads, head_dim)
-                self._multiview_mask_cache[cache_key] = plan
-            scratch_key = ("maskless_merge", query_heads, head_dim, key.dtype, key.device)
-            if (*scratch_key, 0) not in self._multiview_buffer_cache:
-                for index, buffer in enumerate(make_merge_scratch(query_heads, head_dim, key.dtype, key.device)):
-                    self._multiview_buffer_cache[(*scratch_key, index)] = buffer
-            scratch = [self._multiview_buffer_cache[(*scratch_key, index)] for index in range(6)]
-            context = replace(
-                context,
-                maskless_plan=(self._multiview_mask_cache[cache_key], scratch),
-                fa_version=self._maskless_fa_version,
-            )
-
         with self._offload_context("generator"):
             streams = []
             if has_control:

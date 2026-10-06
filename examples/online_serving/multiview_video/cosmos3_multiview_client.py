@@ -104,6 +104,10 @@ def prepare_request(
 ) -> tuple[dict[str, str], list[Path]]:
     """Accept an offline manifest or a video API request containing extra_params."""
     extra = copy.deepcopy(manifest.get("extra_params", {}))
+    for source in (manifest, extra):
+        for key in ("negative_prompt", "negative_metadata_mode"):
+            if source.get(key) is not None:
+                raise ValueError(f"Cosmos3 Multiview-AV does not support {key}; use per_view_negative_prompt instead.")
     if "multiview" not in extra:
         extra["multiview"] = copy.deepcopy(manifest["multiview"])
     _populate_legacy_view_prompts(manifest.get("prompt"), extra["multiview"]["views"])
@@ -235,7 +239,6 @@ def prepare_request(
         "guidance_scale",
         "flow_shift",
         "seed",
-        "negative_prompt",
     ):
         if manifest.get(key) is not None:
             data[key] = str(manifest[key])

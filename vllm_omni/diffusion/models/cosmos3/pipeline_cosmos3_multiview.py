@@ -23,20 +23,22 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_MADS_CAMERAS,
+    COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS,
     COSMOS3_TRANSFER_HINT_KEYS,
     normalize_multiview_aspect_ratio,
+    reject_multiview_negative_fields,
     validate_multiview_request,
 )
 from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames, required_lidar_sweeps
 
 from .action import find_closest_target_size
-from .lidar import Cosmos3LidarDecoder, Cosmos3LidarEncoder, validate_lidar_config
+from .lidar import Cosmos3LidarDecoder, Cosmos3LidarEncoder
+from .multiview_config import _validated_multiview_deployment_config
 from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
     MaskItem,
     MultiviewLayout,
     expand_multiview_condition_frame_indexes,
-    validate_maskless_semantics,
     validate_multiview_backend,
 )
 from .multiview_packing import pack_state, patch_grid, unpack_state
@@ -64,15 +66,13 @@ from .transfer import (
     media_to_uint8_cthw,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import COSMOS3_MULTIVIEW_BACKBONE_TYPE, _tf_config_get
+from .transformer_cosmos3 import _tf_config_get
 from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 from .utils import VIDEO_RES_SIZE_INFO
 
 logger = init_logger(__name__)
 
-# Overrides transformer config multiview.backend, so the Triton and FA4 sparse
-# attention paths can be compared without editing the checkpoint. Without it, a
-# Triton checkpoint runs on FA4 wherever vLLM's FlashAttention resolves to FA4.
+# Select the runtime kernel; both implementations obey the same attention rules.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 
 # Per-camera frame count when the request supplies none.
@@ -87,50 +87,11 @@ COSMOS3_MULTIVIEW_RECOMMENDED_NUM_FRAMES_RANGE = (24, 400)
 # Measured LiDAR sweeps conditioned when lidar.condition_path omits a count,
 # as in the reference inference.
 COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
-# The negative prompt carries the same duration/FPS and resolution sentences as
-# the positive prompt. Requests may override this through sampling params.
-COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE = "same"
-
 # The tokenizer appends eos and vision_start after truncating. Derive the
 # request ceiling from the sparse attention's single fixed UND capacity so the
 # two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
-COSMOS3_MULTIVIEW_EMPHASIS = (
-    "Follow the wsm control videos precisely for every camera view: shape, contour, position, and motion must "
-    "align with the wsm signal at every frame."
-)
-
-# Versioned deployment contracts. Version 3 adds fields a version-2 reader
-# would silently ignore: ``rig_view_embedding`` and a LiDAR patch that differs
-# from the camera patch.
-COSMOS3_MULTIVIEW_SCHEMA_VERSIONS = (2, 3)
-# Every top-level field the imaginaire4 exporter writes for a servable
-# (non-teacher-forcing) artifact. Versioned contracts carrying anything else
-# are rejected, so a future field fails loudly instead of being ignored.
-COSMOS3_MULTIVIEW_CONTRACT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "causal_training_strategy",
-        "attention_scope",
-        "backend",
-        "decomposed_temporal_window_seconds",
-        "control_attends_sensor",
-        "lidar_attends_captions",
-        "align_temporal_positions_across_views",
-        "share_vision_temporal_positions",
-        "cameras",
-        "max_views",
-        "per_view_captions",
-        "variable_view_count",
-        "inference_defaults",
-        "lidar",
-        "lidar_patch_spatial_hw",
-        "rig_view_embedding",
-        # Written by 2026-09 exporters before per_view_captions replaced it.
-        "separate_view_text_tokenization",
-    }
-)
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -265,17 +226,6 @@ def _resolve_multiview_geometry(
     return resolution, aspect_ratio, width, height
 
 
-def _resolve_temporal_position_period(latent_frames: int, num_views: int, align_across_views: bool) -> int | None:
-    if not align_across_views:
-        return None
-    if num_views <= 0 or latent_frames <= 0 or latent_frames % num_views:
-        raise ValueError(
-            "Aligning Cosmos3 multiview temporal positions requires positive latent frames divisible by num_views: "
-            f"latent_frames={latent_frames}, num_views={num_views}."
-        )
-    return latent_frames // num_views
-
-
 def _resolve_multiview_frame_rate(value: Any) -> float:
     """Resolve the request frame rate; ``None`` selects the default.
 
@@ -342,245 +292,11 @@ def _resolve_multiview_num_frames(value: Any, temporal_compression_factor: int) 
     return rounded
 
 
-def _required_deployment_field(config: Mapping[str, Any], name: str) -> Any:
-    if name not in config:
-        raise ValueError(f"Cosmos3 multiview transformer config requires field {name!r}.")
-    return config[name]
-
-
-def _positive_int(value: Any) -> bool:
-    return not isinstance(value, bool) and isinstance(value, int) and value > 0
-
-
-def _validated_lidar_patch(config: Mapping[str, Any], version: int | None, camera_patch: int) -> list[int] | None:
-    """Return the LiDAR stream's ``[height, width]`` patch, defaulting to the camera patch."""
-    patch = config.get("lidar_patch_spatial_hw")
-    if config.get("lidar") is None:
-        if patch is not None:
-            raise ValueError("Cosmos3 multiview lidar_patch_spatial_hw requires a lidar block.")
-        return None
-    if patch is None:
-        return [camera_patch, camera_patch]
-    if not isinstance(patch, list | tuple) or len(patch) != 2 or not all(_positive_int(side) for side in patch):
-        raise ValueError(f"Cosmos3 multiview lidar_patch_spatial_hw must be two positive integers, got {patch!r}.")
-    patch = list(patch)
-    if version == 2 and patch != [camera_patch, camera_patch]:
-        raise ValueError(
-            f"Cosmos3 multiview schema_version=2 requires the LiDAR patch to equal the camera patch "
-            f"{camera_patch}, got {patch}; a different LiDAR patch requires schema_version=3."
-        )
-    return patch
-
-
-def _validated_rig_view_embedding(
-    config: Mapping[str, Any], version: int | None, cameras: Sequence[str]
-) -> dict[str, Any] | None:
-    """Validate the physical rig-ID table: one row per MADS camera ID plus a final LiDAR row."""
-    raw = config.get("rig_view_embedding")
-    if raw is None:
-        return None
-    if version != 3:
-        raise ValueError("Cosmos3 multiview rig_view_embedding requires schema_version=3.")
-    if hasattr(raw, "to_dict"):
-        raw = raw.to_dict()
-    rig = _mapping(raw, "rig_view_embedding")
-    if unknown := set(rig) - {"num_embeddings", "camera_ids", "lidar_id"}:
-        raise ValueError(f"Unknown Cosmos3 multiview rig_view_embedding fields: {sorted(unknown)}.")
-    num_embeddings = rig.get("num_embeddings")
-    if not _positive_int(num_embeddings) or num_embeddings < 2:
-        raise ValueError(
-            f"Cosmos3 multiview rig_view_embedding.num_embeddings must be an integer >= 2, got {num_embeddings!r}."
-        )
-    camera_ids = _mapping(rig.get("camera_ids"), "rig_view_embedding.camera_ids")
-    if set(camera_ids) != set(cameras):
-        raise ValueError(
-            "Cosmos3 multiview rig_view_embedding.camera_ids must name exactly the exported cameras: "
-            f"expected={sorted(cameras)}, got={sorted(camera_ids)}."
-        )
-    for camera, row in camera_ids.items():
-        # Row N-1 is reserved for LiDAR.
-        if isinstance(row, bool) or not isinstance(row, int) or not 0 <= row <= num_embeddings - 2:
-            raise ValueError(
-                f"Cosmos3 multiview rig_view_embedding.camera_ids[{camera!r}] must be an integer in "
-                f"[0, {num_embeddings - 2}], got {row!r}."
-            )
-    lidar_id = rig.get("lidar_id")
-    if isinstance(lidar_id, bool) or not isinstance(lidar_id, int) or lidar_id != num_embeddings - 1:
-        raise ValueError(
-            f"Cosmos3 multiview rig_view_embedding.lidar_id must be the final row {num_embeddings - 1}, "
-            f"got {lidar_id!r}."
-        )
-    return {"num_embeddings": num_embeddings, "camera_ids": dict(camera_ids), "lidar_id": lidar_id}
-
-
-def _validated_multiview_deployment_config(model_config: Any) -> dict[str, Any]:
-    """Validate the flat exported contract before model initialization.
-
-    The backbone is inspected before multiview-specific fields so selecting
-    this pipeline for another Cosmos3 variant reports the actual mismatch.
-    Within a multiview config, the training strategy is inspected first:
-    teacher-forcing artifacts have a different replay/cached-memory runtime
-    contract, so their generic fields must not obscure the targeted rejection.
-    """
-    backbone_type = _tf_config_get(model_config, "backbone_type", None)
-    if backbone_type != COSMOS3_MULTIVIEW_BACKBONE_TYPE:
-        raise ValueError(
-            "Cosmos3MultiviewPipeline requires transformer/config.json "
-            f"backbone_type={COSMOS3_MULTIVIEW_BACKBONE_TYPE!r}, got {backbone_type!r}."
-        )
-
-    raw_config = _tf_config_get(model_config, "multiview", None)
-    if raw_config is None:
-        raise ValueError("Cosmos3 multiview transformer config must contain a 'multiview' object.")
-    if hasattr(raw_config, "to_dict"):
-        raw_config = raw_config.to_dict()
-    config = _mapping(raw_config, "transformer config")
-
-    strategy = _required_deployment_field(config, "causal_training_strategy")
-    if not isinstance(strategy, str):
-        raise TypeError("Cosmos3 multiview causal_training_strategy must be a string.")
-    if strategy in {"teacher_forcing", "teacher_forcing_dcm"}:
-        raise ValueError(
-            f"Cosmos3 multiview {strategy} artifacts require replay/cached-memory inference, "
-            "which vLLM-Omni does not support. Export a bidirectional causal_training_strategy='none' checkpoint."
-        )
-    if strategy != "none":
-        raise ValueError(f"Cosmos3 multiview causal_training_strategy must be 'none' for vLLM-Omni, got {strategy!r}.")
-
-    attention_scope = _required_deployment_field(config, "attention_scope")
-    if not isinstance(attention_scope, str):
-        raise TypeError("Cosmos3 multiview attention_scope must be a string.")
-    if attention_scope not in {"all_views", "same_view", "decomposed"}:
-        raise ValueError(
-            "Cosmos3 multiview attention_scope must be one of ['all_views', 'decomposed', 'same_view']; "
-            f"got {attention_scope!r}."
-        )
-
-    temporal_window = _required_deployment_field(config, "decomposed_temporal_window_seconds")
-    if temporal_window is not None:
-        if isinstance(temporal_window, bool) or not isinstance(temporal_window, int | float):
-            raise TypeError("Cosmos3 multiview decomposed_temporal_window_seconds must be null or a number.")
-        if not math.isfinite(temporal_window) or temporal_window < 0:
-            raise ValueError("Cosmos3 multiview decomposed_temporal_window_seconds must be finite and non-negative.")
-        temporal_window = float(temporal_window)
-
-    for field_name in (
-        "control_attends_sensor",
-        "align_temporal_positions_across_views",
-        "share_vision_temporal_positions",
-    ):
-        if not isinstance(_required_deployment_field(config, field_name), bool):
-            raise TypeError(f"Cosmos3 multiview {field_name} must be boolean.")
-    if not config["share_vision_temporal_positions"]:
-        raise ValueError("Cosmos3 multiview requires share_vision_temporal_positions=true.")
-
-    cameras = _required_deployment_field(config, "cameras")
-    if (
-        not isinstance(cameras, list)
-        or not cameras
-        or not all(isinstance(camera, str) and camera for camera in cameras)
-    ):
-        raise TypeError("Cosmos3 multiview cameras must be a non-empty list of strings.")
-    if len(cameras) != len(set(cameras)):
-        raise ValueError("Cosmos3 multiview cameras must be unique.")
-    max_views = _required_deployment_field(config, "max_views")
-    if isinstance(max_views, bool) or not isinstance(max_views, int):
-        raise TypeError("Cosmos3 multiview max_views must be an integer.")
-    if max_views != len(cameras):
-        raise ValueError(
-            "Cosmos3 multiview max_views must equal the exported camera list length: "
-            f"max_views={max_views}, cameras={len(cameras)}."
-        )
-
-    version = config.get("schema_version")
-    if version is not None and (isinstance(version, bool) or version not in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS):
-        raise ValueError(
-            f"Unsupported Cosmos3 multiview schema_version={version!r}; this vLLM-Omni build reads "
-            f"{list(COSMOS3_MULTIVIEW_SCHEMA_VERSIONS)}."
-        )
-    versioned = version is not None
-    # Unversioned artifacts predate the exporter's field list and keep their
-    # historical pass-through behaviour.
-    if versioned and (unknown := set(config) - COSMOS3_MULTIVIEW_CONTRACT_FIELDS):
-        raise ValueError(
-            f"Unknown Cosmos3 multiview contract fields {sorted(unknown)} (schema_version={version}); "
-            "this vLLM-Omni build cannot honour them."
-        )
-    if version is None and tuple(cameras) != COSMOS3_MADS_CAMERAS:
-        raise ValueError("Unversioned Cosmos3 multiview artifacts require the canonical MADS camera order.")
-    if config.get("lidar") is not None:
-        if not versioned:
-            raise ValueError("Joint artifacts require versioned deployment metadata.")
-        validate_lidar_config(dict(config["lidar"]))
-    camera_patch = int(_tf_config_get(model_config, "latent_patch_size", 2))
-    lidar_patch = _validated_lidar_patch(config, version, camera_patch)
-    rig_view_embedding = _validated_rig_view_embedding(config, version, cameras)
-    if version == 3 and rig_view_embedding is None and lidar_patch in (None, [camera_patch, camera_patch]):
-        raise ValueError(
-            "Cosmos3 multiview schema_version=3 requires rig_view_embedding or a LiDAR patch that differs "
-            "from the camera patch; export version 2 otherwise."
-        )
-    if versioned:
-        for field in ("per_view_captions", "variable_view_count"):
-            if not isinstance(_required_deployment_field(config, field), bool):
-                raise ValueError(f"Cosmos3 multiview {field} must be boolean.")
-        defaults = _mapping(_required_deployment_field(config, "inference_defaults"), "inference_defaults")
-        required_defaults = {
-            "resolution",
-            "fps",
-            "num_steps",
-            "guidance",
-            "shift",
-            "control_guidance",
-            "emphasize_control_in_prompt",
-            "guidance_interval",
-            "control_guidance_interval",
-            "normalize_cfg",
-            "negative_metadata_mode",
-        }
-        if missing := required_defaults - defaults.keys():
-            raise ValueError(f"Incomplete inference_defaults metadata: {sorted(missing)}.")
-        if defaults["resolution"] not in {"480", "720"}:
-            raise ValueError("inference_defaults.resolution must be 480 or 720.")
-        for name in ("fps", "num_steps", "guidance", "shift", "control_guidance"):
-            value = defaults[name]
-            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
-                raise ValueError(f"inference_defaults.{name} must be finite and non-negative.")
-        if defaults["fps"] == 0 or defaults["num_steps"] < 1 or defaults["shift"] == 0:
-            raise ValueError("inference_defaults requires positive FPS, step count and shift.")
-    backend = _required_deployment_field(config, "backend")
-    if not isinstance(backend, str):
-        raise TypeError("Cosmos3 multiview backend must be a string.")
-    validate_multiview_backend(backend)
-    if backend == "maskless":
-        if not versioned:
-            raise ValueError(
-                "Maskless artifacts require a versioned multiview.schema_version; re-export the checkpoint."
-            )
-        validate_maskless_semantics(attention_scope, temporal_window, config["control_attends_sensor"])
-    if not isinstance(config.get("lidar_attends_captions", True), bool):
-        raise TypeError("Cosmos3 multiview lidar_attends_captions must be boolean.")
-    validated = {
-        **config,
-        "decomposed_temporal_window_seconds": temporal_window,
-        "rig_view_embedding": rig_view_embedding,
-    }
-    if lidar_patch is not None:
-        validated["lidar_patch_spatial_hw"] = lidar_patch
-    return validated
-
-
-def _multiview_system_prompt(*, per_view_captions: bool, transfer: bool, joint: bool) -> str:
-    """Select the system prompt the reference inference sends for this request.
-
-    Per-camera-caption checkpoints were trained under AV task prompts: the joint
-    camera+LiDAR prompt for joint requests (reference ``transfer.py``) and the AV
-    multiview prompt for camera-only transfer (reference ``inference.py``).
-    Merged-caption checkpoints keep the generic transfer prompt.
-    """
-    if per_view_captions and joint:
+def _multiview_system_prompt(*, transfer: bool, joint: bool) -> str:
+    """Select the AV task prompt used by reference inference."""
+    if joint:
         return COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT
-    if per_view_captions and transfer:
+    if transfer:
         return COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT
     return COSMOS3_TRANSFER_SYSTEM_PROMPT
 
@@ -636,7 +352,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     """Joint camera/LiDAR and camera-only generation with checkpoint-owned view layouts."""
 
     # The generic engine warmup has no per-camera WSM inputs and uses image
-    # geometry that is invalid for this fixed-layout pipeline. Compile the
+    # geometry that is invalid for this multiview pipeline. Compile the
     # model on its first real request instead of weakening request validation.
     dummy_run_num_frames: ClassVar[int] = 0
     _encoder_modules: ClassVar[list[str]] = []
@@ -662,7 +378,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         multiview_config = _validated_multiview_deployment_config(od_config.tf_model_config)
-        resolved_backend = self._resolve_attention_backend(multiview_config)
+        resolved_backend = self._resolve_attention_backend()
         validate_multiview_parallel_config(
             od_config.parallel_config,
             num_attention_heads=int(_tf_config_get(od_config.tf_model_config, "num_attention_heads", 32)),
@@ -670,10 +386,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             intermediate_size=int(_tf_config_get(od_config.tf_model_config, "intermediate_size", 12288)),
         )
         if od_config.enable_session_state_manager:
-            raise ValueError("Cosmos3 multiview v1 does not support enable_session_state_manager.")
+            raise ValueError("Cosmos3 Multiview-AV does not support enable_session_state_manager.")
         super().__init__(od_config=od_config, prefix=prefix)
         if self.device.type != "cuda":
-            raise ValueError("Cosmos3 multiview v1 requires CUDA for multiview attention.")
+            raise ValueError("Cosmos3 Multiview-AV requires CUDA for multiview attention.")
         if not isinstance(self.transformer, Cosmos3MultiviewVFMTransformer):
             raise ValueError(
                 "Cosmos3MultiviewPipeline requires transformer/config.json backbone_type='cosmos3_multiview'."
@@ -694,64 +410,40 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             )
             self._vae_modules.append("lidar_decoder")
         self.multiview_cameras = tuple(multiview_config["cameras"])
-        self.multiview_attention_scope = multiview_config["attention_scope"]
-        self.multiview_decomposed_temporal_window_seconds = multiview_config["decomposed_temporal_window_seconds"]
-        self.multiview_control_attends_sensor = multiview_config["control_attends_sensor"]
-        self.multiview_align_temporal_positions_across_views = multiview_config["align_temporal_positions_across_views"]
+        self.multiview_cross_view_past_window_seconds = multiview_config["cross_view_past_window_seconds"]
         self.multiview_backend = resolved_backend
 
     @staticmethod
-    def _resolve_attention_backend(multiview_config: Mapping[str, Any]) -> str:
-        """Pick the sparse kernel, but never change checkpoint attention semantics.
-
-        Triton and FA4 implement the same sparse predicate, so a checkpoint that
-        declares Triton runs on FA4 whenever vLLM's bundled FlashAttention
-        resolves to version 4 (SM100/SM110), the same resolution maskless uses.
-        The env override still selects either sparse kernel explicitly. Maskless
-        intentionally counts overlapping branch keys twice and requires a
-        matching checkpoint.
-        """
+    def _resolve_attention_backend() -> str:
+        """Choose FA4 automatically where available, with Triton as the fallback."""
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
-        backend = override if override else _required_deployment_field(multiview_config, "backend")
-        if not isinstance(backend, str):
-            raise TypeError("Cosmos3 multiview attention backend must be a string.")
+        if override is not None:
+            try:
+                return validate_multiview_backend(override)
+            except ValueError as exc:
+                raise ValueError(f"{exc} (from {COSMOS3_MULTIVIEW_BACKEND_ENV}={override!r})") from exc
         try:
-            validate_multiview_backend(backend)
-            source_backend = _required_deployment_field(multiview_config, "backend")
-            if (backend == "maskless") != (source_backend == "maskless"):
-                raise ValueError("Cannot override sparse attention with maskless or maskless with sparse attention.")
-        except ValueError as exc:
-            source = (
-                f"{COSMOS3_MULTIVIEW_BACKEND_ENV}={override!r}" if override else "transformer config multiview.backend"
-            )
-            raise ValueError(f"{exc} (from {source})") from exc
-        if not override and backend == "triton":
             from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
 
-            try:
-                fa_version = resolve_vllm_flash_attn_version()
-            except (ImportError, RuntimeError):  # Not CUDA, or unavailable vLLM FlashAttention: Triton still runs.
-                fa_version = None
-            if fa_version == 4:
-                logger.info(
-                    "Cosmos3 multiview sparse attention defaults to FA4 on this GPU; set %s=triton to keep Triton.",
-                    COSMOS3_MULTIVIEW_BACKEND_ENV,
-                )
+            if resolve_vllm_flash_attn_version() == 4:
                 return "fa4"
-        return backend
+        except (ImportError, RuntimeError):
+            pass  # Non-CUDA hosts or unavailable FlashAttention still resolve to Triton.
+        return "triton"
 
     def _parse_multiview_request(self, sp: Any) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
         extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
         config = getattr(self, "multiview_config", {})
+        reject_multiview_negative_fields(
+            {field: getattr(sp, field, None) for field in COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS},
+            "sampling_params",
+        )
         if extra.get("lidar") is not None and config.get("lidar") is None:
             raise ValueError("Joint camera+LiDAR requests require a complete joint checkpoint.")
         return validate_multiview_request(
             extra,
             self.multiview_cameras,
             media_kind=_media_kind,
-            per_view_captions=config.get("per_view_captions", False),
-            variable_view_count=config.get("schema_version") in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS
-            and config.get("variable_view_count") is True,
         )
 
     @staticmethod
@@ -964,12 +656,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             raise ValueError("Cosmos3MultiviewPipeline supports exactly one prompt per request.")
         prompt_data = req.prompts[0]
         if isinstance(prompt_data, str):
-            prompt = prompt_data
-            request_negative_prompt = None
             request_per_view_negative_prompt = None
         elif isinstance(prompt_data, Mapping):
-            prompt = str(prompt_data.get("prompt", ""))
-            request_negative_prompt = prompt_data.get("negative_prompt")
+            reject_multiview_negative_fields(prompt_data, "prompt")
             request_per_view_negative_prompt = prompt_data.get("per_view_negative_prompt")
         else:
             raise TypeError(f"Unsupported Cosmos3 multiview prompt type: {type(prompt_data).__name__}.")
@@ -1080,12 +769,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 f"control={tuple(control_latents.shape)}, target={tuple(latents.shape)}."
             )
         actual_latent_t = int(latents.shape[2])
-        temporal_position_period = _resolve_temporal_position_period(
-            actual_latent_t,
-            num_views,
-            self.multiview_align_temporal_positions_across_views,
-        )
-
         max_sequence_length = int(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH)
             or COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH
@@ -1145,26 +828,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                         seconds_per_frame=lidar_config["temporal_compression_factor"] / lidar_config["fps"],
                     )
                 )
-        separate_captions = deployment.get("per_view_captions", False)
         layout = MultiviewLayout(
-            attention_scope=self.multiview_attention_scope,  # type: ignore[arg-type]
-            decomposed_temporal_window_seconds=self.multiview_decomposed_temporal_window_seconds,
-            control_attends_sensor=self.multiview_control_attends_sensor,
+            cross_view_past_window_seconds=self.multiview_cross_view_past_window_seconds,
             backend=self.multiview_backend,
-            lidar_attends_captions=deployment.get("lidar_attends_captions", True),
             items=tuple(items),
-            max_und_tokens=DEFAULT_MAX_UND_TOKENS * (num_views if separate_captions else 1),
+            max_und_tokens=DEFAULT_MAX_UND_TOKENS * num_views,
         )
 
-        # Legacy checkpoints use negative_prompt. Separate-view checkpoints
-        # ignore it, matching training's caption dropout, unless the caller
-        # explicitly opts into a shared per-camera negative caption.
-        negative_prompt = request_negative_prompt
-        if negative_prompt is None:
-            negative_prompt = self._get_sp_param(sp, "negative_prompt", None)
-        if negative_prompt is None:
-            negative_prompt = ""
-        negative_prompt = str(negative_prompt)
+        # Match training caption dropout unless an explicit per-camera negative is supplied.
         per_view_negative_prompt = request_per_view_negative_prompt
         if per_view_negative_prompt is None:
             per_view_negative_prompt = self._get_sp_param(sp, "per_view_negative_prompt", None)
@@ -1179,26 +850,16 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             if selected_hints and emphasis
             else None
         )
-        if deployment.get("schema_version") is None and selected_hints == ["wsm"] and emphasis:
-            suffix = COSMOS3_MULTIVIEW_EMPHASIS
         # Per-camera captions carry the sampled-rig and current-camera headers
         # and whole-second durations, exactly as in training and the reference.
-        captions = (
-            format_rig_view_captions([view["prompt"] for view in views], [view["camera_key"] for view in views])
-            if separate_captions
-            else [prompt]
-        )
-        system_prompt = _multiview_system_prompt(
-            per_view_captions=separate_captions,
-            transfer=bool(selected_hints),
-            joint=lidar_request is not None,
-        )
+        captions = format_rig_view_captions([view["prompt"] for view in views], [view["camera_key"] for view in views])
+        system_prompt = _multiview_system_prompt(transfer=bool(selected_hints), joint=lidar_request is not None)
         branches = []
         for caption in captions:
             branches.append(
                 self._format_and_tokenize_prompts(
                     caption,
-                    (per_view_negative_prompt or "") if separate_captions else negative_prompt,
+                    per_view_negative_prompt or "",
                     num_frames,
                     frame_rate,
                     height,
@@ -1210,17 +871,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                     prompt_suffix=suffix,
                     use_duration_template=True,
                     use_resolution_template=True,
-                    negative_metadata_mode=("same" if per_view_negative_prompt else "none")
-                    if separate_captions
-                    else str(
-                        self._get_sp_param(
-                            sp,
-                            "negative_metadata_mode",
-                            defaults.get("negative_metadata_mode", COSMOS3_MULTIVIEW_NEGATIVE_METADATA_MODE),
-                        )
-                    ),
+                    negative_metadata_mode="same" if per_view_negative_prompt else "none",
                     aspect_ratio_override=aspect_ratio,
-                    truncate_duration=separate_captions,
+                    truncate_duration=True,
                 )
             )
 
@@ -1242,8 +895,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         guidance_scale = self._resolve_guidance_scale(sp, defaults.get("guidance", COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE))
         if not math.isfinite(guidance_scale) or guidance_scale < 0:
             raise ValueError("Cosmos3 multiview guidance must be finite and non-negative.")
-        if deployment.get("schema_version") is None:
-            guidance_scale = min(7.0, guidance_scale)
         num_inference_steps = int(
             sp.num_inference_steps or defaults.get("num_steps", COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS)
         )
@@ -1258,17 +909,13 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         # sigma_max (e.g. 80); it is accepted for compatibility and ignored.
         self._set_timesteps(num_inference_steps, device=self.device, shift=flow_shift)
 
-        rig_view_embedding = deployment.get("rig_view_embedding")
+        rig_view_embedding = deployment["rig_view_embedding"]
         # Physical rig IDs, not request positions: subsets and reordered views
         # keep each camera's trained row. LiDAR uses the table's final row.
-        rig_view_ids = (
-            torch.tensor(
-                [rig_view_embedding["camera_ids"][view["camera_key"]] for view in views],
-                dtype=torch.long,
-                device=self.device,
-            )
-            if rig_view_embedding is not None
-            else None
+        rig_view_ids = torch.tensor(
+            [rig_view_embedding["camera_ids"][view["camera_key"]] for view in views],
+            dtype=torch.long,
+            device=self.device,
         )
         video_shape = tuple(int(dim) for dim in latents.shape[2:])
         shared_kwargs = {
@@ -1281,8 +928,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             "noisy_frame_mask": velocity_mask,
             "packed_shapes": tuple(tuple(tensor.shape[1:]) for tensor in targets),
             "lidar_control_latents": lidar_control_latents,
-            "transfer_share_vision_temporal_positions": True,
-            "temporal_position_period": temporal_position_period,
             "multiview_layout": layout,
             "rig_view_ids": rig_view_ids,
             "lidar_condition_frames": lidar_condition_frames,
@@ -1311,7 +956,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             condition_latents=condition_latents,
             generator=generator,
             normalize_cfg=as_bool(self._get_sp_param(sp, "normalize_cfg", defaults.get("normalize_cfg", False)), False),
-            open_guidance_interval=deployment.get("schema_version") in COSMOS3_MULTIVIEW_SCHEMA_VERSIONS,
+            open_guidance_interval=True,
             text_cfg_below_one=True,
         )
         final_targets = unpack_state(packed, shared_kwargs["packed_shapes"])

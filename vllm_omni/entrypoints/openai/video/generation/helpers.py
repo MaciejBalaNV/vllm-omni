@@ -78,6 +78,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_extras.cosmos3 import (
     has_multiview_upload_indexes,
     multiview_lidar_upload_indexes,
+    reject_multiview_negative_fields,
     resolve_multiview_uploads,
 )
 
@@ -1166,6 +1167,7 @@ async def _parse_video_form(
         ):
             raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
         try:
+            reject_multiview_negative_fields({"negative_prompt": request.negative_prompt}, "request")
             # Validate all camera/role mappings and media kinds before creating files.
             # The LiDAR control and the measured LiDAR condition are numeric uploads.
             lidar_indexes = multiview_lidar_upload_indexes(request.extra_params or {})

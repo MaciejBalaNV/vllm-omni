@@ -3,9 +3,8 @@
 ## Summary
 
 - Vendor: NVIDIA
-- Model: Cosmos3 Nano multiview AV exports, e.g.
-  `wsm_transfer_nano_480p_11view_decomposed_attn_16n` (camera-only) and the
-  versioned joint camera+LiDAR exports
+- Model: Cosmos3 Multiview-AV with exact key counting and a 0.4-second
+  cross-view lookback
 - Task: multiview driving video generation (T2V, I2V, video prefix, WSM
   transfer, view completion), optionally joint with numeric LiDAR
 - Mode: offline (`Omni`) and online (`vllm serve --omni`, `/v1/videos`)
@@ -18,8 +17,8 @@
 Use it to generate up to eleven synchronized MADS camera views, and optionally a
 LiDAR range sequence, in one bidirectional denoising pass. The model reuses the
 Cosmos3 Nano architecture and weights, adds camera-major VAE processing and a
-weight-free sparse attention mask, and, for versioned exports, a few small
-projection and embedding tables (see [Checkpoint](#checkpoint)).
+sparse attention mask, required rig embeddings and optional LiDAR
+projection tables (see [Checkpoint](#checkpoint)).
 
 ## Supported model contract
 
@@ -37,20 +36,16 @@ role (control or vision), use all images or all videos.
 
 ### Cameras
 
-| Checkpoint contract | Camera selection |
-| --- | --- |
-| Unversioned, or versioned with `variable_view_count: false` | All exported cameras, in exported order |
-| Versioned (`schema_version` 2 or 3) with `variable_view_count: true` | Any non-empty subset of the exported cameras, in any order |
-
-Request order sets caption association and output order. Version-3
-checkpoints with `rig_view_embedding` embed each camera by its physical rig ID,
-so subsets and reordered views keep the trained per-camera identity.
+Requests may select any non-empty subset of the exported `cameras`, in any order.
+Request order sets caption association and output order. Every camera uses its
+physical ID from the required `rig_view_embedding` table, so reordered subsets
+retain each camera's trained identity.
 
 ### Inputs
 
 | Input | Format and limits |
 | --- | --- |
-| Prompt | One shared prompt. Checkpoints with `per_view_captions: true` also require a plain-text `prompt` per view; runtime camera labels and metadata sentences are rejected. |
+| Prompt | A plain-text `prompt` is required per view; runtime camera labels and metadata sentences are rejected. |
 | Camera control / vision | Local paths (offline, or server-local over HTTP) or multipart uploads. MP4, MOV, MKV, WebM, or BMP, GIF, JPEG, PNG, TIFF, WebP. |
 | LiDAR control | `lidar.control_path`: a `.safetensors` file holding one float32 tensor `frames` of shape `[3, T, 128, 1800]` (range in metres, intensity and validity in `[0, 1]`) |
 | LiDAR condition (optional) | `lidar.condition_path`, same format; `lidar.num_conditional_sweeps` (default 1) measured sweeps condition the start of the generated LiDAR |
@@ -65,9 +60,9 @@ so subsets and reordered views keep the trained per-camera identity.
 | Geometry | `resolution` `"480"` or `"720"` and `aspect_ratio` (see [Resolution and aspect ratio](#resolution-and-aspect-ratio)) |
 | LiDAR (joint checkpoints, opt-in) | `lidar.return_output: true` returns float32 `[3, T, 128, 1800]` sweeps at the checkpoint's LiDAR rate, starting at the camera clip's time origin |
 
-Sampling defaults come from the checkpoint's `inference_defaults` for versioned
-exports. Unversioned exports use the Cosmos3 video defaults (35 steps,
-guidance 6.0, flow shift 10, 480p) and cap guidance at 7.0.
+Sampling defaults come from the checkpoint's required `inference_defaults`.
+The current export uses 35 steps, guidance 6.0, flow shift 10 and 480p.
+Guidance intervals use open timestep bounds, as in reference inference.
 
 ## References
 
@@ -80,33 +75,21 @@ guidance 6.0, flow shift 10, 480p) and cap guidance at 7.0.
 
 ## Checkpoint
 
-Export with the normal Cosmos3 EMA-to-Diffusers conversion, then set
-`model_index.json` to:
+Export the checkpoint through DCP → HF → Diffusers using the imaginaire4
+multiview exporter. Conversion writes `Cosmos3MultiviewPipeline` into
+`model_index.json` and retains `backbone_type="cosmos3_multiview"`.
+Existing deployment artifacts require re-export into fresh directories;
+checkpoint tensor names and weights remain unchanged.
 
-```json
-{"_class_name": "Cosmos3MultiviewPipeline"}
-```
-
-`transformer/config.json` keeps all Cosmos3 Nano fields and adds
-`"backbone_type": "cosmos3_multiview"` plus a `multiview` object. The
-imaginaire4 exporter writes versioned objects (`schema_version` 2 or 3) that
-also carry `per_view_captions`, `variable_view_count`, `inference_defaults`
-and, for joint checkpoints, `lidar`. A versioned object with an unknown field is
-rejected at load time. The minimal unversioned form for the camera-only WSM
-checkpoint is:
+There is one strict `multiview` object. Missing required fields
+and unknown fields are rejected, including old version markers, backend
+settings, attention switches and caption aliases. A camera-only deployment
+example with the full 11-camera rig is:
 
 ```json
 {
   "backbone_type": "cosmos3_multiview",
   "multiview": {
-    "causal_training_strategy": "none",
-    "attention_scope": "decomposed",
-    "decomposed_temporal_window_seconds": null,
-    "control_attends_sensor": false,
-    "align_temporal_positions_across_views": false,
-    "backend": "triton",
-    "max_views": 11,
-    "share_vision_temporal_positions": true,
     "cameras": [
       "camera_front_wide_120fov",
       "camera_cross_right_120fov",
@@ -119,47 +102,83 @@ checkpoint is:
       "camera_left_fisheye_200fov",
       "camera_right_fisheye_200fov",
       "camera_rear_fisheye_200fov"
-    ]
+    ],
+    "cross_view_past_window_seconds": 0.4,
+    "rig_view_embedding": {
+      "num_embeddings": 12,
+      "camera_ids": {
+        "camera_front_wide_120fov": 0,
+        "camera_cross_right_120fov": 1,
+        "camera_rear_right_70fov": 2,
+        "camera_rear_tele_30fov": 3,
+        "camera_rear_left_70fov": 4,
+        "camera_cross_left_120fov": 5,
+        "camera_front_tele_30fov": 6,
+        "camera_front_fisheye_200fov": 7,
+        "camera_left_fisheye_200fov": 8,
+        "camera_right_fisheye_200fov": 9,
+        "camera_rear_fisheye_200fov": 10
+      },
+      "lidar_id": 11
+    },
+    "inference_defaults": {
+      "resolution": "480",
+      "fps": 30.0,
+      "num_steps": 35,
+      "guidance": 6.0,
+      "shift": 10.0,
+      "control_guidance": 1.0,
+      "emphasize_control_in_prompt": true,
+      "guidance_interval": null,
+      "control_guidance_interval": null,
+      "normalize_cfg": false
+    }
   }
 }
 ```
 
-Unversioned artifacts require the canonical camera order above and cannot be
-joint or maskless.
+The exported `cameras` list describes the checkpoint's supported rig. Requests
+may select and reorder subsets; `camera_ids` retains each camera's physical ID.
+
+Joint exports additionally require complete `lidar` tokenizer metadata and
+`lidar_latent_patch_size_hw`, the transformer's `[height, width]` patches over
+LiDAR latents. The current checkpoint uses `[1, 1]`, independently of the camera
+patch. The maximum camera count is the length of `cameras`.
+
+Attention is intrinsic to Cosmos3 Multiview-AV: same-view target and control
+attention spans the full clip, in both temporal directions. Cross-view target
+keys are visible in `[query_time - cross_view_past_window_seconds, query_time]`,
+including both boundaries with `1e-4` tolerance. Targets and controls read their
+own camera caption; LiDAR reads all camera captions. Cross-view controls remain
+isolated. The architecture uses aligned temporal positions and counts each key
+exactly once.
 
 Weights beyond Cosmos3 Nano, checked at load time:
 
 | Contract | Extra transformer weights | Extra directory |
 | --- | --- | --- |
-| Unversioned / version 2, camera-only | None | None |
-| `rig_view_embedding` declared (version 3) | `rig_view_embed.weight` | None |
+| Every Multiview-AV checkpoint | `rig_view_embed.weight` | None |
 | Joint (`multiview.lidar` present) | `lidar_proj_in.{weight,bias}`, `lidar_proj_out.{weight,bias}` | `lidar_vae/` (`config.json`, `diffusion_pytorch_model.safetensors`) |
 
-The scheduler directory must describe the regular FlowUniPC scheduler.
+The LiDAR component includes the full VAE, decoder and latent statistics.
+Its supported architecture is validated through tokenizer fields; it carries
+no redundant `version` marker. The scheduler directory must describe the
+regular FlowUniPC scheduler. Deployment defaults omit the ignored `sigma_max`
+and inapplicable `negative_metadata_mode` settings.
 
 ### Sparse attention backend
 
-`multiview.backend` selects how the visibility mask is executed:
+Kernels are selected at runtime and implement the same visibility rules:
 
-| `backend` | Kernel | Sparse block `(q, kv)` | Requirements |
-| --- | --- | --- | --- |
-| `"triton"` | PyTorch FlexAttention, Triton template | 64 × 64 | Any CUDA GPU |
-| `"fa4"` | vLLM's bundled FlashAttention-4 CuTe (`vllm.vllm_flash_attn.cute`) | 256 × 128 | CUDA build of vLLM; SM100/SM110 (Blackwell), or explicit SM90 (Hopper) pending GPU verification |
-| `"maskless"` | Dense FlashAttention over per-branch key folds | — | Versioned checkpoint trained with maskless semantics (the v2 AV model) |
+| Kernel | Sparse block `(q, kv)` | Requirements |
+| --- | --- | --- |
+| Triton / PyTorch FlexAttention | 64 × 64 | Any CUDA GPU |
+| vLLM's bundled FlashAttention-4 CuTe | 256 × 128 | CUDA build of vLLM; SM100/SM110 (Blackwell), or explicit SM90 (Hopper) pending GPU verification |
 
-Triton and FA4 implement the same visibility predicate and differ in block
-geometry and rounding. For a checkpoint declaring `"triton"`, Cosmos3 selects
-sparse FA4 automatically when its shared version resolver returns FA4. This
-happens on SM100/SM110 when vLLM reports FA4 support. On Hopper (SM90), the
-resolver prefers FA3, or FA2 when FA3 is unavailable, so the sparse checkpoint
-stays on Triton. If the version resolver raises an import or availability error,
-automatic selection also keeps Triton. Maskless uses the resolved FlashAttention
-version for its dense kernels; overlapping branch keys count twice, so it
-requires a matching checkpoint.
-
-Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin a sparse backend
-without editing the checkpoint. An unknown name, or a switch to or from
-`maskless`, fails at load time. To request FA4 explicitly on Hopper, set this
+Cosmos3 automatically selects FA4 when the shared vLLM version resolver returns
+version 4; otherwise it uses Triton, including when detection is unavailable.
+Set `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton|fa4` to pin the implementation.
+`maskless` and unknown overrides fail at load time. To request FA4 on Hopper, set this
 before starting the offline process or server:
 
 ```bash
@@ -211,7 +230,6 @@ Add a top-level `lidar` object for joint requests:
 python examples/offline_inference/multiview_video/cosmos3_multiview.py \
   --model /models/cosmos3-multiview-av \
   --input /data/mv_i2v_wsm.json \
-  --negative-prompt-json recipes/cosmos3/negative_prompt.json \
   --output-dir outputs/mv_i2v_wsm \
   --seed 42 --fps 30 --num-frames 200
 ```
@@ -219,13 +237,11 @@ python examples/offline_inference/multiview_video/cosmos3_multiview.py \
 The script writes `vision_viewNN_<camera>.mp4` per camera (plus
 `combined_views.mp4` with `--combine-views`), `lidar.safetensors` when LiDAR
 output was requested, and `sample_outputs.json` with the resolved geometry and
-metadata. `--negative-prompt-json` applies the required serialization; a
-`negative_prompt` string in the input wins over it. `--fps`, `--num-frames`,
-`--resolution` and `--aspect-ratio` override every record. Records may use
-`guidance`, `num_steps` and `shift` as aliases for `guidance_scale`,
-`num_inference_steps` and `flow_shift`; the vLLM-Omni names win when both are
-present. The negative prompt carries the same duration/FPS and resolution
-sentences as the positive prompt; set `negative_metadata_mode` to change that.
+metadata. `--fps`, `--num-frames`, `--resolution` and `--aspect-ratio`
+override every record. Records may use `guidance`, `num_steps` and `shift` as
+aliases for `guidance_scale`, `num_inference_steps` and `flow_shift`; the
+vLLM-Omni names win when both are present. Records may set
+`per_view_negative_prompt`; see [Negative captions](#negative-captions).
 
 Camera files are encoded concurrently by default (at least two, at most four
 FFmpeg threads per camera, bounded by the CPU affinity mask);
@@ -301,6 +317,22 @@ keys/values are marked dynamic in their sequence dimension. New prompts and the
 two CFG branches therefore do not recompile the GEN layers. The GEN layers
 themselves are compiled statically and specialize per output geometry.
 
+## Negative captions
+
+Every camera has its own caption, and so does its unconditional (CFG) branch.
+By default the unconditional caption is empty, as with training's caption
+dropout. Set `per_view_negative_prompt` at the top level of `extra_args` or
+`extra_params` (or in the prompt dict passed to `Omni.generate`) to apply one
+negative caption to every camera. It carries the same duration/FPS and resolution sentences as the
+positive caption.
+
+There is no shared negative prompt. Requests that set `negative_prompt` (form
+field, prompt object, `extra_args` or `extra_params`) or `negative_metadata_mode`
+are rejected rather than ignored. `/v1/videos` requests with uploaded
+references fail with HTTP 400 before a job is created; other requests fail when
+generation starts. The example scripts reject both fields in their input
+records.
+
 ## Safety guardrails
 
 As for the other Cosmos3 models, safety guardrails are **on by default**
@@ -327,16 +359,26 @@ Run the CPU contract tests:
 pytest -q \
   tests/diffusion/models/cosmos3/test_cosmos3_pipeline.py \
   tests/diffusion/models/cosmos3/test_cosmos3_transformer.py \
+  tests/diffusion/models/cosmos3/test_multiview_config.py \
+  tests/diffusion/models/cosmos3/test_multiview_attention.py \
   -k "multiview or lidar or rig"
 ```
 
-These cover checkpoint contract validation, camera selection, per-camera
-captions, LiDAR admission and conditioning, rig-view embedding, guardrail hooks,
-and FA4 backend selection, mask metadata validation and full-graph custom-op
-capture with mocked kernels. The FA4 tests do not verify CUDA kernel
-correctness or performance. The dedicated GPU attention, LiDAR decoder,
-parallelism, recompilation and HTTP upload suites are not in the tree; run a
-CUDA generation to cover those paths.
+These cover strict checkpoint metadata, single-camera and reordered subsets,
+per-camera captions and negatives, LiDAR conditioning, required rig weights,
+and kernel selection. The attention suite compares both runtime implementations
+to an independent dense reference with mixed sensor clocks, inclusive window
+bounds, unrestricted same-view attention, controls, captions and padding.
+CUDA tests include Triton's compiled Flex kernel and FA4 full-graph execution;
+CPU execution skips these numerical GPU checks.
+
+Run the existing distributed attention suite on the GPU deployment topology
+as well. For export and complete LiDAR VAE copying, run in imaginaire4:
+
+```bash
+cd packages/cosmos3
+pytest -q cosmos3/scripts/multiview_export_test.py cosmos3/scripts/lidar_vae_export_test.py
+```
 
 For checkpoint validation, generate 29-frame clips in WSM-only and
 vision-conditioned modes for all five ratios at both resolutions with the same

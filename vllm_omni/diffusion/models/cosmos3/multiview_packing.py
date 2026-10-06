@@ -87,7 +87,6 @@ def packed_position_ids(
     camera_compression: int,
     lidar_compression: int = 1,
     enable_fps_modulation: bool = True,
-    align_views: bool = True,
 ) -> tuple[torch.Tensor, int | float]:
     """Place sensor streams at a shared origin and return the next sample cursor.
 
@@ -109,7 +108,7 @@ def packed_position_ids(
             temporal_compression_factor=compression,
             base_temporal_compression_factor=camera_compression,
             enable_fps_modulation=enable_fps_modulation,
-            temporal_position_period=item.token_shape[0] // item.num_views if align_views else None,
+            temporal_position_period=item.token_shape[0] // item.num_views,
         )
         positions.append(positions_i)
         end = max(end, endpoint)

@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 from torch import nn
 
+from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_contract
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
@@ -3342,135 +3343,21 @@ class TestForwardRouting:
             pipeline.forward(make_request_batch(prompt, sampling_params))
 
 
-# -- Multiview deployment contract (schema versions 2 and 3) -------------------
-
-
-def _multiview_lidar_contract(chunk: int = 9, context: int | None = 9) -> dict[str, Any]:
-    return {
-        "version": "1.2",
-        "dtype": "float32",
-        "sample_posterior": False,
-        "apply_validity_mask": True,
-        "fps": 10.0,
-        "latent_channels": 128,
-        "temporal_compression_factor": 1,
-        "spatial_compression": [16, 16],
-        "network_config": {
-            "resolution": [128, 1808],
-            "patch_size": [2, 2],
-            "depths": [1, 1, 1, 1],
-            "z_dim": 128,
-            "in_channels": 3,
-            "temporal_downsample": [False, False, False],
-        },
-        "range_projection": {
-            "semantic_width": 1800,
-            "model_width": 1808,
-            "native_height": 128,
-            "model_width_transform": "circular_pad",
-            "intensity_encoding": "unit",
-            "min_range_m": 0.0,
-            "max_range_m": 100.0,
-        },
-        "streaming_chunk_frames": chunk,
-        "streaming_context_frames": context,
-    }
-
-
-def _multiview_contract(model: str) -> dict[str, Any]:
-    """Contracts exactly as the fixed imaginaire4 exporter writes them for the three AV models."""
-    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
-
-    contract = {
-        "schema_version": 2,
-        "per_view_captions": True,
-        "variable_view_count": True,
-        "inference_defaults": {
-            "resolution": "480",
-            "fps": 30.0,
-            "num_steps": 35,
-            "guidance": 6.0,
-            "shift": 10.0,
-            "control_guidance": 1.0,
-            "emphasize_control_in_prompt": True,
-            "guidance_interval": None,
-            "control_guidance_interval": None,
-            "sigma_max": 80.0,
-            "normalize_cfg": False,
-            "negative_metadata_mode": "none",
-        },
-        "causal_training_strategy": "none",
-        "attention_scope": "decomposed",
-        "backend": "triton",
-        "cameras": list(COSMOS3_MADS_CAMERAS),
-        "max_views": len(COSMOS3_MADS_CAMERAS),
-        "share_vision_temporal_positions": True,
-        "decomposed_temporal_window_seconds": 0.4,
-        "control_attends_sensor": True,
-        "lidar_attends_captions": True,
-        "align_temporal_positions_across_views": True,
-        "lidar": _multiview_lidar_contract(),
-        "lidar_patch_spatial_hw": [2, 2],
-    }
-    if model == "baseline":
-        return contract
-    contract.update(
-        schema_version=3,
-        lidar=_multiview_lidar_contract(chunk=20, context=21),
-        lidar_patch_spatial_hw=[1, 1],
-        rig_view_embedding={
-            "num_embeddings": 12,
-            "camera_ids": {camera: index for index, camera in enumerate(COSMOS3_MADS_CAMERAS)},
-            "lidar_id": 11,
-        },
-    )
-    if model == "v2":  # overlapping maskless fold, no window
-        contract.update(backend="maskless", decomposed_temporal_window_seconds=None)
-    else:
-        assert model == "v3"  # exact-count maskless with a window is the Flex windowed mask
-    return contract
-
-
-def _validate_multiview_contract(contract: dict[str, Any], *, camera_patch: int = 2) -> dict[str, Any]:
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
-        _validated_multiview_deployment_config,
-    )
-
-    return _validated_multiview_deployment_config(
-        {"backbone_type": "cosmos3_multiview", "latent_patch_size": camera_patch, "multiview": contract}
-    )
-
-
-@pytest.mark.parametrize("model", ["baseline", "v2", "v3"])
-def test_multiview_contract_accepts_exported_av_models(model: str) -> None:
-    validated = _validate_multiview_contract(_multiview_contract(model))
-
-    if model == "baseline":
-        assert validated["schema_version"] == 2
-        assert validated["lidar_patch_spatial_hw"] == [2, 2]
-        assert validated["rig_view_embedding"] is None
-    else:
-        assert validated["schema_version"] == 3
-        assert validated["lidar_patch_spatial_hw"] == [1, 1]
-        assert validated["rig_view_embedding"]["lidar_id"] == 11
-        assert validated["rig_view_embedding"]["camera_ids"]["camera_front_tele_30fov"] == 6
-    assert validated["backend"] == ("maskless" if model == "v2" else "triton")
+# -- Cosmos3 Multiview-AV deployment contract ---------------------------------
 
 
 @pytest.mark.parametrize(
-    ("source", "override", "fa_version", "expected"),
+    ("override", "fa_version", "expected"),
     [
-        ("triton", None, 4, "fa4"),
-        ("triton", None, 3, "triton"),
-        ("triton", None, None, "triton"),
-        ("triton", "triton", 4, "triton"),
-        ("triton", "fa4", 3, "fa4"),
-        ("fa4", None, 3, "fa4"),
-        ("maskless", None, 4, "maskless"),
+        (None, 4, "fa4"),
+        (None, 3, "triton"),
+        (None, None, "triton"),
+        ("triton", 4, "triton"),
+        ("fa4", 3, "fa4"),
     ],
 )
 def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
-    monkeypatch: pytest.MonkeyPatch, source: str, override: str | None, fa_version: int | None, expected: str
+    monkeypatch: pytest.MonkeyPatch, override: str | None, fa_version: int | None, expected: str
 ) -> None:
     from vllm_omni.diffusion.attention.backends.utils import fa
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
@@ -3489,7 +3376,7 @@ def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
         monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, override)
     monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", resolve_vllm_flash_attn_version)
 
-    assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": source}) == expected
+    assert Cosmos3MultiviewPipeline._resolve_attention_backend() == expected
 
 
 @pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
@@ -3509,7 +3396,7 @@ def test_multiview_sparse_backend_keeps_triton_when_flash_attn_import_fails(
         Mock(side_effect=error_type("CUDA FlashAttention extensions unavailable")),
     )
 
-    assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": "triton"}) == "triton"
+    assert Cosmos3MultiviewPipeline._resolve_attention_backend() == "triton"
 
 
 def test_multiview_fa4_loads_vllm_bundled_flash_attn(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3613,120 +3500,32 @@ def test_multiview_fa4_rejects_invalid_mask_before_launch(monkeypatch: pytest.Mo
     launch.assert_not_called()
 
 
-def test_multiview_contract_defaults_legacy_lidar_patch_to_camera_patch() -> None:
-    contract = _multiview_contract("baseline")
-    del contract["lidar_patch_spatial_hw"]
-    # Exporters from 2026-09 wrote this field before per_view_captions replaced it.
-    contract["separate_view_text_tokenization"] = True
+@pytest.mark.parametrize("override", ["maskless", "unknown", ""])
+def test_multiview_backend_rejects_invalid_overrides(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKEND_ENV,
+        Cosmos3MultiviewPipeline,
+    )
 
-    assert _validate_multiview_contract(contract)["lidar_patch_spatial_hw"] == [2, 2]
-
-
-def test_multiview_contract_keeps_unversioned_pass_through() -> None:
-    contract = _multiview_contract("baseline")
-    for field in ("schema_version", "lidar", "lidar_patch_spatial_hw"):
-        del contract[field]
-    contract["legacy_only_field"] = 1
-
-    assert _validate_multiview_contract(contract)["legacy_only_field"] == 1
+    monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, override)
+    with pytest.raises(ValueError, match=COSMOS3_MULTIVIEW_BACKEND_ENV):
+        Cosmos3MultiviewPipeline._resolve_attention_backend()
 
 
-def _set(**values):
-    return lambda contract: contract.update(values)
-
-
-def _set_rig(**values):
-    return lambda contract: contract["rig_view_embedding"].update(values)
-
-
-def _drop_camera_id(contract: dict[str, Any]) -> None:
-    contract["rig_view_embedding"]["camera_ids"].pop("camera_rear_fisheye_200fov")
-
-
-@pytest.mark.parametrize(
-    ("model", "mutate", "match"),
-    [
-        ("v3", _set(schema_version=4), "Unsupported Cosmos3 multiview schema_version=4"),
-        ("baseline", _set(schema_version=True), "Unsupported Cosmos3 multiview schema_version=True"),
-        ("baseline", _set(future_field=1), r"Unknown Cosmos3 multiview contract fields \['future_field'\]"),
-        ("v3", _set(future_field=1), r"Unknown Cosmos3 multiview contract fields \['future_field'\]"),
-        # Version-2 readers would silently drop these; they need version 3.
-        ("v3", _set(schema_version=2, lidar_patch_spatial_hw=[2, 2]), "rig_view_embedding requires schema_version=3"),
-        ("baseline", _set(lidar_patch_spatial_hw=[1, 1]), "requires schema_version=3"),
-        (
-            "v3",
-            _set(rig_view_embedding=None, lidar_patch_spatial_hw=[2, 2]),
-            "schema_version=3 requires rig_view_embedding or a LiDAR patch",
-        ),
-        ("baseline", _set(schema_version=3), "schema_version=3 requires rig_view_embedding or a LiDAR patch"),
-        ("v3", _set(lidar_patch_spatial_hw=[1]), "lidar_patch_spatial_hw must be two positive integers"),
-        ("v3", _set(lidar_patch_spatial_hw=[1, 0]), "lidar_patch_spatial_hw must be two positive integers"),
-        ("v3", _set(lidar_patch_spatial_hw=[True, 1]), "lidar_patch_spatial_hw must be two positive integers"),
-        ("v3", _set(lidar_patch_spatial_hw=1), "lidar_patch_spatial_hw must be two positive integers"),
-        ("v3", _set(lidar=None), "lidar_patch_spatial_hw requires a lidar block"),
-        ("v3", _set_rig(num_embeddings=1), "num_embeddings must be an integer >= 2"),
-        ("v3", _set_rig(num_embeddings=12.0), "num_embeddings must be an integer >= 2"),
-        ("v3", _drop_camera_id, "camera_ids must name exactly the exported cameras"),
-        ("v3", _set_rig(camera_ids=None), "camera_ids must be an object"),
-        ("v3", lambda c: c["rig_view_embedding"]["camera_ids"].update(camera_front_wide_120fov=11), r"in \[0, 10\]"),
-        ("v3", lambda c: c["rig_view_embedding"]["camera_ids"].update(camera_front_wide_120fov=-1), r"in \[0, 10\]"),
-        ("v3", lambda c: c["rig_view_embedding"]["camera_ids"].update(camera_front_wide_120fov=True), r"in \[0, 10\]"),
-        ("v3", _set_rig(lidar_id=10), "lidar_id must be the final row 11"),
-        ("v3", _set_rig(lidar_id=11.0), "lidar_id must be the final row 11"),
-        ("v3", _set_rig(extra=1), "Unknown Cosmos3 multiview rig_view_embedding fields"),
-        ("v3", _set(rig_view_embedding=[1]), "rig_view_embedding must be an object"),
-    ],
-)
-def test_multiview_contract_rejects_invalid_versioned_metadata(model: str, mutate, match: str) -> None:
-    contract = _multiview_contract(model)
-    mutate(contract)
-
-    with pytest.raises((TypeError, ValueError), match=match):
-        _validate_multiview_contract(contract)
-
-
-def test_multiview_contract_v3_accepts_lidar_patch_without_rig_embedding() -> None:
-    contract = _multiview_contract("v3")
-    del contract["rig_view_embedding"]
-
-    validated = _validate_multiview_contract(contract)
-
-    assert validated["lidar_patch_spatial_hw"] == [1, 1]
-    assert validated["rig_view_embedding"] is None
-
-
-def test_multiview_contract_v3_accepts_camera_only_rig_embedding() -> None:
-    contract = _multiview_contract("v3")
-    for field in ("lidar", "lidar_patch_spatial_hw"):
-        del contract[field]
-
-    validated = _validate_multiview_contract(contract)
-
-    assert "lidar_patch_spatial_hw" not in validated
-    assert validated["rig_view_embedding"]["num_embeddings"] == 12
-
-
-@pytest.mark.parametrize(("version", "accepted"), [(2, True), (3, True), (None, False)])
-def test_multiview_variable_view_count_applies_to_versioned_contracts(version: int | None, accepted: bool) -> None:
+@pytest.mark.parametrize("count", [1, 2])
+def test_multiview_accepts_single_camera_and_reordered_subsets(count: int) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
     from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
 
     pipeline = object.__new__(Cosmos3MultiviewPipeline)
     pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
-    pipeline.multiview_config = {"schema_version": version, "per_view_captions": True, "variable_view_count": True}
-    # A reordered subset: physical rig IDs, not request positions, identify cameras.
+    pipeline.multiview_config = multiview_contract()
     views = [
         {"camera_key": "camera_front_tele_30fov", "prompt": "A truck merges."},
         {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."},
-    ]
-    sp = SimpleNamespace(extra_args={"multiview": {"views": views}})
-
-    if accepted:
-        _, parsed = pipeline._parse_multiview_request(sp)
-        assert [view["camera_key"] for view in parsed] == ["camera_front_tele_30fov", "camera_front_wide_120fov"]
-    else:
-        with pytest.raises(ValueError, match="full exported camera order"):
-            pipeline._parse_multiview_request(sp)
+    ][:count]
+    _, parsed = pipeline._parse_multiview_request(SimpleNamespace(extra_args={"multiview": {"views": views}}))
+    assert parsed == views
 
 
 # -- Multiview per-camera caption parity with imaginaire4 ---------------------
@@ -3796,18 +3595,14 @@ def test_metadata_duration_truncates_to_whole_seconds_for_per_view_captions(trun
 
 
 @pytest.mark.parametrize(
-    ("per_view_captions", "transfer", "joint", "expected"),
+    ("transfer", "joint", "expected"),
     [
-        (True, True, True, "joint"),
-        (True, True, False, "multiview"),
-        (False, True, True, "transfer"),
-        (False, True, False, "transfer"),
-        (True, False, False, "transfer"),
+        (True, True, "joint"),
+        (True, False, "multiview"),
+        (False, False, "transfer"),
     ],
 )
-def test_multiview_system_prompt_matches_reference_selection(
-    per_view_captions: bool, transfer: bool, joint: bool, expected: str
-) -> None:
+def test_multiview_system_prompt_matches_reference_selection(transfer: bool, joint: bool, expected: str) -> None:
     from vllm_omni.diffusion.models.cosmos3.multiview_prompts import (
         COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
         COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
@@ -3820,7 +3615,7 @@ def test_multiview_system_prompt_matches_reference_selection(
         "multiview": COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
         "transfer": COSMOS3_TRANSFER_SYSTEM_PROMPT,
     }
-    actual = _multiview_system_prompt(per_view_captions=per_view_captions, transfer=transfer, joint=joint)
+    actual = _multiview_system_prompt(transfer=transfer, joint=joint)
 
     assert actual == prompts[expected]
 
@@ -3828,34 +3623,30 @@ def test_multiview_system_prompt_matches_reference_selection(
 # -- Explicit per-view negative captions --------------------------------------
 
 
-@pytest.mark.parametrize("model", ["baseline", "v2", "v3"])
 @pytest.mark.parametrize(
-    ("source", "explicit", "separate", "expected"),
+    ("source", "explicit", "expected"),
     [
-        ("extra_args", "Textures crawl.", True, "Textures crawl."),
-        ("prompt", "Textures crawl.", True, "Textures crawl."),
-        ("attribute", "Textures crawl.", True, "Textures crawl."),
-        ("prompt", "", True, ""),
-        ("extra_args", "", True, ""),
-        ("extra_args", None, True, ""),
-        ("extra_args", "Textures crawl.", False, "Legacy negative."),
+        ("extra_args", "Textures crawl.", "Textures crawl."),
+        ("prompt", "Textures crawl.", "Textures crawl."),
+        ("attribute", "Textures crawl.", "Textures crawl."),
+        ("prompt", "", ""),
+        ("extra_args", "", ""),
+        ("extra_args", None, ""),
     ],
 )
+@pytest.mark.parametrize("joint", [False, True])
 def test_multiview_forward_per_view_negative_captions(
-    make_cosmos3_pipeline, model, source, explicit, separate, expected
+    make_cosmos3_pipeline, monkeypatch, source, explicit, expected, joint: bool
 ) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
     from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
 
     pipeline = make_cosmos3_pipeline()
     pipeline.__class__ = Cosmos3MultiviewPipeline
-    pipeline.multiview_config = _multiview_contract(model)
-    pipeline.multiview_config["per_view_captions"] = separate
+    pipeline.multiview_config = multiview_contract()
     pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
-    pipeline.multiview_align_temporal_positions_across_views = True
-    pipeline.multiview_attention_scope = "decomposed"
-    pipeline.multiview_decomposed_temporal_window_seconds = None
-    pipeline.multiview_control_attends_sensor = True
+    pipeline.multiview_cross_view_past_window_seconds = 0.4
     pipeline.multiview_backend = "triton"
     pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
     pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
@@ -3879,8 +3670,30 @@ def test_multiview_forward_per_view_negative_captions(
         {"camera_key": COSMOS3_MADS_CAMERAS[0], "prompt": "A car drives.", "control_path": "front.mp4"},
     ]
     extra = {"multiview": {"views": views}, "wsm": {}, "aspect_ratio": "16,9"}
-    prompt = {"prompt": "Driving.", "negative_prompt": "Legacy negative."}
-    sp = make_sampling_params(num_frames=297, num_inference_steps=1, latents=None, extra_args=extra)
+    if joint:
+        extra["lidar"] = {"control_path": "lidar.safetensors", "return_output": True}
+        monkeypatch.setattr(
+            pipeline_module, "load_lidar_frames", lambda path, num_sweeps: torch.zeros(3, num_sweeps, 1, 3)
+        )
+        pipeline.transformer.lidar_patch_hw = (1, 1)
+        pipeline.lidar_encoder = lambda frames: torch.zeros(1, 128, frames.shape[1], 1, 3)
+
+        class Decoder:
+            config = pipeline.multiview_config["lidar"]
+
+            def __call__(self, latents):
+                return torch.zeros(1, 3, latents.shape[2], 1, 3)
+
+        pipeline.lidar_decoder = Decoder()
+    prompt = {"prompt": "Driving."}
+    sp = make_sampling_params(
+        num_frames=297,
+        num_inference_steps=1,
+        latents=None,
+        extra_args=extra,
+        guidance_scale=9.0,
+        guidance_scale_provided=True,
+    )
     if explicit is not None:
         if source == "prompt":
             prompt["per_view_negative_prompt"] = explicit
@@ -3889,20 +3702,27 @@ def test_multiview_forward_per_view_negative_captions(
             sp.per_view_negative_prompt = explicit
         else:
             extra["per_view_negative_prompt"] = explicit
-    pipeline.forward(make_request_batch(prompt, sp))
+    output = pipeline.forward(make_request_batch(prompt, sp))
 
     # Capture the real formatter's input to the tokenizer, and the separate
     # unconditional segments delivered to CFG, rather than just its options.
     negatives = tokenizations[1::2]
-    assert len(negatives) == (2 if separate else 1)
+    assert len(negatives) == 2
     formatted = (
         f"{expected} The video is 9.0 seconds long and is of 30 FPS. This video is of 480x832 resolution."
-        if separate and expected
+        if expected
         else expected
     )
     assert all(call["text"] == formatted for call in negatives)
     assert all(call["system_prompt"] == tokenizations[0]["system_prompt"] for call in negatives)
-    assert diffuse_calls[0]["uncond_mask"].tolist() == ([[1, 2]] if separate else [[1]])
+    assert diffuse_calls[0]["uncond_mask"].tolist() == [[1, 2]]
+    assert diffuse_calls[0]["open_guidance_interval"] is True
+    assert diffuse_calls[0]["guidance_scale"] == 9.0
+    assert diffuse_calls[0]["shared_kwargs"]["rig_view_ids"].tolist() == [1, 0]
+    layout = diffuse_calls[0]["shared_kwargs"]["multiview_layout"]
+    assert layout.cross_view_past_window_seconds == 0.4
+    assert sum(item.is_lidar for item in layout.items) == (2 if joint else 0)
+    assert ("lidar" in output.output["payload"]) is joint
 
 
 @pytest.mark.parametrize("negative", [[], {}, 42, True])
@@ -3911,6 +3731,83 @@ def test_multiview_admission_rejects_non_string_per_view_negative_prompt(negativ
 
     with pytest.raises(ValueError, match="per_view_negative_prompt must be a string"):
         validate_multiview_request({**_joint_multiview_extra(), "per_view_negative_prompt": negative})
+
+
+@pytest.mark.parametrize("field", ["negative_prompt", "negative_metadata_mode"])
+@pytest.mark.parametrize("value", ["", "same"])
+def test_multiview_admission_rejects_shared_negative_fields(field: str, value: str) -> None:
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS, validate_multiview_request
+
+    # Declared, so request normalization forwards them to this rejection.
+    assert field in COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+    with pytest.raises(ValueError, match=rf"does not support extra_args\.{field}; set per_view_negative_prompt"):
+        validate_multiview_request({**_joint_multiview_extra(), field: value})
+
+
+@pytest.mark.parametrize(
+    ("source", "field"),
+    [
+        ("prompt", "negative_prompt"),
+        ("prompt", "negative_metadata_mode"),
+        ("attribute", "negative_prompt"),
+        ("attribute", "negative_metadata_mode"),
+    ],
+)
+def test_multiview_forward_rejects_shared_negative_fields(make_cosmos3_pipeline, source: str, field: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.__class__ = Cosmos3MultiviewPipeline
+    pipeline.multiview_config = multiview_contract()
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    views = [{"camera_key": COSMOS3_MADS_CAMERAS[0], "prompt": "A car drives.", "control_path": "front.mp4"}]
+    sp = make_sampling_params(num_frames=93, extra_args={"multiview": {"views": views}, "wsm": {}})
+    prompt: dict[str, Any] = {"prompt": "Driving."}
+    if source == "prompt":
+        prompt[field] = "Legacy negative."
+    else:
+        setattr(sp, field, "Legacy negative.")
+    location = "prompt" if source == "prompt" else "sampling_params"
+
+    with pytest.raises(ValueError, match=rf"does not support {location}\.{field}"):
+        pipeline.forward(make_request_batch(prompt, sp))
+
+
+@pytest.mark.parametrize("field", ["negative_prompt", "negative_metadata_mode"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_multiview_clients_reject_shared_negative_fields(tmp_path, monkeypatch, field: str, nested: bool) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[4]
+
+    def load_client(name, relative):
+        spec = importlib.util.spec_from_file_location(name, root / relative)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    engine_module = types.ModuleType("vllm_omni.entrypoints.omni")
+    engine_module.Omni = SimpleNamespace
+    monkeypatch.setitem(sys.modules, engine_module.__name__, engine_module)
+    online = load_client("reject_online_client", "examples/online_serving/multiview_video/cosmos3_multiview_client.py")
+    offline = load_client("reject_offline_client", "examples/offline_inference/multiview_video/cosmos3_multiview.py")
+    params = {
+        field: "Legacy negative.",
+        "multiview": {"views": [{"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."}]},
+    }
+    manifest = {"prompt": "Driving.", **({"extra_params": params} if nested else params)}
+
+    with pytest.raises(ValueError, match=f"does not support {field}"):
+        online.prepare_request(manifest, tmp_path)
+
+    def generate(prompt, sampling_params):
+        raise AssertionError("Rejected records must not reach the engine.")
+
+    with pytest.raises(ValueError, match=rf"does not support input record\.{field}"):
+        offline._run_request(SimpleNamespace(generate=generate), manifest, output_dir=tmp_path, seed=0)
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -3956,9 +3853,7 @@ def test_multiview_clients_forward_per_view_negative_prompt(tmp_path, monkeypatc
         raise GeneratedError
 
     with pytest.raises(GeneratedError):
-        offline._run_request(
-            SimpleNamespace(generate=generate), manifest, output_dir=tmp_path, seed=0, fallback_negative_prompt=None
-        )
+        offline._run_request(SimpleNamespace(generate=generate), manifest, output_dir=tmp_path, seed=0)
 
 
 # -- Multiview LiDAR prefix conditioning ---------------------------------------
@@ -3983,7 +3878,7 @@ def test_multiview_admission_accepts_lidar_condition_prefix() -> None:
         {"condition_path": "measured.safetensors"},
         {"condition_path": "measured.safetensors", "num_conditional_sweeps": 3, "return_output": True},
     ):
-        validate_multiview_request(_joint_multiview_extra(**lidar), variable_view_count=True)
+        validate_multiview_request(_joint_multiview_extra(**lidar))
 
 
 @pytest.mark.parametrize(
@@ -4001,7 +3896,7 @@ def test_multiview_admission_rejects_invalid_lidar_condition(lidar: dict[str, An
     from vllm_omni.model_extras.cosmos3 import validate_multiview_request
 
     with pytest.raises(ValueError, match=match):
-        validate_multiview_request(_joint_multiview_extra(**lidar), variable_view_count=True)
+        validate_multiview_request(_joint_multiview_extra(**lidar))
 
 
 def _multiview_pipeline_with_packed_camera_and_lidar():

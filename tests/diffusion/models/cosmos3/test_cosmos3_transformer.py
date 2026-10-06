@@ -11,6 +11,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_lidar_contract
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -377,7 +378,9 @@ def test_multiview_timestep_update_reuses_projection_output(masked: bool) -> Non
     model = object.__new__(Cosmos3MultiviewVFMTransformer)
     nn.Module.__init__(model)
     model.latent_patch_size = 1
-    model.rig_view_embed = None
+    model.rig_view_embed = nn.Embedding(2, 3)
+    model.rig_view_embed.weight.data.zero_()
+    model.rig_lidar_id = 1
     model.proj_in = nn.Linear(2, 3, bias=False)
     model.proj_in.weight.copy_(
         torch.tensor(
@@ -412,6 +415,7 @@ def test_multiview_timestep_update_reuses_projection_output(masked: bool) -> Non
         timestep=torch.tensor([0.25, 0.75]),
         camera=camera,
         noisy_frame_mask=frame_mask,
+        rig_view_ids=torch.tensor([0]),
     )
 
     if frame_mask is None:
@@ -457,6 +461,40 @@ def test_multiview_square_patch_accepts_int_and_pair() -> None:
     for bad in (0, (1,), (1, 0), (True, 1), 1.0):
         with pytest.raises(ValueError, match="patch size"):
             spatial_patch_hw(bad)
+
+
+def test_multiview_camera_only_checkpoint_requires_rig_weights() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+    model = object.__new__(Cosmos3MultiviewVFMTransformer)
+    nn.Module.__init__(model)
+    model.lidar_config = None
+    with pytest.raises(ValueError, match="rig_view_embed.weight"):
+        model.validate_loaded_weights({"transformer.proj_in.weight"})
+    model.validate_loaded_weights({"transformer.rig_view_embed.weight"})
+
+
+def test_multiview_positions_align_camera_subsets_and_lidar_capture_times() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import MaskItem
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import packed_position_ids
+
+    # Two cameras sampled at 5 Hz share positions. LiDAR at 10 Hz advances
+    # by half the camera stride and uses its own rectangular spatial grid.
+    items = (
+        MaskItem((6, 1, 1), 2, is_control=True, seconds_per_frame=0.2),
+        MaskItem((6, 1, 1), 2, seconds_per_frame=0.2),
+        MaskItem((5, 1, 2), 1, view_offset=2, is_lidar=True, seconds_per_frame=0.1),
+    )
+    positions, _ = packed_position_ids(items, text_origin=7, base_fps=20, camera_compression=4)
+    torch.testing.assert_close(positions[0, :12], torch.tensor([7.0, 8.0, 9.0, 7.0, 8.0, 9.0] * 2))
+    torch.testing.assert_close(positions[0, 12:], torch.tensor([7.0, 7.0, 7.5, 7.5, 8.0, 8.0, 8.5, 8.5, 9.0, 9.0]))
+    single, _ = packed_position_ids(
+        (MaskItem((3, 1, 1), 1, seconds_per_frame=0.2),),
+        text_origin=7,
+        base_fps=20,
+        camera_compression=4,
+    )
+    torch.testing.assert_close(single, positions[:, :3])
 
 
 def test_multiview_lidar_patch1_token_grid() -> None:
@@ -546,9 +584,6 @@ def test_multiview_embed_adds_rig_rows_after_projection_and_before_timestep() ->
 
     with pytest.raises(ValueError, match="physical camera IDs"):
         model._embed_packed_streams(items, streams, torch.tensor([0.5]), camera, None, None)
-    model.rig_view_embed = None
-    with pytest.raises(ValueError, match="no rig view embedding"):
-        model._embed_packed_streams(items[:2], streams[:2], torch.tensor([0.5]), camera, None, ids)
 
 
 @torch.no_grad()
@@ -562,7 +597,9 @@ def test_multiview_embed_skips_timestep_on_lidar_condition_prefix() -> None:
     nn.Module.__init__(model)
     model.latent_patch_size = 1
     model.lidar_patch_hw = (1, 1)
-    model.rig_view_embed = None
+    model.rig_view_embed = nn.Embedding(2, 3)
+    model.rig_view_embed.weight.data.zero_()
+    model.rig_lidar_id = 1
     model.proj_in = nn.Linear(2, 3, bias=False)
     model.lidar_proj_in = nn.Linear(4, 3, bias=False)
     time = torch.tensor([[1.0, 2.0, 3.0]])
@@ -572,7 +609,7 @@ def test_multiview_embed_skips_timestep_on_lidar_condition_prefix() -> None:
     items = (MaskItem((2, 1, 1), 1), MaskItem((3, 1, 2), 1, view_offset=1, is_lidar=True))
 
     actual = model._embed_packed_streams(
-        items, [camera, lidar], torch.tensor([0.5]), camera, None, None, lidar_condition_frames=1
+        items, [camera, lidar], torch.tensor([0.5]), camera, None, torch.tensor([0]), lidar_condition_frames=1
     )
 
     lidar_tokens = model.lidar_proj_in(lidar.permute(0, 2, 3, 4, 1).reshape(1, -1, 4))[0]
@@ -581,24 +618,36 @@ def test_multiview_embed_skips_timestep_on_lidar_condition_prefix() -> None:
 
 
 def _tiny_multiview_deployment(**overrides) -> dict[str, Any]:
+    lidar = multiview_lidar_contract()
+    lidar["latent_channels"] = 4
+    lidar["network_config"]["z_dim"] = 4
     deployment = {
-        "schema_version": 3,
-        "backend": "triton",
-        "lidar": {"latent_channels": 4, "temporal_compression_factor": 1},
-        "lidar_patch_spatial_hw": [1, 1],
+        "cameras": ["a", "b"],
+        "cross_view_past_window_seconds": 0.4,
+        "inference_defaults": {
+            "resolution": "480",
+            "fps": 30.0,
+            "num_steps": 35,
+            "guidance": 6.0,
+            "shift": 10.0,
+            "control_guidance": 1.0,
+            "emphasize_control_in_prompt": True,
+            "guidance_interval": None,
+            "control_guidance_interval": None,
+            "normalize_cfg": False,
+        },
+        "lidar": lidar,
+        "lidar_latent_patch_size_hw": [1, 1],
         "rig_view_embedding": {"num_embeddings": 3, "camera_ids": {"a": 0, "b": 1}, "lidar_id": 2},
     }
     deployment.update(overrides)
     return deployment
 
 
-def test_multiview_transformer_builds_per_stream_lidar_patch_and_rig_table(monkeypatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import lidar as lidar_module
+def test_multiview_transformer_builds_per_stream_lidar_patch_and_rig_table() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
         Cosmos3MultiviewVFMTransformer,
     )
-
-    monkeypatch.setattr(lidar_module, "validate_lidar_config", lambda config: None)
 
     def build(deployment):
         config = _tiny_cosmos3_config(latent_patch_size=2, backbone_type="cosmos3_multiview", multiview=deployment)
@@ -621,12 +670,11 @@ def test_multiview_transformer_builds_per_stream_lidar_patch_and_rig_table(monke
         model.validate_loaded_weights(loaded)
     model.validate_loaded_weights(loaded | {"transformer.rig_view_embed.weight"})
 
-    # Schema-2 artifacts omit both fields: LiDAR shares the camera patch.
-    legacy = build(_tiny_multiview_deployment(schema_version=2, lidar_patch_spatial_hw=None, rig_view_embedding=None))
-    assert legacy.lidar_patch_hw == (2, 2)
-    assert tuple(legacy.lidar_proj_in.weight.shape) == (8, 16)
-    assert legacy.rig_view_embed is None
-    legacy.validate_loaded_weights(loaded)
+    for field in ("rig_view_embedding", "lidar_latent_patch_size_hw"):
+        incomplete = _tiny_multiview_deployment()
+        del incomplete[field]
+        with pytest.raises(ValueError, match="requires field"):
+            build(incomplete)
 
 
 @pytest.mark.parametrize(

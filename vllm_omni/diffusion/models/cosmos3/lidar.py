@@ -22,7 +22,6 @@ def validate_lidar_config(config: dict[str, Any]) -> None:
     if not isinstance(config, dict):
         raise ValueError("LiDAR metadata must be a JSON object.")
     required = {
-        "version",
         "dtype",
         "sample_posterior",
         "apply_validity_mask",
@@ -37,8 +36,8 @@ def validate_lidar_config(config: dict[str, Any]) -> None:
     }
     if missing := required - config.keys():
         raise ValueError(f"Incomplete joint artifact: missing LiDAR metadata {sorted(missing)}.")
-    if config["version"] != "1.2":
-        raise ValueError("Only the V1.2 LiDAR tokenizer is supported.")
+    if unknown := config.keys() - required:
+        raise ValueError(f"Unknown LiDAR metadata fields: {sorted(unknown)}.")
     if config["dtype"] != "float32" or config["sample_posterior"] is not False:
         raise ValueError("LiDAR requires FP32 execution and posterior-mean encoding.")
     if not isinstance(config["apply_validity_mask"], bool):
@@ -56,21 +55,29 @@ def validate_lidar_config(config: dict[str, Any]) -> None:
     if any(projection.get(key) != value for key, value in expected.items()):
         raise ValueError("V1.2 requires the 128x1800 metric/unit-intensity grid with circular padding to 1808.")
     minimum, maximum = projection.get("min_range_m"), projection.get("max_range_m")
-    if not all(isinstance(v, int | float) and math.isfinite(v) for v in (minimum, maximum)) or maximum <= minimum:
+    if (
+        not all(not isinstance(v, bool) and isinstance(v, int | float) and math.isfinite(v) for v in (minimum, maximum))
+        or maximum <= minimum
+    ):
         raise ValueError("LiDAR range normalization requires finite min_range_m < max_range_m.")
     network = config["network_config"]
+    if type(config["latent_channels"]) is not int or config["latent_channels"] <= 0:
+        raise ValueError("LiDAR latent_channels must be a positive integer.")
     if (
         network.get("resolution") != [128, 1808]
         or network.get("patch_size") != [2, 2]
-        or len(network.get("depths", [])) != 4
+        or not isinstance(network.get("depths"), list)
+        or len(network["depths"]) != 4
         or config["spatial_compression"] != [16, 16]
+        or type(config["temporal_compression_factor"]) is not int
         or config["temporal_compression_factor"] != 1
         or network.get("z_dim") != config["latent_channels"]
         or network.get("in_channels") != 3
-        or any(network.get("temporal_downsample", [True]))
+        or network.get("temporal_downsample") != [False, False, False]
     ):
         raise ValueError("LiDAR architecture and V1.2 compression metadata disagree.")
-    if not math.isfinite(config["fps"]) or config["fps"] <= 0:
+    fps = config["fps"]
+    if isinstance(fps, bool) or not isinstance(fps, int | float) or not math.isfinite(fps) or fps <= 0:
         raise ValueError("LiDAR FPS must be finite and positive.")
     chunk, context = config["streaming_chunk_frames"], config["streaming_context_frames"]
     if type(chunk) is not int or chunk < 1 or (context is not None and (type(context) is not int or context < chunk)):
