@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+import json
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.data import uses_rank_local_dp_concurrency
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -19,11 +21,18 @@ from vllm_omni.diffusion.sched.interface import (
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
-# Request-owned fields and LoRA identity must be resolved separately from the
-# bulk sampling-param lookup.
+# Derived and request-owned fields must be resolved separately from the bulk
+# sampling-param lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"condition_key", "flow_shift", "lora_int_id", "negative_conditioning", "sample_solver"}
+) - {
+    "condition_key",
+    "flow_shift",
+    "lora_int_id",
+    "negative_conditioning",
+    "rank_local_dp_extra_args_signature",
+    "sample_solver",
+}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -38,6 +47,11 @@ def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def build_rank_local_dp_extra_args_signature(request: OmniDiffusionRequest) -> str:
+    """Compare full extra_args for admission and dispatch of collective waves."""
+    return json.dumps(getattr(request.sampling_params, "extra_args", None), sort_keys=True, default=repr)
 
 
 def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
@@ -118,7 +132,13 @@ class RequestScheduler(BaseScheduler):
         )
 
     def _build_sampling_params_key(self, request: OmniDiffusionRequest) -> RequestBatchSamplingParamsKey:
-        return build_request_batch_sampling_params_key(request)
+        key = build_request_batch_sampling_params_key(request)
+        if uses_rank_local_dp_concurrency(self.od_config):
+            # Serialize once before the request enters the queue. Invalid
+            # extra_args then fail this submission, rather than schedule()
+            # raising and shutting down the engine with other requests active.
+            key = replace(key, rank_local_dp_extra_args_signature=build_rank_local_dp_extra_args_signature(request))
+        return key
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import multiprocessing as mp
 import multiprocessing.connection
 import os
@@ -37,7 +36,10 @@ from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     resolve_offload,
 )
-from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+from vllm_omni.diffusion.sched.request_scheduler import (
+    build_rank_local_dp_extra_args_signature,
+    build_request_batch_sampling_params_key,
+)
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
 
@@ -565,10 +567,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     "denoise schedule, output count, and LoRA settings for all "
                     "requests in one collective wave."
                 )
-            extra_args_signatures: set = set()
-            for nr in new_reqs:
-                ea = getattr(nr.req.sampling_params, "extra_args", None)
-                extra_args_signatures.add(json.dumps(ea, sort_keys=True, default=repr) if ea is not None else None)
+            extra_args_signatures = {build_rank_local_dp_extra_args_signature(nr.req) for nr in new_reqs}
             if len(extra_args_signatures) > 1:
                 raise ValueError(
                     "DP multi-concurrency requires all concurrent requests to "

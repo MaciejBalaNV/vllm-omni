@@ -10,7 +10,6 @@ rank and a common rendezvous address before the actor constructs its worker.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import weakref
@@ -37,7 +36,10 @@ from vllm_omni.diffusion.offloader.config import (
     any_selected_component_uses_allgather,
     resolve_offload,
 )
-from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+from vllm_omni.diffusion.sched.request_scheduler import (
+    build_rank_local_dp_extra_args_signature,
+    build_request_batch_sampling_params_key,
+)
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -560,10 +562,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
                     "Rank-local DP concurrency requires compatible shape, CFG, denoise schedule, "
                     "output count, and LoRA settings for every request in a collective wave."
                 )
-            extra_args_signatures = {
-                json.dumps(getattr(item.req.sampling_params, "extra_args", None), sort_keys=True, default=repr)
-                for item in new_reqs
-            }
+            extra_args_signatures = {build_rank_local_dp_extra_args_signature(item.req) for item in new_reqs}
             if len(extra_args_signatures) > 1:
                 raise ValueError("DP multi-concurrency requires identical extra_args for every request")
             if _uses_text_encoder_allgather(self.od_config):

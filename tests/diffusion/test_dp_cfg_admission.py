@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Admission must align effective CFG branches across sharded-weight ranks."""
+"""Admission must align collective schedules across sharded-weight ranks."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,10 +11,11 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.ray_executor import RayDiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.worker.utils import RunnerOutput
@@ -176,3 +178,167 @@ def test_negative_pooled_embeds_change_admission_key():
     assert build_request_batch_sampling_params_key(without_pooled) != build_request_batch_sampling_params_key(
         with_pooled
     )
+
+
+@pytest.mark.parametrize(
+    ("first_extra_args", "second_extra_args"),
+    [
+        ({"use_resolution_template": True}, {"use_resolution_template": False}),
+        ({"custom": {"enabled": True}}, {"custom": {"enabled": False}}),
+        (None, {}),
+    ],
+)
+def test_dp_extra_args_mismatch_runs_in_separate_waves(executor, wave_config, first_extra_args, second_extra_args):
+    wave_config.max_num_seqs = 2
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    first = _make_request("first")
+    second = _make_request("second")
+    first.sampling_params.extra_args = first_extra_args
+    second.sampling_params.extra_args = second_extra_args
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+
+    # These requests differ only in fields outside the ordinary batching key.
+    assert build_request_batch_sampling_params_key(first) == build_request_batch_sampling_params_key(second)
+    with pytest.raises(ValueError, match="extra_args"):
+        executor.execute_request(_make_wave(first, second))
+    executor.collective_rpc.assert_not_called()
+
+    for request_id, waiting_count in (("first", 1), ("second", 0)):
+        wave = scheduler.schedule()
+        assert wave.scheduled_request_ids == [request_id]
+        assert wave.num_waiting_reqs == waiting_count
+        if waiting_count:
+            assert scheduler.get_request_state("second").status == DiffusionRequestStatus.WAITING
+
+        executor.collective_rpc.return_value = DiffusionOutput(output=request_id)
+        output = executor.execute_batch(wave)
+        assert scheduler.update_from_output(wave, output) == {request_id}
+        assert scheduler.get_request_state(request_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+        scheduler.pop_request_state(request_id)
+
+    assert executor.collective_rpc.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("first_extra_args", "second_extra_args"),
+    [
+        ({"use_resolution_template": True}, {"use_resolution_template": True}),
+        (
+            {"use_resolution_template": True, "custom": {"a": 1, "b": 2}},
+            {"custom": {"b": 2, "a": 1}, "use_resolution_template": True},
+        ),
+        (None, None),
+        ({}, {}),
+    ],
+)
+def test_dp_matching_extra_args_share_wave(executor, wave_config, first_extra_args, second_extra_args):
+    wave_config.max_num_seqs = 2
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    for request_id, extra_args in (("first", first_extra_args), ("second", second_extra_args)):
+        request = _make_request(request_id)
+        request.sampling_params.extra_args = extra_args
+        scheduler.add_request(request)
+
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == ["first", "second"]
+    assert wave.num_waiting_reqs == 0
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="second")]
+    executor.collective_rpc.return_value = (
+        [{"dp_rank": rank, "output": out} for rank, out in enumerate(results)]
+        if isinstance(executor, RayDiffusionExecutor)
+        else results
+    )
+
+    output = executor.execute_batch(wave)
+    assert scheduler.update_from_output(wave, output) == {"first", "second"}
+    for request_id in ("first", "second"):
+        assert scheduler.get_request_state(request_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+    executor.collective_rpc.assert_called_once()
+
+
+def test_ordinary_batching_keeps_extra_args_request_local():
+    scheduler = RequestScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2, parallel_config=SimpleNamespace(data_parallel_size=2)))
+    for request_id, enabled in (("first", True), ("second", False)):
+        request = _make_request(request_id)
+        request.sampling_params.extra_args = {"use_resolution_template": enabled}
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().scheduled_request_ids == ["first", "second"]
+
+
+@pytest.fixture(params=["tuple_key", "mixed_keys", "nested_tuple_key", "circular_value"])
+def unserializable_extra_args(request):
+    if request.param == "tuple_key":
+        return {("a", "b"): 1}, TypeError, "keys must be"
+    if request.param == "mixed_keys":
+        return {1: "x", "a": "y"}, TypeError, "not supported between"
+    if request.param == "nested_tuple_key":
+        return {"custom": {("a", "b"): 1}}, TypeError, "keys must be"
+    circular = {}
+    circular["self"] = circular
+    return circular, ValueError, "Circular reference"
+
+
+def test_dp_invalid_extra_args_only_fail_submission(executor, wave_config, unserializable_extra_args):
+    wave_config.max_num_seqs = 2
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine.executor = executor
+    engine._cv = threading.Condition()
+    engine._closed = False
+    engine._out_streams = {}
+    engine._request_cancellations = Mock()
+
+    engine._add_prepared_request(_make_request("first"))
+    invalid = _make_request("invalid")
+    invalid.sampling_params.extra_args, error_type, message = unserializable_extra_args
+
+    with pytest.raises(error_type, match=message):
+        engine._add_prepared_request(invalid)
+
+    assert not engine._closed
+    assert scheduler.get_request_state("invalid") is None
+    assert scheduler.num_waiting_requests() == 1
+    assert scheduler.num_running_requests() == 0
+    assert set(engine._out_streams) == {"first"}
+    engine._request_cancellations.finish.assert_called_once_with("invalid")
+    assert invalid.cancellation_signal is None
+    executor.collective_rpc.assert_not_called()
+
+    # The engine can admit more requests and execute the existing queue.
+    engine._add_prepared_request(_make_request("later"))
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == ["first", "later"]
+    assert wave.num_waiting_reqs == 0
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="later")]
+    executor.collective_rpc.return_value = (
+        [{"dp_rank": rank, "output": out} for rank, out in enumerate(results)]
+        if isinstance(executor, RayDiffusionExecutor)
+        else results
+    )
+
+    output = executor.execute_batch(wave)
+    assert scheduler.update_from_output(wave, output) == {"first", "later"}
+    for request_id in ("first", "later"):
+        assert scheduler.get_request_state(request_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
+    executor.collective_rpc.assert_called_once()
+
+
+def test_ordinary_batching_does_not_serialize_extra_args(unserializable_extra_args):
+    scheduler = RequestScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2, parallel_config=SimpleNamespace(data_parallel_size=2)))
+    for request_id in ("first", "second"):
+        request = _make_request(request_id)
+        request.sampling_params.extra_args = unserializable_extra_args[0]
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().scheduled_request_ids == ["first", "second"]

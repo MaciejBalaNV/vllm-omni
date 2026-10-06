@@ -164,6 +164,11 @@ class RequestBatchSamplingParamsKey:
     lora_int_id: int | None = None
     lora_scale: float = 1.0
 
+    # Rank-local DP shares weight collectives across requests and requires
+    # identical full extra_args. The scheduler caches this at request addition;
+    # ordinary request batching leaves it unset to allow request-local values.
+    rank_local_dp_extra_args_signature: str | None = None
+
 
 @dataclass
 class SchedulerRequestState:
