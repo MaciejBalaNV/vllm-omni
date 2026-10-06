@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.cosmos3.lidar_encoder.encoding import generate_polar_coords
+from vllm_omni.diffusion.models.cosmos3.lidar_encoder.rope3d import VideoRopePosition3DEmb, apply_rotary_emb
 from vllm_omni.diffusion.models.cosmos3.lidar_encoder.transformer_vae import (
     CausalTemporalAttention,
     Decoder,
@@ -17,6 +18,18 @@ from vllm_omni.diffusion.models.cosmos3.lidar_encoder.transformer_vae import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("head_dim", [4, 8, 16, 32, 64])
+def test_3d_rotary_matches_complex_rotation(head_dim):
+    angles = VideoRopePosition3DEmb(head_dim=head_dim, len_t=2, len_h=3, len_w=5)(2, 3, 5)
+    x = torch.randn(2, 30, 3, head_dim)
+    real, imaginary = x.chunk(2, dim=-1)
+    half_angles = angles[:, : head_dim // 2].unsqueeze(-2)
+    rotation = torch.polar(torch.ones_like(half_angles), half_angles)
+    expected = torch.complex(real, imaginary) * rotation
+    expected = torch.cat((expected.real, expected.imag), dim=-1)
+    torch.testing.assert_close(apply_rotary_emb(x, angles), expected, rtol=1e-6, atol=1e-6)
 
 
 def network_config(joint=False):

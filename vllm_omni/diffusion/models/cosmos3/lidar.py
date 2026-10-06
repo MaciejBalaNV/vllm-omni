@@ -132,19 +132,18 @@ class _LidarComponent(nn.Module):
     def from_pretrained(cls, model_path: str, config: dict[str, Any], device: torch.device) -> Self:
         from safetensors import safe_open
 
-        checkpoint_path = Path(model_path)
-        if not checkpoint_path.exists():
-            from vllm_omni.transformers_utils.repo_utils import hf_api
+        from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 
-            checkpoint_path = Path(
-                hf_api().snapshot_download(
-                    model_path,
-                    allow_patterns=[
-                        f"{_LIDAR_VAE_SUBFOLDER}/config.json",
-                        f"{_LIDAR_VAE_SUBFOLDER}/{_LIDAR_VAE_WEIGHTS}",
-                    ],
-                )
+        checkpoint_path = Path(
+            resolve_model_to_local_path(
+                model_path,
+                allow_download=True,
+                allow_patterns=[
+                    f"{_LIDAR_VAE_SUBFOLDER}/config.json",
+                    f"{_LIDAR_VAE_SUBFOLDER}/{_LIDAR_VAE_WEIGHTS}",
+                ],
             )
+        )
         folder = checkpoint_path / _LIDAR_VAE_SUBFOLDER
         if not (folder / "config.json").is_file() or not (folder / _LIDAR_VAE_WEIGHTS).is_file():
             raise ValueError(

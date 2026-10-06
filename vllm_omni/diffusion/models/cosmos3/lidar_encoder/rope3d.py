@@ -22,6 +22,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.layers.rope import apply_rotary_emb_torch
+
 
 class VideoRopePosition3DEmb(nn.Module):
     """3D RoPE producing angles for a ``(T, H, W)`` token grid.
@@ -94,27 +96,6 @@ class VideoRopePosition3DEmb(nn.Module):
 def apply_rotary_emb(
     x: torch.Tensor, rope_emb: torch.Tensor
 ) -> torch.Tensor:  # x: [...,S,N,D], rope_emb: [S,D], returns [...,S,N,D]
-    """Rotate the last dim of ``x`` via GPT-NeoX rotary embeddings.
-
-    Args:
-        x: ``(..., S, num_heads, head_dim)`` (any leading shape).
-        rope_emb: ``(S, head_dim)`` angles tensor produced by
-            :class:`VideoRopePosition3DEmb`.
-
-    Notes:
-        Standard GPT-NeoX rotation pairs channel ``i`` with channel
-        ``i + head_dim/2`` (not adjacent channels). With ``rope_emb``'s
-        ``[half | half]`` duplication, ``cos(rope_emb[:half]) ==
-        cos(rope_emb[half:])`` so both halves of a pair rotate by the same
-        angle.
-    """
-    rope_emb = rope_emb.to(x.dtype).unsqueeze(-2)  # [S,1,D]
-    cos = rope_emb.cos()  # [S,1,D]
-    sin = rope_emb.sin()  # [S,1,D]
-    half = x.shape[-1] // 2
-    x_lo, x_hi = x[..., :half], x[..., half:]  # [...,S,N,D/2], [...,S,N,D/2]
-    cos_lo, cos_hi = cos[..., :half], cos[..., half:]  # [S,1,D/2], [S,1,D/2]
-    sin_lo, sin_hi = sin[..., :half], sin[..., half:]  # [S,1,D/2], [S,1,D/2]
-    out_lo = x_lo * cos_lo - x_hi * sin_lo  # [...,S,N,D/2]
-    out_hi = x_hi * cos_hi + x_lo * sin_hi  # [...,S,N,D/2]
-    return torch.cat([out_lo, out_hi], dim=-1)  # [...,S,N,D]
+    """Apply half-split rotation using the shared helper and duplicated 3D angles."""
+    angles = rope_emb[:, : x.shape[-1] // 2].to(x.dtype)
+    return apply_rotary_emb_torch(x, angles.cos(), angles.sin(), interleaved=False)
