@@ -848,7 +848,7 @@ class _DiffusionConfigProjection:
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
-    diffusion_compile_dynamic: bool | None = Field(default=None, strict=True)
+    diffusion_compile_dynamic: bool = Field(default=True, strict=True)
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

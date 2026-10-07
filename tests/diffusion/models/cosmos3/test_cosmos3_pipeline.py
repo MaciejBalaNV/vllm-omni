@@ -654,6 +654,50 @@ def test_pipeline_registered_and_exported() -> None:
         assert pipeline_name in CUSTOM_DIT_ENABLERS
 
 
+@pytest.mark.parametrize("granularity", ["regional", "full"])
+@pytest.mark.parametrize("configured_dynamic", [True, False])
+def test_multiview_setup_compile_keeps_gen_regions_static(monkeypatch, granularity, configured_dynamic) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+    pipeline = object.__new__(pipeline_module.Cosmos3MultiviewPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_compile_granularity=granularity,
+        diffusion_compile_dynamic=configured_dynamic,
+    )
+    # Exercise the regional compiler's container matching with small blocks,
+    # using the actual transformer's declarations. Other components stay eager.
+    transformer = nn.Module()
+    transformer._repeated_blocks = Cosmos3MultiviewVFMTransformer._repeated_blocks
+    transformer._layerwise_offload_blocks_attrs = Cosmos3MultiviewVFMTransformer._layerwise_offload_blocks_attrs
+    transformer.gen_layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+    transformer.language_model = nn.Linear(2, 2)
+    transformer.proj_out = nn.Linear(2, 2)
+    pipeline.transformer = transformer
+
+    compile_calls = []
+
+    def compile_forward(forward, **kwargs):
+        compile_calls.append((forward, kwargs))
+        return forward
+
+    monkeypatch.setattr(torch, "compile", compile_forward)
+    warning = Mock()
+    monkeypatch.setattr(pipeline_module.logger, "warning", warning)
+
+    pipeline.setup_compile()
+
+    assert compile_calls == [(layer.forward, {"dynamic": False}) for layer in transformer.gen_layers]
+    if granularity == "full":
+        warning.assert_called_once_with(
+            "Cosmos3 multiview uses regional compilation; diffusion_compile_granularity=%r is ignored.",
+            "full",
+        )
+    else:
+        warning.assert_not_called()
+
+
 def test_multiview_pipeline_registers_guardrail_hooks() -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview
     from vllm_omni.diffusion.registry import (

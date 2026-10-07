@@ -317,6 +317,13 @@ keys/values are marked dynamic in their sequence dimension. New prompts and the
 two CFG branches therefore do not recompile the GEN layers. The GEN layers
 themselves are compiled statically and specialize per output geometry.
 
+The pipeline's `setup_compile()` hook owns this static regional policy.
+`--diffusion-compile-dynamic` and its negative form do not change it;
+`--diffusion-compile-granularity full` also uses regional compilation, with a
+warning. `--enforce-eager` skips GEN compilation through the hook. Triton's
+model-local FlexAttention compilation remains dynamic.
+Shared configuration validation still rejects `full` with parallelism or offload.
+
 ## Negative captions
 
 Every camera has its own caption, and so does its unconditional (CFG) branch.

@@ -22,10 +22,6 @@ class DiffusionModelMetadata:
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
     supports_latent_mask_editing: bool = False
-    # Default for ``diffusion_compile_dynamic`` when neither the CLI nor the
-    # deploy config sets it. The model runner applies it after loading, once the
-    # pipeline class is final.
-    compile_dynamic: bool = True
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -136,7 +132,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Cosmos3MultiviewPipeline": DiffusionModelMetadata(
         supports_multiview_reference_inputs=True,
         final_output_type="video",
-        compile_dynamic=False,
     ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),

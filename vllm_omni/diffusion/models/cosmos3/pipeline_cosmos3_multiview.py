@@ -485,6 +485,18 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self.multiview_cross_view_past_window_seconds = multiview_config["cross_view_past_window_seconds"]
         self.multiview_backend = resolved_backend
 
+    def setup_compile(self) -> None:
+        """Compile multiview GEN layers with static shapes."""
+        from vllm_omni.diffusion.compile import regionally_compile
+
+        if self.od_config.diffusion_compile_granularity != "regional":
+            logger.warning(
+                "Cosmos3 multiview uses regional compilation; diffusion_compile_granularity=%r is ignored.",
+                self.od_config.diffusion_compile_granularity,
+            )
+
+        regionally_compile(self.transformer, dynamic=False)
+
     @staticmethod
     def _resolve_attention_backend() -> str:
         """Choose FA4 automatically where available, with Triton as the fallback."""
