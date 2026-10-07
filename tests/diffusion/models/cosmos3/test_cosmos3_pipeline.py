@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -654,14 +655,21 @@ def test_pipeline_registered_and_exported() -> None:
 
 
 def test_multiview_pipeline_registers_guardrail_hooks() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview
     from vllm_omni.diffusion.registry import (
         _DIFFUSION_POST_PROCESS_FUNCS,
         _DIFFUSION_PRE_PROCESS_FUNCS,
+        _load_process_func,
     )
     from vllm_omni.model_extras.cosmos3 import COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
 
     assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_multiview_pre_process_func"
-    assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_post_process_func"
+    postprocess_name = _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3MultiviewPipeline"]
+    assert postprocess_name == "get_cosmos3_multiview_post_process_func"
+    assert postprocess_name in pipeline_cosmos3_multiview.__all__
+    postprocess = _load_process_func(SimpleNamespace(model_class_name="Cosmos3MultiviewPipeline"), postprocess_name)
+    latent_output = {"payload": {"video": torch.zeros(1, 3, 6, 4, 4)}}
+    assert postprocess(latent_output, output_type="latent") is latent_output
     assert "guardrails" in COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
 
 
@@ -733,7 +741,9 @@ def test_multiview_preprocess_skips_guardrail_load_when_disabled(fake_cosmos3_gu
 
 
 def test_multiview_postprocess_applies_video_guardrail_per_camera(fake_cosmos3_guardrails) -> None:
-    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
 
     checked_shapes = []
 
@@ -743,7 +753,7 @@ def test_multiview_postprocess_applies_video_guardrail_per_camera(fake_cosmos3_g
 
     fake_cosmos3_guardrails.is_guardrails_enabled = lambda od_config, sampling_params=None: True
     fake_cosmos3_guardrails.check_video_safety = check_video_safety
-    postprocess = get_cosmos3_post_process_func(SimpleNamespace(model_config={}))
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={}))
 
     video = torch.ones(1, 3, 2 * 3, 4, 4)
     result = postprocess(
@@ -757,6 +767,93 @@ def test_multiview_postprocess_applies_video_guardrail_per_camera(fake_cosmos3_g
     assert checked_shapes == [(1, 3, 3, 4, 4), (1, 3, 3, 4, 4)]
     # The guardrail output, not the raw decode, reaches the response.
     assert np.allclose(result["payload"]["video"], 0.5)
+
+
+@pytest.mark.parametrize("output_type", ["np", "pt", "pil"])
+def test_multiview_postprocess_preserves_camera_order_lidar_and_metadata(output_type: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    video = torch.cat((torch.full((1, 3, 3, 4, 4), -1.0), torch.ones(1, 3, 3, 4, 4)), dim=2)
+    # Sensor values must retain their numeric range and layout, rather than
+    # being normalized, clamped or converted to RGB by VideoProcessor.
+    lidar = torch.arange(36, dtype=torch.float64).reshape(1, 3, 2, 3, 2).transpose(-1, -2).requires_grad_()
+    metadata = {
+        "multiview": {"cameras": ["front", "rear"], "frames_per_view": 3, "fps": 30},
+        "lidar": {"fps": 10, "units": ["metres", "unit", "probability"]},
+        "internal": {"private": True},
+    }
+    output = {"payload": {"video": video, "lidar": lidar}, "metadata": metadata}
+    assert postprocess(output, output_type="latent") is output
+    result = postprocess(output, output_type=output_type)
+
+    processed = result["payload"]["video"]
+    if output_type == "pil":
+        assert len(processed) == 1 and len(processed[0]) == 6
+        assert all(np.all(np.asarray(frame) == 0) for frame in processed[0][:3])
+        assert all(np.all(np.asarray(frame) == 255) for frame in processed[0][3:])
+    elif output_type == "np":
+        assert processed.shape == (1, 6, 4, 4, 3)
+        assert np.all(processed[:, :3] == 0) and np.all(processed[:, 3:] == 1)
+    else:
+        assert processed.shape == (1, 6, 3, 4, 4)
+        assert processed.device.type == "cpu"
+        assert torch.all(processed[:, :3] == 0) and torch.all(processed[:, 3:] == 1)
+    processed_lidar = result["payload"]["lidar"]
+    torch.testing.assert_close(processed_lidar, lidar.detach().float())
+    assert processed_lidar.device.type == "cpu"
+    assert processed_lidar.is_contiguous() and not processed_lidar.requires_grad
+    assert result["metadata"] == {key: value for key, value in metadata.items() if key != "internal"}
+    assert output["payload"]["lidar"] is lidar
+    assert "internal" in output["metadata"]
+
+
+@pytest.mark.parametrize("output_type", ["np", "pt"])
+def test_multiview_postprocess_releases_converted_view_before_next_camera(monkeypatch, output_type: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as pipeline_module
+
+    converted_views = []
+
+    class TrackingVideoProcessor(pipeline_module.VideoProcessor):
+        def postprocess_video(self, video, output_type="np"):
+            assert video.device.type == "cpu" and video.shape == (1, 3, 3, 4, 4)
+            assert all(reference() is None for reference in converted_views)
+            result = super().postprocess_video(video, output_type=output_type)
+            converted_views.append(weakref.ref(result))
+            return result
+
+    monkeypatch.setattr(pipeline_module, "VideoProcessor", TrackingVideoProcessor)
+    postprocess = pipeline_module.get_cosmos3_multiview_post_process_func(SimpleNamespace())
+    postprocess(
+        {
+            "payload": {"video": torch.zeros(1, 3, 9, 4, 4)},
+            "metadata": {"multiview": {"cameras": ["front", "rear", "left"], "frames_per_view": 3}},
+        },
+        output_type=output_type,
+    )
+    assert len(converted_views) == 3
+    assert all(reference() is None for reference in converted_views)
+
+
+@pytest.mark.parametrize(
+    ("multiview", "video", "message"),
+    [
+        (None, torch.zeros(1, 3, 6, 4, 4), "requires multiview metadata"),
+        ({"cameras": [], "frames_per_view": 3}, torch.zeros(1, 3, 6, 4, 4), "positive integer"),
+        ({"cameras": ["front"], "frames_per_view": True}, torch.zeros(1, 3, 6, 4, 4), "positive integer"),
+        ({"cameras": ["front", "rear"], "frames_per_view": 2}, torch.zeros(1, 3, 6, 4, 4), "matching its metadata"),
+    ],
+)
+def test_multiview_postprocess_rejects_invalid_camera_layout(multiview, video, message: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_post_process_func,
+    )
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    with pytest.raises(ValueError, match=message):
+        postprocess({"payload": {"video": video}, "metadata": {"multiview": multiview}})
 
 
 @pytest.mark.parametrize(

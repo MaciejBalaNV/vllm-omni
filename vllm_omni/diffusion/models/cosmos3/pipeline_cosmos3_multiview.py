@@ -14,9 +14,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.video_processor import VideoProcessor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -57,7 +59,6 @@ from .pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
     _ceil_video_num_frames,
     get_cosmos3_ir_op_priority_func,
-    get_cosmos3_post_process_func,
 )
 from .transfer import (
     IMAGE_EXTENSIONS,
@@ -325,7 +326,7 @@ def get_cosmos3_multiview_pre_process_func(od_config: OmniDiffusionConfig):
 
     Camera and LiDAR media are decoded by the pipeline, so the only request-time
     work is the Cosmos3 text guardrail over the shared prompt and every
-    per-camera caption. The shared Cosmos3 postprocessor applies the video
+    per-camera caption. The multiview postprocessor applies the video
     guardrail to each camera.
     """
     from .guardrails import check_text_safety, ensure_initialized, is_guardrails_enabled
@@ -346,6 +347,77 @@ def get_cosmos3_multiview_pre_process_func(od_config: OmniDiffusionConfig):
         return request
 
     return pre_process_func
+
+
+def get_cosmos3_multiview_post_process_func(od_config: OmniDiffusionConfig):
+    """Process camera-major video one view at a time and preserve numeric LiDAR."""
+    from .guardrails import check_video_safety, is_guardrails_enabled
+
+    video_processor = VideoProcessor(vae_scale_factor=16)
+
+    def post_process_func(output: dict[str, Any], output_type: str = "np", sampling_params=None):
+        if output_type == "latent":
+            return output
+
+        payload = output.get("payload")
+        if not isinstance(payload, dict) or "video" not in payload:
+            raise ValueError("Cosmos3 multiview postprocess requires a video payload.")
+        metadata = output.get("metadata") or {}
+        public_metadata = {key: value for key, value in metadata.items() if key != "internal"}
+        multiview = public_metadata.get("multiview")
+        if not isinstance(multiview, Mapping):
+            raise ValueError("Cosmos3 multiview output requires multiview metadata.")
+        cameras = multiview.get("cameras")
+        frames_per_view = multiview.get("frames_per_view")
+        if (
+            not isinstance(cameras, list | tuple)
+            or not cameras
+            or not isinstance(frames_per_view, int)
+            or isinstance(frames_per_view, bool)
+            or frames_per_view <= 0
+        ):
+            raise ValueError("Cosmos3 multiview output requires cameras and a positive integer frames_per_view.")
+        video = payload["video"]
+        if video.ndim != 5 or video.shape[:2] != (1, 3) or video.shape[2] != len(cameras) * frames_per_view:
+            raise ValueError("Cosmos3 multiview output must have shape [1, 3, V*F, H, W] matching its metadata.")
+        if output_type not in ("np", "pt", "pil"):
+            raise ValueError(f"{output_type} does not exist. Please choose one of ['np', 'pt', 'pil']")
+
+        guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
+        processed_video = None
+        for view_index in range(len(cameras)):
+            frame_start = view_index * frames_per_view
+            # Move only this camera to the host, even for an in-process CUDA
+            # caller. Guardrail conversions then stay bounded to one CPU clip.
+            view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
+            if guardrails_enabled:
+                view = check_video_safety(view)
+            processed_view = video_processor.postprocess_video(view, output_type=output_type)
+            if processed_video is None:
+                if output_type == "pil":
+                    processed_video = [[]]
+                else:
+                    output_shape = (1, video.shape[2], *processed_view.shape[2:])
+                    if output_type == "np":
+                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
+                    else:
+                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
+            if output_type == "pil":
+                processed_video[0].extend(processed_view[0])
+            else:
+                processed_video[:, frame_start : frame_start + frames_per_view] = processed_view
+            # Retaining converted clips and concatenating them would duplicate
+            # the complete processed multiview output.
+            del view, processed_view
+
+        assert processed_video is not None
+        processed_payload: dict[str, Any] = {"video": processed_video}
+        if (lidar := payload.get("lidar")) is not None:
+            # Numeric range images must never pass through RGB processing.
+            processed_payload["lidar"] = lidar.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        return {"payload": processed_payload, "metadata": public_metadata}
+
+    return post_process_func
 
 
 class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
@@ -1012,5 +1084,5 @@ __all__ = [
     "Cosmos3MultiviewPipeline",
     "get_cosmos3_ir_op_priority_func",
     "get_cosmos3_multiview_pre_process_func",
-    "get_cosmos3_post_process_func",
+    "get_cosmos3_multiview_post_process_func",
 ]

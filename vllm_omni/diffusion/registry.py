@@ -717,7 +717,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
-    "Cosmos3MultiviewPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_multiview_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",

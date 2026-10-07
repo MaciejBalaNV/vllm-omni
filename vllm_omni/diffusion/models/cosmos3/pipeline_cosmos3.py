@@ -722,58 +722,6 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             fps_value = 24.0
         return int(fps_value) if fps_value.is_integer() else fps_value
 
-    def _postprocess_multiview_video(
-        video: torch.Tensor,
-        multiview: Mapping[str, Any],
-        *,
-        output_type: str,
-        guardrails_enabled: bool,
-    ) -> np.ndarray | torch.Tensor | list[list[PIL.Image.Image]]:
-        """Process one camera at a time into the final CPU presentation buffer."""
-        cameras = multiview.get("cameras")
-        frames_per_view = multiview.get("frames_per_view")
-        if (
-            not isinstance(cameras, list | tuple)
-            or not cameras
-            or not isinstance(frames_per_view, int)
-            or isinstance(frames_per_view, bool)
-            or frames_per_view <= 0
-        ):
-            raise ValueError("Cosmos3 multiview output requires cameras and a positive integer frames_per_view.")
-        if video.ndim != 5 or video.shape[:2] != (1, 3) or video.shape[2] != len(cameras) * frames_per_view:
-            raise ValueError("Cosmos3 multiview output must have shape [1, 3, V*F, H, W] matching its metadata.")
-        if output_type not in ("np", "pt", "pil"):
-            raise ValueError(f"{output_type} does not exist. Please choose one of ['np', 'pt', 'pil']")
-
-        processed_video = None
-        for view_index in range(len(cameras)):
-            frame_start = view_index * frames_per_view
-            # Move only this camera to the host, even if an in-process caller
-            # supplies a CUDA tensor. Guardrail conversions then stay on CPU.
-            view = video.narrow(2, frame_start, frames_per_view).detach().cpu()
-            if guardrails_enabled:
-                view = check_video_safety(view)
-            processed_view = video_processor.postprocess_video(view, output_type=output_type)
-            if processed_video is None:
-                if output_type == "pil":
-                    processed_video = [[]]
-                else:
-                    output_shape = (1, video.shape[2], *processed_view.shape[2:])
-                    if output_type == "np":
-                        processed_video = np.empty(output_shape, dtype=processed_view.dtype)
-                    else:
-                        processed_video = torch.empty(output_shape, dtype=processed_view.dtype, device="cpu")
-            if output_type == "pil":
-                processed_video[0].extend(processed_view[0])
-            else:
-                processed_video[:, frame_start : frame_start + frames_per_view] = processed_view
-            # Do not retain converted camera clips and concatenate them later:
-            # that would duplicate the complete processed multiview output.
-            del view, processed_view
-
-        assert processed_video is not None
-        return processed_video
-
     def post_process_func(
         output: torch.Tensor | dict[str, torch.Tensor] | tuple,
         output_type: str = "np",
@@ -792,29 +740,24 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
             return action
 
         pending_action = None
-        pending_lidar = None
+        pending_action_metadata: dict[str, Any] = {}
         envelope_public_metadata: dict[str, Any] = {}
         if isinstance(output, dict) and isinstance(output.get("payload"), dict):
             envelope_payload = dict(output.get("payload") or {})
             metadata = output.get("metadata") or {}
             envelope_metadata = metadata if isinstance(metadata, dict) else {}
             envelope_public_metadata = {key: value for key, value in envelope_metadata.items() if key != "internal"}
-            pending_lidar = envelope_payload.pop("lidar", None)
-            if pending_lidar is not None:
-                if "video" not in envelope_payload:
-                    raise ValueError("Cosmos3 LiDAR output requires a video payload.")
-                # Numeric range images must never pass through RGB processing.
-                pending_lidar = pending_lidar.detach().to(device="cpu", dtype=torch.float32).contiguous()
             action = envelope_payload.pop("actions", None)
             if action is not None:
                 pending_action = _postprocess_action(action, envelope_metadata)
+                pending_action_metadata = envelope_public_metadata
                 if not envelope_payload:
                     return {
                         "payload": {
                             "video": [],
                             "actions": pending_action,
                         },
-                        "metadata": envelope_public_metadata,
+                        "metadata": pending_action_metadata,
                     }
             output = envelope_payload
 
@@ -864,24 +807,21 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
                 }
             return processed_image
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
-        multiview = envelope_public_metadata.get("multiview")
-        if isinstance(multiview, Mapping):
-            processed_video = _postprocess_multiview_video(
-                video, multiview, output_type=output_type, guardrails_enabled=guardrails_enabled
-            )
-        else:
-            if guardrails_enabled:
-                video = check_video_safety(video)
-            processed_video = video_processor.postprocess_video(video, output_type=output_type)
-        auxiliary_payload = {}
-        if pending_action is not None:
-            auxiliary_payload["actions"] = pending_action
-        if pending_lidar is not None:
-            auxiliary_payload["lidar"] = pending_lidar
+        if guardrails_enabled:
+            video = check_video_safety(video)
+        processed_video = video_processor.postprocess_video(video, output_type=output_type)
         if audio is None:
-            if auxiliary_payload or envelope_public_metadata:
+            if pending_action is not None:
                 return {
-                    "payload": {"video": processed_video, **auxiliary_payload},
+                    "payload": {
+                        "video": processed_video,
+                        "actions": pending_action,
+                    },
+                    "metadata": pending_action_metadata,
+                }
+            if envelope_public_metadata:
+                return {
+                    "payload": {"video": processed_video},
                     "metadata": envelope_public_metadata,
                 }
             return processed_video
@@ -894,27 +834,31 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         }
         if audio_sample_rate is not None:
             result["audio_sample_rate"] = int(audio_sample_rate)
-        if auxiliary_payload or envelope_public_metadata:
-            video_metadata = envelope_public_metadata.get("video")
-            audio_metadata = envelope_public_metadata.get("audio")
-            video_metadata = (
-                {"fps": result["fps"], **video_metadata} if isinstance(video_metadata, dict) else {"fps": result["fps"]}
-            )
-            audio_metadata = dict(audio_metadata) if isinstance(audio_metadata, dict) else {}
-            if audio_sample_rate is not None:
-                audio_metadata["sample_rate"] = int(audio_sample_rate)
-            else:
-                audio_metadata.setdefault("sample_rate", None)
+        if pending_action is not None:
             return {
                 "payload": {
                     "video": result["video"],
                     "audio": result["audio"],
-                    **auxiliary_payload,
+                    "actions": pending_action,
+                },
+                "metadata": {
+                    **pending_action_metadata,
+                    "video": {"fps": result["fps"]},
+                    "audio": {"sample_rate": result.get("audio_sample_rate")},
+                },
+            }
+        if envelope_public_metadata:
+            return {
+                "payload": {
+                    "video": result["video"],
+                    "audio": result["audio"],
                 },
                 "metadata": {
                     **envelope_public_metadata,
-                    "video": video_metadata,
-                    "audio": audio_metadata,
+                    "video": {"fps": result["fps"], **envelope_public_metadata.get("video", {})}
+                    if isinstance(envelope_public_metadata.get("video"), dict)
+                    else {"fps": result["fps"]},
+                    "audio": {"sample_rate": result.get("audio_sample_rate")},
                 },
             }
         return result
