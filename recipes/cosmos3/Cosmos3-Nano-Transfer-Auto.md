@@ -55,7 +55,7 @@ retain each camera's trained identity.
 
 | Output | Contract |
 | --- | --- |
-| Video | One camera-major clip per request; all cameras share one size. The offline example writes one MP4 per camera. |
+| Video | One camera-major clip per request; all cameras share one size. |
 | Frames and rate | `num_frames` per camera (default 201) is rounded up to the VAE's `4k+1` grid. fps defaults to 30, the training rate. Other rates are accepted, with a warning outside [10, 30]. |
 | Geometry | `resolution` `"480"` or `"720"` and `aspect_ratio` (see [Resolution and aspect ratio](#resolution-and-aspect-ratio)) |
 | LiDAR (joint checkpoints, opt-in) | `lidar.return_output: true` returns float32 `[3, T, 128, 1800]` sweeps at the checkpoint's LiDAR rate, starting at the camera clip's time origin |
@@ -66,8 +66,6 @@ Guidance intervals use open timestep bounds, as in reference inference.
 
 ## References
 
-- Offline example: [`examples/offline_inference/multiview_video/cosmos3_multiview.py`](../../examples/offline_inference/multiview_video/cosmos3_multiview.py)
-- Online client: [`examples/online_serving/multiview_video/cosmos3_multiview_client.py`](../../examples/online_serving/multiview_video/cosmos3_multiview_client.py)
 - [Video API](../../docs/serving/videos_api.md)
 - [Supported models](../../docs/models/supported_models.md) and the
   [diffusion feature matrix](../../docs/user_guide/diffusion_features.md)
@@ -214,7 +212,7 @@ with `VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND=triton`.
 
 ## Command
 
-### Offline
+### Request manifest
 
 The input JSON carries the prompt, one hint (`"wsm": {}`), and
 `multiview.views`, one entry per camera with `camera_key`, `control_path` and,
@@ -225,27 +223,6 @@ Add a top-level `lidar` object for joint requests:
 ```json
 "lidar": {"control_path": "lidar_control.safetensors", "return_output": true}
 ```
-
-```bash
-python examples/offline_inference/multiview_video/cosmos3_multiview.py \
-  --model /models/Cosmos3-Nano-Transfer-Auto \
-  --input /data/mv_i2v_wsm.json \
-  --output-dir outputs/mv_i2v_wsm \
-  --seed 42 --fps 30 --num-frames 200
-```
-
-The script writes `vision_viewNN_<camera>.mp4` per camera (plus
-`combined_views.mp4` with `--combine-views`), `lidar.safetensors` when LiDAR
-output was requested, and `sample_outputs.json` with the resolved geometry and
-metadata. `--fps`, `--num-frames`, `--resolution` and `--aspect-ratio`
-override every record. Records may use `guidance`, `num_steps` and `shift` as
-aliases for `guidance_scale`, `num_inference_steps` and `flow_shift`; the
-vLLM-Omni names win when both are present. Records may set
-`per_view_negative_prompt`; see [Negative captions](#negative-captions).
-
-Camera files are encoded concurrently by default (at least two, at most four
-FFmpeg threads per camera, bounded by the CPU affinity mask);
-`--video-encoding-mode serial` is a diagnostic fallback.
 
 ### Online
 
@@ -260,17 +237,11 @@ JSON-encoded `extra_params` form field. Media may be server-local
 referenced by zero-based `control_reference_index`/`vision_reference_index`
 (LiDAR: `control_reference_index`/`condition_reference_index`). Every upload
 must be referenced exactly once, and one camera role cannot have both a path and
-an index. The client uploads the local paths of an offline manifest:
-
-```bash
-python examples/online_serving/multiview_video/cosmos3_multiview_client.py \
-  request.json --server http://localhost:8091 --output multiview.mp4
-```
+an index.
 
 `/content` returns one camera-major MP4. For joint jobs with
 `lidar.return_output: true`, the completed job carries a `lidar` descriptor and
-`GET /v1/videos/{video_id}/lidar` returns the numeric file; the client saves
-`<output-stem>.lidar.safetensors` and `.lidar.json`. LiDAR output requires the
+`GET /v1/videos/{video_id}/lidar` returns the numeric file. LiDAR output requires the
 asynchronous endpoint; `/v1/videos/sync` rejects it.
 
 Setting `extra_params.parallel_multiview_encoding: true` opts in to
@@ -337,8 +308,7 @@ There is no shared negative prompt. Requests that set `negative_prompt` (form
 field, prompt object, `extra_args` or `extra_params`) or `negative_metadata_mode`
 are rejected rather than ignored. `/v1/videos` requests with uploaded
 references fail with HTTP 400 before a job is created; other requests fail when
-generation starts. The example scripts reject both fields in their input
-records.
+generation starts.
 
 ## Safety guardrails
 
@@ -353,7 +323,7 @@ passes the video guardrail (face blur) separately. The guardrails load the
 3. Export a token with access: `export HF_TOKEN=hf_...`
 
 To run **without** guardrails (you are responsible for license compliance), add
-`--no-guardrails` to the offline script or to `vllm serve`; neither needs
+`--no-guardrails` to `vllm serve`; this needs neither
 the token nor `cosmos-guardrail`. When the server loads guardrails, a request
 can skip them with `"guardrails": false` in its `extra_params`; a request cannot
 turn them on for a server started with `--no-guardrails`.
