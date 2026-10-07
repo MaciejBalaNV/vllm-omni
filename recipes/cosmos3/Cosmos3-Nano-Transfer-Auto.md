@@ -244,11 +244,6 @@ an index.
 `GET /v1/videos/{video_id}/lidar` returns the numeric file. LiDAR output requires the
 asynchronous endpoint; `/v1/videos/sync` rejects it.
 
-Setting `extra_params.parallel_multiview_encoding: true` opts in to
-camera-parallel MP4 encoding on the server. It needs at least two cameras, no
-audio, and enough affinity CPUs; otherwise the server logs why and uses the
-regular encoder.
-
 ## Resolution and aspect ratio
 
 `resolution` selects the `"480"` or `"720"` bucket (default: the checkpoint's
