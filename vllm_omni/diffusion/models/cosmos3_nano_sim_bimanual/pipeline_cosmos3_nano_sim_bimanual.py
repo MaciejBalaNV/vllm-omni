@@ -397,7 +397,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             "num_layers": int(cache.num_layers),
             "num_kv_heads": int(cache.num_kv_heads),
             "head_size": int(cache.head_size),
-            "tokens_per_frame": int(cache.block_size),
+            "tokens_per_frame": int(cache.spec.chunk_size),
             "frames_per_block": int(cache.frames_per_block),
             "max_scratch_frames_per_branch": int(cache.max_scratch_frames_per_branch),
             "max_scratch_tokens_per_branch": int(cache.max_scratch_tokens_per_branch),
