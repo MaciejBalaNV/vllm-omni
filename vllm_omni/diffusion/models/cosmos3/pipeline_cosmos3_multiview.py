@@ -68,7 +68,6 @@ from .transfer import (
     uint8_cthw_to_normalized_5d,
 )
 from .transformer_cosmos3 import _tf_config_get
-from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
 from .utils import VIDEO_RES_SIZE_INFO
 
 logger = init_logger(__name__)
@@ -93,12 +92,6 @@ COSMOS3_MULTIVIEW_DEFAULT_LIDAR_CONDITION_SWEEPS = 1
 # two cannot drift and accidentally trigger shape-specific recompilation.
 COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS = 2
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = DEFAULT_MAX_UND_TOKENS - COSMOS3_MULTIVIEW_PROMPT_FRAMING_TOKENS
-
-
-def _mapping(value: Any, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise TypeError(f"Cosmos3 multiview {name} must be an object, got {type(value).__name__}.")
-    return value
 
 
 def _media_kind(value: Any) -> str:
@@ -434,6 +427,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         lengths_by_text = kwargs.pop("_multiview_caption_lengths", None)
         if lengths_by_text is not None:
             kwargs["caption_lengths"] = lengths_by_text[kwargs["text_ids"].data_ptr()]
+        # The shared transfer loop passes these to every branch. Captions are
+        # already compacted, hints carry no per-control weight, and the LiDAR
+        # condition prefix is applied by _apply_transfer_condition.
+        for key in ("text_mask", "control_weights", "lidar_condition_latents"):
+            kwargs.pop(key, None)
         return super().predict_noise(**kwargs)
 
     def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
@@ -462,10 +460,6 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         super().__init__(od_config=od_config, prefix=prefix)
         if self.device.type != "cuda":
             raise ValueError("Cosmos3-Nano-Transfer-Auto requires CUDA for multiview attention.")
-        if not isinstance(self.transformer, Cosmos3MultiviewVFMTransformer):
-            raise ValueError(
-                "Cosmos3MultiviewPipeline requires transformer/config.json backbone_type='cosmos3_multiview'."
-            )
 
         self.multiview_config = multiview_config
         self._encoder_modules = []
@@ -961,20 +955,14 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 )
             )
 
-        # Positive integers identify separate text segments. Zero remains padding.
-        # Each segment gets its own causal UND pass and shared position origin.
-        def combine_branch(ids_index: int, mask_index: int) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
-            ids, masks, lengths = [], [], []
-            for index, branch in enumerate(branches, 1):
-                real = branch[mask_index].bool()
-                tokens = branch[ids_index][real].reshape(1, -1)
-                ids.append(tokens)
-                masks.append(torch.full_like(tokens, index))
-                lengths.append(tokens.shape[1])
-            return torch.cat(ids, dim=1), torch.cat(masks, dim=1), tuple(lengths)
+        # Compact each camera's real caption tokens into one sequence. The host-side
+        # lengths give each segment its own causal UND pass and position origin.
+        def combine_branch(ids_index: int, mask_index: int) -> tuple[torch.Tensor, tuple[int, ...]]:
+            ids = [branch[ids_index][branch[mask_index].bool()].reshape(1, -1) for branch in branches]
+            return torch.cat(ids, dim=1), tuple(tokens.shape[1] for tokens in ids)
 
-        cond_ids, cond_mask, cond_lengths = combine_branch(0, 1)
-        uncond_ids, uncond_mask, uncond_lengths = combine_branch(2, 3)
+        cond_ids, cond_lengths = combine_branch(0, 1)
+        uncond_ids, uncond_lengths = combine_branch(2, 3)
 
         guidance_scale = self._resolve_guidance_scale(sp, defaults.get("guidance", COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE))
         if not math.isfinite(guidance_scale) or guidance_scale < 0:
@@ -1001,14 +989,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             dtype=torch.long,
             device=self.device,
         )
-        video_shape = tuple(int(dim) for dim in latents.shape[2:])
         shared_kwargs = {
             "_multiview_caption_lengths": {
                 cond_ids.data_ptr(): cond_lengths,
                 uncond_ids.data_ptr(): uncond_lengths,
             },
-            "video_shape": video_shape,
-            "fps": frame_rate,
             "noisy_frame_mask": velocity_mask,
             "packed_shapes": tuple(tuple(tensor.shape[1:]) for tensor in targets),
             "lidar_control_latents": lidar_control_latents,
@@ -1025,9 +1010,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             latents=initial_state.pop(),
             timesteps=self.scheduler.timesteps,
             cond_ids=cond_ids,
-            cond_mask=cond_mask,
+            # The multiview transformer reads caption lengths, not a text mask.
+            cond_mask=None,
             uncond_ids=uncond_ids,
-            uncond_mask=uncond_mask,
+            uncond_mask=None,
             guidance_scale=guidance_scale,
             control_guidance=float(self._get_sp_param(sp, "control_guidance", defaults.get("control_guidance", 1.0))),
             control_guidance_interval=self._get_sp_param(

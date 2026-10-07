@@ -12,7 +12,6 @@ from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
 
 from .multiview_attention import multiview_attention
-from .multiview_config import _validated_multiview_deployment_config
 from .multiview_flex_attention import (
     MaskItem,
     MultiviewAttentionContext,
@@ -150,11 +149,6 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             output[:, start:end] = self.proj_out(self.norm_moe_gen(hidden_video[:, start:end]))
         return output
 
-    @staticmethod
-    def _validate_supported_config(model_config: Any) -> None:
-        Cosmos3VFMTransformer._validate_supported_config(model_config)
-        _validated_multiview_deployment_config(model_config)
-
     def __init__(self, *args, **kwargs) -> None:
         od_config = kwargs.get("od_config", args[0] if args else None)
         deployment = _tf_config_get(od_config.tf_model_config, "multiview", {})
@@ -248,36 +242,31 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             embeddings.append(hidden)
         return torch.cat(embeddings, dim=1)
 
-    def _forward_packed(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         text_ids: torch.Tensor,
-        text_mask: torch.Tensor,
         multiview_layout: MultiviewLayout,
         packed_shapes: tuple[tuple[int, ...], ...],
         caption_lengths: tuple[int, ...],
-        control_latents=None,
+        control_latents: list[torch.Tensor] | None = None,
         lidar_control_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         rig_view_ids: torch.Tensor | None = None,
         lidar_condition_frames: int = 0,
-        **kwargs,
     ) -> torch.Tensor:
         """Pack sensor-specific embeddings around the base transformer's shared GEN execution.
 
         Captions arrive compacted from the pipeline with host-side lengths;
         no text-mask reduction or device-to-host synchronization is needed here.
+        Caption boundaries are validated when the attention plan is built.
         """
-        if kwargs.get("action_latents") is not None or kwargs.get("sound_latents") is not None:
-            raise ValueError("Multiview generation cannot be combined with action or sound.")
         targets = unpack_state(hidden_states, packed_shapes)
         camera = targets[0]
         has_control = control_latents is not None and len(control_latents) > 0
         items = tuple(item for item in multiview_layout.items if has_control or not item.is_control)
         lengths = caption_lengths
-        if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != text_ids.shape[1]:
-            raise ValueError("Packed caption lengths must cover the compacted text tokens with nonempty segments.")
         layout = replace(multiview_layout, items=items, caption_lengths=lengths)
         if self.cached_kv is None or self.cached_freqs_gen is None:
             dummy = camera.new_empty(0)
@@ -357,13 +346,3 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
                 patch = self.lidar_patch_hw if item.is_lidar else self.latent_patch_size
                 outputs.append(unpatchify_sensor(projected, tuple(latent.shape[1:]), patch))
             return pack_state(outputs)
-
-    def forward(
-        self,
-        *args,
-        multiview_layout: MultiviewLayout | None = None,
-        **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        if multiview_layout is None:
-            return super().forward(*args, **kwargs)
-        return self._forward_packed(*args, multiview_layout=multiview_layout, **kwargs)

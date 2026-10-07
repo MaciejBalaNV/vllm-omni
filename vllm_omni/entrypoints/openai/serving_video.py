@@ -874,7 +874,7 @@ class OmniOpenAIServingVideo:
         if audio is None:
             return [None] * expected_count
 
-        if isinstance(audio, list | tuple):
+        if isinstance(audio, (list, tuple)):
             if len(audio) == expected_count and any(hasattr(item, "shape") or hasattr(item, "ndim") for item in audio):
                 return list(audio)
             if expected_count == 1:
@@ -990,7 +990,7 @@ class OmniOpenAIServingVideo:
             value = value.cpu()
         if hasattr(value, "tolist"):
             return cls._to_jsonable(value.tolist())
-        if isinstance(value, list | tuple):
+        if isinstance(value, (list, tuple)):
             return [cls._to_jsonable(item) for item in value]
         if hasattr(value, "item"):
             try:
@@ -1007,7 +1007,7 @@ class OmniOpenAIServingVideo:
                 return [int(dim) for dim in shape]
             except (TypeError, ValueError):
                 pass
-        if isinstance(value, list | tuple):
+        if isinstance(value, (list, tuple)):
             if not value:
                 return [0]
             return [len(value)] + cls._shape_of(value[0])

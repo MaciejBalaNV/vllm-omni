@@ -8,6 +8,8 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any, TypeGuard
 
+from vllm_omni.model_extras.cosmos3 import _mapping
+
 from .lidar import validate_lidar_config
 
 COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
@@ -15,12 +17,6 @@ COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
 
 def _tf_config_get(config: Any, key: str, default: Any = None) -> Any:
     return config.get(key, default) if isinstance(config, Mapping) else getattr(config, key, default)
-
-
-def _mapping(value: Any, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise TypeError(f"Cosmos3 multiview {name} must be an object, got {type(value).__name__}.")
-    return value
 
 
 COSMOS3_MULTIVIEW_CONTRACT_FIELDS = frozenset(

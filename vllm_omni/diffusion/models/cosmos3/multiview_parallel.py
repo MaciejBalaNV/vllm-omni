@@ -69,19 +69,9 @@ def multiview_ulysses_attention(
 
     Inputs have shape [B, local_GEN, TP_local_heads, D]. UND K/V are replicated
     across CP ranks, already TP-local. Plans and sparse masks stay in global camera-major coordinates. CP padding
-    is removed before dispatch and restored before the inverse exchange.
+    is removed before dispatch and restored before the inverse exchange. Head
+    divisibility is checked at load by ``validate_multiview_parallel_config``.
     """
-    if world_size < 2 or not 0 <= rank < world_size:
-        raise ValueError("Multiview Ulysses requires a valid rank in a group of at least two workers.")
-    if q.ndim != 4 or k.ndim != 4 or q.shape[:2] != k.shape[:2] or k.shape != v.shape:
-        raise ValueError("Multiview Ulysses requires matching [B, local_GEN, H, D] Q/K/V geometry.")
-    if k_und.ndim != 4 or k_und.shape != v_und.shape or k_und.shape[0] != k.shape[0]:
-        raise ValueError("Multiview Ulysses requires matching [B, UND, Hkv, D] text K/V geometry.")
-    if k_und.shape[2:] != k.shape[2:] or q.shape[3] != k.shape[3]:
-        raise ValueError("Multiview Ulysses requires the same GEN and UND KV head geometry.")
-    if q.shape[2] % world_size or k.shape[2] % world_size or q.shape[2] % k.shape[2]:
-        raise ValueError("Multiview Ulysses requires query/KV heads divisible by CP and an integral GQA ratio.")
-
     real_len = context.layout.gen_tokens
     local_len = (real_len + world_size - 1) // world_size
     if q.shape[1] != local_len:

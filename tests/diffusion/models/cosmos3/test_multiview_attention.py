@@ -12,17 +12,26 @@ import torch
 from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
     MaskItem,
     MultiviewAttentionContext,
+    MultiviewFlexMetadata,
     MultiviewLayout,
     PaddedAttentionGeometry,
+    _make_pair_allowed,
     _pack_padded_bshd,
     build_multiview_block_sparsity,
     build_multiview_flex_metadata,
     get_multiview_attention_plan,
-    multiview_pair_predicate,
     padded_multiview_flex_attention,
+    validate_multiview_backend,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+def _pair_predicate(metadata: MultiviewFlexMetadata, q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
+    pair_allowed = _make_pair_allowed(
+        metadata.query_vectors(), metadata.key_vectors(), metadata.cross_view_past_window_seconds
+    )
+    return pair_allowed(q_index, kv_index)
 
 
 def _layout(window: float = 0.4, backend: str = "triton") -> MultiviewLayout:
@@ -86,7 +95,7 @@ def test_attention_pairs_match_independent_dense_reference(window: float) -> Non
     layout = _layout(window)
     geometry = PaddedAttentionGeometry(layout.gen_tokens, 64, 5, 64)
     metadata = build_multiview_flex_metadata(layout, geometry, "cpu")
-    actual = multiview_pair_predicate(metadata, torch.arange(64)[:, None], torch.arange(128)[None, :])
+    actual = _pair_predicate(metadata, torch.arange(64)[:, None], torch.arange(128)[None, :])
     expected = _dense_reference(layout, geometry)
     torch.testing.assert_close(actual, expected)
     assert metadata.timestamp.dtype == torch.float32
@@ -132,22 +141,15 @@ def test_capture_time_tolerance_at_both_boundaries(
         max_und_tokens=64,
     )
     metadata = build_multiview_flex_metadata(layout, PaddedAttentionGeometry(8, 64, 2, 64), "cpu")
-    visible_pair = multiview_pair_predicate(metadata, torch.tensor(2), torch.tensor(64 + 3 + lidar_frame))
+    visible_pair = _pair_predicate(metadata, torch.tensor(2), torch.tensor(64 + 3 + lidar_frame))
     assert bool(visible_pair) is visible
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("window", [None, True, -0.1, float("inf"), float("nan")])
-def test_layout_rejects_invalid_window(window: float) -> None:
-    with pytest.raises(ValueError, match="finite.*non-negative"):
-        _layout(window)
-
-
-@pytest.mark.cpu
 @pytest.mark.parametrize("backend", ["maskless", "unknown"])
-def test_layout_rejects_removed_backends(backend: str) -> None:
+def test_backend_validation_rejects_removed_backends(backend: str) -> None:
     with pytest.raises(ValueError, match="backend must be one of"):
-        _layout(backend=backend)
+        validate_multiview_backend(backend)
 
 
 def _numerical_comparison(device: str, backend: str, dtype: torch.dtype, *, compiled: bool = False) -> None:

@@ -649,11 +649,10 @@ def test_multiview_transformer_builds_per_stream_lidar_patch_and_rig_table() -> 
         Cosmos3MultiviewVFMTransformer,
     )
 
-    def build(deployment):
-        config = _tiny_cosmos3_config(latent_patch_size=2, backbone_type="cosmos3_multiview", multiview=deployment)
-        return Cosmos3MultiviewVFMTransformer(SimpleNamespace(tf_model_config=config, dtype=torch.float32))
-
-    model = build(_tiny_multiview_deployment())
+    config = _tiny_cosmos3_config(
+        latent_patch_size=2, backbone_type="cosmos3_multiview", multiview=_tiny_multiview_deployment()
+    )
+    model = Cosmos3MultiviewVFMTransformer(SimpleNamespace(tf_model_config=config, dtype=torch.float32))
     assert model.lidar_patch_hw == (1, 1)
     assert tuple(model.lidar_proj_in.weight.shape) == (8, 4)
     assert tuple(model.lidar_proj_out.weight.shape) == (4, 8)
@@ -669,12 +668,6 @@ def test_multiview_transformer_builds_per_stream_lidar_patch_and_rig_table() -> 
     with pytest.raises(ValueError, match="rig_view_embed.weight"):
         model.validate_loaded_weights(loaded)
     model.validate_loaded_weights(loaded | {"transformer.rig_view_embed.weight"})
-
-    for field in ("rig_view_embedding", "lidar_latent_patch_size_hw"):
-        incomplete = _tiny_multiview_deployment()
-        del incomplete[field]
-        with pytest.raises(ValueError, match="requires field"):
-            build(incomplete)
 
 
 @pytest.mark.parametrize(

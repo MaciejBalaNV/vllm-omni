@@ -3856,7 +3856,9 @@ def test_multiview_forward_per_view_negative_captions(
     )
     assert all(call["text"] == formatted for call in negatives)
     assert all(call["system_prompt"] == tokenizations[0]["system_prompt"] for call in negatives)
-    assert diffuse_calls[0]["uncond_mask"].tolist() == [[1, 2]]
+    uncond_ids = diffuse_calls[0]["uncond_ids"]
+    caption_lengths = diffuse_calls[0]["shared_kwargs"]["_multiview_caption_lengths"]
+    assert caption_lengths[uncond_ids.data_ptr()] == (1, 1)
     assert diffuse_calls[0]["open_guidance_interval"] is True
     assert diffuse_calls[0]["guidance_scale"] == 9.0
     assert diffuse_calls[0]["shared_kwargs"]["rig_view_ids"].tolist() == [1, 0]

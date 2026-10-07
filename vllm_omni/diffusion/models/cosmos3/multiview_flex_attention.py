@@ -103,25 +103,6 @@ class MaskItem:
     seconds_per_frame: float = 1.0
     is_lidar: bool = False
 
-    def __post_init__(self) -> None:
-        latent_t, patch_h, patch_w = self.token_shape
-        if latent_t <= 0 or patch_h <= 0 or patch_w <= 0:
-            raise ValueError(f"Cosmos3 multiview token_shape must be positive, got {self.token_shape}.")
-        if self.num_views <= 0 or latent_t % self.num_views:
-            raise ValueError(
-                "Cosmos3 multiview latent frames must be divisible by num_views: "
-                f"latent_t={latent_t}, num_views={self.num_views}."
-            )
-        if (
-            isinstance(self.seconds_per_frame, bool)
-            or not isinstance(self.seconds_per_frame, int | float)
-            or not math.isfinite(self.seconds_per_frame)
-            or self.seconds_per_frame <= 0
-        ):
-            raise ValueError(
-                f"Cosmos3 multiview seconds_per_frame must be finite and positive, got {self.seconds_per_frame!r}."
-            )
-
     @property
     def num_tokens(self) -> int:
         return math.prod(self.token_shape)
@@ -145,7 +126,10 @@ class MultiviewLayout:
     caption_lengths: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        validate_multiview_backend(self.backend)
+        # The pipeline validates the backend, window and geometry once per
+        # request. ``dataclasses.replace`` reruns this on every forward, so keep
+        # only the FA4 op registration and the single-rate-per-view invariant
+        # that semantic run grouping depends on.
         if self.backend == "fa4":
             # Importing here registers vllm_omni::cosmos3_multiview_fa4 while we
             # are still host-side.  The attention call site imports the module
@@ -154,20 +138,6 @@ class MultiviewLayout:
             # something to rely on.  The module itself defers every CuTe/CUTLASS
             # import to _load_fa4, so this stays safe on CPU-only hosts.
             from . import multiview_fa4  # noqa: F401
-        if self.max_und_tokens <= 0:
-            raise ValueError(f"Cosmos3 multiview max_und_tokens must be positive, got {self.max_und_tokens}.")
-        if not self.items:
-            raise ValueError("Cosmos3 multiview layout requires at least one vision item.")
-        if (
-            isinstance(self.cross_view_past_window_seconds, bool)
-            or not isinstance(self.cross_view_past_window_seconds, int | float)
-            or not math.isfinite(self.cross_view_past_window_seconds)
-            or self.cross_view_past_window_seconds < 0
-        ):
-            raise ValueError(
-                "Cosmos3 multiview cross_view_past_window_seconds must be a finite "
-                f"non-negative number, got {self.cross_view_past_window_seconds!r}."
-            )
         rates_by_view_offset: dict[int, float] = {}
         for item in self.items:
             expected = rates_by_view_offset.setdefault(item.view_offset, item.seconds_per_frame)
@@ -409,20 +379,6 @@ def _make_pair_allowed(
     return pair_allowed
 
 
-def multiview_pair_predicate(
-    metadata: MultiviewFlexMetadata,
-    q_index: torch.Tensor,
-    kv_index: torch.Tensor,
-) -> torch.Tensor:
-    """Evaluate the exact token visibility predicate (also used as mask_mod)."""
-    pair_allowed = _make_pair_allowed(
-        metadata.query_vectors(),
-        metadata.key_vectors(),
-        metadata.cross_view_past_window_seconds,
-    )
-    return pair_allowed(q_index, kv_index)
-
-
 def _semantic_groups(vectors: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor]:
     """Return run IDs and first-token indexes without converting field dtypes."""
     if not vectors:
@@ -495,8 +451,8 @@ class MultiviewBlockSparsity:
     FlashAttention-4 consumes unchanged as ``BlockSparseTensorsTorch``.  The
     remaining fields are the exact per-element fallback used inside partially
     masked tiles: a token-to-run id for each side plus the packed truth table
-    over run pairs.  Together they encode ``multiview_pair_predicate`` without
-    the kernel knowing anything about views, frames, or timestamps.
+    over run pairs.  Together they encode the ``_make_pair_allowed`` predicate
+    without the kernel knowing anything about views, frames, or timestamps.
     """
 
     partial_counts: torch.Tensor
@@ -506,8 +462,6 @@ class MultiviewBlockSparsity:
     q_word_base: torch.Tensor
     k_group_ids: torch.Tensor
     allowed_words: torch.Tensor
-    group_allowed: torch.Tensor
-    words_per_row: int
     q_block_size: int
     kv_block_size: int
     metadata: MultiviewFlexMetadata
@@ -519,10 +473,6 @@ class MultiviewBlockSparsity:
     @property
     def kv_len(self) -> int:
         return self.metadata.kv_len
-
-    def aux_tensors(self) -> list[torch.Tensor]:
-        """The mask_mod auxiliary tensors, in the order the kernel indexes them."""
-        return [self.q_word_base, self.k_group_ids, self.allowed_words]
 
     def to_block_mask(self) -> BlockMask:
         metadata = self.metadata
@@ -606,8 +556,6 @@ def build_multiview_block_sparsity(
         q_word_base=q_word_base,
         k_group_ids=k_group_ids.to(torch.int32).contiguous(),
         allowed_words=allowed_words,
-        group_allowed=group_allowed,
-        words_per_row=words_per_row,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
         metadata=metadata,
@@ -637,16 +585,6 @@ def get_multiview_attention_plan(
     identically shaped tensors, so they share one compiled kernel.
     """
     layout = context.layout
-    if real_q_len != layout.gen_tokens:
-        raise ValueError(
-            "Cosmos3 multiview packed GEN length does not match the request layout: "
-            f"attention={real_q_len}, layout={layout.gen_tokens}."
-        )
-    if not 0 <= real_und_len <= layout.max_und_tokens:
-        raise ValueError(
-            "Cosmos3 multiview UND stream exceeds the layout capacity the attention was sized for: "
-            f"tokens={real_und_len}, max_und_tokens={layout.max_und_tokens}."
-        )
     q_block_size, kv_block_size = layout.block_sizes
     padded_q_len = _round_up(real_q_len, q_block_size)
     padded_und_len = _round_up(layout.max_und_tokens, kv_block_size)
@@ -842,16 +780,6 @@ def padded_multiview_flex_attention(
     context: MultiviewAttentionContext,
 ) -> torch.Tensor:
     """Pad UND and GEN independently, attend once, then trim GEN rows."""
-    if q.shape[:2] != k.shape[:2] or k.shape != v.shape:
-        raise ValueError(
-            "Cosmos3 multiview q/k/v sequence geometry must match before GQA: "
-            f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}."
-        )
-    if k_und.shape != v_und.shape or k_und.shape[0] != q.shape[0]:
-        raise ValueError(
-            "Cosmos3 multiview UND key/value geometry mismatch: "
-            f"k_und={tuple(k_und.shape)}, v_und={tuple(v_und.shape)}."
-        )
     plan, geometry = get_multiview_attention_plan(
         context,
         real_und_len=k_und.shape[1],
