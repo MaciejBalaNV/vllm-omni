@@ -198,15 +198,15 @@ The following tables show which models support each feature:
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Kandinsky 6 TI2VA**        | ✅* (uncalibrated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ✅ (FP8) | ✅ (1 request) |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
-| **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ✅ | ❌ | ✅ | ❓ | ❌ | ❓ | ❌ |
+| **Cosmos3-Nano-Transfer-Auto**      |     ❌     |     ❌      | ✅ (strict Ulysses) | ✅ (2-way) | ❓ | ❌ | ❓ | ❓ | ❌ | ❓ | ❌ |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 
 > Notes:
-> Cosmos3-Nano-Transfer-Auto supports CFGP, strict Ulysses CP, HSDP, and TP;
-> see the [Cosmos3-Nano-Transfer-Auto recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto.md).
+> Cosmos3-Nano-Transfer-Auto runs CFGP and strict Ulysses CP on GB200; HSDP and TP are configuration-only;
+> see the [Cosmos3-Nano-Transfer-Auto recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-Nano-Transfer-Auto-GB200.md).
 > HSDP and TP are alternative memory modes and cannot be combined.
 >
 > 5\. SANA-WM cannot support sequence parallelism: its bidirectional gated delta

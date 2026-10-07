@@ -3669,7 +3669,7 @@ def test_multiview_accepts_single_camera_and_reordered_subsets(count: int) -> No
     assert parsed == views
 
 
-# -- Multiview per-camera caption parity with imaginaire4 ---------------------
+# -- Multiview per-camera caption parity with the reference -------------------
 
 
 def test_multiview_rig_view_caption_matches_reference_single_camera() -> None:

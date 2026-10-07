@@ -969,7 +969,7 @@ class Encoder(nn.Module):
         return h, new_cache
 
 
-# Decoder ported from imaginaire4 9ca7bd6adfe; shared spatial attention uses FlexAttention.
+# Decoder ported from the reference implementation; shared spatial attention uses FlexAttention.
 class Decoder(nn.Module):
     """Inference-only decoder with spatial upsampling and causal temporal mixing."""
 

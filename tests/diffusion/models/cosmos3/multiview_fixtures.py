@@ -37,7 +37,7 @@ def multiview_lidar_contract(chunk: int = 9, context: int | None = 9) -> dict[st
 
 
 def multiview_contract() -> dict[str, Any]:
-    """The canonical contract emitted by imaginaire4 for Cosmos3-Nano-Transfer-Auto."""
+    """The canonical exported deployment contract for Cosmos3-Nano-Transfer-Auto."""
     from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
 
     return {

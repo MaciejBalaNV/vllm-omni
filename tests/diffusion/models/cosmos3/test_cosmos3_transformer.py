@@ -447,7 +447,7 @@ def test_multiview_sensor_patchify_round_trips_rectangular_patches(patch) -> Non
     assert (hp, wp) == (-(-5 // ph), -(-7 // pw))
     assert tokens.shape == (2, 4 * hp * wp, ph * pw * 3)
     torch.testing.assert_close(unpatchify_sensor(tokens, tuple(latent.shape[1:]), patch), latent, rtol=0, atol=0)
-    # Feature layout is (ph, pw, C), matching imaginaire4's "cthpwq->thwpqc".
+    # Feature layout is (ph, pw, C), matching the reference "cthpwq->thwpqc".
     padded = torch.nn.functional.pad(latent, (0, wp * pw - 7, 0, hp * ph - 5))
     reference = torch.einsum("bcthpwq->bthwpqc", padded.reshape(2, 3, 4, hp, ph, wp, pw)).reshape(2, -1, ph * pw * 3)
     torch.testing.assert_close(tokens, reference, rtol=0, atol=0)

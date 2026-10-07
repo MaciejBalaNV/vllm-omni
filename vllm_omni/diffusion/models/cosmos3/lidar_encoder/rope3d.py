@@ -3,8 +3,8 @@
 
 """3D rotary positional embedding for ``(T, H, W)`` token grids.
 
-Adapted (PyTorch-only, no TransformerEngine) from
-``imaginaire.networks.video_backbone.VideoRopePosition3DEmb``: the head dim
+Adapted (PyTorch-only, no TransformerEngine) from the reference
+``VideoRopePosition3DEmb``: the head dim
 is split into three chunks ``(dim_t, dim_h, dim_w)``, each axis contributes
 its own rotary frequency band, and the resulting angles are duplicated
 across the two rotation halves (GPT-NeoX style) so that

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 from .utils import COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE
 
-# The MADS rig, verbatim from imaginaire4 ``datasets/multiview/camera_attributes.py``.
+# The MADS rig, verbatim from the reference camera attributes.
 # Per-view caption headers quote these values, so a drifted copy still produces
 # well-formed captions that describe the wrong rig.
 MADS_CAMERA_ATTRIBUTES: dict[str, dict[str, str | int]] = {
@@ -79,7 +79,7 @@ MADS_CAMERA_ATTRIBUTES: dict[str, dict[str, str | int]] = {
     },
 }
 
-# imaginaire4 ``text_tokenizer.py`` task prompts for per-camera-caption AV checkpoints.
+# Reference task prompts for per-camera-caption AV checkpoints.
 _AV_WSM_CONTROL_INSTRUCTION = (
     "Follow WSM controls for vehicles (including trucks), cyclists, pedestrians, traffic lights, traffic signs, "
     "road markings, lane boundaries, and road boundaries. "
@@ -119,7 +119,7 @@ def _facing(camera: str) -> str:
 def format_rig_view_captions(captions: Sequence[str], cameras: Sequence[str]) -> list[str]:
     """Prefix each camera's caption with the sampled-rig and current-camera headers.
 
-    Mirrors imaginaire4 ``format_separate_view_captions(add_camera_rig_prefix=True)``,
+    Mirrors the reference ``format_separate_view_captions(add_camera_rig_prefix=True)``,
     which per-camera-caption training and reference inference both use. The rig
     sentence lists the request's cameras in request order.
     """
