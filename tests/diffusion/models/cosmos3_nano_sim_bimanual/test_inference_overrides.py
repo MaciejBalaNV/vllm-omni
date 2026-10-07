@@ -43,7 +43,13 @@ def settings(**overrides):
 def methods():
     tree = ast.parse((SOURCE / "pipeline_cosmos3_nano_sim_bimanual.py").read_text())
     cls = next(node for node in tree.body if getattr(node, "name", "") == "Cosmos3NanoSimBimanualPipeline")
-    selected = {"_denoise_chunk", "_kv_spec_for_geometry", "_append_dense_kv", "_transformer_forward"}
+    selected = {
+        "_denoise_chunk",
+        "_kv_spec_for_geometry",
+        "_append_dense_kv",
+        "_transformer_forward",
+        "_validate_bound_kv_geometry",
+    }
     body = [node for node in cls.body if getattr(node, "name", "") in selected]
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias("annotations")], level=0)] + body, type_ignores=[]
