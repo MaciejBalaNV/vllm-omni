@@ -19,6 +19,12 @@ def multiview_attention(
     v_und: torch.Tensor,
     context: MultiviewAttentionContext,
 ) -> torch.Tensor:
+    if context.layout.backend == "maskless":
+        # Imported lazily: the module registers a custom op and is only needed
+        # on workers that resolved the maskless backend.
+        from .multiview_maskless_attention import maskless_multiview_attention
+
+        return maskless_multiview_attention(q, k, v, k_und, v_und, context)
     if context.layout.backend == "triton":
         return padded_multiview_triton_attention(q, k, v, k_und, v_und, context)
     return padded_multiview_flex_attention(q, k, v, k_und, v_und, context)

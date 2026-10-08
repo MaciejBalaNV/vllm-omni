@@ -3491,10 +3491,12 @@ class TestForwardRouting:
     ("override", "fa_version", "expected"),
     [
         (None, 4, "fa4"),
-        (None, 3, "triton"),
+        (None, 3, "maskless"),
+        (None, 2, "maskless"),
         (None, None, "triton"),
         ("triton", 4, "triton"),
         ("fa4", 3, "fa4"),
+        ("maskless", 4, "maskless"),
     ],
 )
 def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
@@ -3641,7 +3643,7 @@ def test_multiview_fa4_rejects_invalid_mask_before_launch(monkeypatch: pytest.Mo
     launch.assert_not_called()
 
 
-@pytest.mark.parametrize("override", ["maskless", "unknown", ""])
+@pytest.mark.parametrize("override", ["flex", "unknown", ""])
 def test_multiview_backend_rejects_invalid_overrides(monkeypatch: pytest.MonkeyPatch, override: str) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
         COSMOS3_MULTIVIEW_BACKEND_ENV,

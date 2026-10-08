@@ -146,10 +146,17 @@ def test_capture_time_tolerance_at_both_boundaries(
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("backend", ["maskless", "unknown"])
-def test_backend_validation_rejects_removed_backends(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["unknown", "", "flex"])
+def test_backend_validation_rejects_unknown_backends(backend: str) -> None:
     with pytest.raises(ValueError, match="backend must be one of"):
         validate_multiview_backend(backend)
+
+
+@pytest.mark.cpu
+def test_backend_validation_accepts_runtime_backends() -> None:
+    assert [validate_multiview_backend(name) for name in ("fa4", "maskless", "triton")] == ["fa4", "maskless", "triton"]
+    with pytest.raises(RuntimeError, match="no sparse block geometry"):
+        _ = _layout(backend="maskless").block_sizes
 
 
 def _numerical_comparison(device: str, backend: str, dtype: torch.dtype, *, compiled: bool = False) -> None:

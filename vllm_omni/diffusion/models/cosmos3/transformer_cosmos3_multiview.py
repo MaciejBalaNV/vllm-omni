@@ -302,6 +302,12 @@ class Cosmos3MultiviewVFMTransformer(Cosmos3VFMTransformer):
             self.cached_freqs_gen = (cos.unsqueeze(2), sin.unsqueeze(2))
 
         context = MultiviewAttentionContext(layout, self._multiview_mask_cache, self._multiview_buffer_cache)
+        if layout.backend == "maskless":
+            # Plan on the host before the compiled GEN layers; the plan tensors
+            # cross the compile boundary as opaque custom-op inputs.
+            from .multiview_maskless_attention import prepare_maskless_context
+
+            context = prepare_maskless_context(context, num_und_tokens=int(text_ids.shape[1]), device=camera.device)
         if layout.backend != "fa4":
             # Compact prompt-dependent dimensions cross the compiled GEN boundary
             # as dynamic tensors, so neither new prompts nor the two CFG branches

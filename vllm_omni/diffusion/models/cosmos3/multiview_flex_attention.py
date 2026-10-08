@@ -69,7 +69,10 @@ _BACKEND_BLOCK_SIZES: dict[str, tuple[int, int]] = {
 # ``vision_start`` framing tokens the tokenizer appends after truncating.
 DEFAULT_MAX_UND_TOKENS = 4096 + 2
 
-MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted(_BACKEND_BLOCK_SIZES))
+# ``maskless`` is not a sparse kernel: it runs the same visibility rules as a
+# few unmasked varlen FlashAttention passes merged by log-sum-exp (see
+# ``multiview_maskless_attention``), so it has no block geometry.
+MULTIVIEW_BACKENDS: tuple[str, ...] = tuple(sorted({*_BACKEND_BLOCK_SIZES, "maskless"}))
 
 
 def validate_multiview_backend(backend: str) -> str:
@@ -138,6 +141,9 @@ class MultiviewLayout:
             # something to rely on.  The module itself defers every CuTe/CUTLASS
             # import to _load_fa4, so this stays safe on CPU-only hosts.
             from . import multiview_fa4  # noqa: F401
+        elif self.backend == "maskless":
+            # Same reason: register vllm_omni::cosmos3_maskless_attention host-side.
+            from . import multiview_maskless_attention  # noqa: F401
         rates_by_view_offset: dict[int, float] = {}
         for item in self.items:
             expected = rates_by_view_offset.setdefault(item.view_offset, item.seconds_per_frame)
@@ -154,7 +160,10 @@ class MultiviewLayout:
     @property
     def block_sizes(self) -> tuple[int, int]:
         """The ``(q, kv)`` sparse block granularity this backend demands."""
-        return _BACKEND_BLOCK_SIZES[self.backend]
+        sizes = _BACKEND_BLOCK_SIZES.get(self.backend)
+        if sizes is None:
+            raise RuntimeError(f"Cosmos3 multiview backend {self.backend!r} has no sparse block geometry.")
+        return sizes
 
 
 @dataclass(frozen=True)
@@ -218,8 +227,12 @@ class MultiviewAttentionContext:
     """Runtime wrapper that keeps the request-local caches on the transformer."""
 
     layout: MultiviewLayout
-    mask_cache: MutableMapping[tuple[Any, ...], BlockMask | MultiviewBlockSparsity]
+    #: Sparse backends cache a ``BlockMask``/``MultiviewBlockSparsity``; the
+    #: maskless backend caches its ``MultiviewMasklessPlan`` under its own key.
+    mask_cache: MutableMapping[tuple[Any, ...], Any]
     buffer_cache: MutableMapping[tuple[Any, ...], torch.Tensor] = field(default_factory=dict)
+    #: ``MasklessRuntime`` attached by ``prepare_maskless_context``; ``None`` for sparse backends.
+    maskless: Any = None
 
 
 @dataclass(frozen=True)
