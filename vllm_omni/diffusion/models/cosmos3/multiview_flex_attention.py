@@ -28,19 +28,6 @@ SPARSE_KV_BLOCK_SIZE = 64
 # square tile supported by the forward autotuner. Aligning the sparse mask
 # blocks with the compute tile also avoids sub-block address arithmetic in the
 # generated kernel.
-#
-# Within that 64x64 tile the KV pipeline depth and the TMA load path are free
-# parameters: both only change how the K/V tiles reach shared memory, never the
-# tile sequence or the order of the softmax/PV accumulation, so the output stays
-# bit-identical.  One stage leaves the tensor cores waiting on every KV load.
-# Two stages overlap the next load with the current tile's MMA, and TMA replaces
-# the per-tile address arithmetic with a single descriptor copy.  A 64x64 bf16
-# head_dim=128 K+V double buffer is 64 KiB of shared memory, within the SM80+
-# opt-in budget, and deeper pipelines (3+) regress by spilling occupancy.
-# Measured on the released 11-view / 561-frame / 15x26 geometry (H200, SM90):
-# 1350 ms at one stage without TMA, 1131 ms at two stages, 997 ms with both.
-# ``USE_TMA`` is advisory: Inductor clears it via ``can_use_tma()`` on hardware
-# or layouts without TMA support, so this stays correct off Hopper/Blackwell.
 TRITON_Q_BLOCK_SIZE = 64
 TRITON_KV_BLOCK_SIZE = 64
 TRITON_NUM_STAGES = 2
