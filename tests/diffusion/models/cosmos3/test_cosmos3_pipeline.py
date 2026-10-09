@@ -3490,16 +3490,17 @@ class TestForwardRouting:
 @pytest.mark.parametrize(
     ("override", "fa_version", "expected"),
     [
-        (None, 4, "fa4"),
+        (None, 4, "maskless"),
         (None, 3, "maskless"),
         (None, 2, "maskless"),
         (None, None, "triton"),
         ("triton", 4, "triton"),
+        ("fa4", 4, "fa4"),
         ("fa4", 3, "fa4"),
         ("maskless", 4, "maskless"),
     ],
 )
-def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
+def test_multiview_backend_defaults_to_maskless_with_vllm_flash_attn(
     monkeypatch: pytest.MonkeyPatch, override: str | None, fa_version: int | None, expected: str
 ) -> None:
     from vllm_omni.diffusion.attention.backends.utils import fa

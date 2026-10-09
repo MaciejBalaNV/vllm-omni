@@ -496,12 +496,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
     def _resolve_attention_backend() -> str:
         """Pick the kernel strategy from the worker's vLLM-bundled FlashAttention.
 
-        FA4 block-sparse attention is the default where vLLM resolves FA4
-        (SM100/SM103/SM110): its 256x128 sparse map visits only a few percent
-        more MACs than the exact key set.  Elsewhere the exact maskless passes
-        on FA3/FA2 varlen replace the much slower Triton FlexAttention kernel,
-        which remains the fallback when no bundled FlashAttention is importable.
-        All three implement the same visibility rules.
+        Exact maskless passes on FA4/FA3/FA2 varlen are the default, including
+        on Blackwell. Triton FlexAttention remains the fallback when no bundled
+        FlashAttention is importable. FA4 block-sparse attention is available
+        through the environment override. All three implement the same
+        visibility rules.
         """
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
         if override is not None:
@@ -512,10 +511,10 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         try:
             from vllm_omni.diffusion.attention.backends.utils.fa import resolve_vllm_flash_attn_version
 
-            fa_version = resolve_vllm_flash_attn_version()
+            resolve_vllm_flash_attn_version()
         except (ImportError, RuntimeError):
             return "triton"  # Non-CUDA hosts or no bundled FlashAttention.
-        return "fa4" if fa_version == 4 else "maskless"
+        return "maskless"
 
     def _parse_multiview_request(self, sp: Any) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
         extra = sp.extra_args if isinstance(sp.extra_args, Mapping) else {}
