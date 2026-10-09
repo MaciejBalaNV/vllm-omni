@@ -728,11 +728,6 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
-        if self.vae_parallel_mode == "batch" and (
-            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
-        ):
-            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
-
         world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else self.data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
@@ -802,6 +797,11 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             if self.hsdp_data_parallel:
                 raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
+
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))

@@ -526,7 +526,10 @@ class DiffusionParallelConfig:
                     f"WORLD size ({world_size}) must equal HSDP size "
                     f"({self.hsdp_replicate_size} x {self.hsdp_shard_size} = {expected_world_size})"
                 )
-            self.data_parallel_size = world_size if self.hsdp_data_parallel else 1
+            inferred_data_parallel_size = world_size if self.hsdp_data_parallel else 1
+            if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+                raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
+            self.data_parallel_size = inferred_data_parallel_size
             self.world_size = world_size
             return self.data_parallel_size
 
