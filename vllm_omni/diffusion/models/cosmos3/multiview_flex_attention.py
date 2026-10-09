@@ -25,13 +25,14 @@ SPARSE_KV_BLOCK_SIZE = 64
 # 128x64 with three stages and eight warps. The multiview mask_mod adds enough
 # state that the default first exceeded shared-memory capacity and, after only
 # shrinking BLOCK_N, produced an illegal access at launch. Use the smallest
-# square tile supported by the forward autotuner, remove software pipelining,
-# and keep TMA disabled. Aligning the sparse mask blocks with the compute tile
-# also avoids sub-block address arithmetic in the generated kernel.
+# square tile supported by the forward autotuner. Aligning the sparse mask
+# blocks with the compute tile also avoids sub-block address arithmetic in the
+# generated kernel.
 TRITON_Q_BLOCK_SIZE = 64
 TRITON_KV_BLOCK_SIZE = 64
-TRITON_NUM_STAGES = 1
+TRITON_NUM_STAGES = 2
 TRITON_NUM_WARPS = 4
+TRITON_USE_TMA = True
 
 # The UND stream is padded to a fixed capacity rather than to the nearest block
 # above each prompt's real length.  A pad that tracks the prompt changes the
@@ -594,7 +595,7 @@ def flex_attention(
         "BLOCK_N": TRITON_KV_BLOCK_SIZE,
         "num_stages": TRITON_NUM_STAGES,
         "num_warps": TRITON_NUM_WARPS,
-        "USE_TMA": False,
+        "USE_TMA": TRITON_USE_TMA,
     }
     if q.device.type == "cuda":
         global _compiled_flex_attention
