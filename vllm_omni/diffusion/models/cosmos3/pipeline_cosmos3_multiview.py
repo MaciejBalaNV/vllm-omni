@@ -72,7 +72,7 @@ from .utils import VIDEO_RES_SIZE_INFO
 
 logger = init_logger(__name__)
 
-# Select the runtime kernel strategy (fa4 | maskless | triton); all three obey
+# Select the runtime kernel strategy (maskless | triton); both obey
 # the same attention rules.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 
@@ -498,9 +498,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
 
         Exact maskless passes on FA4/FA3/FA2 varlen are the default, including
         on Blackwell. Triton FlexAttention remains the fallback when no bundled
-        FlashAttention is importable. FA4 block-sparse attention is available
-        through the environment override. All three implement the same
-        visibility rules.
+        FlashAttention is importable. Both implement the same visibility rules.
         """
         override = os.environ.get(COSMOS3_MULTIVIEW_BACKEND_ENV)
         if override is not None:
