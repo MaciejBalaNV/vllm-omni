@@ -198,6 +198,12 @@ class CircularNeighborhoodSelfAttentionBlock(GlobalSelfAttentionBlock):
     def before_attn(self, q, k, v):
         if not self.circular:
             return q, k, v
+        # TODO: A dilated window needs dilation * (kernel // 2) wrapped columns,
+        # so for dilation > 1 the azimuth seam does not fully wrap (k=3, d=2:
+        # column 0 attends {0, 2, 4}, not {W-2, 0, 2}). This matches the NATTEN
+        # reference the checkpoint was trained with, and shipped configs use
+        # dilation 1, where the two agree. Fix together with the reference and
+        # retrain; also update after_attn and the oracle tests.
         padding = self.kernel_size[1] // 2
         if padding == 0:
             return q, k, v
