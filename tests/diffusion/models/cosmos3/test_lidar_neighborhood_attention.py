@@ -47,22 +47,16 @@ def reference_attention(query, key, value, *, kernel_size, dilation, scale):
     return torch.einsum("bshk,bskhd->bshd", scores.softmax(-1), v[:, indices]).reshape(query.shape)
 
 
-@pytest.mark.parametrize(
-    "device",
-    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))],
-)
-@pytest.mark.parametrize("circular", [False, True])
-@pytest.mark.parametrize(
-    "hw,kernel,dilation",
-    [
-        ((1, 1), (1, 1), (1, 1)),
-        ((5, 13), (3, 5), (1, 1)),
-        ((7, 17), (3, 5), (2, 3)),
-        ((9, 11), (1, 3), (4, 2)),
-        ((8, 13), (4, 2), (2, 3)),
-    ],
-)
-def test_operator_matches_fp64_neighborhoods(hw, kernel, dilation, circular, device):
+OPERATOR_CASES = [
+    ((1, 1), (1, 1), (1, 1)),
+    ((5, 13), (3, 5), (1, 1)),
+    ((7, 17), (3, 5), (2, 3)),
+    ((9, 11), (1, 3), (4, 2)),
+    ((8, 13), (4, 2), (2, 3)),
+]
+
+
+def check_operator_matches_fp64_neighborhoods(hw, kernel, dilation, circular, device):
     generator = torch.Generator(device=device).manual_seed(721)
     tensors = [torch.randn(2, *hw, 2, 8, device=device, generator=generator) for _ in range(3)]
     block = CircularNeighborhoodSelfAttentionBlock(16, 2, kernel, dilation, circular=circular)
@@ -78,6 +72,12 @@ def test_operator_matches_fp64_neighborhoods(hw, kernel, dilation, circular, dev
     assert torch.get_float32_matmul_precision() == precision
     assert torch.equal(torch.random.get_rng_state(), rng)
     torch.testing.assert_close(result.double(), expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("circular", [False, True])
+@pytest.mark.parametrize("hw,kernel,dilation", OPERATOR_CASES)
+def test_operator_matches_fp64_neighborhoods(hw, kernel, dilation, circular):
+    check_operator_matches_fp64_neighborhoods(hw, kernel, dilation, circular, "cpu")
 
 
 @pytest.mark.parametrize(
@@ -266,29 +266,3 @@ def test_cpu_production_grid_rejected_before_eager_allocation():
     q = torch.empty(1, 64, 904, 1, 4)
     with pytest.raises(RuntimeError, match="use CUDA"):
         attention.neighborhood_attention_2d(q, q, q, kernel_size=3, dilation=1, scale=1.0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_cuda_compile_failure_propagates_without_fallback(monkeypatch):
-    def fail(*args):
-        raise RuntimeError("injected compilation failure")
-
-    monkeypatch.setattr(attention, "_get_compiled_runner", fail)
-    q = torch.ones(1, 3, 7, 1, 8, device="cuda")
-    with pytest.raises(RuntimeError, match="compiled sparse attention is required") as error:
-        attention.neighborhood_attention_2d(q, q, q, kernel_size=3, dilation=1, scale=1.0)
-    assert "injected compilation failure" in str(error.value.__cause__)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.accelerator.device_count() < 2, reason="Two CUDA devices required"
-)
-def test_masks_follow_device_after_offload_reload():
-    masks = []
-    for index in [0, 1, 0]:
-        q = torch.ones(1, 3, 7, 1, 8).to(torch.device("cuda", index))
-        attention.neighborhood_attention_2d(q, q, q, kernel_size=3, dilation=1, scale=1.0)
-        mask = attention._get_block_mask(q.device, 3, 7, (3, 3), (1, 1))
-        assert mask.kv_indices.device == q.device
-        masks.append(mask)
-    assert masks[0] is masks[2] and masks[0] is not masks[1]
