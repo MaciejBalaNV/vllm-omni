@@ -12,10 +12,11 @@ transformer or generation pipeline is required::
     device = torch.device("cuda")
     encoder = Cosmos3LidarEncoder.from_pretrained(str(root), config, device)
     decoder = Cosmos3LidarDecoder.from_pretrained(str(root), config, device)
-    latents = encoder(frames)  # FP32 physical frames: [3, T, 128, 1800]
-    reconstructed = decoder(latents)  # [1, 3, T, 128, 1800]
+    latents = encoder(frames)  # FP32 physical frames: [B, 3, T, 128, 1800]
+    reconstructed = decoder(latents)  # [B, 3, T, 128, 1800]
 
-The latent shape is ``[1, latent_channels, T, 8, 113]``. Decoder channels are
+The latent shape is ``[B, latent_channels, T, 8, 113]``; an unbatched
+``[3, T, 128, 1800]`` input encodes with ``B = 1``. Decoder channels are
 range in metres, unit intensity, and validity. Full-size neighborhood
 attention requires CUDA; CPU execution is for small correctness fixtures.
 """
@@ -111,7 +112,21 @@ def _validate_lidar_vae_config(component: dict[str, Any], deployment: dict[str, 
 
 def prepare_lidar_encoder_input(frames: torch.Tensor, projection: dict[str, Any]) -> torch.Tensor:
     """Reference physical normalization after symmetric circular width padding."""
-    frames = frames.float().unsqueeze(0)
+    if frames.ndim == 4:
+        frames = frames.unsqueeze(0)
+    height, width = projection["native_height"], projection["semantic_width"]
+    if (
+        frames.ndim != 5
+        or frames.shape[1] != 3
+        or tuple(frames.shape[-2:]) != (height, width)
+        or frames.shape[0] < 1
+        or frames.shape[2] < 1
+    ):
+        raise ValueError(
+            f"Expected nonempty LiDAR frames [3,T,{height},{width}] or [B,3,T,{height},{width}], "
+            f"got {tuple(frames.shape)}."
+        )
+    frames = frames.float()
     padding = projection["model_width"] - projection["semantic_width"]
     if padding < 0 or padding % 2:
         raise ValueError("LiDAR model width must allow symmetric circular padding of the semantic width.")

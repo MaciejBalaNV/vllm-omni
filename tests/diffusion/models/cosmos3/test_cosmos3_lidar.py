@@ -14,6 +14,7 @@ from safetensors.torch import save_file
 
 from vllm_omni.diffusion.models.cosmos3.lidar import (
     Cosmos3LidarEncoder,
+    postprocess_lidar_decoder_output,
     prepare_lidar_encoder_input,
     validate_lidar_config,
 )
@@ -96,8 +97,7 @@ def test_rejects_incompatible_encoder_metadata(field, value):
         validate_lidar_config(config)
 
 
-@pytest.mark.parametrize("apply_validity_mask", [False, True])
-def test_encoder_uses_fp32_posterior_mean_chunk_context_and_latent_affine(apply_validity_mask):
+def fake_encoder_model(apply_validity_mask=True):
     model = object.__new__(Cosmos3LidarEncoder)
     torch.nn.Module.__init__(model)
     model.config = lidar_config()
@@ -118,6 +118,12 @@ def test_encoder_uses_fp32_posterior_mean_chunk_context_and_latent_affine(apply_
 
     model.encoder = Encoder()
     model.quant_conv = torch.nn.Identity()
+    return model, calls
+
+
+@pytest.mark.parametrize("apply_validity_mask", [False, True])
+def test_encoder_uses_fp32_posterior_mean_chunk_context_and_latent_affine(apply_validity_mask):
+    model, calls = fake_encoder_model(apply_validity_mask)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         result = model(numeric_frames(5))
     assert calls == [(2, 0), (2, 1), (1, 2)]
@@ -126,12 +132,56 @@ def test_encoder_uses_fp32_posterior_mean_chunk_context_and_latent_affine(apply_
     assert not hasattr(model, "decode")
 
 
+def test_encoder_accepts_batched_decoder_output():
+    model, _ = fake_encoder_model()
+    decoded = postprocess_lidar_decoder_output(torch.zeros(1, 3, 5, 128, 1808), model.config)
+    assert decoded.shape == (1, 3, 5, 128, 1800)
+    torch.testing.assert_close(model(decoded), model(decoded[0]))
+
+    frames = torch.stack((numeric_frames(5), numeric_frames(5)))
+    frames[1, 0] = 24.0
+    result = model(frames)
+    assert result.shape == (2, 1, 5, 1, 1)
+    for index in range(2):
+        torch.testing.assert_close(result[index : index + 1], model(frames[index]))
+    assert not torch.equal(result[0], result[1])
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (3, 128, 1800),
+        (1, 1, 3, 1, 128, 1800),
+        (0, 3, 1, 128, 1800),
+        (4, 1, 128, 1800),
+        (1, 2, 1, 128, 1800),
+        (3, 0, 128, 1800),
+        (3, 1, 127, 1800),
+        (3, 1, 128, 1799),
+        (1, 3, 1, 128, 1808),
+    ],
+)
+def test_encoder_rejects_invalid_frame_geometry(shape):
+    model, calls = fake_encoder_model()
+    with pytest.raises(ValueError, match="Expected nonempty LiDAR frames"):
+        prepare_lidar_encoder_input(torch.zeros(shape), model.config["range_projection"])
+    with pytest.raises(ValueError, match="Expected nonempty LiDAR frames"):
+        model(torch.zeros(shape))
+    assert calls == []
+
+
 @pytest.mark.parametrize("model_width", [6, 10])
 def test_encoder_padding_uses_projection_widths(model_width):
     frames = torch.ones(3, 1, 1, 6)
     frames[0] = 52.5
     frames[1] = torch.linspace(0, 1, 6)
-    projection = {"model_width": model_width, "semantic_width": 6, "min_range_m": 5, "max_range_m": 100}
+    projection = {
+        "model_width": model_width,
+        "semantic_width": 6,
+        "native_height": 1,
+        "min_range_m": 5,
+        "max_range_m": 100,
+    }
     actual = prepare_lidar_encoder_input(frames, projection)
     half_padding = (model_width - 6) // 2
     columns = [(index - half_padding) % 6 for index in range(model_width)]
