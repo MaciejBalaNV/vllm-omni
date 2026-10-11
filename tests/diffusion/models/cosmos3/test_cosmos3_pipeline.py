@@ -69,7 +69,13 @@ def test_cosmos3_conditioning_with_encoder_fastpath(dtype):
     torch.manual_seed(7)
     vae = OmniAutoencoderKLWan(**CONFIG).eval().to(dtype)
     vae.register_to_config(latents_mean=[0.1, -0.2, 0.3, -0.4], latents_std=[0.5, 0.6, 0.7, 0.8])
-    pipeline = SimpleNamespace(vae=vae, dtype=dtype, device=torch.device("cpu"), vae_scale_factor_spatial=16)
+    pipeline = SimpleNamespace(
+        vae=vae,
+        dtype=dtype,
+        device=torch.device("cpu"),
+        vae_scale_factor_spatial=16,
+        sampling_dtype=Cosmos3OmniDiffusersPipeline.sampling_dtype,
+    )
     for name in (
         "_to_vae_device",
         "_get_latents_mean_std",
