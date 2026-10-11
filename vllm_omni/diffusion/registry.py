@@ -51,10 +51,20 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
+    "JoyImageEditPipeline": (
+        "joy_image",
+        "pipeline_joy_image_edit",
+        "JoyImageEditPipeline",
+    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
         "QwenImageLayeredPipeline",
+    ),
+    "QwenImage21Pipeline": (
+        "qwen_image_21",
+        "pipeline_qwen_image_21",
+        "QwenImage21Pipeline",
     ),
     "GlmImagePipeline": (
         "glm_image",
@@ -135,6 +145,11 @@ _DIFFUSION_MODELS = {
         "minimax_h3",
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
+    ),
+    "MiniMaxH3DecoderPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_decoder",
+        "MiniMaxH3DecoderPipeline",
     ),
     "AuKPipeline": (
         "auk",
@@ -426,6 +441,10 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
+    # branch) across denoising steps, which conflicts with cache_dit / tea_cache
+    # step-skipping hooks.
+    "QwenImage21Pipeline",
 }
 
 
@@ -616,28 +635,19 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             if plan is None:
                 continue
 
-            # AllGather-KV reuses the Ulysses sequence-sharding hooks.
-            allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
-            if allgather_degree > 1:
-                sp_config = SequenceParallelConfig(
-                    allgather_degree=allgather_degree,
-                )
-                mode = "allgather_kv"
-            else:
-                sp_config = SequenceParallelConfig(
-                    ulysses_degree=od_config.parallel_config.ulysses_degree,
-                    ring_degree=od_config.parallel_config.ring_degree,
-                )
-                # Apply hooks according to the plan
-                mode = (
-                    "hybrid"
-                    if sp_config.ulysses_degree > 1 and sp_config.ring_degree > 1
-                    else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
-                )
+            # The SP hooks shard by `sequence_parallel_size`, so carry the full
+            # degree triple; AllGather-KV and the composed topology reuse them as-is.
+            parallel_config = od_config.parallel_config
+            sp_config = SequenceParallelConfig(
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
+            )
 
             logger.info(
                 f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
-                f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                f"(sp_size={sp_size}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree}, "
+                f"allgather={sp_config.allgather_degree})"
             )
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
@@ -665,6 +675,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
@@ -683,6 +695,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
@@ -754,6 +767,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
