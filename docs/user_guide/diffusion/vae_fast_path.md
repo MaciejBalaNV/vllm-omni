@@ -84,7 +84,7 @@ Cosmos3 encoder uses 160/320/640 channels and produces 48 latent channels.
 Other Wan architectures retain their reference encoding path.
 
 | Encoder level | Default | Behavior |
-|---|---|---|
+| --- | --- | --- |
 | `lossless` | yes | Reuses the exact normalization epilogue, causal input/cache assembly and bias/residual fusions. Fuses spatial pad/input assembly and temporal downsampling cache copies. Keeps the reference shortcut averaging reduction. |
 | `channels_last` | no | Also converts encoder convolution weights to channels-last, uses single-pass normalization and fuses shortcut averaging with residual addition. Outputs can differ in the last bits. |
 | `off` | no | Reference encoding. |
@@ -94,8 +94,9 @@ into the temporally assembled convolution input and the next two-frame cache.
 Already-normalized history is copied unchanged; missing history stays zero.
 `lossless` retains ATen's reduction and the existing intermediate rounding,
 and only folds SiLU for dtypes that pass the installation-time exactness probe.
-`channels_last` retains its existing single-pass normalization math; this fusion
-does not change its quality gates. Unsupported layouts, non-identity or hooked
+`channels_last` retains its existing single-pass normalization math, except
+that for BF16 the encoder keeps the reference's intermediate roundings (the
+decoder keeps fast math); this fusion does not change its quality gates. Unsupported layouts, non-identity or hooked
 dropout, and rejected spatial-padding probes use the existing separate path.
 This fusion is encoder-only; decoder dispatch is unchanged.
 

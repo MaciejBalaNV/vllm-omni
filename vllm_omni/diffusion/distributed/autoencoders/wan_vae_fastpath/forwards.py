@@ -73,6 +73,8 @@ class FastPathConfig:
     channels_last: bool = False
     clone_encoder_shortcuts: bool = False
     fuse_norm_cache: bool = False
+    # Keep the reference BF16 roundings in the channels-last norm (encoder only).
+    exact_bf16_norm: bool = False
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
@@ -180,7 +182,7 @@ def rms_norm_fastpath(
     cfg = getattr(norm, CFG_ATTR, None)
     if cfg is not None and cfg.channels_last and _kernels_allowed(x):
         # Tier 2: one read, one write; not bit-exact (different reduction order).
-        out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias)
+        out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
         if out is not None:
             return out
     if bias is not None:
@@ -303,7 +305,8 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     if a.shape != b.shape or a.dtype != b.dtype:
         return False
     int_dtype = torch.int16 if a.element_size() == 2 else torch.int32
-    return bool(torch.equal(a.contiguous().view(int_dtype), b.contiguous().view(int_dtype)))
+    # A same-size dtype view works for any strides, so no contiguous copies are made.
+    return bool(torch.equal(a.view(int_dtype), b.view(int_dtype)))
 
 
 _PROBE_SEED = 0
@@ -319,6 +322,7 @@ def _equal_on_random_operands(
     weight: torch.Tensor,
     candidate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    reference_input: Callable[[torch.Tensor], torch.Tensor],
 ) -> bool:
     """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
 
@@ -326,12 +330,22 @@ def _equal_on_random_operands(
     weights give the same bytes under any kernel. Which kernel cuDNN runs
     depends only on the verdict key's metadata, never on values, so a match on
     random data is what makes a verdict reusable for every later input and
-    weight update. A private generator leaves the global RNG streams untouched.
+    weight update; it is also the only comparison needed. A private generator
+    leaves the global RNG streams untouched.
+
+    ``reference`` convolves ``reference_input(x)`` (the pre-padded or
+    channels-first copy). The probe input is drawn twice from the same
+    generator state, so each formulation's input is freed before the other's
+    is created; callers probe before running the real convolution. The first
+    call for a shape then holds at most one probe input, the reference copy
+    and the two probe outputs, no more than comparing real operands did.
     """
     generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
-    probe_x = _random_like(x, generator)
     probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
-    return _bitwise_equal(candidate(probe_x, probe_weight), reference(probe_x, probe_weight))
+    state = generator.get_state()
+    reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
+    generator.set_state(state)
+    return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
 
 
 def _conv_with_spatial_padding(
@@ -346,9 +360,10 @@ def _conv_with_spatial_padding(
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
     but is only bit-identical if cuDNN selects the same kernel for both
-    formulations, so the first call for each (conv, shape) runs both, on the
-    real and on random operands, and compares bitwise; later calls reuse the
-    verdict until it is evicted.
+    formulations, so the first call for each (conv, shape) compares both on
+    seeded random operands (see :func:`_equal_on_random_operands`) before
+    running the real convolution once with the selected formulation; later
+    calls reuse the verdict until it is evicted.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
     pads = (pad_width, pad_width, pad_height, pad_height, 0, 0)
@@ -356,24 +371,24 @@ def _conv_with_spatial_padding(
     def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x, weight, bias, conv.stride, (0, pad_height, pad_width), conv.dilation, conv.groups)
 
-    def padded(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return F.conv3d(F.pad(x, pads), weight, bias, conv.stride, 0, conv.dilation, conv.groups)
+    def pad(x: torch.Tensor) -> torch.Tensor:
+        return F.pad(x, pads)
 
-    fast = candidate(assembled, conv.weight)
-    if key in verdicts:
-        return fast
-    reference = padded(assembled, conv.weight)
-    verdict = _bitwise_equal(fast, reference) and _equal_on_random_operands(assembled, conv.weight, candidate, padded)
-    _record_verdict(verdicts, key, verdict)
-    if not verdict:
-        logger.info(
-            "cuDNN spatial padding is not bitwise identical to pre-padded input for %s %s; "
-            "using the pre-padded path for this shape",
-            type(conv).__name__,
-            tuple(assembled.shape),
-        )
-        return reference
-    return fast
+    def padded(x_padded: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv3d(x_padded, weight, bias, conv.stride, 0, conv.dilation, conv.groups)
+
+    verdict = verdicts.get(key)
+    if verdict is None:
+        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, padded, pad)
+        _record_verdict(verdicts, key, verdict)
+        if not verdict:
+            logger.info(
+                "cuDNN spatial padding is not bitwise identical to pre-padded input for %s %s; "
+                "using the pre-padded path for this shape",
+                type(conv).__name__,
+                tuple(assembled.shape),
+            )
+    return candidate(assembled, conv.weight) if verdict else padded(pad(assembled), conv.weight)
 
 
 def _layout_tag(x: torch.Tensor) -> str:
@@ -597,11 +612,12 @@ def _run_conv_out_channels_last(
     input is assembled pre-padded anyway; assembling it channels-last directly
     (one fused transpose in the pixels kernel) saves the separate channels-first
     assembly and cuDNN's transpose. The output is made contiguous, so nothing
-    downstream sees a layout change. The first call per (conv, shape) also runs
-    the channels-first formulation and compares bitwise, on the real and on
-    random operands (see :func:`_equal_on_random_operands`); a mismatch routes that
-    shape back to the standard path while its verdict is cached. Evicted shapes
-    are checked again on their next use.
+    downstream sees a layout change. The first call per (conv, shape) compares
+    it bitwise with the channels-first formulation on seeded random operands
+    (see :func:`_equal_on_random_operands`) before running the real
+    convolution once; a mismatch routes that shape back to the standard path
+    while its verdict is cached. Evicted shapes are checked again on their
+    next use.
     """
     cache = cache_list[index]
     payload = cache if isinstance(cache, torch.Tensor) else None
@@ -627,26 +643,21 @@ def _run_conv_out_channels_last(
     def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups).contiguous()
 
-    def channels_first(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    def channels_first(x_contiguous: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         # The channels-first path convolves exactly this tensor in NCDHW layout.
-        return F.conv3d(x.contiguous(), weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
+        return F.conv3d(x_contiguous, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
 
-    out = candidate(assembled, conv.weight)
-    if key in verdicts:
-        return out
-    reference = channels_first(assembled, conv.weight)
-    verdict = _bitwise_equal(out, reference) and _equal_on_random_operands(
-        assembled, conv.weight, candidate, channels_first
-    )
-    _record_verdict(verdicts, key, verdict)
-    if not verdict:
-        logger.info(
-            "channels-last conv_out input is not bitwise identical to the channels-first one for %s; "
-            "using the channels-first path for this shape",
-            tuple(assembled.shape),
-        )
-        return reference
-    return out
+    if key not in verdicts:
+        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, channels_first, lambda t: t.contiguous())
+        _record_verdict(verdicts, key, verdict)
+        if not verdict:
+            logger.info(
+                "channels-last conv_out input is not bitwise identical to the channels-first one for %s; "
+                "using the channels-first path for this shape",
+                tuple(assembled.shape),
+            )
+            return channels_first(assembled.contiguous(), conv.weight)
+    return candidate(assembled, conv.weight)
 
 
 def _residual_add(

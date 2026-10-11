@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU reference, cache and installation tests for the Cosmos3 Wan encoder."""
 
 from __future__ import annotations
@@ -273,6 +273,9 @@ def test_encoder_decoder_installation_is_independent(encode_first):
     assert is_encoder_installed(vae) and is_installed(vae)
     assert getattr(vae.encoder, fp.CFG_ATTR).fuse_norm_cache
     assert not getattr(vae.decoder, fp.CFG_ATTR).fuse_norm_cache
+    # Exact BF16 normalization is encoder-only; the decoder keeps fast math.
+    assert getattr(vae.encoder, fp.CFG_ATTR).exact_bf16_norm
+    assert not getattr(vae.decoder, fp.CFG_ATTR).exact_bf16_norm
     decoder_stride = vae.decoder.conv_in.weight.stride()
     vae.encoder.conv_in.weight.add_(1)
     updated = vae.encoder.conv_in.weight.clone()

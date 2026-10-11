@@ -132,8 +132,8 @@ def test_evicted_verdict_is_revalidated(verdict_cache, cpu_assembly, monkeypatch
             assert torch.equal(output, expected)
         assert len(cache[conv]) <= 2
 
-    # A match on the real operands is confirmed on random ones; a mismatch is final.
-    check = [True, True] if matches else [False]
+    # One comparison on random operands decides each new shape.
+    check = [matches]
     run(4)
     run(5)
     assert comparisons == check * 2
@@ -233,7 +233,7 @@ def test_causal_conv_forward_shares_spatial_padding_verdicts(cpu_assembly, monke
     monkeypatch.setattr(fp, "_bitwise_equal", compare)
     for _ in range(2):
         assert torch.equal(fp.causal_conv_forward(conv, x, cache_x), expected)
-    check = [True, True] if matches else [False]
+    check = [matches]
     assert comparisons == check  # Verified once, then reused.
     assert list(cache[conv].values()) == [matches]
     # The cached call site shares the verdict instead of probing again.

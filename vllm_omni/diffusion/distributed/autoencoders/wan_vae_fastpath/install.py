@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Instance-level installers for independent Wan VAE encoder/decoder fast paths."""
 
 from __future__ import annotations
@@ -222,6 +222,7 @@ def _install_bindings(
         channels_last=level == "channels_last",
         clone_encoder_shortcuts=clone_encoder_shortcuts,
         fuse_norm_cache=encoder,
+        exact_bf16_norm=encoder,
     )
 
     with ExitStack() as rollback:

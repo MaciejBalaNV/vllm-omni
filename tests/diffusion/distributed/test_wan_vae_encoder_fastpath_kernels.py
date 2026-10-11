@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDA encoder parity/layout tests; run on both H100 and GB200."""
 
 from __future__ import annotations
@@ -310,7 +310,7 @@ def test_channels_last_bf16_preserves_normalization_rounding(silu):
     x = x.contiguous(memory_format=torch.channels_last_3d)
     norm = WanRMS_norm(160, images=False).to(device="cuda", dtype=x.dtype)
     norm.gamma.copy_(torch.linspace(-2, 2, 160, device="cuda", dtype=x.dtype).view_as(norm.gamma))
-    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True, exact_bf16_norm=True))
     expected = F.silu(norm(x)) if silu else norm(x)
     bits_equal(fp.rms_norm_fastpath(norm, x, silu=silu), expected)
     actual, cache = nc.norm_act_cat_time(x, norm.gamma, norm.scale, None, 2, channels_last=True, silu=silu)
@@ -356,7 +356,8 @@ def test_fused_norm_cache_matches_existing_kernels(dtype, layout, channels, fram
         x = x.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4)
     norm = WanRMS_norm(channels, images=False).to(device="cuda", dtype=dtype)
     norm.gamma.uniform_(-2, 2)
-    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last))
+    # The fused kernel is encoder-only, so compare it with the encoder's norm configuration.
+    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last, exact_bf16_norm=True))
     bias = torch.randn(channels, device="cuda", dtype=dtype) if channels_last else None
     cache = None
     if history:
@@ -392,7 +393,7 @@ def test_fused_norm_cache_edge_values(dtype, channels_last, pad):
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last_3d)
     norm = WanRMS_norm(160, images=False).to(device="cuda", dtype=dtype)
-    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last))
+    setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last, exact_bf16_norm=True))
     expected = fp.rms_norm_fastpath(norm, x, silu=True)
     expected, history = fp.dm.cat_time_5d(expected, None, pad, keep_cache_frames=2)
     actual, cache = nc.norm_act_cat_time(x, norm.gamma, norm.scale, None, pad, channels_last=channels_last, silu=True)
@@ -469,7 +470,12 @@ def test_norm_cache_history_across_fusion_and_fallback(monkeypatch, dtype, chann
     conv = WanCausalConv3d(160, 160, 3, padding=1).eval().to(device="cuda", dtype=dtype)
     if channels_last:
         conv.to(memory_format=torch.channels_last_3d)
-    cfg = fp.FastPathConfig(fused_silu_dtypes=frozenset({dtype}), channels_last=channels_last, fuse_norm_cache=True)
+    cfg = fp.FastPathConfig(
+        fused_silu_dtypes=frozenset({dtype}),
+        channels_last=channels_last,
+        fuse_norm_cache=True,
+        exact_bf16_norm=True,
+    )
     setattr(norm, fp.CFG_ATTR, cfg)
     cache, reference_cache = [None], [None]
     fused = nc.norm_act_cat_time

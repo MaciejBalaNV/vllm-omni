@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803
 """Single-pass channels-last RMSNorm(+SiLU) for the Wan VAE decoder (Tier 2, not bit-exact).
 
@@ -16,8 +16,10 @@ to the activation dtype at the end. The bit-exact epilogue sequence (IEEE
 ``div_rn`` twice, libdevice ``exp``, six intermediate roundings) measured
 ALU-bound at 1.6 TB/s on the 512-channel stage.
 
-BF16 retains the reference epilogue's intermediate roundings: removing them
-accumulates excessive posterior drift across the encoder's normalization layers.
+The encoder opts into ``exact_bf16`` for BF16: it retains the reference
+epilogue's intermediate roundings, because removing them accumulates excessive
+posterior drift across the encoder's normalization layers. The decoder keeps
+the fast math above for every dtype.
 
 The kernel can also absorb the bias of the convolution that produced ``x``:
 ``WanResidualBlock.conv1`` feeds only ``norm2``, so at this level the
@@ -44,9 +46,11 @@ _NUM_WARPS = 4
 if HAS_TRITON:
 
     @triton.jit
-    def _normalize_channels_last(x, gamma, scale, eps, DTYPE: tl.constexpr, SILU: tl.constexpr):
+    def _normalize_channels_last(
+        x, gamma, scale, eps, DTYPE: tl.constexpr, SILU: tl.constexpr, EXACT_BF16: tl.constexpr
+    ):
         denom = tl.maximum(tl.sqrt(tl.sum(x * x, axis=1)), eps)
-        if DTYPE == tl.bfloat16:
+        if EXACT_BF16 and DTYPE == tl.bfloat16:
             v = tl.math.div_rn(x, denom[:, None]).to(DTYPE).to(tl.float32)
             v = (v * scale).to(DTYPE).to(tl.float32)
             v = (v * gamma[None, :]).to(DTYPE).to(tl.float32)
@@ -73,6 +77,7 @@ if HAS_TRITON:
         BLOCK_C: tl.constexpr,
         SILU: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        EXACT_BF16: tl.constexpr,
         BLOCK_P: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
@@ -89,7 +94,7 @@ if HAS_TRITON:
             bias = tl.load(BIAS + col, mask=col_mask, other=0.0).to(tl.float32)
             x = (x + bias[None, :]).to(dtype).to(tl.float32)
         gamma = tl.load(GAMMA + col, mask=col_mask, other=0.0).to(tl.float32)
-        v = _normalize_channels_last(x, gamma, scale, eps, dtype, SILU)
+        v = _normalize_channels_last(x, gamma, scale, eps, dtype, SILU, EXACT_BF16)
         tl.store(OUT + offsets, v, mask=mask)
 
 
@@ -119,11 +124,13 @@ def rms_norm_channels_last(
     silu: bool = False,
     bias: torch.Tensor | None = None,
     eps: float = 1e-12,
+    exact_bf16: bool = False,
 ) -> torch.Tensor | None:
     """``F.normalize(x + bias, dim=1) * scale * gamma`` [then SiLU] for channels-last ``x`` (fast math), or ``None``.
 
     ``bias`` is an optional per-channel vector (the un-added bias of the
-    convolution that produced ``x``); ``None`` skips the add.
+    convolution that produced ``x``); ``None`` skips the add. ``exact_bf16``
+    keeps the reference epilogue's roundings for BF16 (encoder only).
     """
     if not HAS_TRITON or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
         return None
@@ -161,6 +168,7 @@ def rms_norm_channels_last(
             BLOCK_C=block_c,
             SILU=silu,
             HAS_BIAS=bias is not None,
+            EXACT_BF16=exact_bf16,
             BLOCK_P=block_p,
             num_warps=_NUM_WARPS,
             enable_fp_fusion=False,

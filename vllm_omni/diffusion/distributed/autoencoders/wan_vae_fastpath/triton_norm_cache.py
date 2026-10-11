@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803
 """Normalize directly into a causal convolution's temporal input and next cache.
 
@@ -10,6 +10,12 @@ and missing history is zero-filled without applying bias or normalization.
 
 Spatial padding remains the responsibility of the caller's bitwise-verified
 convolution path. Unsupported inputs decline without changing any cache state.
+
+Plane sizes and strides are runtime arguments, so a new resolution, batch
+size or tile edge reuses the compiled kernels. Only per-model values (channel
+count, chunk frames, temporal padding and cache depth) stay specialized; they
+keep the per-program index math to constant divisions. A 2D grid (plane, tile)
+avoids dividing by the runtime plane size.
 """
 
 from __future__ import annotations
@@ -22,6 +28,8 @@ from . import triton_rms_norm as rn
 from . import triton_rms_norm_cl as cl
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# Grid axis 1 (tiles per plane) is limited by CUDA; larger planes decline.
+_MAX_TILES = 65535
 
 if HAS_TRITON:
 
@@ -34,24 +42,23 @@ if HAS_TRITON:
         OUT,
         KEEP,
         scale,
+        S,
+        X0,
+        X1,
+        X2,
+        K0,
+        K1,
+        K2,
         C: tl.constexpr,
         T: tl.constexpr,
-        S: tl.constexpr,
         PAD: tl.constexpr,
         TC: tl.constexpr,
         TK: tl.constexpr,
-        X0: tl.constexpr,
-        X1: tl.constexpr,
-        X2: tl.constexpr,
-        K0: tl.constexpr,
-        K1: tl.constexpr,
-        K2: tl.constexpr,
         SILU: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        tiles: tl.constexpr = triton.cdiv(S, BLOCK)
-        plane = tl.program_id(0).to(tl.int64) // tiles
-        s = tl.program_id(0).to(tl.int64) % tiles * BLOCK + tl.arange(0, BLOCK)
+        plane = tl.program_id(0).to(tl.int64)
+        s = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         mask = s < S
         frame = plane % (PAD + T)
         c = plane // (PAD + T) % C
@@ -91,22 +98,21 @@ if HAS_TRITON:
         KEEP,
         scale,
         eps,
+        S,
+        K0,
+        K2,
         C: tl.constexpr,
         T: tl.constexpr,
-        S: tl.constexpr,
         PAD: tl.constexpr,
         TC: tl.constexpr,
         TK: tl.constexpr,
-        K0: tl.constexpr,
-        K2: tl.constexpr,
         SILU: tl.constexpr,
         HAS_BIAS: tl.constexpr,
         BLOCK_C: tl.constexpr,
         BLOCK_P: tl.constexpr,
     ):
-        tiles: tl.constexpr = triton.cdiv(S, BLOCK_P)
-        plane = tl.program_id(0).to(tl.int64) // tiles
-        row = tl.program_id(0).to(tl.int64) % tiles * BLOCK_P + tl.arange(0, BLOCK_P)
+        plane = tl.program_id(0).to(tl.int64)
+        row = tl.program_id(1).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
         c = tl.arange(0, BLOCK_C)
         mask = (row[:, None] < S) & (c[None, :] < C)
         frame = plane % (PAD + T)
@@ -119,9 +125,9 @@ if HAS_TRITON:
             if HAS_BIAS:
                 bias = tl.load(BIAS + c, mask=c < C, other=0).to(tl.float32)
                 x = (x + bias[None, :]).to(dtype).to(tl.float32)
-            # Share the standalone epilogue, including BF16 intermediate rounding.
+            # Share the standalone encoder epilogue, including BF16 intermediate rounding.
             gamma = tl.load(GAMMA + c, mask=c < C, other=0).to(tl.float32)
-            value = cl._normalize_channels_last(x, gamma, scale, eps, dtype, SILU)
+            value = cl._normalize_channels_last(x, gamma, scale, eps, dtype, SILU, True)
         elif TC > 0:
             cached_frame = frame - (PAD - TC)
             if cached_frame >= 0:
@@ -201,14 +207,20 @@ def norm_act_cat_time(
 
     out_t = pad_front + t
     keep_t = min(2, out_t)
+    if channels_last:
+        block_c = triton.next_power_of_2(c)
+        block_p = max(1, cl._TILE_ELEMENTS // block_c)
+        tiles = triton.cdiv(h * w, block_p)
+    else:
+        tiles = triton.cdiv(h * w, rn._BLOCK)
+    if tiles > _MAX_TILES:
+        return None
     fmt = torch.channels_last_3d if channels_last else torch.contiguous_format
     out = torch.empty((b, c, out_t, h, w), dtype=x.dtype, device=x.device, memory_format=fmt)
     keep = torch.empty((b, c, keep_t, h, w), dtype=x.dtype, device=x.device, memory_format=fmt)
     with torch.get_device_module().device(x.device):
         if channels_last:
-            block_c = triton.next_power_of_2(c)
-            block_p = max(1, cl._TILE_ELEMENTS // block_c)
-            _norm_cl_cat_time_kernel[(b * out_t * triton.cdiv(h * w, block_p),)](
+            _norm_cl_cat_time_kernel[(b * out_t, tiles)](
                 x,
                 gamma,
                 x if bias is None else bias,
@@ -217,14 +229,14 @@ def norm_act_cat_time(
                 keep,
                 float(scale),
                 1e-12,
-                c,
-                t,
                 h * w,
-                pad_front,
-                tc,
-                keep_t,
                 cache_strides[0],
                 cache_strides[2],
+                C=c,
+                T=t,
+                PAD=pad_front,
+                TC=tc,
+                TK=keep_t,
                 SILU=silu,
                 HAS_BIAS=bias is not None,
                 BLOCK_C=block_c,
@@ -236,7 +248,7 @@ def norm_act_cat_time(
             denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
             if not denom.is_contiguous():
                 denom = denom.contiguous()
-            _norm_scale_cat_time_kernel[(b * c * out_t * triton.cdiv(h * w, rn._BLOCK),)](
+            _norm_scale_cat_time_kernel[(b * c * out_t, tiles)](
                 x,
                 denom,
                 gamma,
@@ -244,14 +256,14 @@ def norm_act_cat_time(
                 out,
                 keep,
                 float(scale),
-                c,
-                t,
                 h * w,
-                pad_front,
-                tc,
-                keep_t,
                 *x.stride()[:3],
                 *cache_strides,
+                C=c,
+                T=t,
+                PAD=pad_front,
+                TC=tc,
+                TK=keep_t,
                 SILU=silu,
                 BLOCK=rn._BLOCK,
                 num_warps=rn._NUM_WARPS,
