@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Replacement forwards for Cosmos3's residual Wan encoder."""
 
 from __future__ import annotations
@@ -19,6 +19,19 @@ from torch import nn
 from . import forwards as fp
 from . import triton_data_movement as dm
 from . import triton_downsample as down
+
+
+def quant_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
+    """``quant_conv`` with the reference's contiguous output layout.
+
+    Its output is the public posterior. At the ``channels_last`` level the
+    encoder activations and this convolution's weights are channels-last, so
+    the posterior (and the channel slices ``latent_dist.mode()`` returns) would
+    otherwise carry channels-last strides on every encode path. The latent is
+    small, so the copy is negligible; already-contiguous outputs are returned
+    unchanged. The decoder's ``conv_out`` restores its layout the same way.
+    """
+    return fp.causal_conv_forward(self, x, cache_x).contiguous()
 
 
 def is_spatial_downsample(module: WanResample) -> bool:

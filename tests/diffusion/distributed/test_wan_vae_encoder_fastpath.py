@@ -143,10 +143,34 @@ def test_bf16_channels_last_encoder_uses_replacement_forwards(monkeypatch, autoc
     with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
         bits_equal(encode_frames(fast, x), ref.encode(x).latent_dist.parameters)
     assert calls
-    assert fast.quant_conv.forward.__func__ is fp.causal_conv_forward
+    assert fast.quant_conv.forward.__func__ is ef.quant_conv_forward
     uninstall_wan_vae_encoder_fastpath(fast)
     assert "forward" not in fast.encoder.__dict__
     assert "forward" not in fast.quant_conv.__dict__
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("tiled", [False, True])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_channels_last_posterior_keeps_reference_layout(tiled, batch):
+    """The channels-last level must not leak channels-last strides into the public posterior."""
+    ref, fast = pair()
+    x = torch.randn(batch, 3, 5, 96, 128)
+    for vae in (ref, fast):
+        if tiled:
+            vae.enable_tiling(
+                tile_sample_min_height=64,
+                tile_sample_min_width=64,
+                tile_sample_stride_height=48,
+                tile_sample_stride_width=48,
+            )
+    assert install_wan_vae_encoder_fastpath(fast, level="channels_last").installed
+    expected = ref.encode(x).latent_dist
+    actual = fast.encode(x).latent_dist
+    assert actual.parameters.is_contiguous()
+    assert actual.parameters.stride() == expected.parameters.stride()
+    assert actual.mode().stride() == expected.mode().stride()
+    torch.testing.assert_close(actual.parameters, expected.parameters)
 
 
 @torch.no_grad()

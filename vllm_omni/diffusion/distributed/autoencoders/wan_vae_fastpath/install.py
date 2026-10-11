@@ -359,6 +359,8 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
     bypassed: set[nn.Module] = set()
     for _, module in modules:
         replacement = replacements.get(type(module))
+        if module is vae.quant_conv:
+            replacement = ef.quant_conv_forward
         if forwards.is_diffusers_rms_norm(module):
             replacement = forwards.rms_norm_forward
             bypassed.add(module)
