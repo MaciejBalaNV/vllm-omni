@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.cosmos3 import multiview_maskless_attention as m
 from vllm_omni.diffusion.models.cosmos3.multiview_attention import multiview_attention
 from vllm_omni.diffusion.models.cosmos3.multiview_flex_attention import (
@@ -31,6 +34,13 @@ from vllm_omni.diffusion.models.cosmos3.multiview_maskless_plan import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+
+@pytest.fixture
+def isolate_dynamo_cache():
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
 
 
 def layout(
@@ -242,6 +252,52 @@ def test_merge_matches_fp64_reference(branches: int, dtype: torch.dtype) -> None
     torch.testing.assert_close(acc_lse[finite], torch.stack(lses).logsumexp(0)[finite], atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.usefixtures("isolate_dynamo_cache")
+@pytest.mark.parametrize(
+    "device", [pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)]
+)
+@pytest.mark.parametrize("identity", [False, True])
+@pytest.mark.parametrize("passes", [1, 2, 3])
+def test_merge_pass_matches_reference(device, identity, passes):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(912)
+    rows = 17
+    order = torch.arange(rows, device=device) if identity else torch.randperm(rows, device=device)
+    # Two passes end on a subset, exercising full output writeback after a partial merge.
+    indices = [order, order[::2].flip(0), order][:passes]
+    outputs = [torch.randn(i.numel(), 2, 16, device=device).bfloat16()[..., ::2] for i in indices]
+    lses = [torch.randn(2, i.numel(), device=device).T for i in indices]
+    merge = m._compiled_merge_pass if device == "cuda" else m._merge_pass
+    with torch.inference_mode():
+        acc = torch.empty(rows, 2, 8, device=device)
+        acc_lse = torch.empty(rows, 2, device=device)
+        result = torch.full((rows, 2, 16), float("nan"), dtype=torch.bfloat16, device=device)[..., ::2]
+        dense_outputs, dense_lses = [], []
+        for ordinal, (out, lse, index) in enumerate(zip(outputs, lses, indices, strict=True)):
+            full_out = torch.zeros_like(acc, dtype=torch.float64)
+            full_lse = torch.full_like(acc_lse, -float("inf"), dtype=torch.float64)
+            full_out[index], full_lse[index] = out.double(), lse.double()
+            dense_outputs.append(full_out)
+            dense_lses.append(full_lse)
+            merge(
+                acc,
+                acc_lse,
+                out,
+                lse,
+                index,
+                identity and ordinal != 1,
+                first_pass=ordinal == 0,
+                result=result if ordinal == passes - 1 else None,
+            )
+            if ordinal != passes - 1:
+                assert result.isnan().all()
+        expected = merge_oracle(dense_outputs, dense_lses)
+        torch.testing.assert_close(acc.double(), expected, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(acc_lse.double(), torch.stack(dense_lses).logsumexp(0), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(result.double(), expected, atol=0.003, rtol=0.02)
+
+
 # -- Attention op ---------------------------------------------------------------------
 
 
@@ -433,3 +489,34 @@ def test_cuda_maskless_matches_dense_and_sparse(fa_version: int, dtype: torch.dt
         torch.testing.assert_close(maskless.double(), dense_reference(spec, *qkv), atol=tolerance, rtol=tolerance)
         triton = padded_multiview_flex_attention(*qkv, MultiviewAttentionContext(replace(spec, backend="triton"), {}))
         torch.testing.assert_close(maskless, triton, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.usefixtures("isolate_dynamo_cache")
+@pytest.mark.cuda
+@pytest.mark.parametrize("fa_version", [3, 4])
+def test_fusion_forward_config(fa_version):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    if not is_fa_version_supported(fa_version):
+        pytest.skip(f"FA{fa_version} is unavailable")
+    spec = layout(views=3)
+    num_und = sum(spec.caption_lengths)
+    inputs = tensors(spec, num_und, dtype=torch.bfloat16, head_dim=128, device="cuda")
+    context = prepared_context(spec, num_und, kernel=f"fa{fa_version}", device="cuda")
+    # The outer graph keeps the custom-op boundary; merge uses real Inductor.
+    attention = torch.compile(m.maskless_multiview_attention, backend="eager", fullgraph=True)
+    with torch.no_grad(), patch.object(m, "_compiled_merge_pass", wraps=m._compiled_merge_pass) as merge:
+        with set_forward_context():
+            expected = attention(*inputs, context)
+        merge.assert_not_called()
+        for enabled in (True, False):
+            config = OmniDiffusionConfig(custom_pipeline_args={"cosmos3_lse_fusion": enabled})
+            with set_forward_context(omni_diffusion_config=config):
+                actual = attention(*inputs, context)
+            assert merge.call_count == (context.maskless.num_passes if enabled else 0)
+            torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
+            assert not actual.is_inference()
+            assert isinstance(actual._version, int)
+            merge.reset_mock()
