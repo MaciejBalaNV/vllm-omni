@@ -22,6 +22,7 @@ from vllm_omni.diffusion.models.cosmos3.lidar_encoder.rope3d import (
     VideoRopePosition3DEmb,
     apply_rotary_emb,
 )
+from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
 
 __all__ = ["Encoder", "Decoder"]
 
@@ -59,27 +60,6 @@ def _validate_inference_options(
         raise ValueError("LiDAR 3D bottlenecks require causal_time=True and use_3d_rope=True.")
     if not 0 <= dropout <= 1:
         raise ValueError("dropout probability must be between 0 and 1.")
-
-
-# =============================================================================
-# Normalization
-# =============================================================================
-
-
-class RMSNorm(torch.nn.Module):
-    def __init__(self, in_dim: int, scale: bool = True, eps: float = 1e-6):
-        super().__init__()
-        self.in_dim = in_dim
-        self.eps = eps
-        self.scale = nn.Parameter(torch.ones(in_dim)) if scale else 1.0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_fp32 = x.float()
-        x_normed = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x_normed * self.scale).to(x)
-
-    def extra_repr(self) -> str:
-        return f"in_dim={self.in_dim}"
 
 
 # =============================================================================

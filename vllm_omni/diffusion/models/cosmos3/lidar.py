@@ -33,6 +33,7 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
+from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
 from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 
 _LIDAR_VAE_SUBFOLDER = "lidar_vae"
@@ -170,16 +171,29 @@ class _LidarComponent(nn.Module):
         # Convert before loading so FP32 checkpoint values are never rounded.
         model = cls(component_config).float()
         expected = model.state_dict()
+        # Original VAE checkpoints name RMSNorm weights "scale". Derive the
+        # mapping from modules so attention temperature scales stay untouched,
+        # including norms in Sequential containers (head/detokenizer).
+        norm_keys = {
+            f"{name}.scale": f"{name}.weight" for name, module in model.named_modules() if isinstance(module, RMSNorm)
+        }
         with safe_open(folder / _LIDAR_VAE_WEIGHTS, framework="pt", device="cpu") as weights:
             # Each component reads only its own parameters and the shared buffers.
-            keys = [name for name in weights.keys() if not name.startswith(cls._unused_prefixes)]
-            if unexpected := set(keys) - expected.keys():
+            keys = {}
+            for checkpoint_name in weights.keys():
+                if checkpoint_name.startswith(cls._unused_prefixes):
+                    continue
+                name = norm_keys.get(checkpoint_name, checkpoint_name)
+                if name in keys:
+                    raise ValueError(f"Duplicate LiDAR {cls._component_name} tensor after RMSNorm remapping: {name}.")
+                keys[name] = checkpoint_name
+            if unexpected := keys.keys() - expected.keys():
                 raise ValueError(f"Unexpected LiDAR {cls._component_name} tensors: {sorted(unexpected)}.")
             state = {}
-            for name in keys:
-                if expected[name].is_floating_point() and weights.get_slice(name).get_dtype() != "F32":
-                    raise ValueError(f"LiDAR {cls._component_name} tensor {name} must be FP32.")
-                state[name] = weights.get_tensor(name)
+            for name, checkpoint_name in keys.items():
+                if expected[name].is_floating_point() and weights.get_slice(checkpoint_name).get_dtype() != "F32":
+                    raise ValueError(f"LiDAR {cls._component_name} tensor {checkpoint_name} must be FP32.")
+                state[name] = weights.get_tensor(checkpoint_name)
             model.load_state_dict(state, strict=True)
         if (
             not torch.isfinite(model.latent_mean).all()
