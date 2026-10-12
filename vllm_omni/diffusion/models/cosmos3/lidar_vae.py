@@ -1,30 +1,345 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Independent LiDAR encoder and decoder loaded from the unified VAE.
+
+The checkpoint root contains ``lidar_vae/config.json`` and safetensors
+weights (optionally sharded). Both components load their own weights through
+``DiffusersPipelineLoader`` and run in FP32. No multiview
+transformer or generation pipeline is required::
+
+    from vllm_omni.diffusion.models.cosmos3.lidar_vae import Cosmos3LidarDecoder, Cosmos3LidarEncoder
+
+    root = Path("/models/cosmos3")
+    config = json.loads((root / "lidar_vae/config.json").read_text())
+    device = torch.device("cuda")
+    encoder = Cosmos3LidarEncoder.from_pretrained(str(root), config, device)
+    decoder = Cosmos3LidarDecoder.from_pretrained(str(root), config, device)
+    latents = encoder(frames)  # FP32 physical frames: [B, 3, T, 128, 1800]
+    reconstructed = decoder(latents)  # [B, 3, T, 128, 1800]
+
+The latent shape is ``[B, latent_channels, T, 8, 113]``; an unbatched
+``[3, T, 128, 1800]`` input encodes with ``B = 1``. Decoder channels are
+range in metres, unit intensity, and validity. Full-size neighborhood
+attention requires CUDA; CPU execution is for small correctness fixtures.
+"""
 
 from __future__ import annotations
 
-# Inference-only LiDAR VAE: spatial hourglass with causal temporal
-# attention and no temporal resampling. Encoder blocks run spatial→temporal;
-# decoder blocks run temporal→spatial. The bottleneck is factorized or joint 3D.
-# Based on https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/models/image_transformer_v2.py.
+import inspect
+import json
 import math
-from typing import Literal
+from collections.abc import Iterable
+from functools import lru_cache
+from pathlib import Path
+from types import FunctionType
+from typing import TYPE_CHECKING, Any, Literal
 
 import einops
 import torch
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch import nn
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.nn.modules.utils import _pair
+from typing_extensions import Self
 
-from vllm_omni.diffusion.models.cosmos3.lidar_encoder.neighborhood_attention import neighborhood_attention_2d
-from vllm_omni.diffusion.models.cosmos3.lidar_encoder.rope3d import (
-    VideoRopePosition3DEmb,
-    apply_rotary_emb,
-)
+from vllm_omni.diffusion.layers.rope import apply_rotary_emb_torch
 from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
 
-__all__ = ["Encoder", "Decoder"]
+if TYPE_CHECKING:
+    from vllm.config.load import LoadConfig
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+
+# =============================================================================
+# Polar coordinates
+# =============================================================================
+
+
+def generate_polar_coords(
+    height: int, width: int, device: torch.device | str = "cpu"
+) -> torch.Tensor:  # returns [1,2,H,W]
+    """Build spherical angles for a range map.
+
+    phi: elevation in (-pi/2, pi/2], decreasing with row; row 0 is +pi/2.
+    theta: azimuth in (-pi, pi], decreasing with column; column 0 is +pi.
+    Angles span the model width linearly (padded columns are not wrapped),
+    matching the reference buffer stored in the checkpoint.
+    """
+    phi = (0.5 - torch.arange(height, device=device) / height) * torch.pi  # [H]
+    theta = (1 - torch.arange(width, device=device) / width) * 2 * torch.pi - torch.pi  # [W]
+    phi, theta = torch.meshgrid(phi, theta, indexing="ij")  # [H,W], [H,W]
+    angles = torch.stack([phi, theta])  # [2,H,W]
+    return angles[None]  # [1,2,H,W]
+
+
+# =============================================================================
+# 3D rotary positional embedding
+# =============================================================================
+
+
+class VideoRopePosition3DEmb(nn.Module):
+    """3D RoPE producing angles for a ``(T, H, W)`` token grid.
+
+    The head dimension is split into three chunks ``(dim_t, dim_h, dim_w)``.
+    Each axis contributes its own rotary frequency band, and the resulting angles are duplicated
+    across the two rotation halves (GPT-NeoX style) so that
+    :func:`apply_rotary_emb` can rotate Q/K with a single tensor.
+
+    For a query at position ``p_q = (t_q, h_q, w_q)`` and a key at
+    ``p_k = (t_k, h_k, w_k)``, the dot product after rotation depends only on
+    ``p_q - p_k``. If the query and key share the same value along some axis
+    (e.g. a factored *spatial* attention block where both are on the same
+    frame), the rotation along that axis cancels out -- so this single 3D
+    RoPE specializes correctly to 2D RoPE for spatial-only blocks and 1D RoPE
+    for temporal-only blocks.
+
+    Args:
+        head_dim: Per-head channel count. Must satisfy
+            ``head_dim - 2 * (head_dim // 6 * 2) > 0``.
+        len_t: Maximum supported temporal grid size.
+        len_h: Maximum supported grid height.
+        len_w: Maximum supported grid width. Frequencies are cached for these
+            maxima; ``forward`` accepts any smaller ``(T, H, W)``.
+        base_theta: RoPE base (``10000.0`` matches LLaMA/Cosmos).
+    """
+
+    def __init__(
+        self,
+        *,
+        head_dim: int,
+        len_t: int,
+        len_h: int,
+        len_w: int,
+        base_theta: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        dim = head_dim
+        dim_h = (dim // 6) * 2
+        dim_w = dim_h
+        dim_t = dim - dim_h - dim_w
+        assert dim_t >= 2, f"head_dim={dim} too small for 3D RoPE (dim_t={dim_t}, dim_h={dim_h}, dim_w={dim_w})"
+        self.head_dim = dim
+        self.dim_t = dim_t
+        self.dim_h = dim_h
+        self.dim_w = dim_w
+        self.max_t = len_t
+        self.max_h = len_h
+        self.max_w = len_w
+
+        idx_h = torch.arange(0, dim_h, 2, dtype=torch.float32) / dim_h
+        idx_w = torch.arange(0, dim_w, 2, dtype=torch.float32) / dim_w
+        idx_t = torch.arange(0, dim_t, 2, dtype=torch.float32) / dim_t
+        self.register_buffer("freqs_h", 1.0 / (base_theta**idx_h), persistent=False)
+        self.register_buffer("freqs_w", 1.0 / (base_theta**idx_w), persistent=False)
+        self.register_buffer("freqs_t", 1.0 / (base_theta**idx_t), persistent=False)
+        self.register_buffer("seq_h", torch.arange(len_h, dtype=torch.float32), persistent=False)
+        self.register_buffer("seq_w", torch.arange(len_w, dtype=torch.float32), persistent=False)
+        self.register_buffer("seq_t", torch.arange(len_t, dtype=torch.float32), persistent=False)
+
+    def forward(self, num_frames: int, height: int, width: int) -> torch.Tensor:  # returns [T*H*W,D]
+        """Returns rope angles of shape ``(T*H*W, head_dim)``.
+
+        Each half of the last dim duplicates the per-axis angles
+        ``[t_half | h_half | w_half | t_half | h_half | w_half]`` so that
+        :func:`apply_rotary_emb` (GPT-NeoX style) can rotate Q/K via
+        ``[x_lo, x_hi] @ rot``.
+        """
+        assert num_frames <= self.max_t and height <= self.max_h and width <= self.max_w, (
+            f"Requested ({num_frames},{height},{width}) exceeds cached ({self.max_t},{self.max_h},{self.max_w})"
+        )
+        ang_t = torch.outer(self.seq_t[:num_frames], self.freqs_t)  # [T,Dt/2]
+        ang_h = torch.outer(self.seq_h[:height], self.freqs_h)  # [H,Dh/2]
+        ang_w = torch.outer(self.seq_w[:width], self.freqs_w)  # [W,Dw/2]
+        ang_t_b = ang_t.view(num_frames, 1, 1, -1).expand(num_frames, height, width, -1)  # [T,H,W,Dt/2]
+        ang_h_b = ang_h.view(1, height, 1, -1).expand(num_frames, height, width, -1)  # [T,H,W,Dh/2]
+        ang_w_b = ang_w.view(1, 1, width, -1).expand(num_frames, height, width, -1)  # [T,H,W,Dw/2]
+        half = torch.cat([ang_t_b, ang_h_b, ang_w_b], dim=-1)  # [T,H,W,D/2]
+        full = torch.cat([half, half], dim=-1)  # [T,H,W,D]
+        return full.reshape(num_frames * height * width, -1)  # [T*H*W,D]
+
+
+def apply_rotary_emb(
+    x: torch.Tensor, rope_emb: torch.Tensor
+) -> torch.Tensor:  # x: [...,S,N,D], rope_emb: [S,D], returns [...,S,N,D]
+    """Apply half-split rotation using the shared helper and duplicated 3D angles."""
+    angles = rope_emb[:, : x.shape[-1] // 2].to(x.dtype)
+    return apply_rotary_emb_torch(x, angles.cos(), angles.sin(), interleaved=False)
+
+
+# =============================================================================
+# Neighborhood attention
+# =============================================================================
+
+
+# Inference-only, inward-shifted 2D neighborhood attention for the LiDAR VAE.
+#
+# Only geometry and compiled code are shared across requests. Spatial padding is
+# owned by the caller; masks describe the actual (possibly padded) input grid.
+
+_BLOCK_SIZE = 64
+_QUERY_CHUNK_SIZE = 4096
+_CACHE_SIZE = 32
+_KERNEL_OPTIONS = {
+    "BLOCK_M": 64,
+    "BLOCK_N": 64,
+    "num_warps": 4,
+    "num_stages": 1,
+    "USE_TMA": False,
+    "FORCE_USE_FLEX_ATTENTION": True,
+    # Triton's dot precision is local to this operator, including the P @ V
+    # multiplication. Do not change the surrounding model's TF32 policy.
+    "FLOAT32_PRECISION": "'ieee'",
+}
+
+
+def _attention_pair(value, name: str) -> tuple[int, int]:
+    pair = tuple(value) if isinstance(value, tuple | list) else (value, value)
+    if len(pair) != 2 or any(type(v) is not int or v < 1 for v in pair):
+        raise ValueError(f"LiDAR attention {name} must contain two positive integers, got {value!r}.")
+    return pair
+
+
+def _axis_start(q, length: int, kernel: int, dilation: int):
+    residue = q % dilation
+    group_length = (length - 1 - residue) // dilation + 1
+    return torch.minimum((q // dilation - kernel // 2).clamp(min=0), group_length - kernel)
+
+
+def _mask_predicate(height: int, width: int, kernel: tuple[int, int], dilation: tuple[int, int]):
+    def mask_mod(batch, head, q, p):
+        qh, qw = q // width, q % width
+        ph, pw = p // width, p % width
+        sh = _axis_start(qh, height, kernel[0], dilation[0])
+        sw = _axis_start(qw, width, kernel[1], dilation[1])
+        return (
+            (q < height * width)
+            & (p < height * width)
+            & (qh % dilation[0] == ph % dilation[0])
+            & (qw % dilation[1] == pw % dilation[1])
+            & (ph // dilation[0] >= sh)
+            & (ph // dilation[0] < sh + kernel[0])
+            & (pw // dilation[1] >= sw)
+            & (pw // dilation[1] < sw + kernel[1])
+        )
+
+    return mask_mod
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
+def _get_block_mask(
+    device: torch.device, height: int, width: int, kernel: tuple[int, int], dilation: tuple[int, int]
+) -> BlockMask:
+    for length, k, d in zip((height, width), kernel, dilation):
+        # Every residue group must contain the entire window, including the
+        # shorter groups when the axis is not divisible by dilation.
+        if length < k * d:
+            raise ValueError(f"LiDAR attention axis length {length} is smaller than kernel {k} * dilation {d}.")
+    sequence = height * width
+    blocks = math.ceil(sequence / _BLOCK_SIZE)
+    counts = torch.empty((blocks,), dtype=torch.int32, device=device)
+    indices = torch.empty((blocks, blocks), dtype=torch.int32, device=device)
+    dh = torch.arange(kernel[0], device=device)
+    dw = torch.arange(kernel[1], device=device)
+    for first in range(0, sequence, _QUERY_CHUNK_SIZE):
+        q = torch.arange(first, min(first + _QUERY_CHUNK_SIZE, sequence), device=device)
+        qh, qw = q // width, q % width
+        ph = (_axis_start(qh, height, kernel[0], dilation[0])[:, None] + dh) * dilation[0]
+        ph = ph + (qh % dilation[0])[:, None]
+        pw = (_axis_start(qw, width, kernel[1], dilation[1])[:, None] + dw) * dilation[1]
+        pw = pw + (qw % dilation[1])[:, None]
+        key_blocks = ((ph[:, :, None] * width + pw[:, None, :]) // _BLOCK_SIZE).flatten(1)
+        row = (q - first) // _BLOCK_SIZE
+        rows = math.ceil(q.numel() / _BLOCK_SIZE)
+        present = torch.zeros((rows, blocks), dtype=torch.bool, device=device)
+        present.view(-1).scatter_(0, (row[:, None] * blocks + key_blocks).flatten(), True)
+        start = first // _BLOCK_SIZE
+        counts[start : start + rows] = present.sum(-1, dtype=torch.int32)
+        # Full-width contiguous int32 metadata matches FlexAttention's native
+        # layout. Only the first `counts[row]` entries are visited by the kernel.
+        indices[start : start + rows] = present.to(torch.int8).argsort(descending=True, stable=True).to(torch.int32)
+    return BlockMask.from_kv_blocks(
+        counts[None, None],
+        indices[None, None],
+        BLOCK_SIZE=(_BLOCK_SIZE, _BLOCK_SIZE),
+        mask_mod=_mask_predicate(height, width, kernel, dilation),
+        seq_lengths=(sequence, sequence),
+        compute_q_blocks=False,
+    )
+
+
+def _run_attention(query, key, value, block_mask, scale):
+    head_dim = query.shape[-1]
+    # Pad small head dimensions to 16 for CUDA FlexAttention. Zero padding
+    # preserves Q @ K and P @ V with an explicit scale.
+    if head_dim < 16:
+        query, key, value = (F.pad(t, (0, 16 - head_dim)) for t in (query, key, value))
+    output = flex_attention(query, key, value, block_mask=block_mask, scale=scale, kernel_options=_KERNEL_OPTIONS)
+    return output[..., :head_dim] if head_dim < 16 else output
+
+
+@lru_cache(maxsize=_CACHE_SIZE)
+def _get_compiled_runner(device, shape, kernel, dilation, scale):
+    # Dynamo caches by code object. A new wrapper around the same code would
+    # still hit its recompile limit across decoder levels and partial chunks.
+    # Give each static specialization its own code object, without capturing
+    # tensors or a mask (which would keep evicted device allocations alive).
+    runner = FunctionType(_run_attention.__code__.replace(), globals(), _run_attention.__name__)
+    return torch.compile(runner, fullgraph=True, dynamic=False)
+
+
+def neighborhood_attention_2d(query, key, value, *, kernel_size, dilation, scale):
+    """Attend to a fixed 2D window on FP32 [B,H,W,heads,head_dim] tensors.
+
+    CUDA always uses compiled sparse attention and propagates failures. Eager
+    CPU FlexAttention is available only for small correctness fixtures, since
+    PyTorch's eager implementation materializes token-level scores.
+    """
+    if query.ndim != 5 or any(t.shape != query.shape for t in (key, value)) or min(query.shape) < 1:
+        raise ValueError("LiDAR attention requires matching nonempty [B,H,W,heads,head_dim] tensors.")
+    if any(t.dtype != torch.float32 or t.device != query.device for t in (query, key, value)):
+        raise ValueError("LiDAR attention requires FP32 query, key, and value on the same device.")
+    if query.device.type not in {"cpu", "cuda"}:
+        raise RuntimeError(f"LiDAR FlexAttention requires CUDA (or CPU correctness fixtures), got {query.device}.")
+    kernel, dilation = _attention_pair(kernel_size, "kernel_size"), _attention_pair(dilation, "dilation")
+    batch, height, width, heads, dim = query.shape
+    if query.device.type == "cpu" and height * width > 4096:
+        raise RuntimeError("Eager CPU LiDAR FlexAttention is limited to 4096 tokens; use CUDA for production grids.")
+    # Tensor.device resolves an unindexed 'cuda' to the actual device, so an
+    # offloaded/reloaded module never reuses another GPU's mask or runner.
+    try:
+        mask = _get_block_mask(query.device, height, width, kernel, dilation)
+        q, k, v = (
+            t.permute(0, 3, 1, 2, 4).reshape(batch, heads, height * width, dim).contiguous()
+            for t in (query, key, value)
+        )
+        runner = (
+            _get_compiled_runner(query.device, tuple(query.shape), kernel, dilation, scale)
+            if query.is_cuda
+            else _run_attention
+        )
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            output = runner(q, k, v, mask, scale)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cosmos3 LiDAR FlexAttention failed on {query.device} for shape {tuple(query.shape)}, "
+            f"kernel={kernel}, dilation={dilation}; compiled sparse attention is required on CUDA."
+        ) from exc
+    return output.transpose(1, 2).reshape(batch, height, width, heads, dim).contiguous()
+
+
+# =============================================================================
+# Transformer VAE blocks
+# =============================================================================
+
+
+# Inference-only LiDAR VAE: spatial hourglass with causal temporal
+# attention and no temporal resampling. Encoder blocks run spatial→temporal;
+# decoder blocks run temporal→spatial. The bottleneck is factorized or joint 3D.
+# Based on https://github.com/crowsonkb/k-diffusion/blob/master/k_diffusion/models/image_transformer_v2.py.
 
 
 def _zero_out(module: nn.Module) -> None:
@@ -1192,3 +1507,406 @@ class Decoder(nn.Module):
                 raise ValueError(f"unused temporal KV cache keys: {sorted(missing)}")
             return h, new_cache
         return h
+
+
+# =============================================================================
+# LiDAR configuration, checkpoint loading, and inference
+# =============================================================================
+
+
+_LIDAR_VAE_SUBFOLDER = "lidar_vae"
+_LIDAR_CONFIG_FIELDS = frozenset(
+    {
+        "dtype",
+        "sample_posterior",
+        "apply_validity_mask",
+        "fps",
+        "latent_channels",
+        "temporal_compression_factor",
+        "spatial_compression",
+        "network_config",
+        "range_projection",
+        "streaming_chunk_frames",
+        "streaming_context_frames",
+    }
+)
+
+
+def validate_lidar_config(config: dict[str, Any]) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("LiDAR metadata must be a JSON object.")
+    if missing := _LIDAR_CONFIG_FIELDS - config.keys():
+        raise ValueError(f"Incomplete joint artifact: missing LiDAR metadata {sorted(missing)}.")
+    if config["dtype"] != "float32" or config["sample_posterior"] is not False:
+        raise ValueError("LiDAR requires FP32 execution and posterior-mean encoding.")
+    if not isinstance(config["apply_validity_mask"], bool):
+        raise ValueError("LiDAR apply_validity_mask must be boolean.")
+    projection = config["range_projection"]
+    if not isinstance(projection, dict) or not isinstance(config["network_config"], dict):
+        raise ValueError("LiDAR range_projection and network_config must be JSON objects.")
+    expected = {
+        "semantic_width": 1800,
+        "model_width": 1808,
+        "native_height": 128,
+        "model_width_transform": "circular_pad",
+        "intensity_encoding": "unit",
+    }
+    if any(projection.get(key) != value for key, value in expected.items()):
+        raise ValueError("LiDAR requires the 128x1800 metric/unit-intensity grid with circular padding to 1808.")
+    minimum, maximum = projection.get("min_range_m"), projection.get("max_range_m")
+    if not all(isinstance(v, int | float) and math.isfinite(v) for v in (minimum, maximum)) or maximum <= minimum:
+        raise ValueError("LiDAR range normalization requires finite min_range_m < max_range_m.")
+    network = config["network_config"]
+    if (
+        network.get("resolution") != [128, 1808]
+        or network.get("patch_size") != [2, 2]
+        or len(network.get("depths", [])) != 4
+        or config["spatial_compression"] != [16, 16]
+        or config["temporal_compression_factor"] != 1
+        or network.get("z_dim") != config["latent_channels"]
+        or network.get("in_channels") != 3
+        or any(network.get("temporal_downsample", [True]))
+    ):
+        raise ValueError("LiDAR architecture and compression metadata disagree.")
+    if not math.isfinite(config["fps"]) or config["fps"] <= 0:
+        raise ValueError("LiDAR FPS must be finite and positive.")
+    chunk, context = config["streaming_chunk_frames"], config["streaming_context_frames"]
+    if type(chunk) is not int or chunk < 1 or (context is not None and (type(context) is not int or context < chunk)):
+        raise ValueError("LiDAR streaming context must be at least the positive chunk length.")
+
+
+def _validate_lidar_vae_config(component: dict[str, Any], deployment: dict[str, Any]) -> None:
+    validate_lidar_config(deployment)
+    validate_lidar_config(component)
+    for key in _LIDAR_CONFIG_FIELDS:
+        expected = deployment[key]
+        if key == "network_config":
+            # The VAE resolves constructor defaults that transformer metadata may omit.
+            if any(name not in component[key] or component[key][name] != value for name, value in expected.items()):
+                raise ValueError("LiDAR VAE network_config metadata disagrees with transformer deployment metadata.")
+        elif key not in component or component[key] != expected:
+            raise ValueError(f"LiDAR VAE {key} metadata disagrees with transformer deployment metadata.")
+
+
+def prepare_lidar_encoder_input(frames: torch.Tensor, projection: dict[str, Any]) -> torch.Tensor:
+    """Reference physical normalization after symmetric circular width padding."""
+    if frames.ndim == 4:
+        frames = frames.unsqueeze(0)
+    height, width = projection["native_height"], projection["semantic_width"]
+    if (
+        frames.ndim != 5
+        or frames.shape[1] != 3
+        or tuple(frames.shape[-2:]) != (height, width)
+        or frames.shape[0] < 1
+        or frames.shape[2] < 1
+    ):
+        raise ValueError(
+            f"Expected nonempty LiDAR frames [3,T,{height},{width}] or [B,3,T,{height},{width}], "
+            f"got {tuple(frames.shape)}."
+        )
+    frames = frames.float()
+    padding = projection["model_width"] - projection["semantic_width"]
+    if padding < 0 or padding % 2:
+        raise ValueError("LiDAR model width must allow symmetric circular padding of the semantic width.")
+    half_padding = padding // 2
+    if half_padding:
+        frames = torch.cat((frames[..., -half_padding:], frames, frames[..., :half_padding]), dim=-1)
+    minimum, maximum = projection["min_range_m"], projection["max_range_m"]
+    ranges, intensities, validity = frames.split(1, dim=1)
+    valid = (validity >= 0.5) & (ranges >= minimum) & (ranges <= maximum)
+    ranges = (ranges.clamp(minimum, maximum) - minimum) / (maximum - minimum) * 2 - 1
+    intensities = intensities.clamp(0, 1) * 2 - 1
+    return torch.cat((ranges.masked_fill(~valid, -1), intensities.masked_fill(~valid, -1), valid.float()), dim=1)
+
+
+class _LidarComponent(nn.Module):
+    _unused_prefixes: tuple[str, ...]
+    _component_name: str
+    weights_sources: list[DiffusersPipelineLoader.ComponentSource]
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: str,
+        config: dict[str, Any],
+        device: torch.device,
+        *,
+        load_config: LoadConfig | None = None,
+        od_config: OmniDiffusionConfig | None = None,
+    ) -> Self:
+        """Load a standalone component with the shared loader's configuration.
+
+        Pipeline callers can construct the component from its config, declare
+        a ``lidar_vae`` ComponentSource on the pipeline, and route its iterator
+        to :meth:`load_weights` without loading or moving weights during init.
+        """
+        from vllm.config.load import LoadConfig
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+        from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+        load_config = load_config if load_config is not None else LoadConfig()
+        od_config = od_config if od_config is not None else OmniDiffusionConfig(dtype=torch.float32)
+        checkpoint_path = Path(model_path)
+        if not checkpoint_path.is_dir():
+            # Fetch metadata only; weight discovery and downloads belong to the
+            # shared loader, using the original repository ID and revision.
+            checkpoint_path = Path(
+                download_weights_from_hf_specific(
+                    model_name_or_path=model_path,
+                    cache_dir=load_config.download_dir,
+                    allow_patterns=[f"{_LIDAR_VAE_SUBFOLDER}/config.json"],
+                    revision=od_config.revision,
+                    ignore_patterns=load_config.ignore_patterns,
+                    require_all=True,
+                )
+            )
+        config_path = checkpoint_path / _LIDAR_VAE_SUBFOLDER / "config.json"
+        if not config_path.is_file():
+            raise ValueError(f"Incomplete joint artifact: {_LIDAR_VAE_SUBFOLDER}/config.json is required.")
+        component_config = json.loads(config_path.read_text())
+        _validate_lidar_vae_config(component_config, config)
+        model = cls(component_config).float().to(device=device)
+        model.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder=_LIDAR_VAE_SUBFOLDER,
+                revision=od_config.revision,
+                prefix="",
+                fall_back_to_pt=False,
+            ),
+        ]
+        DiffusersPipelineLoader(load_config, od_config).load_weights(model)
+        return model
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Stream this component's parameters and buffers from the unified VAE."""
+        from vllm.model_executor.models.utils import AutoWeightsLoader
+
+        # Pipeline construction may set the default parameter dtype to BF16.
+        # Convert before loading so FP32 checkpoint values are never rounded.
+        self.float()
+        expected = self.state_dict()
+        # Original VAE checkpoints name RMSNorm weights "scale". Derive the
+        # mapping from modules so attention temperature scales stay untouched,
+        # including norms in Sequential containers (head/detokenizer).
+        norm_keys = {
+            f"{name}.scale": f"{name}.weight" for name, module in self.named_modules() if isinstance(module, RMSNorm)
+        }
+        seen: set[str] = set()
+
+        def remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            for checkpoint_name, tensor in weights:
+                if checkpoint_name.startswith(self._unused_prefixes):
+                    continue
+                name = norm_keys.get(checkpoint_name, checkpoint_name)
+                if name in seen:
+                    raise ValueError(f"Duplicate LiDAR {self._component_name} tensor after RMSNorm remapping: {name}.")
+                if name not in expected:
+                    raise ValueError(f"Unexpected LiDAR {self._component_name} tensors: {[name]}.")
+                if expected[name].is_floating_point() and tensor.dtype != torch.float32:
+                    raise ValueError(f"LiDAR {self._component_name} tensor {checkpoint_name} must be FP32.")
+                if tensor.shape != expected[name].shape:
+                    raise RuntimeError(
+                        f"LiDAR {self._component_name} size mismatch for {name}: "
+                        f"expected {tuple(expected[name].shape)}, got {tuple(tensor.shape)}."
+                    )
+                seen.add(name)
+                yield name, tensor
+
+        loaded = AutoWeightsLoader(self).load_weights(remapped_weights())
+        # The shared loader checks parameters; LiDAR also requires every
+        # persistent buffer, particularly coordinates and latent statistics.
+        if missing := expected.keys() - loaded:
+            raise RuntimeError(f"Missing keys in LiDAR {self._component_name} checkpoint: {sorted(missing)}.")
+        if (
+            not torch.isfinite(self.latent_mean).all()
+            or not torch.isfinite(self.latent_std).all()
+            or (self.latent_std <= 0).any()
+        ):
+            raise ValueError("LiDAR latent statistics must be finite with positive standard deviations.")
+        self.eval().requires_grad_(False)
+        return loaded
+
+
+class Cosmos3LidarEncoder(_LidarComponent):
+    _unused_prefixes = ("decoder.", "post_quant_conv.")
+    _component_name = "encoder"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        validate_lidar_config(config)
+
+        self.config = config
+        network = config["network_config"]
+        encoder_args = set(inspect.signature(Encoder).parameters)
+        self.encoder = Encoder(**{key: value for key, value in network.items() if key in encoder_args})
+        channels = config["latent_channels"]
+        self.quant_conv = nn.Conv2d(channels * 2, channels * 2, 1)
+        self.register_buffer("coords", generate_polar_coords(*network["resolution"]))
+        self.register_buffer("latent_mean", torch.empty(1, channels, 1, 1, 1))
+        self.register_buffer("latent_std", torch.empty(1, channels, 1, 1, 1))
+
+    @torch.inference_mode()
+    def forward(self, frames: torch.Tensor) -> torch.Tensor:
+        # Keep normalization, network execution and the latent affine in FP32,
+        # including when the parent DiT is under BF16 autocast.
+        with torch.autocast(device_type=self.coords.device.type, enabled=False):
+            state = prepare_lidar_encoder_input(frames.to(self.coords.device), self.config["range_projection"])
+            chunk = self.config["streaming_chunk_frames"]
+            context = self.config["streaming_context_frames"]
+            outputs, cache = [], None
+            for start in range(0, state.shape[2], chunk):
+                pixels = state[:, :, start : start + chunk]
+                if cache is not None and context is not None:
+                    keep = context - pixels.shape[2]
+                    cache = (
+                        {key: (k[:, :, -keep:], v[:, :, -keep:]) for key, (k, v) in cache.items()} if keep > 0 else None
+                    )
+                parameters, cache = self.encoder.forward_stream(pixels, self.coords, cache)
+                batch, _, time, height, width = parameters.shape
+                parameters = parameters.permute(0, 2, 1, 3, 4).flatten(0, 1)
+                mean = self.quant_conv(parameters).chunk(2, dim=1)[0]
+                outputs.append(mean.reshape(batch, time, -1, height, width).permute(0, 2, 1, 3, 4))
+            latent = torch.cat(outputs, dim=2)
+            return (latent - self.latent_mean) / self.latent_std
+
+
+def lidar_decoder_args(network: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the decoder topology exactly as the reference TransformerVAE."""
+
+    args = {key: value for key, value in network.items() if key in inspect.signature(Decoder).parameters}
+    # TransformerVAE never enables the standalone decoder's external-encoder stem.
+    args.pop("stem_patchify", None)
+    for field in ("depths", "num_heads", "dilation"):
+        if network.get(f"decoder_{field}") is not None:
+            args[field] = network[f"decoder_{field}"]
+    if network.get("decoder_depths") is not None:
+        temporal = network.get("decoder_temporal_upsample")
+        if temporal is None:
+            raise ValueError("An asymmetric LiDAR decoder requires decoder_temporal_upsample.")
+        args.update(temporal_downsample=temporal, temporal_upsample=temporal)
+    return args
+
+
+def validate_lidar_decoder_config(config: dict[str, Any]) -> None:
+    validate_lidar_config(config)
+    network = config["network_config"]
+    if (
+        network.get("out_channels") != 3
+        or network.get("predict_validity", False)
+        or network.get("mask_as_input", False)
+        or network.get("formulation", "VAE") != "VAE"
+    ):
+        raise ValueError("LiDAR decoding requires three output channels with embedded validity logits.")
+    args = lidar_decoder_args(network)
+    depths = args["depths"]
+    patch = args.get("out_patch_size") or args["patch_size"]
+    temporal = args.get("temporal_upsample")
+    if temporal is None:
+        temporal = args["temporal_downsample"]
+    if (
+        len(depths) < 1
+        or len(patch) != 2
+        or [size * 2 ** (len(depths) - 1) for size in patch] != config["spatial_compression"]
+        or len(temporal) != len(depths) - 1
+        or any(temporal)
+        or any(len(args.get(field, ())) != len(depths) for field in ("num_heads", "dilation"))
+    ):
+        raise ValueError("LiDAR decoder topology must preserve spatial and temporal compression.")
+    if args.get("temporal_mixer", "attention") != "attention" or (
+        args.get("bottleneck_3d", False)
+        and not (args.get("bottleneck_3d_causal_time", False) and args.get("bottleneck_3d_rope", False))
+    ):
+        raise ValueError("LiDAR streaming decode requires causal temporal attention with RoPE for a 3D bottleneck.")
+    threshold = config["range_projection"].get("validity_threshold", 0.5)
+    if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0 < threshold < 1:
+        raise ValueError("LiDAR validity_threshold must lie in (0, 1).")
+
+
+def postprocess_lidar_decoder_output(output: torch.Tensor, config: dict[str, Any]) -> torch.Tensor:
+    """Convert raw network predictions to the unpadded metric sensor grid."""
+    projection = config["range_projection"]
+    if (
+        output.ndim != 5
+        or output.shape[1] != 3
+        or tuple(output.shape[-2:])
+        != (
+            projection["native_height"],
+            projection["model_width"],
+        )
+    ):
+        raise ValueError(f"Unexpected LiDAR decoder output shape: {tuple(output.shape)}.")
+    output = output.float()
+    minimum, maximum = projection["min_range_m"], projection["max_range_m"]
+    ranges = (output[:, :1].clamp(-1, 1) + 1) * 0.5 * (maximum - minimum) + minimum
+    intensity = (output[:, 1:2].clamp(-1, 1) + 1) * 0.5
+    validity = output[:, 2:3].sigmoid()
+    if config["apply_validity_mask"]:
+        valid = validity >= projection.get("validity_threshold", 0.5)
+        ranges = ranges.masked_fill(~valid, 0)
+        intensity = intensity.masked_fill(~valid, 0)
+        validity = valid.float()
+    frames = torch.cat((ranges, intensity, validity), dim=1)
+    offset = (projection["model_width"] - projection["semantic_width"]) // 2
+    return frames[..., offset : offset + projection["semantic_width"]].contiguous()
+
+
+class Cosmos3LidarDecoder(_LidarComponent):
+    """Inference-only, FP32 decoder for normalized diffusion latents."""
+
+    _unused_prefixes = ("encoder.", "quant_conv.")
+    _component_name = "decoder"
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        validate_lidar_decoder_config(config)
+
+        self.config = config
+        self.decoder = Decoder(**lidar_decoder_args(config["network_config"]))
+        channels = config["latent_channels"]
+        self.post_quant_conv = nn.Conv2d(channels, channels, 1)
+        self.register_buffer("coords", generate_polar_coords(*config["network_config"]["resolution"]))
+        self.register_buffer("latent_mean", torch.empty(1, channels, 1, 1, 1))
+        self.register_buffer("latent_std", torch.empty(1, channels, 1, 1, 1))
+
+    @torch.inference_mode()
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Return [B,3,T,128,1800] metric frames, keeping each request's cache local."""
+        expected_hw = tuple(
+            size // factor
+            for size, factor in zip(self.config["network_config"]["resolution"], self.config["spatial_compression"])
+        )
+        if (
+            latents.ndim != 5
+            or latents.shape[1] != self.config["latent_channels"]
+            or tuple(latents.shape[-2:]) != expected_hw
+            or latents.shape[0] < 1
+            or latents.shape[2] < 1
+        ):
+            raise ValueError(f"Expected nonempty LiDAR latents [B,{self.config['latent_channels']},T,{expected_hw}].")
+        with torch.autocast(device_type=self.coords.device.type, enabled=False):
+            latents = latents.to(device=self.coords.device, dtype=torch.float32)
+            latents = latents * self.latent_std + self.latent_mean
+            chunk = self.config["streaming_chunk_frames"]
+            context = self.config["streaming_context_frames"]
+            outputs, cache = [], None
+            for start in range(0, latents.shape[2], chunk):
+                latent = latents[:, :, start : start + chunk]
+                batch, _, time, height, width = latent.shape
+                if cache is not None and context is not None:
+                    keep = context - time
+                    cache = (
+                        {key: (k[:, :, -keep:], v[:, :, -keep:]) for key, (k, v) in cache.items()} if keep > 0 else None
+                    )
+                latent = latent.permute(0, 2, 1, 3, 4).flatten(0, 1)
+                latent = self.post_quant_conv(latent)
+                latent = latent.reshape(batch, time, -1, height, width).permute(0, 2, 1, 3, 4)
+                output, cache = self.decoder(
+                    latent, self.coords, temporal_kv_cache=cache, return_temporal_kv_cache=True
+                )
+                outputs.append(postprocess_lidar_decoder_output(output, self.config))
+            return torch.cat(outputs, dim=2)
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        return self.decode(latents)
