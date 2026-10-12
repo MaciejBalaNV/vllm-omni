@@ -517,6 +517,12 @@ def media_hw(value: Any) -> tuple[int, int] | None:
     return None
 
 
+#: FP32 working set allowed for one resize batch, in bytes.  Upcasting a whole
+#: 1080p clip costs gigabytes of temporaries; batching keeps the source slice,
+#: the resampled frames and the crop near cache instead.
+_RESIZE_FP32_BATCH_BYTES = 32 << 20
+
+
 def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}.")
@@ -524,17 +530,27 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     scale = max(width / orig_w, height / orig_h)
     resize_h = int(np.ceil(scale * orig_h))
     resize_w = int(np.ceil(scale * orig_w))
-    frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    # Match torchvision resize + center_crop, which the reference and training
-    # use: antialiased bilinear (plain bilinear aliases large downscales such
-    # as 1080p WSM to 480p) and offsets rounded half to even.
-    resized = F.interpolate(
-        frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False, antialias=True
-    )
     top = int(round((resize_h - height) / 2.0))
     left = int(round((resize_w - width) / 2.0))
-    cropped = resized[:, :, top : top + height, left : left + width]
-    return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
+    frames_tchw = frames.permute(1, 0, 2, 3)
+    num_frames = int(frames.shape[1])
+    batch = max(1, _RESIZE_FP32_BATCH_BYTES // (3 * orig_h * orig_w * 4))
+    output = torch.empty((num_frames, 3, height, width), dtype=torch.uint8)
+    # Match torchvision resize + center_crop, which the reference and training
+    # use: antialiased bilinear (plain bilinear aliases large downscales such
+    # as 1080p WSM to 480p) and offsets rounded half to even.  Each output pixel
+    # draws only on its own frame, so batching changes no value.
+    for start in range(0, num_frames, batch):
+        resized = F.interpolate(
+            frames_tchw[start : start + batch].to(dtype=torch.float32),
+            size=(resize_h, resize_w),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        cropped = resized[:, :, top : top + height, left : left + width]
+        output[start : start + batch] = cropped.round().clamp(0, 255).to(torch.uint8)
+    return output.permute(1, 0, 2, 3).contiguous()
 
 
 def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch.Tensor:

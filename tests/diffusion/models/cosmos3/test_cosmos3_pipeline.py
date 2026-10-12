@@ -1691,6 +1691,71 @@ def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
     assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
 
 
+def test_transfer_resize_batches_match_a_whole_clip_resize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Batching only shrinks temporaries, so every batch size must agree bitwise."""
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    generator = torch.Generator().manual_seed(11)
+    clip = torch.randint(0, 256, (3, 7, 36, 64), generator=generator, dtype=torch.uint8)
+    # One call for the whole clip is exactly the pre-batching behaviour.
+    monkeypatch.setattr(transfer, "_RESIZE_FP32_BATCH_BYTES", 1 << 40)
+    reference = transfer.resize_center_crop_uint8_cthw(clip, 12, 22)
+    assert tuple(reference.shape) == (3, 7, 12, 22)
+    for budget in (1, 3 * 3 * 36 * 64 * 4):  # one frame per batch, and batches of 3 with a short tail
+        monkeypatch.setattr(transfer, "_RESIZE_FP32_BATCH_BYTES", budget)
+        assert torch.equal(transfer.resize_center_crop_uint8_cthw(clip, 12, 22), reference)
+
+
+def test_multiview_prep_workers_resolve_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_multiview as mv
+
+    monkeypatch.delenv(mv.COSMOS3_MULTIVIEW_PREP_WORKERS_ENV, raising=False)
+    assert mv._pixel_prepare_workers(11) == mv.COSMOS3_MULTIVIEW_DEFAULT_PREP_WORKERS
+    assert mv._pixel_prepare_workers(2) == 2  # never more threads than cameras
+    monkeypatch.setenv(mv.COSMOS3_MULTIVIEW_PREP_WORKERS_ENV, "1")
+    assert mv._pixel_prepare_workers(11) == 1  # 1 disables the pool
+    monkeypatch.setenv(mv.COSMOS3_MULTIVIEW_PREP_WORKERS_ENV, "8")
+    assert mv._pixel_prepare_workers(11) == 8
+    for invalid in ("0", "two"):
+        monkeypatch.setenv(mv.COSMOS3_MULTIVIEW_PREP_WORKERS_ENV, invalid)
+        with pytest.raises(ValueError, match="VLLM_OMNI_COSMOS3_MULTIVIEW_PREP_WORKERS"):
+            mv._pixel_prepare_workers(11)
+
+
+def _prepare_pixels(count: int, *, missing: tuple[int, ...] = ()) -> torch.Tensor:
+    """Pack ``count`` cameras through the real preparation path."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    generator = torch.Generator().manual_seed(5)
+    views = []
+    for index in range(count):
+        view = {"camera_key": f"cam{index}"}
+        if index not in missing:
+            view["control"] = torch.rand(3, 5, 40, 60, generator=generator).mul(2).sub(1)
+        views.append(view)
+    stub = SimpleNamespace(dtype=torch.float32, _view_value=Cosmos3MultiviewPipeline._view_value)
+    return Cosmos3MultiviewPipeline._prepare_camera_major_pixels(
+        stub, views, field="control", height=16, width=24, num_frames=5, keep_first=False
+    )
+
+
+def test_multiview_pixel_prep_threads_match_the_inline_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The thread pool must not change the packed camera-major tensor."""
+    monkeypatch.setenv("VLLM_OMNI_COSMOS3_MULTIVIEW_PREP_WORKERS", "1")
+    inline = _prepare_pixels(6)
+    assert tuple(inline.shape) == (1, 3, 6 * 5, 16, 24)
+    for workers in ("4", "16"):  # the default, and more threads than cameras
+        monkeypatch.setenv("VLLM_OMNI_COSMOS3_MULTIVIEW_PREP_WORKERS", workers)
+        assert torch.equal(_prepare_pixels(6), inline)
+
+
+def test_multiview_pixel_prep_reports_the_first_failing_camera(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cameras fail concurrently; the error must still be the first in camera order."""
+    monkeypatch.setenv("VLLM_OMNI_COSMOS3_MULTIVIEW_PREP_WORKERS", "4")
+    with pytest.raises(ValueError, match="'cam2' is missing control input"):
+        _prepare_pixels(6, missing=(2, 4))
+
+
 def test_transfer_control_weight_validation_and_normalization() -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
 
