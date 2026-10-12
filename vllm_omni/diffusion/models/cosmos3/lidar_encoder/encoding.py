@@ -13,7 +13,9 @@ from __future__ import annotations
 import torch
 
 
-def generate_polar_coords(H: int, W: int, device: torch.device | str = "cpu") -> torch.Tensor:  # returns [1,2,H,W]
+def generate_polar_coords(
+    height: int, width: int, device: torch.device | str = "cpu"
+) -> torch.Tensor:  # returns [1,2,H,W]
     """Build spherical angles for a range map.
 
     phi: elevation in (-pi/2, pi/2], decreasing with row; row 0 is +pi/2.
@@ -21,8 +23,8 @@ def generate_polar_coords(H: int, W: int, device: torch.device | str = "cpu") ->
     Angles span the model width linearly (padded columns are not wrapped),
     matching the reference buffer stored in the checkpoint.
     """
-    phi = (0.5 - torch.arange(H, device=device) / H) * torch.pi  # [H]
-    theta = (1 - torch.arange(W, device=device) / W) * 2 * torch.pi - torch.pi  # [W]
+    phi = (0.5 - torch.arange(height, device=device) / height) * torch.pi  # [H]
+    theta = (1 - torch.arange(width, device=device) / width) * 2 * torch.pi - torch.pi  # [W]
     phi, theta = torch.meshgrid(phi, theta, indexing="ij")  # [H,W], [H,W]
     angles = torch.stack([phi, theta])  # [2,H,W]
     return angles[None]  # [1,2,H,W]
