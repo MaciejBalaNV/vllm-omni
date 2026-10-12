@@ -272,6 +272,7 @@ class TestDiffusionParallelConfigHSDP:
 
         assert config.world_size == 8
         assert config.data_parallel_size == 8
+        assert config.text_encoder_tp_size == 1
 
     def test_hsdp_data_parallel_requires_hsdp(self):
         with pytest.raises(ValueError, match="requires use_hsdp=True"):
@@ -285,6 +286,27 @@ class TestDiffusionParallelConfigHSDP:
                 hsdp_shard_size=2,
                 cfg_parallel_size=2,
             )
+
+    @pytest.mark.parametrize("text_encoder_tp_size", [2, 4, 8])
+    def test_hsdp_data_parallel_rejects_text_encoder_tp(self, text_encoder_tp_size):
+        with pytest.raises(ValueError, match="hsdp_data_parallel requires text_encoder_tp_size to be 1"):
+            DiffusionParallelConfig(
+                use_hsdp=True,
+                hsdp_data_parallel=True,
+                hsdp_shard_size=8,
+                text_encoder_tp_size=text_encoder_tp_size,
+            )
+
+    def test_hsdp_allows_text_encoder_tp(self):
+        config = DiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_shard_size=8,
+            text_encoder_tp_size=2,
+        )
+
+        assert config.world_size == 8
+        assert config.data_parallel_size in (None, 1)
+        assert config.text_encoder_tp_size == 2
 
     def test_hsdp_data_parallel_rejects_vae_patch_parallel(self):
         with pytest.raises(ValueError, match="vae_patch_parallel_size to be 1"):

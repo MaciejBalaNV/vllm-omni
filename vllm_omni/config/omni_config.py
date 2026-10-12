@@ -758,6 +758,10 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
                 raise ValueError(
                     "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
                 )
+            if self.hsdp_data_parallel and self.text_encoder_tp_size > 1:
+                # Encoder TP collectives require every encoder rank to process
+                # the same input, while HSDP request ranks own different prompts.
+                raise ValueError("hsdp_data_parallel requires text_encoder_tp_size to be 1")
             if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
                 # Patch-parallel VAE decode splits and stitches tiles across WORLD,
                 # which would mix latents from the different requests on each rank.

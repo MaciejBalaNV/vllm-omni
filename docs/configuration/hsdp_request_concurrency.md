@@ -15,9 +15,10 @@ Short waves repeat requests on surplus ranks to keep collective execution
 aligned; only the requested results are returned.
 
 Tensor, sequence, pipeline, and CFG parallel sizes must all be one; expert
-parallelism is unsupported with HSDP. `vae_patch_parallel_size` must also be
-one, because patch-parallel VAE decode stitches tiles across all ranks and would
-mix the different requests' latents. Requests in a wave must have compatible
+parallelism is unsupported with HSDP. `text_encoder_tp_size` must be one,
+because encoder TP ranks must process the same prompt. `vae_patch_parallel_size`
+must also be one, because patch-parallel VAE decode stitches tiles across all
+ranks and would mix the different requests' latents. Requests in a wave must have compatible
 shapes, guidance, denoising schedules, output counts, and LoRA settings, with
 identical extra arguments and nonempty prompts. Step execution is unsupported.
 MiniMax-H3 is unsupported because conditioning and output ownership are not

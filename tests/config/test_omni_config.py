@@ -1285,6 +1285,30 @@ def test_diffusion_parallel_config_supports_hsdp_rank_local_requests():
 
     assert cfg.world_size == 8
     assert cfg.data_parallel_size == 8
+    assert cfg.text_encoder_tp_size == 1
+
+
+@pytest.mark.parametrize("text_encoder_tp_size", [2, 4, 8])
+def test_diffusion_parallel_config_rejects_hsdp_rank_local_requests_with_text_encoder_tp(text_encoder_tp_size):
+    with pytest.raises(ValueError, match="hsdp_data_parallel requires text_encoder_tp_size to be 1"):
+        OmniStageDiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=8,
+            text_encoder_tp_size=text_encoder_tp_size,
+        )
+
+
+def test_diffusion_parallel_config_supports_hsdp_with_text_encoder_tp():
+    cfg = OmniStageDiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_shard_size=8,
+        text_encoder_tp_size=2,
+    )
+
+    assert cfg.world_size == 8
+    assert cfg.data_parallel_size == 1
+    assert cfg.text_encoder_tp_size == 2
 
 
 def test_diffusion_parallel_config_rejects_hsdp_rank_local_requests_with_vae_patch_parallel():
