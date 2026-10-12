@@ -48,6 +48,7 @@ from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm.config.load import LoadConfig
+
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 
@@ -1641,6 +1642,7 @@ class _LidarComponent(nn.Module):
         to :meth:`load_weights` without loading or moving weights during init.
         """
         from vllm.config.load import LoadConfig
+
         from vllm_omni.diffusion.data import OmniDiffusionConfig
         from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
         from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
