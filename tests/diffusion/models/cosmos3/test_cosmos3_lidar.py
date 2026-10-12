@@ -5,13 +5,15 @@
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
-from types import SimpleNamespace
 
+import huggingface_hub
 import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm.config.load import LoadConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.model_loader import diffusers_loader
 from vllm_omni.diffusion.models.cosmos3.lidar import (
     Cosmos3LidarEncoder,
     postprocess_lidar_decoder_output,
@@ -221,39 +223,37 @@ def lidar_vae_artifact(tmp_path):
     return tmp_path, config, component, state
 
 
-def test_encoder_artifact_inventory_and_fp32_loading(lidar_vae_artifact, monkeypatch):
-    import safetensors
-
+@pytest.mark.parametrize("multithread", [False, True])
+def test_encoder_artifact_inventory_and_fp32_loading(lidar_vae_artifact, monkeypatch, multithread):
     path, config, component, state = lidar_vae_artifact
-    safe_open = safetensors.safe_open
-    reads = []
+    iterator_name = "multi_thread_safetensors_weights_iterator" if multithread else "safetensors_weights_iterator"
+    iterator = getattr(diffusers_loader, iterator_name)
+    calls = []
 
-    @contextmanager
-    def encoder_only_open(filename, **kwargs):
-        assert kwargs == {"framework": "pt", "device": "cpu"}
-        with safe_open(filename, **kwargs) as handle:
+    def tracked(*args, **kwargs):
+        calls.append((args, kwargs))
+        yield from iterator(*args, **kwargs)
 
-            def get_slice(name):
-                assert not name.startswith(("decoder.", "post_quant_conv."))
-                return handle.get_slice(name)
-
-            def get_tensor(name):
-                assert not name.startswith(("decoder.", "post_quant_conv."))
-                reads.append(name)
-                return handle.get_tensor(name)
-
-            yield SimpleNamespace(keys=handle.keys, get_slice=get_slice, get_tensor=get_tensor)
-
-    monkeypatch.setattr(safetensors, "safe_open", encoder_only_open)
+    monkeypatch.setattr(diffusers_loader, iterator_name, tracked)
+    load_config = LoadConfig(safetensors_load_strategy="eager", use_tqdm_on_load=False)
+    od_config = OmniDiffusionConfig(enable_multithread_weight_load=multithread, num_weight_load_threads=2)
     previous = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.bfloat16)
-        loaded = TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+        loaded = TinyLidarEncoder.from_pretrained(
+            str(path), config, torch.device("cpu"), load_config=load_config, od_config=od_config
+        )
     finally:
         torch.set_default_dtype(previous)
     assert loaded.config == component
     assert loaded.encoder.out_features == 4
-    assert set(reads) == loaded.state_dict().keys()
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[:2] == ([str(path / "lidar_vae/diffusion_pytorch_model.safetensors")], False)
+    if multithread:
+        assert kwargs == {"max_workers": 2}
+    else:
+        assert args[2] == "eager"
     for name, tensor in loaded.state_dict().items():
         assert tensor.dtype == torch.float32
         torch.testing.assert_close(tensor, state[name], rtol=0, atol=0)
@@ -265,25 +265,101 @@ def test_encoder_resolves_vae_from_hub(lidar_vae_artifact, monkeypatch):
     from vllm_omni.model_executor.model_loader import weight_utils
 
     path, config, _, _ = lidar_vae_artifact
+    repo = "test-org/joint-lidar-model"
+    cache = str(path / "cache")
+    revision = "test-revision"
+    calls = []
 
-    def download(*, model_name_or_path, cache_dir, allow_patterns, require_all):
-        assert model_name_or_path == "test-org/joint-lidar-model"
-        assert cache_dir is None
-        assert allow_patterns == ["lidar_vae/config.json", "lidar_vae/diffusion_pytorch_model.safetensors"]
-        assert require_all is True
+    def download_config(**kwargs):
+        assert kwargs == {
+            "model_name_or_path": repo,
+            "cache_dir": cache,
+            "allow_patterns": ["lidar_vae/config.json"],
+            "revision": revision,
+            "ignore_patterns": ["ignored/*"],
+            "require_all": True,
+        }
+        calls.append("config")
         return str(path)
 
-    monkeypatch.setattr(weight_utils, "download_weights_from_hf_specific", download)
-    loaded = TinyLidarEncoder.from_pretrained("test-org/joint-lidar-model", config, torch.device("cpu"))
+    def missing_index(**kwargs):
+        assert kwargs["repo_id"] == repo
+        assert kwargs["cache_dir"] == cache
+        assert kwargs["revision"] == revision
+        raise huggingface_hub.errors.EntryNotFoundError("No shard index")
+
+    def download_weights(model, cache_dir, allow_patterns, revision_arg, *, subfolder, ignore_patterns):
+        assert (model, cache_dir, revision_arg, subfolder) == (repo, cache, revision, "lidar_vae")
+        assert "*.safetensors" in allow_patterns
+        assert ignore_patterns == ["ignored/*"]
+        calls.append("weights")
+        return str(path)
+
+    monkeypatch.setattr(weight_utils, "download_weights_from_hf_specific", download_config)
+    monkeypatch.setattr(diffusers_loader.hf_api(), "hf_hub_download", missing_index)
+    monkeypatch.setattr(diffusers_loader, "download_weights_from_hf", download_weights)
+    monkeypatch.setattr(diffusers_loader, "maybe_download_from_modelscope", lambda *args: None)
+    loaded = TinyLidarEncoder.from_pretrained(
+        repo,
+        config,
+        torch.device("cpu"),
+        load_config=LoadConfig(download_dir=cache, ignore_patterns=["ignored/*"]),
+        od_config=OmniDiffusionConfig(revision=revision),
+    )
+    assert calls == ["config", "weights"]
+    assert loaded.weights_sources[0].model_or_path == repo
+    assert loaded.weights_sources[0].revision == revision
     assert loaded.encoder.out_features == 4
 
 
-@pytest.mark.parametrize("missing", ["config.json", "diffusion_pytorch_model.safetensors"])
-def test_encoder_requires_vae_files(lidar_vae_artifact, missing):
+@pytest.mark.parametrize(
+    "missing,error,message",
+    [
+        ("config.json", ValueError, "Incomplete joint artifact: lidar_vae/config.json"),
+        ("diffusion_pytorch_model.safetensors", RuntimeError, "Cannot find any model weights"),
+    ],
+)
+def test_encoder_requires_vae_files(lidar_vae_artifact, missing, error, message):
     path, config, _, _ = lidar_vae_artifact
     (path / "lidar_vae" / missing).unlink()
-    with pytest.raises(ValueError, match="Incomplete joint artifact: lidar_vae/config.json"):
+    with pytest.raises(error, match=message):
         TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+
+
+def test_encoder_loads_indexed_shards(lidar_vae_artifact):
+    path, config, _, state = lidar_vae_artifact
+    folder = path / "lidar_vae"
+    weight_map = {}
+    for index in range(2):
+        shard = dict(list(state.items())[index::2])
+        filename = f"diffusion_pytorch_model-{index + 1:05d}-of-00002.safetensors"
+        save_file(shard, folder / filename)
+        weight_map.update({name: filename for name in shard})
+    (folder / "diffusion_pytorch_model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    # An old unsharded file must not override the authoritative shard index.
+    save_file({"encoder.unexpected": torch.ones(1)}, folder / "diffusion_pytorch_model.safetensors")
+    loaded = TinyLidarEncoder.from_pretrained(str(path), config, torch.device("cpu"))
+    for name, tensor in loaded.state_dict().items():
+        torch.testing.assert_close(tensor, state[name], rtol=0, atol=0)
+
+
+def test_encoder_load_weights_streams_and_preserves_device(lidar_vae_artifact):
+    _, _, component, state = lidar_vae_artifact
+    model = TinyLidarEncoder(component).bfloat16()
+    original_device = model.encoder.weight.device
+
+    def weights():
+        for name, tensor in state.items():
+            yield name, tensor
+            if name in model.state_dict():
+                # Consumed weights must be copied before requesting the next
+                # tensor, without retaining a checkpoint-sized state dict.
+                torch.testing.assert_close(model.state_dict()[name], tensor, rtol=0, atol=0)
+
+    loaded = model.load_weights(weights())
+    assert loaded == set(model.state_dict())
+    assert model.encoder.weight.device == original_device
+    assert not model.training and all(not p.requires_grad for p in model.parameters())
 
 
 @pytest.mark.parametrize("missing", ["encoder.weight", "quant_conv.weight", "coords", "latent_mean", "latent_std"])

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Independent LiDAR encoder and decoder loaded from the unified VAE.
 
-The checkpoint root contains ``lidar_vae/config.json`` and
-``lidar_vae/diffusion_pytorch_model.safetensors``. Both components load their
-own weights from that shared checkpoint and run in FP32. No multiview
+The checkpoint root contains ``lidar_vae/config.json`` and safetensors
+weights (optionally sharded). Both components load their own weights through
+``DiffusersPipelineLoader`` and run in FP32. No multiview
 transformer or generation pipeline is required::
 
     root = Path("/models/cosmos3")
@@ -26,18 +26,22 @@ from __future__ import annotations
 import inspect
 import json
 import math
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 from typing_extensions import Self
 
 from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
-from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
+
+if TYPE_CHECKING:
+    from vllm.config.load import LoadConfig
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 
 _LIDAR_VAE_SUBFOLDER = "lidar_vae"
-_LIDAR_VAE_WEIGHTS = "diffusion_pytorch_model.safetensors"
 _LIDAR_CONFIG_FIELDS = frozenset(
     {
         "dtype",
@@ -145,63 +149,111 @@ def prepare_lidar_encoder_input(frames: torch.Tensor, projection: dict[str, Any]
 class _LidarComponent(nn.Module):
     _unused_prefixes: tuple[str, ...]
     _component_name: str
+    weights_sources: list[DiffusersPipelineLoader.ComponentSource]
 
     @classmethod
-    def from_pretrained(cls, model_path: str, config: dict[str, Any], device: torch.device) -> Self:
-        from safetensors import safe_open
+    def from_pretrained(
+        cls,
+        model_path: str,
+        config: dict[str, Any],
+        device: torch.device,
+        *,
+        load_config: LoadConfig | None = None,
+        od_config: OmniDiffusionConfig | None = None,
+    ) -> Self:
+        """Load a standalone component with the shared loader's configuration.
 
-        checkpoint_path = Path(
-            resolve_model_to_local_path(
-                model_path,
-                allow_download=True,
-                allow_patterns=[
-                    f"{_LIDAR_VAE_SUBFOLDER}/config.json",
-                    f"{_LIDAR_VAE_SUBFOLDER}/{_LIDAR_VAE_WEIGHTS}",
-                ],
+        Pipeline callers can construct the component from its config, declare
+        a ``lidar_vae`` ComponentSource on the pipeline, and route its iterator
+        to :meth:`load_weights` without loading or moving weights during init.
+        """
+        from vllm.config.load import LoadConfig
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+        from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+        load_config = load_config if load_config is not None else LoadConfig()
+        od_config = od_config if od_config is not None else OmniDiffusionConfig(dtype=torch.float32)
+        checkpoint_path = Path(model_path)
+        if not checkpoint_path.is_dir():
+            # Fetch metadata only; weight discovery and downloads belong to the
+            # shared loader, using the original repository ID and revision.
+            checkpoint_path = Path(
+                download_weights_from_hf_specific(
+                    model_name_or_path=model_path,
+                    cache_dir=load_config.download_dir,
+                    allow_patterns=[f"{_LIDAR_VAE_SUBFOLDER}/config.json"],
+                    revision=od_config.revision,
+                    ignore_patterns=load_config.ignore_patterns,
+                    require_all=True,
+                )
             )
-        )
-        folder = checkpoint_path / _LIDAR_VAE_SUBFOLDER
-        if not (folder / "config.json").is_file() or not (folder / _LIDAR_VAE_WEIGHTS).is_file():
-            raise ValueError(
-                f"Incomplete joint artifact: {_LIDAR_VAE_SUBFOLDER}/config.json and {_LIDAR_VAE_WEIGHTS} are required."
-            )
-        component_config = json.loads((folder / "config.json").read_text())
+        config_path = checkpoint_path / _LIDAR_VAE_SUBFOLDER / "config.json"
+        if not config_path.is_file():
+            raise ValueError(f"Incomplete joint artifact: {_LIDAR_VAE_SUBFOLDER}/config.json is required.")
+        component_config = json.loads(config_path.read_text())
         _validate_lidar_vae_config(component_config, config)
+        model = cls(component_config).float().to(device=device)
+        model.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder=_LIDAR_VAE_SUBFOLDER,
+                revision=od_config.revision,
+                prefix="",
+                fall_back_to_pt=False,
+            ),
+        ]
+        DiffusersPipelineLoader(load_config, od_config).load_weights(model)
+        return model
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Stream this component's parameters and buffers from the unified VAE."""
+        from vllm.model_executor.models.utils import AutoWeightsLoader
+
         # Pipeline construction may set the default parameter dtype to BF16.
         # Convert before loading so FP32 checkpoint values are never rounded.
-        model = cls(component_config).float()
-        expected = model.state_dict()
+        self.float()
+        expected = self.state_dict()
         # Original VAE checkpoints name RMSNorm weights "scale". Derive the
         # mapping from modules so attention temperature scales stay untouched,
         # including norms in Sequential containers (head/detokenizer).
         norm_keys = {
-            f"{name}.scale": f"{name}.weight" for name, module in model.named_modules() if isinstance(module, RMSNorm)
+            f"{name}.scale": f"{name}.weight" for name, module in self.named_modules() if isinstance(module, RMSNorm)
         }
-        with safe_open(folder / _LIDAR_VAE_WEIGHTS, framework="pt", device="cpu") as weights:
-            # Each component reads only its own parameters and the shared buffers.
-            keys = {}
-            for checkpoint_name in weights.keys():
-                if checkpoint_name.startswith(cls._unused_prefixes):
+        seen: set[str] = set()
+
+        def remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            for checkpoint_name, tensor in weights:
+                if checkpoint_name.startswith(self._unused_prefixes):
                     continue
                 name = norm_keys.get(checkpoint_name, checkpoint_name)
-                if name in keys:
-                    raise ValueError(f"Duplicate LiDAR {cls._component_name} tensor after RMSNorm remapping: {name}.")
-                keys[name] = checkpoint_name
-            if unexpected := keys.keys() - expected.keys():
-                raise ValueError(f"Unexpected LiDAR {cls._component_name} tensors: {sorted(unexpected)}.")
-            state = {}
-            for name, checkpoint_name in keys.items():
-                if expected[name].is_floating_point() and weights.get_slice(checkpoint_name).get_dtype() != "F32":
-                    raise ValueError(f"LiDAR {cls._component_name} tensor {checkpoint_name} must be FP32.")
-                state[name] = weights.get_tensor(checkpoint_name)
-            model.load_state_dict(state, strict=True)
+                if name in seen:
+                    raise ValueError(f"Duplicate LiDAR {self._component_name} tensor after RMSNorm remapping: {name}.")
+                if name not in expected:
+                    raise ValueError(f"Unexpected LiDAR {self._component_name} tensors: {[name]}.")
+                if expected[name].is_floating_point() and tensor.dtype != torch.float32:
+                    raise ValueError(f"LiDAR {self._component_name} tensor {checkpoint_name} must be FP32.")
+                if tensor.shape != expected[name].shape:
+                    raise RuntimeError(
+                        f"LiDAR {self._component_name} size mismatch for {name}: "
+                        f"expected {tuple(expected[name].shape)}, got {tuple(tensor.shape)}."
+                    )
+                seen.add(name)
+                yield name, tensor
+
+        loaded = AutoWeightsLoader(self).load_weights(remapped_weights())
+        # The shared loader checks parameters; LiDAR also requires every
+        # persistent buffer, particularly coordinates and latent statistics.
+        if missing := expected.keys() - loaded:
+            raise RuntimeError(f"Missing keys in LiDAR {self._component_name} checkpoint: {sorted(missing)}.")
         if (
-            not torch.isfinite(model.latent_mean).all()
-            or not torch.isfinite(model.latent_std).all()
-            or (model.latent_std <= 0).any()
+            not torch.isfinite(self.latent_mean).all()
+            or not torch.isfinite(self.latent_std).all()
+            or (self.latent_std <= 0).any()
         ):
             raise ValueError("LiDAR latent statistics must be finite with positive standard deviations.")
-        return model.eval().requires_grad_(False).to(device=device, dtype=torch.float32)
+        self.eval().requires_grad_(False)
+        return loaded
 
 
 class Cosmos3LidarEncoder(_LidarComponent):

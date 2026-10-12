@@ -8,6 +8,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.layers.norm import RMSNorm as FrameworkRMSNorm
 from vllm_omni.diffusion.models.cosmos3.lidar import Cosmos3LidarDecoder, Cosmos3LidarEncoder
 from vllm_omni.diffusion.models.cosmos3.norm import RMSNorm
@@ -102,6 +103,17 @@ def test_original_norm_checkpoint_loads_exactly(original_norm_artifact):
         torch.set_default_dtype(previous)
     assert loaded.state_dict().keys() == expected.keys()
     for name, value in loaded.state_dict().items():
+        assert value.dtype == torch.float32
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+
+
+def test_original_norm_checkpoint_loads_as_pipeline_component(original_norm_artifact):
+    cls, _, config, expected, _, state, _ = original_norm_artifact
+    pipeline = torch.nn.Module()
+    pipeline.add_module("lidar_vae", cls(config).bfloat16())
+    loaded = AutoWeightsLoader(pipeline).load_weights((f"lidar_vae.{name}", tensor) for name, tensor in state.items())
+    assert loaded == {f"lidar_vae.{name}" for name in expected}
+    for name, value in pipeline.lidar_vae.state_dict().items():
         assert value.dtype == torch.float32
         torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
