@@ -107,6 +107,7 @@ LATENT_EDIT_SOURCE_MAX_BYTES = 512 * 1024 * 1024
 LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+# Scheduling slack on top of the engine abort budget when DELETE waits for a cancelled job.
 VIDEO_DELETE_TIMEOUT_S = 2.0
 _VIDEO_SAVE_CANCEL_GRACE_S = 1.0
 _VIDEO_CLEANUP_TIMEOUT_S = 1.0
