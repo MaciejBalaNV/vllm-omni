@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Admission contracts for the native Inductor path and Sim parallel execution."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -9,6 +11,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     resolve_ar_compile_mode,
     validate_sim_parallel_config,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("source", ["direct", "model_config", "custom_pipeline_args"])
@@ -40,7 +44,7 @@ def test_old_mode_selector_fails_with_migration_message(mode):
 
 @pytest.mark.parametrize("source", ["direct", "model_config", "custom_pipeline_args"])
 def test_hsdp_rejects_cuda_graphs(source):
-    options = {"use_cuda_graphs": True}
+    options: dict[str, Any] = {"use_cuda_graphs": True}
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(use_hsdp=True, hsdp_shard_size=2),
         **(options if source == "direct" else {source: options}),
