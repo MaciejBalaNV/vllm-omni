@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -76,6 +77,11 @@ logger = init_logger(__name__)
 # the same attention rules.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
 
+# Cameras decoded and resized concurrently; 1 prepares them inline. Each worker
+# holds one decoded clip, so raising this trades host memory for overlap.
+COSMOS3_MULTIVIEW_PREP_WORKERS_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_PREP_WORKERS"
+COSMOS3_MULTIVIEW_DEFAULT_PREP_WORKERS = 4
+
 # Per-camera frame count when the request supplies none.
 COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
 # Frame rate when the request supplies none. The MADS WSM transfer recipes train
@@ -126,6 +132,20 @@ def _normalize_local_condition_indexes(value: Any) -> list[int]:
     else:
         raise TypeError("Cosmos3 multiview condition_frame_indexes_vision must be an int, list, or CSV string.")
     return sorted({int(index) for index in values})
+
+
+def _pixel_prepare_workers(num_views: int) -> int:
+    """Threads for per-camera pixel preparation, capped by the camera count."""
+    raw = os.environ.get(COSMOS3_MULTIVIEW_PREP_WORKERS_ENV)
+    workers = COSMOS3_MULTIVIEW_DEFAULT_PREP_WORKERS
+    if raw is not None:
+        try:
+            workers = int(raw)
+        except ValueError:
+            workers = 0
+        if workers < 1:
+            raise ValueError(f"{COSMOS3_MULTIVIEW_PREP_WORKERS_ENV} must be a positive integer, got {raw!r}.")
+    return max(1, min(num_views, workers))
 
 
 def _pad_multiview_view_video(
@@ -544,13 +564,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         keep_first: bool,
         require_complete: bool = False,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        def prepare(view: Mapping[str, Any]) -> torch.Tensor:
             value = self._view_value(view, field)
             if value is None:
                 if field == "vision":
-                    prepared.append(torch.full((3, num_frames, height, width), 128, dtype=torch.uint8))
-                    continue
+                    return torch.full((3, num_frames, height, width), 128, dtype=torch.uint8)
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(
                 value,
@@ -562,8 +580,19 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 raise ValueError(
                     f"Known camera {view['camera_key']!r} requires a complete RGB video of {num_frames} frames."
                 )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
+            return _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        # Cameras are independent and dominated by the ffmpeg decode and the
+        # resize, both of which release the GIL.  ``map`` yields in camera order,
+        # so the packed tensor is unchanged and the first failing camera raises.
+        workers = _pixel_prepare_workers(len(views))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cosmos3-mv-pixels") as pool:
+                prepared = list(pool.map(prepare, views))
+        else:
+            prepared = [prepare(view) for view in views]
         camera_major = torch.cat(prepared, dim=1)
+        del prepared
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
 
     def _encode_multiview_video(
