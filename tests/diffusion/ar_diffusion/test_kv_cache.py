@@ -410,6 +410,7 @@ def _make_tiny_capacity_kv(
     gpu_memory_fraction: float = 1.0,
     model_owned_state_bytes_per_session: int = 0,
     reuse_history_staging: bool = False,
+    cross_attention_heads: int = 1,
 ) -> ARDiffusionKVCache:
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
@@ -430,10 +431,19 @@ def _make_tiny_capacity_kv(
         kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
         session_capacity=requested_capacity,
         cross_attention_lengths={"text": 2},
+        cross_attention_kv_heads={"text": cross_attention_heads},
         frames_per_block=3,
         model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
         device=torch.device("cpu"),
     )
+
+
+def test_cross_attention_head_count_is_reserved_in_the_kv_budget():
+    kv = _make_tiny_capacity_kv(requested_capacity=2, available_bytes=192, cross_attention_heads=2)
+    assert kv.session_capacity == 1
+    assert kv.cross_attention_bytes_per_session == 32
+    assert kv.cross_attention_reserved_bytes == 32
+    assert kv.num_blocks_total * 8 + kv.cross_attention_reserved_bytes <= 192
 
 
 def test_history_staging_is_reserved_in_the_kv_budget(monkeypatch):

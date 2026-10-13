@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reference cache capacity, checkpoint defaults, and session separation."""
 
 from types import SimpleNamespace
@@ -41,6 +42,17 @@ def test_override_preserves_checkpoint_and_separates_sessions():
     assert effective.digest != baseline.digest
     assert effective.chunk_size == baseline.chunk_size and effective.t_list == baseline.t_list
     assert options.tf_model_config["cosmos3_nano_sim_bimanual"]["window_frames"] == baseline.window_frames
+
+
+def test_transfer_keeps_request_window_semantics():
+    from test_transfer_resolution_contract import pipeline
+
+    options = config(kv_cache_inference_size=30, attention_sink_size=3)
+    artifact = options.tf_model_config["cosmos3_nano_sim_bimanual"]
+    artifact["conditioning"] = pipeline().manifest.require_control_video_conditioning().model_dump(mode="json")
+    artifact.update(chunk_size=1, window_frames=51, sink_frames=1)
+    effective = Cosmos3NanoSimBimanualManifest.from_od_config(options)
+    assert (effective.window_frames, effective.sink_frames) == (51, 1)
 
 
 def test_retained_history_matches_reference_frame_indices():

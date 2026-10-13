@@ -129,9 +129,7 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
     height: int
     width: int
     fps: float
-    domain_id: int
-    embodiment: str
-    action_contract_sha256: str
+    conditioning: tuple[tuple[str, Any], ...]
     checkpoint_id: str
     manifest_id: str
     sampler_id: str
@@ -146,12 +144,11 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
                 "Cosmos3-Nano-Sim-Bimanual fingerprint resolution/FPS must be "
                 f"positive, got {self.height}x{self.width}@{self.fps}"
             )
-        if self.domain_id < 0:
-            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual domain_id must be non-negative, got {self.domain_id}")
-        if not self.embodiment:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires an embodiment")
-        if not self.action_contract_sha256:
-            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires action_contract_sha256")
+        if not self.conditioning:
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual session fingerprint requires conditioning")
+        names = [name for name, _ in self.conditioning]
+        if any(not name for name in names) or len(names) != len(set(names)):
+            raise ValueError("Cosmos3-Nano-Sim-Bimanual conditioning fingerprint keys must be non-empty and unique")
         if not self.real_text_kv_lengths:
             raise ValueError("Cosmos3-Nano-Sim-Bimanual fingerprint requires at least one text KV branch")
         if any(length <= 0 for _, length in self.real_text_kv_lengths):

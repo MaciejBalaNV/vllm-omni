@@ -146,6 +146,8 @@ class ARDiffusionKVCacheMemoryEstimate:
     cross_attention_bytes_per_session: int
     cross_attention_reserved_bytes: int
     model_owned_state_reserved_bytes: int
+    history_staging_tokens: int
+    history_staging_reserved_bytes: int
     required_bytes: int
 
 
@@ -202,6 +204,10 @@ def estimate_ar_diffusion_kv_cache_memory(
         scratch_frames * blocks_per_frame + extra_scratch_blocks,
         scratch_blocks_override,
     )
+    if spec.eviction_group_frames > 1 and spec.tokens_per_frame % block_size:
+        # Exact grouped windows may need repacking across unaligned page boundaries.
+        visible_tokens = (spec.window_frames + spec.sink_frames + scratch_frames) * spec.tokens_per_frame
+        scratch_blocks_per_local_branch += -(-(visible_tokens + spec.max_scratch_tokens_per_branch) // block_size)
     scratch_num_blocks = spec.num_local_kv_branches * scratch_blocks_per_local_branch
     scratch_reserved_bytes = scratch_num_blocks * page_size_bytes
     managed_num_blocks = (
@@ -220,11 +226,25 @@ def estimate_ar_diffusion_kv_cache_memory(
     )
     cross_attention_reserved_bytes = session_capacity * cross_attention_bytes_per_session
     model_owned_state_reserved_bytes = session_capacity * spec.model_owned_state_bytes_per_session
+    # The contiguous history staging buffers are shared by all sessions.
+    history_staging_tokens = 0
+    if config.reuse_history_staging and contiguous_kv_gather_enabled():
+        window_blocks = visible_window_blocks(
+            chunk_size=config.chunk_size,
+            block_size=block_size,
+            sink_tokens=config.sink_chunks * config.chunk_size,
+            window_tokens=config.window_chunks * config.chunk_size,
+        )
+        history_staging_tokens = (window_blocks + 1) * block_size
+    history_staging_reserved_bytes = int(
+        2 * spec.num_layers * history_staging_tokens * spec.num_kv_heads * spec.head_size * dtype.itemsize
+    )
     required_bytes = (
         scratch_reserved_bytes
         + managed_num_blocks * page_size_bytes
         + cross_attention_reserved_bytes
         + model_owned_state_reserved_bytes
+        + history_staging_reserved_bytes
     )
     return ARDiffusionKVCacheMemoryEstimate(
         page_size_bytes=page_size_bytes,
@@ -235,6 +255,8 @@ def estimate_ar_diffusion_kv_cache_memory(
         cross_attention_bytes_per_session=cross_attention_bytes_per_session,
         cross_attention_reserved_bytes=cross_attention_reserved_bytes,
         model_owned_state_reserved_bytes=model_owned_state_reserved_bytes,
+        history_staging_tokens=history_staging_tokens,
+        history_staging_reserved_bytes=history_staging_reserved_bytes,
         required_bytes=required_bytes,
     )
 
@@ -291,6 +313,11 @@ class ARDiffusionKVCache:
     Build once per loaded model (dimensions known); then per request:
     ``begin_request`` → per chunk (``allocate_chunk`` → ``chunk_write_slots`` →
     [model writes K/V] → ``commit_chunk``) → ``end_request``.
+
+    ``eviction_group_frames`` counts consecutive KV frame blocks that must be
+    evicted together, independently of the forward's commit span. The default
+    is 1. See :class:`ARDiffusionKVCacheSpec` for the grouping policy and a
+    model-specific example.
     """
 
     def __init__(
@@ -313,6 +340,7 @@ class ARDiffusionKVCache:
         max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
+        eviction_group_frames: int = 1,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -394,6 +422,7 @@ class ARDiffusionKVCache:
             window_chunks=config.window_chunks,
             sink_chunks=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
+            eviction_group_frames=eviction_group_frames,
         )
 
         override_blocks = ar_diffusion_scratch_blocks_override()
@@ -408,6 +437,7 @@ class ARDiffusionKVCache:
             window_frames=config.window_chunks,
             sink_frames=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
+            eviction_group_frames=eviction_group_frames,
             kv_branches=kv_branches,
             session_capacity=session_capacity,
             cross_attention=tuple(
@@ -441,74 +471,17 @@ class ARDiffusionKVCache:
         compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
         self.scratch_reserved_bytes = one_session.scratch_reserved_bytes
         self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
+        self.cross_attention_bytes_per_session = one_session.cross_attention_bytes_per_session
 
-        def _cross_pool_bytes(length: int, heads: int) -> int:
-            return int(2 * len(self.kv_branches) * length * heads * head_size * dtype.itemsize * num_layers)
-
-        self.cross_attention_bytes_per_session = sum(
-            _cross_pool_bytes(length, self.cross_attention_kv_heads[name])
-            for name, length in self.cross_attention_lengths.items()
-        )
-
-        def _required_managed_blocks(capacity: int) -> int:
-            """Managed blocks needed to hold ``capacity`` resident sessions.
-
-            Every term here counts *frames*, so each is converted to blocks.
-            Before block size and frame size were allowed to differ this
-            conversion was the identity and the frame counts could be used
-            directly; they cannot once a frame spans several blocks.
-
-            Converting rather than rewriting keeps the budget the same number
-            of *tokens* it always was, so a finer block size does not inflate
-            the requirement -- it only stops the final block of each term from
-            rounding up a whole frame's worth of memory.
-            """
-            resident_frames = config.sink_chunks + config.window_chunks
-            per_session_blocks = resident_frames * self.blocks_per_frame
-            in_flight_blocks = self.frames_per_block * self.blocks_per_frame
-            headroom_blocks = 2 * self.blocks_per_frame
-            return self.num_local_kv_branches * (capacity * per_session_blocks + in_flight_blocks) + headroom_blocks
-
-        # reuse_history_staging keeps one contiguous K and V buffer per layer,
-        # sized to the padded visible window (sink + window plus the
-        # action-capacity block build_block_table always reserves), for the
-        # whole worker. It is allocated lazily on the first prepared forward,
-        # which is after admission, so it has to be reserved here or admission
-        # can succeed and that first forward run out of memory. Only the
-        # contiguous-gather attention path consumes it.
-        self.history_staging_reserved_bytes = 0
-        self.history_staging_tokens = 0
-        if config.reuse_history_staging:
-            if contiguous_kv_gather_enabled():
-                # The same width build_block_table pads to: a sink or window
-                # that is not a whole number of blocks spans one more block.
-                window_blocks = visible_window_blocks(
-                    chunk_size=config.chunk_size,
-                    block_size=block_size,
-                    sink_tokens=config.sink_chunks * config.chunk_size,
-                    window_tokens=self.spec.sliding_window,
-                )
-                self.history_staging_tokens = (window_blocks + 1) * block_size
-                self.history_staging_reserved_bytes = int(
-                    2 * num_layers * self.history_staging_tokens * num_kv_heads * head_size * dtype.itemsize
-                )
-            else:
-                _log.warning(
-                    "reuse_history_staging is set but the contiguous K/V gather path (%s=1) is off: "
-                    "staging has no consumer and is neither budgeted nor allocated.",
-                    KV_GATHER_ENV,
-                )
-
-        def _required_bytes(capacity: int) -> int:
-            return (
-                self.scratch_reserved_bytes
-                + self.history_staging_reserved_bytes
-                + capacity * self.cross_attention_bytes_per_session
-                + capacity * self.model_owned_state_bytes_per_session
-                + _required_managed_blocks(capacity) * page_size_bytes
+        self.history_staging_tokens = one_session.history_staging_tokens
+        self.history_staging_reserved_bytes = one_session.history_staging_reserved_bytes
+        if config.reuse_history_staging and not contiguous_kv_gather_enabled():
+            _log.warning(
+                "reuse_history_staging is set but the contiguous K/V gather path (%s=1) is off: "
+                "staging has no consumer and is neither budgeted nor allocated.",
+                KV_GATHER_ENV,
             )
-
-        one_session_bytes = _required_bytes(1)
+        one_session_bytes = one_session.required_bytes
         if one_session_bytes > available_bytes:
             raise ValueError(
                 "AR-Diffusion available device memory cannot fit one session: "
@@ -527,9 +500,17 @@ class ARDiffusionKVCache:
         effective_capacity = 0
         required_managed_blocks = 0
         for candidate in range(session_capacity, 0, -1):
-            if _required_bytes(candidate) <= self.memory_budget_bytes:
+            candidate_estimate = estimate_ar_diffusion_kv_cache_memory(
+                config,
+                effective_spec,
+                dtype,
+                session_capacity=candidate,
+                scratch_blocks_override=override_blocks,
+                block_size=block_size,
+            )
+            if candidate_estimate.required_bytes <= self.memory_budget_bytes:
                 effective_capacity = candidate
-                required_managed_blocks = _required_managed_blocks(candidate)
+                required_managed_blocks = candidate_estimate.managed_num_blocks
                 break
         assert effective_capacity > 0
 

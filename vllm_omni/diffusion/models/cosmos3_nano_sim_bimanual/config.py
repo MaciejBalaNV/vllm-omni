@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict schema-v1 artifact and deployment configuration for Cosmos3-Nano-Sim-Bimanual."""
 
 from __future__ import annotations
@@ -395,6 +396,9 @@ class Cosmos3NanoSimBimanualManifest:
                 f"missing={missing}, unknown={unknown}."
             )
         manifest = cls(**_parse_artifact(artifact))
+        if manifest.action_schema is None:
+            # Transfer resolves its temporal-frame window on each request.
+            return manifest
         cache_size = deploy_option(od_config, "kv_cache_inference_size")
         sinks = deploy_option(od_config, "attention_sink_size")
         if cache_size is None:

@@ -4,6 +4,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -15,6 +16,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import p
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
     parse_cosmos3_nano_sim_bimanual_conditioning,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def production():
@@ -44,6 +47,46 @@ def test_per_row_domains_follow_action_chunks():
     assert domains.tolist() == [2] * 4 + [15] * 8
     with pytest.raises(ValueError):
         prepare_domain_ids([99], rows=12, allowed={2, 15})
+
+
+@pytest.mark.parametrize("clean_mode", ["framewise", "batched"])
+def test_mixed_domains_reach_denoising_and_clean_commits(clean_mode):
+    pipe, _ = fake_pipeline()
+    pipe.manifest = replace(production(), chunk_size=2, sink_frames=0)
+    pipe.action_normalizers = {}
+    pipe.clean_commit_mode = clean_mode
+    pipe._set_mixed_precision_step = Mock()
+    pipe._reset_mixed_precision = Mock()
+    pipe.forward(
+        request(
+            13,
+            action=torch.zeros(12, 59),
+            action_space="normalized_unified_v1",
+            domain_id=[15] * 4 + [2] * 4 + [15] * 4,
+        )
+    )
+    forwards = pipe._transformer_forward.call_args_list
+    denoise = [call for call in forwards if not call.kwargs["condition_vision"]]
+    assert denoise[0].kwargs["conditioning_kwargs"]["action_domain_ids"].tolist() == [[15] * 4 + [2] * 4]
+    assert denoise[1].kwargs["conditioning_kwargs"]["action_domain_ids"].tolist() == [15]
+    if clean_mode == "batched":
+        clean = [call for call in forwards if call.kwargs.get("frame_causal")]
+        assert len(clean) == 1
+        assert clean[0].kwargs["conditioning_kwargs"]["action_domain_ids"].tolist() == [[15] * 4 + [2] * 4]
+    else:
+        clean = [call for call in pipe._commit_clean_frame.call_args_list if call.kwargs["frame_idx"] > 0]
+        assert [call.kwargs["conditioning_kwargs"]["action_domain_ids"].tolist() for call in clean] == [[15], [2]]
+
+
+def test_mixed_camera_rows_reject_non_camera_action_slots():
+    pipe, _ = fake_pipeline()
+    pipe.manifest = production()
+    pipe.action_normalizers = {}
+    action = torch.zeros(8, 59)
+    action[4, 9] = 1
+    with pytest.raises(ValueError, match="Camera rows must have zero"):
+        pipe.forward(request(9, action=action, action_space="normalized_unified_v1", domain_id=[15] * 4 + [2] * 4))
+    pipe._transformer_forward.assert_not_called()
 
 
 @pytest.mark.parametrize("domain", [15, [15], torch.tensor(15), torch.tensor([15])])

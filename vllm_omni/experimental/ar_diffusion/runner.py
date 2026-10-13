@@ -289,6 +289,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             max_scratch_frames_per_branch=spec.max_scratch_frames_per_branch,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
+            eviction_group_frames=spec.eviction_group_frames,
             device=self.device,
         )
         self._session_capacity = self.kv_cache.session_capacity
@@ -452,6 +453,57 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None
 
+    def _prepare_ar_request(
+        self,
+        req: OmniDiffusionRequest,
+        session_id: str,
+        *,
+        reset: bool = False,
+    ) -> object | None:
+        """Validate request geometry before resetting sessions or replacing pools."""
+        capability = self._ar_diffusion_capability
+        geometry_key: object | None = None
+        requested_spec = self._ar_diffusion_kv_cache_spec
+        if isinstance(capability, SupportsDynamicARDiffusion):
+            try:
+                request_spec = capability.ar_diffusion_request_spec(req)
+            except ARDiffusionRequestRejectedError:
+                raise
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
+            request_spec = self._require_request_spec(request_spec, "ar_diffusion_request_spec()")
+            geometry_key = request_spec.geometry_key
+            requested_spec, requested_config = self._effective_spec(capability, request_spec.kv_spec)
+            budget = getattr(self, "_available_memory_budget", None)
+            if requested_spec != self._ar_diffusion_kv_cache_spec and budget is not None:
+                estimate = estimate_ar_diffusion_kv_cache_memory(
+                    requested_config,
+                    requested_spec,
+                    self.od_config.dtype,
+                    scratch_blocks_override=ar_diffusion_scratch_blocks_override(),
+                    block_size=paging_block_size(requested_spec.tokens_per_frame),
+                )
+                if estimate.required_bytes > budget:
+                    raise ARDiffusionRequestRejectedError(
+                        "AR-Diffusion request KV capacity exceeds available memory: "
+                        f"required={estimate.required_bytes}, available={budget}."
+                    )
+
+            geometry_keys = getattr(self, "_session_geometry_keys", {})
+            if session_id in self._sessions and geometry_keys.get(session_id) != geometry_key and not reset:
+                raise ARDiffusionRequestRejectedError(
+                    f"AR-Diffusion session {session_id!r} geometry changed from "
+                    f"{geometry_keys.get(session_id)!r} to {geometry_key!r}; reset is required."
+                )
+
+        if requested_spec is None:
+            raise RuntimeError("AR-Diffusion request specification is unavailable")
+        if requested_spec != self._ar_diffusion_kv_cache_spec:
+            self._rebuild_for_spec(requested_spec)
+        elif reset:
+            self.reset_session(session_id)
+        return geometry_key
+
     @contextmanager
     def _bound_ar_session(
         self,
@@ -460,12 +512,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         description: str,
         synchronize: bool = True,
         geometry_key: object | None = None,
+        preserve_rejected_session: bool = False,
     ) -> Iterator[None]:
         """Bind runner-owned KV for one runner invocation and fail closed.
 
-        The pipeline sees the state only inside this context. Execution failures
-        release the session before propagating, so a later request cannot resume
-        half-written pages. Side-effect-free admission rejections retain it.
+        The pipeline sees the state only inside this context. Failures release
+        the session so later requests cannot resume half-written pages. Request
+        mode retains state on admission rejection, which guarantees no mutation.
         """
         capability = self._ar_diffusion_capability
         if capability is None:
@@ -476,16 +529,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 yield
             if synchronize:
                 current_omni_platform.synchronize()
-        except ARDiffusionRequestRejectedError:
-            # Admission rejection is guaranteed to occur before any session or
-            # KV mutation, so retain the paid-for history for a corrected retry.
-            logger.info(
-                "AR-Diffusion %s rejected at admission for session=%s; session state retained",
-                description,
-                session_id,
-            )
-            raise
-        except Exception:
+        except Exception as exc:
+            if preserve_rejected_session and isinstance(exc, ARDiffusionRequestRejectedError):
+                logger.info(
+                    "AR-Diffusion request rejected at admission for session=%s; session state retained",
+                    session_id,
+                )
+                raise
             self._release_session(
                 session_id,
                 reset_model=False,
@@ -535,35 +585,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         session_id, extra_args, tick = self._request_session(req)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-
-        geometry_key: object | None = None
-        requested_spec = self._ar_diffusion_kv_cache_spec
-        if isinstance(capability, SupportsDynamicARDiffusion):
-            try:
-                request_spec = capability.ar_diffusion_request_spec(req)
-            except ARDiffusionRequestRejectedError:
-                raise
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ARDiffusionRequestRejectedError(str(exc)) from exc
-            request_spec = self._require_request_spec(request_spec, "ar_diffusion_request_spec()")
-            geometry_key = request_spec.geometry_key
-            requested_spec, _ = self._effective_spec(capability, request_spec.kv_spec)
-
-            geometry_keys = getattr(self, "_session_geometry_keys", {})
-            if session_id in self._sessions and geometry_keys.get(session_id) != geometry_key and not reset:
-                raise ARDiffusionRequestRejectedError(
-                    f"AR-Diffusion session {session_id!r} geometry changed from "
-                    f"{geometry_keys.get(session_id)!r} to {geometry_key!r}; reset is required."
-                )
-
-        if requested_spec is None:
-            raise RuntimeError("AR-Diffusion request specification is unavailable")
-        if requested_spec != self._ar_diffusion_kv_cache_spec:
-            self._rebuild_for_spec(requested_spec)
-        elif reset:
-            self.reset_session(session_id)
+        geometry_key = self._prepare_ar_request(req, session_id, reset=reset)
         started = time.perf_counter()
-        with self._bound_ar_session(session_id, description="forward", geometry_key=geometry_key):
+        with self._bound_ar_session(
+            session_id,
+            description="forward",
+            geometry_key=geometry_key,
+            preserve_rejected_session=True,
+        ):
             output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         self._perf_e2e_times.append(time.perf_counter() - started)
         if close_session:
@@ -666,6 +695,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Bind runner-owned KV for one stepwise invocation, then inherit the step loop."""
+        cache_failure = getattr(self, "_cache_failure", None)
+        if cache_failure is not None:
+            raise RuntimeError("AR-Diffusion KV cache is permanently failed") from cache_failure
         pipeline = getattr(self, "pipeline", None)
         if pipeline is None or not supports_step_execution(pipeline):
             raise RuntimeError(
@@ -689,12 +721,24 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
         request_id = request_ids[0]
         session_id = request_id
+        geometry_key = None
+        if isinstance(self._ar_diffusion_capability, SupportsDynamicARDiffusion):
+            new_req = next(
+                (row.req for row in scheduler_output.scheduled_new_reqs if row.request_id == request_id),
+                None,
+            )
+            if new_req is not None:
+                geometry_key = self._prepare_ar_request(new_req, session_id)
+            elif session_id not in self._sessions:
+                raise RuntimeError(f"AR-Diffusion cached request {request_id!r} has no resident KV session")
         chunk_started = self._stepwise_chunk_started.setdefault(request_id, time.perf_counter())
         try:
             # Denoise steps inside one chunk need no device barrier; the chunk
             # boundary below is the meaningful one, and syncing per step would
             # cost one synchronize per denoise step instead of per AR block.
-            with self._bound_ar_session(session_id, description="stepwise", synchronize=False):
+            with self._bound_ar_session(
+                session_id, description="stepwise", synchronize=False, geometry_key=geometry_key
+            ):
                 output = super().execute_stepwise(scheduler_output)
             runner_output = output.get_request_output(request_id)
             finished = bool(runner_output is not None and runner_output.finished)

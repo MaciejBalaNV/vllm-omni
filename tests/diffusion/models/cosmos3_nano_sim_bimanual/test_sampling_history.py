@@ -38,7 +38,7 @@ def methods():
     tree = ast.parse((SOURCE / "pipeline_cosmos3_nano_sim_bimanual.py").read_text())
     cls = next(node for node in tree.body if getattr(node, "name", "") == "Cosmos3NanoSimBimanualPipeline")
     selected = {
-        "_denoise_chunk",
+        "_sample_distilled",
         "_kv_spec_for_geometry",
         "_append_dense_kv",
         "_transformer_forward",
@@ -83,7 +83,7 @@ def test_actual_scheduler_uses_checkpoint_sigmas_and_existing_rng(frame, sigmas)
         calls.append(timestep.item())
         return x * 0.25
 
-    output = pipe._denoise_chunk(velocity, initial, generator=generator)
+    output = pipe._sample_distilled(velocity, initial, generator=generator)
     sigmas = [*sigmas, 0]
     expected = initial.clone()
     reference_rng = torch.Generator().set_state(generator_state)
@@ -122,10 +122,8 @@ def test_full_history_reaches_dense_paged_and_batched_paths():
         real_text_kv_len=1,
         frame_start=1,
         fps=30,
-        action_latents=None,
-        action_domain_ids=None,
+        conditioning_kwargs={},
         condition_vision=True,
-        null_action_frame_indexes=(),
         commit_current=False,
         frame_causal=True,
     )
@@ -137,7 +135,7 @@ def test_full_rollout_uses_chunk2_without_history_limit():
     pipe.manifest = replace(pipe.manifest, chunk_size=2, window_frames=None, sink_frames=0, t_list=(1.0, 5 / 6))
     pipe.forward(request(901, output_type="latent"))
     assert state.next_frame_idx == 226
-    assert pipe._denoise_chunk.call_count == len(range(1, 226, 2))
+    assert pipe._sample_distilled.call_count == len(range(1, 226, 2))
 
 
 def test_checkpoint_schedule_changes_session_fingerprint():

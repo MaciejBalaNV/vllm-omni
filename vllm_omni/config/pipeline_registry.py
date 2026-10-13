@@ -55,7 +55,10 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_POLICY_PIPELINE,
 )
 from vllm_omni.model_executor.models.cosmos3_nano_sim_auto.pipeline import COSMOS3_NANO_SIM_AUTO_PIPELINE
-from vllm_omni.model_executor.models.cosmos3_nano_sim_bimanual.pipeline import COSMOS3_NANO_SIM_BIMANUAL_PIPELINE
+from vllm_omni.model_executor.models.cosmos3_nano_sim_bimanual.pipeline import (
+    COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
+    COSMOS3_NANO_SIM_TRANSFER_PIPELINE,
+)
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
@@ -148,6 +151,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "breeze": BREEZE_TTS_2_PIPELINE,
     "cosmos3_nano_sim_auto": COSMOS3_NANO_SIM_AUTO_PIPELINE,
     "cosmos3_nano_sim_bimanual": COSMOS3_NANO_SIM_BIMANUAL_PIPELINE,
+    "cosmos3_nano_sim_transfer": COSMOS3_NANO_SIM_TRANSFER_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
