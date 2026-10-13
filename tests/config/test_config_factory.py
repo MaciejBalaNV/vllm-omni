@@ -19,6 +19,7 @@ from vllm_omni.config.config_factory import StageConfigFactory, _materialize_obj
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
+from vllm_omni.config.resolver import _convert_dataclasses_to_dict
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     DeployConfig,
@@ -738,10 +739,14 @@ class TestModelIndexDiscovery:
         hf_config = PretrainedConfig(**config_dict) if load_hf_config else None
 
         with patch.object(StageConfigFactory, "get_hf_config", return_value=hf_config):
+            # Pass the overrides as resolve_omni_config does: it converts
+            # dataclass values to dicts before calling the factory.
             config = StageConfigFactory.create_from_model(
                 str(tmp_path),
                 trust_remote_code=False,
-                cli_overrides={"parallel_config": DiffusionParallelConfig(tensor_parallel_size=tp_size)},
+                cli_overrides=_convert_dataclasses_to_dict(
+                    {"parallel_config": DiffusionParallelConfig(tensor_parallel_size=tp_size)}
+                ),
                 deploy_config_path=None,
             )
             explicit_pipeline = StageConfigFactory.get_pipeline_config(
