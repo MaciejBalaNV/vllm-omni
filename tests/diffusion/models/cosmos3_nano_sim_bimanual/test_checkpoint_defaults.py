@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 import torch
 from test_cookbook import manifest
-from test_cookbook_runner import runner  # noqa: F401 - shared fixture
 from test_rollout import fake_pipeline, request
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_domain_ids
@@ -53,13 +52,3 @@ def test_singleton_domain_representations_share_session_identity(domain):
     baseline, baseline_state = fake_pipeline()
     baseline.forward(request(9, domain_id=15, close_session=False))
     assert state.fingerprint == baseline_state.fingerprint
-
-
-def test_cli_reads_prepared_sidecar(tmp_path, runner):  # noqa: F811
-    module = runner
-    sidecar = {"action_space": "normalized_unified_v1", "action": [[0.0] * 59] * 8, "domain_names": ["agibotworld"]}
-    (tmp_path / "actions.json").write_text(json.dumps(sidecar))
-    path = tmp_path / "samples.jsonl"
-    path.write_text(json.dumps({"action_path": "actions.json", "vision_path": "initial.png"}) + "\n")
-    record = module._load_record(path, 0)
-    assert record["action_space"] == "normalized_unified_v1" and record["image"] == "initial.png"

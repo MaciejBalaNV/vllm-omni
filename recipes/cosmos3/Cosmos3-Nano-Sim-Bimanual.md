@@ -166,42 +166,5 @@ the real text K/V in the auxiliary scratch slots; the dense path concatenates th
 same three spans. Compile/CUDA graphs, RF/CFG checkpoints, and multi-session
 serving remain follow-up work.
 
-See the [offline runner](../../examples/offline_inference/cosmos3_nano_sim_bimanual/README.md)
-for reference JSONL/NPZ input, action-sidecar and camera inputs, and validation
-commands. CPU tests do not establish checkpoint quality, GPU memory usage, or
+CPU tests do not establish checkpoint quality, GPU memory usage, or
 equivalence between one-shot and incremental VAE decoding.
-
-## Cookbook port assessment
-
-The cookbook additions were ported from the uncommitted work based on
-`mbala/cosmos_dreams_transfer` (`8f37207b3`) to `mbala/cosmos_dreams`
-(`2c974f21e`). The target already has causal generation, action/video packing,
-typed robot ticks, session-owned VAE caches, and dense/paged KV history. Its
-pipeline has a different request-control structure and newer media transport
-and mixed-precision support, so replacing it with the Transfer pipeline would
-discard target-branch behavior.
-
-| Change | Applicability on the target branch |
-| --- | --- |
-| Action-sidecar JSONL, media loading, prompt formatting, batch output metadata | Added through the offline cookbook adapter; the existing reference format remains available. |
-| Explicit raw/model action space | Added to request controls and the session fingerprint. Sidecars bypass normalization; raw inputs normalize once. |
-| Camera commands and pose JSON | Added with frame alignment, rot6d conversion, 16-frame anchors, and frozen camera regression vectors. |
-| Camera inference profile and global-asinh normalizer | Added with action-schema-v4 validation; existing v3 contracts remain supported. |
-| Canonical resolution helper and 480p portrait bucket | Added while retaining the target's current framework imports and embodiment aliases. |
-| Incremental decoding for long full videos | Adapted to this branch's generation loop and shared output builder. Typed media, guardrail routing, latent output, and denoising precision schedules remain available. |
-| Transfer-only pipeline helpers, registration, and documentation | Omitted; the cookbook exercises action/camera conditioning. Unrelated Nano/Transfer wording edits were also omitted. |
-
-The adapter covers both open-loop cookbook inputs, but GPU acceptance is still
-required before claiming reproduced model outputs. It accepts aligned frame
-counts explicitly instead of silently rounding them, and rejects malformed
-camera commands. The supported sampler uses the exported four-step distilled
-schedule and guidance 1.0; the framework command's guidance 3.0, shift 5.0,
-defaults file, and latency preset are not interchangeable CLI settings here.
-
-Use the matching two-stage exporter described above to obtain an artifact for
-the private-preview checkpoint. Then validate the four 61-frame camera cases,
-the 901-frame action rollout, and a 1801-frame endurance run on CUDA. Compare
-conditioning and pre-VAE latents first, then causal versus one-shot decoding,
-and record actual frame counts, action/camera adherence, memory, and throughput.
-The bounded KV window and incremental VAE path need numerical and visual
-acceptance independently. Closed-loop policy feedback is outside these examples.
