@@ -49,7 +49,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frustum_retrieval impo
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
-    conditioning_image_size,
     resolve_cosmos3_nano_sim_bimanual_geometry,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
@@ -152,30 +151,22 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
 
     manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
     policy = _resolution_policy(od_config, manifest)
-    cosmos3_pre_process = get_cosmos3_pre_process_func(od_config)
+    cosmos3_pre_process = get_cosmos3_pre_process_func(od_config, crop_action_image=True)
 
     def pre_process_func(request):
         sp = request.sampling_params
         prompt = request.prompt
         media = _request_media(prompt)
-        geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
-        image_size = conditioning_image_size(sp)
-        if image_size is not None:
-            from vllm_omni.diffusion.models.cosmos3.transfer import media_hw
-
-            if media is None or media_hw(media) != image_size[:2]:
-                raise ValueError("conditioning_image_size requires media matching the padded canvas exactly.")
-            # Encode the original padded pixels, but admit/schedule the cropped grid.
-            sp.height, sp.width = image_size[:2]
-        else:
+        multimodal = prompt.get("multi_modal_data", {}) if isinstance(prompt, Mapping) else {}
+        if multimodal.get("image") is None or sp.height is not None or sp.width is not None:
+            geometry = resolve_cosmos3_nano_sim_bimanual_geometry(sp, media, policy)
             sp.height, sp.width = geometry.height, geometry.width
 
-        try:
-            result = cosmos3_pre_process(request)
-        finally:
-            sp.height, sp.width = geometry.height, geometry.width
-        if image_size is not None:
-            result.sampling_params.height, result.sampling_params.width = geometry.height, geometry.width
+        result = cosmos3_pre_process(request)
+        if isinstance(result.prompt, Mapping):
+            image = result.prompt.get("additional_information", {}).get("preprocessed_image")
+            if image is not None:
+                policy.resolve(*image.shape[-2:])
         # Re-resolving explicit final dimensions catches any downstream
         # alignment, area, aspect, or model-grid violation.
         final_sp = result.sampling_params
@@ -1056,11 +1047,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if not isinstance(image, torch.Tensor):
             raise TypeError("Cosmos3-Nano-Sim-Bimanual preprocessed image must be a torch.Tensor.")
         latent = self._encode_conditioning_image_latent(image)
-        image_size = conditioning_image_size(sp)
-        if image_size is not None:
-            if tuple(image.shape[-2:]) != image_size[:2]:
-                raise ValueError("Preprocessed conditioning image no longer matches its padded canvas.")
-            latent = self._crop_latent_to_image_size(latent, image_size)
+        latent = latent[..., : geometry.latent_height, : geometry.latent_width].contiguous()
         expected = (
             1,
             self.transformer.latent_channel_size,
