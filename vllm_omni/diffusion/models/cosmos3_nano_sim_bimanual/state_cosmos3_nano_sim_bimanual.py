@@ -135,7 +135,7 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
     checkpoint_id: str
     manifest_id: str
     sampler_id: str
-    action_space: str = "raw"
+    action_space: str = "normalized_unified_v1"
     inference_id: str = ""
 
     def __post_init__(self) -> None:

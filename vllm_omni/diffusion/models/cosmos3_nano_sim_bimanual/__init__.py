@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cosmos3-Nano-Sim-Bimanual diffusion model family."""
 
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_contract import Cosmos3NanoSimBimanualActionSchema
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import Cosmos3NanoSimBimanualActionSchema
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
-    Cosmos3NanoSimBimanualActionConditioning,
-    Cosmos3NanoSimBimanualControlVideoConditioning,
-)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
@@ -15,8 +11,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
 
 __all__ = [
     "Cosmos3NanoSimBimanualActionSchema",
-    "Cosmos3NanoSimBimanualActionConditioning",
-    "Cosmos3NanoSimBimanualControlVideoConditioning",
     "Cosmos3NanoSimBimanualGeometry",
     "Cosmos3NanoSimBimanualManifest",
     "Cosmos3NanoSimBimanualPipeline",

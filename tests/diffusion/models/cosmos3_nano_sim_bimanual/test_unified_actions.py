@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Keep legacy defaults while reading production sampling and prepared actions."""
+"""Read production sampling and unified actions from checkpoint metadata."""
 
 import json
 from dataclasses import replace
@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 import torch
-from test_cookbook import manifest
+from test_action_schema import manifest
 from test_rollout import fake_pipeline, request
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_domain_ids
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract import (
-    parse_cosmos3_nano_sim_bimanual_conditioning,
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import (
+    Cosmos3NanoSimBimanualActionSchema,
 )
 
 
@@ -21,21 +21,17 @@ def production():
     return replace(
         manifest(),
         window_frames=None,
-        t_list=(1.0, 5 / 6),
-        conditioning=parse_cosmos3_nano_sim_bimanual_conditioning({"mode": "action", **schema}),
+        conditioning=Cosmos3NanoSimBimanualActionSchema.model_validate({"mode": "action", **schema}),
     )
 
 
 def test_prepared_actions_are_not_normalized_twice():
     pipe, _ = fake_pipeline()
     pipe.manifest = production()
-    pipe.action_normalizers = {}
     x = torch.arange(118, dtype=torch.float32).reshape(2, 59)
-    y = pipe._prepare_raw_action(embodiment="agibotworld", action_value=x, action_space="normalized_unified_v1")
+    y = pipe._prepare_action(embodiment="agibotworld", action_value=x, action_space="normalized_unified_v1")
     assert torch.equal(y[:, :59].float(), x)
     assert y.shape == (2, 64) and not torch.count_nonzero(y[:, 59:])
-    with pytest.raises(ValueError, match="Schema 5"):
-        pipe._prepare_raw_action(embodiment="agibotworld", action_value=x, action_space="raw")
 
 
 def test_per_row_domains_follow_action_chunks():

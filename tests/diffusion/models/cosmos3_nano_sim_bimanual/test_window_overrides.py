@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_cookbook import manifest
+from test_action_schema import manifest
 
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS,
@@ -33,11 +33,12 @@ def config(**overrides):
     return SimpleNamespace(tf_model_config={"cosmos3_nano_sim_bimanual": artifact}, model_config=overrides)
 
 
-def test_override_preserves_checkpoint_and_separates_sessions():
+@pytest.mark.parametrize(("cache_size", "sinks"), [(16, 0), (64, 8), (128, 32)])
+def test_override_preserves_checkpoint_and_separates_sessions(cache_size, sinks):
     baseline = Cosmos3NanoSimBimanualManifest.from_od_config(config())
-    options = config(kv_cache_inference_size=64, attention_sink_size=8)
+    options = config(kv_cache_inference_size=cache_size, attention_sink_size=sinks)
     effective = Cosmos3NanoSimBimanualManifest.from_od_config(options)
-    assert (effective.window_frames, effective.sink_frames) == (55, 8)
+    assert (effective.window_frames, effective.sink_frames) == (cache_size - sinks - 1, sinks)
     assert effective.digest != baseline.digest
     assert effective.chunk_size == baseline.chunk_size and effective.t_list == baseline.t_list
     assert options.tf_model_config["cosmos3_nano_sim_bimanual"]["window_frames"] == baseline.window_frames
