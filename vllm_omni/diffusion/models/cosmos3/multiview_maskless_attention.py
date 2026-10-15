@@ -24,6 +24,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
 from .multiview_flex_attention import MultiviewAttentionContext
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
@@ -198,6 +200,38 @@ def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, t
     return _compiled_merge_step
 
 
+def _merge_pass(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q_index: torch.Tensor,
+    identity_q: bool,
+    first_pass: bool,
+    result: torch.Tensor | None = None,
+) -> None:
+    """Seed or merge one pass in FP32; the last pass also writes the final output."""
+    if first_pass:
+        merged, merged_lse = out.float(), lse.float()
+    else:
+        previous = acc if identity_q else acc.index_select(0, q_index)
+        previous_lse = acc_lse if identity_q else acc_lse.index_select(0, q_index)
+        merged, merged_lse = merge_step(previous, previous_lse, out, lse)
+    if identity_q:
+        acc.copy_(merged)
+        acc_lse.copy_(merged_lse)
+    else:
+        acc.index_copy_(0, q_index, merged)
+        acc_lse.index_copy_(0, q_index, merged_lse)
+    if result is not None:
+        # The last pass may cover only some rows; write the full accumulated output.
+        result.copy_(acc.to(result.dtype))
+
+
+# Compilation is lazy; the callable is shared across passes and attention layers.
+_compiled_merge_pass = torch.compile(_merge_pass, fullgraph=True, dynamic=True)
+
+
 def _maskless_attention_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -227,7 +261,13 @@ def _maskless_attention_impl(
         raise ValueError("Maskless attention requires an integral GQA ratio.")
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
-    merge = _merge_step_for(q.device)
+    config = get_forward_context().omni_diffusion_config if is_forward_context_available() else None
+    pipeline_args = config.custom_pipeline_args if config is not None else None
+    lse_fusion = (pipeline_args or {}).get("cosmos3_lse_fusion", False)
+    if not isinstance(lse_fusion, bool):
+        raise ValueError("custom_pipeline_args['cosmos3_lse_fusion'] must be a bool.")
+    fused_merge = lse_fusion and q.device.type == "cuda"
+    merge = _compiled_merge_pass if fused_merge else _merge_step_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
     # inference-mode temporaries.
@@ -270,6 +310,18 @@ def _maskless_attention_impl(
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+            if fused_merge:
+                merge(
+                    acc,
+                    acc_lse,
+                    out,
+                    lse,
+                    q_index,
+                    identity_q,
+                    first_pass=index == 0,
+                    result=result[0] if index == num_passes - 1 else None,
+                )
+            elif index == 0:
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
                     if identity_q:
@@ -294,9 +346,10 @@ def _maskless_attention_impl(
                         acc_lse.index_copy_(0, gather, merged_lse)
             del out, lse
         assert acc is not None
-        for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
-            chunk = slice(start, start + MERGE_CHUNK_SIZE)
-            result[0, chunk].copy_(acc[chunk])
+        if not fused_merge:
+            for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
+                chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                result[0, chunk].copy_(acc[chunk])
     return result
 
 
