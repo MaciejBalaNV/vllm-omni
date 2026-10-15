@@ -193,6 +193,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
     VideoUploadResources,
+    _cleanup_timeline_guides,
     _cleanup_video,
     _cleanup_video_references,
     _lidar_storage_key,
@@ -869,15 +870,17 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await openai_app_state._get_vllm_config(engine_client)
 
-    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
+    # Detect if it's Diffusion mode (every stage is a diffusion stage). This
+    # covers both single-stage diffusion and multi-stage diffusion pipelines
+    # such as the Wan Encode/Generation (EG) (text_encode + dit) disaggregation,
+    # which must use the diffusion serving path (no vllm_config) rather than the
+    # LLM/multi-stage path.
     is_pure_diffusion = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+        if all(get_stage_type(sc) == "diffusion" for sc in stage_configs):
+            is_pure_diffusion = True
+            logger.info("Detected diffusion mode (%d diffusion stage(s))", len(stage_configs))
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -2698,6 +2701,7 @@ async def create_video(
     def _cleanup_request_resources() -> None:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
         upload_resources.cleanup()
+        _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
@@ -2816,6 +2820,7 @@ async def create_video_sync(
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
         upload_resources.cleanup()
+        _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

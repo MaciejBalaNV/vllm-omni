@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING, Any, cast
 import pybase64 as base64
 from fastapi import HTTPException
 from PIL import Image
-
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
+
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import DiffusionModelMetadata, get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.media_utils import count_mp4_frames, normalize_preencode_batch_frames
@@ -114,6 +114,14 @@ class LatentEditInput:
     source_audio: str | None = None
     video_noise_mask: Any | None = None
     audio_noise_mask: Any | None = None
+    cleanup_paths: tuple[str, ...] = ()
+
+
+@dataclass
+class TimelineGuideInput:
+    """Resolved timeline guides and the request-owned files they reference."""
+
+    guides: list[dict[str, Any]]
     cleanup_paths: tuple[str, ...] = ()
 
 
@@ -285,6 +293,12 @@ class OmniOpenAIServingVideo:
         return any(item.supports_multiview_reference_inputs for item in metadata)
 
     @property
+    def supports_timeline_guides(self) -> bool:
+        """Return whether the configured diffusion model accepts timeline guides."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_timeline_guides for item in metadata)
+
+    @property
     def supported_control_upload_types(self) -> frozenset[str]:
         """Return multipart control types accepted by the active pipeline.
 
@@ -426,6 +440,9 @@ class OmniOpenAIServingVideo:
                     if value is not None
                 }
             )
+        guide_input = request._timeline_guide_input
+        if guide_input is not None:
+            multi_modal_data["timeline_guides"] = guide_input.guides
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
