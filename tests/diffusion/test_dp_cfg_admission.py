@@ -382,6 +382,109 @@ def _complete_scheduled_wave(scheduler, executor, wave):
         scheduler.pop_request_state(request_id)
 
 
+def _make_cosmos3_request(
+    request_id: str, modalities: str | list[str] | None, **prompt_fields: object
+) -> OmniDiffusionRequest:
+    prompt: dict[str, object] = {"prompt": f"A mountain lake {request_id}.", **prompt_fields}
+    if modalities is not None:
+        prompt["modalities"] = modalities
+    return OmniDiffusionRequest(
+        request_id=request_id,
+        prompt=prompt,
+        sampling_params=OmniDiffusionSamplingParams(
+            height=720,
+            width=1280,
+            num_frames=193,
+            num_inference_steps=None,
+            guidance_scale=1.0,
+            extra_args={},
+        ),
+    )
+
+
+@pytest.fixture
+def cosmos3_preprocess(monkeypatch, wave_config):
+    from vllm_omni.diffusion.models.cosmos3 import guardrails
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    monkeypatch.setattr(guardrails, "is_guardrails_enabled", lambda *args: False)
+    return get_cosmos3_pre_process_func(wave_config)
+
+
+@pytest.mark.parametrize("image_first", [False, True])
+@pytest.mark.parametrize("num_inference_steps", [None, 2])
+def test_cosmos3_mixed_output_modes_run_in_separate_waves(
+    executor, wave_config, cosmos3_preprocess, image_first, num_inference_steps
+):
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    modes = (["image"], ["video"]) if image_first else (["video"], ["image"])
+    requests = [_make_cosmos3_request(request_id, mode) for request_id, mode in zip(("first", "second"), modes)]
+    for request in requests:
+        request.sampling_params.num_inference_steps = num_inference_steps
+        scheduler.add_request(cosmos3_preprocess(request))
+
+    # Bypassing scheduler admission must still fail before either backend's RPC.
+    with pytest.raises(ValueError, match="compatible shape, CFG"):
+        executor.execute_batch(_make_wave(*requests))
+    executor.collective_rpc.assert_not_called()
+
+    for request_id, waiting in (("first", 1), ("second", 0)):
+        wave = scheduler.schedule()
+        assert wave.scheduled_request_ids == [request_id]
+        assert wave.num_waiting_reqs == waiting
+        _complete_scheduled_wave(scheduler, executor, wave)
+    assert executor.collective_rpc.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("first_mode", "second_mode"),
+    [(["image"], "image"), (["image"], ["text", "image"]), (["video"], "video"), (["video"], None)],
+)
+def test_cosmos3_matching_output_modes_share_wave(executor, wave_config, cosmos3_preprocess, first_mode, second_mode):
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    for request_id, mode in (("first", first_mode), ("second", second_mode)):
+        scheduler.add_request(cosmos3_preprocess(_make_cosmos3_request(request_id, mode)))
+
+    wave = scheduler.schedule()
+    assert wave.scheduled_request_ids == ["first", "second"]
+    assert wave.num_waiting_reqs == 0
+    _complete_scheduled_wave(scheduler, executor, wave)
+    executor.collective_rpc.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "variant_fields",
+    [{"action_mode": "policy"}, {"generate_sound": True}, {"edge": True}],
+    ids=["action", "sound", "transfer"],
+)
+def test_cosmos3_prompt_level_schedule_modes_run_in_separate_waves(
+    executor, wave_config, cosmos3_preprocess, variant_fields
+):
+    executor.od_config = wave_config
+    scheduler = RequestScheduler()
+    scheduler.initialize(wave_config)
+    requests = [
+        _make_cosmos3_request("first", None),
+        _make_cosmos3_request("second", None, **variant_fields),
+    ]
+    for request in requests:
+        scheduler.add_request(cosmos3_preprocess(request))
+
+    with pytest.raises(ValueError, match="compatible shape, CFG"):
+        executor.execute_batch(_make_wave(*requests))
+    executor.collective_rpc.assert_not_called()
+
+    for request_id, waiting in (("first", 1), ("second", 0)):
+        wave = scheduler.schedule()
+        assert wave.scheduled_request_ids == [request_id]
+        assert wave.num_waiting_reqs == waiting
+        _complete_scheduled_wave(scheduler, executor, wave)
+
+
 @pytest.mark.parametrize("embeddings_first", [False, True])
 def test_text_encoder_allgather_schedules_mixed_inputs_separately(executor, embeddings_first):
     config = _make_wave_config("dlo_text_encoder")
