@@ -1488,9 +1488,10 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
 
     frames = FramesWithFps(Image.new("RGB", (8, 4), color) for color in ("red", "green", "blue", "yellow", "black"))
     prompt = {"prompt": "transfer", "multi_modal_data": {"video": frames}}
-    request = SimpleNamespace(
+    request = OmniDiffusionRequest(
+        request_id="transfer-preprocess-budget",
         prompt=prompt,
-        sampling_params=SimpleNamespace(
+        sampling_params=OmniDiffusionSamplingParams(
             height=16,
             width=32,
             extra_args={"edge": True, "max_frames": 4, "resolution": "256"},
