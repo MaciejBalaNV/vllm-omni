@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import FramePageState, paged_write_attn
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
@@ -92,6 +93,7 @@ def test_separate_text_pages_real_length_and_causal_rows():
         state.close()
 
 
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires supported CUDA GPU and FA4")
 def test_installed_fa4_matches_exact_dense_attention():
     import torch.nn.functional as F
@@ -137,3 +139,51 @@ def test_installed_fa4_matches_exact_dense_attention():
         assert len(cache.window_block_ids(state.adapter("main"))) <= 3
     finally:
         state.close()
+
+
+@pytest.mark.cpu
+def test_pipeline_binds_actual_upstream_cache_geometry():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.pipeline_cosmos3_nano_sim_bimanual import (
+        Cosmos3NanoSimBimanualPipeline,
+    )
+
+    pipeline = object.__new__(Cosmos3NanoSimBimanualPipeline)
+    pipeline.transformer = SimpleNamespace(num_hidden_layers=2, num_kv_heads_local=1, head_dim=4)
+    pipeline.manifest = SimpleNamespace(
+        conditioning_tokens_per_frame=4, chunk_size=2, window_frames=2, sink_frames=1, text_cache_max_len=8
+    )
+    geometry = SimpleNamespace(tokens_per_frame=lambda _: 5)
+    pipeline.resolution_policy = SimpleNamespace(default_resolution=(1, 1), resolve=lambda *args: geometry)
+    state = make_state()
+    try:
+        pipeline._validate_bound_kv_geometry(state, geometry)
+        with pipeline.bind_ar_diffusion_state("test", state.state):
+            assert isinstance(pipeline._ar_diffusion_kv_state, FramePageState)
+        assert pipeline._ar_diffusion_kv_state is None
+    finally:
+        state.close()
+
+
+@pytest.mark.cpu
+def test_attention_rejects_missing_frame_pages_before_computing():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
+        Cosmos3NanoSimBimanualJointAttention,
+    )
+
+    with pytest.raises(RuntimeError, match="requires FA4 frame-page inputs"):
+        Cosmos3NanoSimBimanualJointAttention.forward(
+            SimpleNamespace(),
+            torch.zeros(1, 5, 8),
+            text_k=torch.zeros(1, 1, 1, 4),
+            text_v=torch.zeros(1, 1, 1, 4),
+            real_text_kv_len=1,
+            freqs_cos=torch.ones(1, 5, 1, 4),
+            freqs_sin=torch.zeros(1, 5, 1, 4),
+            num_frames=1,
+            tokens_per_frame=5,
+            action_tokens_per_frame=1,
+        )

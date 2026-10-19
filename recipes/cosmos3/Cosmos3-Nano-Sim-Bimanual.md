@@ -1,0 +1,105 @@
+# Cosmos3-Nano-Sim-Bimanual
+
+The distilled action-conditioned world model uses the checkpoint's sampling
+schedule and normalized unified action schema. Install the `cosmos-sim` extra
+in addition to the CUDA dependencies required by this branch:
+
+```bash
+pip install -e '.[cosmos-sim]'
+```
+
+The supported attention path calls installed
+`flash_attn.cute.flash_attn_varlen_func` directly with paged K/V. FA4 is required;
+missing or unsupported kernels raise an error. There is no experimental switch
+or automatic alternate attention backend. Use FP16 or BF16 on an FA4-supported
+CUDA GPU. Validation on SM103 used FA4 `4.0.0b33` without source modifications.
+
+## Deployment
+
+Start from [the deployment configuration](../../vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml)
+or [the bounded-window configuration](../../vllm_omni/deploy/cosmos3_nano_sim_bimanual_windowed.yaml).
+Keep `engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine`
+and `max_num_seqs: 1`. For regional compilation, set these stage options:
+
+```yaml
+enforce_eager: false
+diffusion_compile_granularity: regional
+diffusion_compile_dynamic: true
+```
+
+`model_config.use_cuda_graphs: true` selects Inductor CUDA graphs and requires
+regional compilation. The paired single-GPU profiles use compilation with
+CUDA graphs disabled. Tensor parallelism and HSDP code paths are available;
+this validation covers one GPU. HSDP requires CUDA graphs disabled.
+
+## Actions and geometry
+
+Provide `N-1` action rows for `N` output video frames, where `(N-1) % 4 == 0`.
+Set `action_space="normalized_unified_v1"`; each row contains 59 normalized
+values. The runtime validates domain IDs and pads rows to the model's 64D
+width. Use `domain_name` or `domain_id` from the checkpoint action schema.
+Full rollouts normally use `reset=true` and `close_session=true`.
+
+Pass the original reference image. With explicit `height` and `width`, the
+runtime validates the requested patch grid and `max_pixels`. Without them,
+preprocessing selects an aspect-matched canvas, downsizes if needed, pads for
+VAE encoding, and crops the latent to aligned content dimensions. Resolution
+changes within a session require a reset and rebuild the pool after admission.
+
+## KV pages and attention visibility
+
+At 720×1280, the latent patch grid contains **920 video tokens**. Four action
+tokens make a frame page **924 tokens**, with no divisibility-by-16 requirement.
+Every attention row is logically:
+
+```text
+[protected sink frame pages | recent frame pages | current frame pages | text pages]
+```
+
+Each frame starts at offset zero. Text occupies separate pages of the same
+size; sequence lengths exclude unused text-page capacity. FA4 reads the block
+table directly. Valid frames and text have no intervening padding, and history
+is never gathered into contiguous K/V.
+
+The upstream allocator owns pages and session lifetime. After all layers
+finish a clean forward, newly computed frame pages are published from bounded
+scratch storage. Upstream whole-frame eviction reclaims old pages and compacts
+host metadata. Only new frames are copied during publication. There is no
+16-token paging, private tail packing, page rotation, or model-specific history
+eviction implementation.
+
+`kv_cache_inference_size` includes the sinks and current frame;
+`attention_sink_size` sets protected initial frames. For example, a capacity
+of 4 with 1 sink retains 2 recent past frames. Both settings use latent-frame
+units. Changing visibility can change generated output. Without overrides,
+the checkpoint history policy applies. A full-history checkpoint sizes the
+cache for the admitted rollout and necessarily retains all its frames.
+
+Typed tick requests retain model and KV state across calls, enforce session
+fingerprints and chunk order, and return transport-safe correlation metadata.
+Invalid admission preserves existing history; execution failure releases it.
+Fresh full-video requests decode chunks to CPU to bound VAE GPU history.
+`clean_commit_mode: batched` refreshes clean frames together, and
+`overlap_vae_decode: true` overlaps supported full-rollout decoding and refresh.
+
+## Validation and profiling
+
+`tests/diffusion/models/cosmos3_nano_sim_bimanual/test_frame_pages.py` covers
+257-frame bounded reclamation, exact window/text metadata, real upstream cache
+binding, and an installed-FA4 GPU comparison against a dense numerical oracle.
+
+`benchmarks/diffusion/bench_cosmos_sim_frame_pages.py` runs the cached checkpoint
+example and saves raw frames, MP4, deployment YAML, and runtime metadata. For a
+long compiled rollout whose window rolls repeatedly:
+
+```bash
+export HF_HOME=/path/to/checkpoints
+python benchmarks/diffusion/bench_cosmos_sim_frame_pages.py \
+  --output-dir "$PWD/var/cosmos-sim-profile" --num-frames 241 \
+  --warmup-frames 25 --warmup-runs 2 --compile
+```
+
+The benchmark labels warmups and the measured generation with NVTX. Point
+Nsight Systems at that command to capture CUDA dispatch and overall execution.
+The model must already be cached, or downloaded once using credentials with
+access to `nvidia/Cosmos3-Nano-Sim-Bimanual`.
