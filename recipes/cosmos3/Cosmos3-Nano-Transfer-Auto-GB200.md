@@ -214,10 +214,12 @@ Weights beyond Cosmos3 Nano, checked at load time:
 | Contract | Extra transformer weights | Extra directory |
 | --- | --- | --- |
 | Every Cosmos3-Nano-Transfer-Auto checkpoint | `rig_view_embed.weight` | None |
-| Joint (`multiview.lidar` present) | `lidar_proj_in.{weight,bias}`, `lidar_proj_out.{weight,bias}` | `lidar_vae/` (`config.json`, `diffusion_pytorch_model.safetensors`) |
+| Joint (`multiview.lidar` present) | `lidar_proj_in.{weight,bias}`, `lidar_proj_out.{weight,bias}` | `lidar_vae/` (`config.json`, safetensors weights, optionally sharded) |
 
-The LiDAR component includes the full VAE, decoder and latent statistics; its
-architecture is validated through the tokenizer fields. The scheduler directory
+The pipeline reuses the shared Cosmos3 LiDAR VAE encoder and decoder, including
+FP32 execution, checkpoint loading and latent statistics. Its architecture is
+validated through the tokenizer fields; loader metadata such as `_class_name`
+is also accepted. The scheduler directory
 must describe the regular FlowUniPC scheduler. Deployment defaults omit the
 ignored `sigma_max` and inapplicable `negative_metadata_mode` settings.
 

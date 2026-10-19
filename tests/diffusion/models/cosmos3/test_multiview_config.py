@@ -159,12 +159,16 @@ def test_contract_rejects_invalid_defaults(field: str, value: Any) -> None:
         _validate_multiview_contract(contract)
 
 
-@pytest.mark.parametrize("change", ["version", "unknown", "missing", "null"])
+def test_contract_accepts_lidar_vae_loader_metadata() -> None:
+    contract = multiview_contract()
+    contract["lidar"].update(_class_name="Cosmos3LidarEncoder", _diffusers_version="0.35.0")
+    assert _validate_multiview_contract(contract) == contract
+
+
+@pytest.mark.parametrize("change", ["missing", "null"])
 def test_contract_rejects_invalid_lidar_metadata(change: str) -> None:
     contract = multiview_contract()
-    if change in {"version", "unknown"}:
-        contract["lidar"][change] = "1.2"
-    elif change == "missing":
+    if change == "missing":
         del contract["lidar"]["network_config"]
     else:
         contract["lidar"] = None

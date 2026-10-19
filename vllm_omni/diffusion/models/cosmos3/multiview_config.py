@@ -10,7 +10,7 @@ from typing import Any, TypeGuard
 
 from vllm_omni.model_extras.cosmos3 import _mapping
 
-from .lidar import validate_lidar_config
+from .lidar_vae import validate_lidar_config
 
 COSMOS3_MULTIVIEW_BACKBONE_TYPE = "cosmos3_multiview"
 

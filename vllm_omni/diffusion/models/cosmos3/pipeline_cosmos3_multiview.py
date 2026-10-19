@@ -34,7 +34,7 @@ from vllm_omni.model_extras.cosmos3 import (
 from vllm_omni.model_extras.cosmos3_lidar import load_lidar_frames, required_lidar_sweeps
 
 from .action import find_closest_target_size
-from .lidar import Cosmos3LidarDecoder, Cosmos3LidarEncoder
+from .lidar_vae import Cosmos3LidarDecoder, Cosmos3LidarEncoder
 from .multiview_config import _validated_multiview_deployment_config
 from .multiview_flex_attention import (
     DEFAULT_MAX_UND_TOKENS,
@@ -469,11 +469,11 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         self.lidar_decoder = None
         if multiview_config.get("lidar") is not None:
             self.lidar_encoder = Cosmos3LidarEncoder.from_pretrained(
-                od_config.model, multiview_config["lidar"], self.device
+                od_config.model, multiview_config["lidar"], self.device, od_config=od_config
             )
             self._encoder_modules = ["lidar_encoder"]
             self.lidar_decoder = Cosmos3LidarDecoder.from_pretrained(
-                od_config.model, multiview_config["lidar"], self.device
+                od_config.model, multiview_config["lidar"], self.device, od_config=od_config
             )
             self._vae_modules.append("lidar_decoder")
         self.multiview_cameras = tuple(multiview_config["cameras"])
