@@ -34,6 +34,9 @@ classifiers = [
 
 [project.optional-dependencies]
 
+# Validated paged-attention backend for Cosmos3-Nano-Sim-Bimanual.
+cosmos-sim = ["flash-attn-4==4.0.0b33"]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
