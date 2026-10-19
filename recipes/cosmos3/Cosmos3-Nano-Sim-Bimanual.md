@@ -8,11 +8,15 @@ in addition to the CUDA dependencies required by this branch:
 pip install -e '.[cosmos-sim]'
 ```
 
-The supported attention path calls installed
-`flash_attn.cute.flash_attn_varlen_func` directly with paged K/V. FA4 is required;
-missing or unsupported kernels raise an error. There is no experimental switch
-or automatic alternate attention backend. Use FP16 or BF16 on an FA4-supported
-CUDA GPU. Validation on SM103 used FA4 `4.0.0b33` without source modifications.
+Frame-page attention requires a backend that supports the selected page size,
+physical page tables, and explicit sequence lengths. The cache layout and
+attention visibility contract are independent of the backend implementation.
+
+The current implementation uses installed FA4 through
+`flash_attn.cute.flash_attn_varlen_func`. This backend requires FP16 or BF16 on
+a supported CUDA GPU. Missing dependencies or unsupported kernels raise an
+error; there is no automatic backend fallback. Validation on SM103 used FA4
+`4.0.0b33` without source modifications.
 
 ## Deployment
 
@@ -57,9 +61,9 @@ Every attention row is logically:
 ```
 
 Each frame starts at offset zero. Text occupies separate pages of the same
-size; sequence lengths exclude unused text-page capacity. FA4 reads the block
-table directly. Valid frames and text have no intervening padding, and history
-is never gathered into contiguous K/V.
+size; sequence lengths exclude unused text-page capacity. The attention backend
+reads the block table directly. Valid frames and text have no intervening padding,
+and history is never gathered into contiguous K/V.
 
 The upstream allocator owns pages and session lifetime. After all layers
 finish a clean forward, newly computed frame pages are published from bounded

@@ -72,7 +72,7 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
                 f"Cosmos3-Nano-Sim-Bimanual text K/V shapes differ: {tuple(text_k.shape)} != {tuple(text_v.shape)}"
             )
         if paged_context is None:
-            raise RuntimeError("Cosmos3 Sim requires FA4 frame-page inputs; no dense attention path")
+            raise RuntimeError("Cosmos3 Sim requires frame-page attention inputs")
 
         batch, seq_len, _ = hidden_states.shape
         q = self.to_q(hidden_states).view(batch, seq_len, self.num_heads_local, self.head_dim)
@@ -300,7 +300,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         """Denoise or clean-commit one current chunk.
 
         ``paged_kv`` is non-committing during denoise. Clean refreshes commit
-        one frame or a frame-causal batch. Every forward uses FA4 frame pages.
+        one frame or a frame-causal batch. Every forward uses frame-page attention.
         """
         if self._inductor_cudagraphs:
             # Regional block calls belong to one invocation. Without this,
@@ -321,7 +321,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                 f"Cosmos3-Nano-Sim-Bimanual expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}"
             )
         if paged_kv is None or len(paged_kv) != self.num_hidden_layers:
-            raise ValueError(f"Cosmos3 Sim requires {self.num_hidden_layers} FA4 frame-page contexts")
+            raise ValueError(f"Cosmos3 Sim requires {self.num_hidden_layers} frame-page attention contexts")
 
         _, _, num_frames, latent_h, latent_w = hidden_states.shape
         grid_h, grid_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)

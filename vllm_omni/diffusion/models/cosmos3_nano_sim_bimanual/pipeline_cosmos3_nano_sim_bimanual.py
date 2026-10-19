@@ -192,7 +192,7 @@ def get_cosmos3_nano_sim_bimanual_ir_op_priority_func(od_config: OmniDiffusionCo
 
 
 class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
-    """Cosmos3 Sim inference with one complete latent frame per FA4 KV page."""
+    """Cosmos3 Sim inference with one complete latent frame per KV page."""
 
     # The engine's generic warmup request is 512x512 with a one-step sampler,
     # while Cosmos3-Nano-Sim-Bimanual has request-resolved geometry and checkpoint-defined sampling.
@@ -213,7 +213,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         self._ar_compile_mode = resolve_ar_compile_mode(od_config)
         validate_sim_parallel_config(od_config)
         if od_config.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("Cosmos3 Sim FA4 requires float16 or bfloat16")
+            raise ValueError("The selected paged attention backend requires float16 or bfloat16")
         fa4_paged_func()  # Fail before loading weights if the required backend is absent.
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
@@ -657,7 +657,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             action_space=action_space,
         )
 
-    # -- FA4 frame-page transformer bridge -------------------------------
+    # -- Frame-page transformer bridge -------------------------------
 
     def _transformer_forward(
         self,
@@ -680,7 +680,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         paged_state = self._ar_diffusion_kv_state
         tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
         if paged_state is None or paged_state.kv_cache.block_size != tokens_per_frame:
-            raise RuntimeError("FA4 frame pages require the ARDiffusionEngine; no dense fallback is permitted")
+            raise RuntimeError(
+                "Cosmos3 Sim requires ARDiffusionEngine state with one complete latent frame per KV page"
+            )
         seq_len = hidden_states.shape[2] * tokens_per_frame
         paged_kv = paged_state.get_kv_caches(
             self._MAIN_BRANCH,

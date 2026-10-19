@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Frame-page FA4 attention using upstream AR-Diffusion allocation/lifetime.
+"""Frame-page attention using upstream AR-Diffusion allocation and session lifetime.
 
 Only current frames are staged. Once every layer finishes a clean forward,
 publish those pages through the upstream allocator, which reclaims whole old
@@ -23,9 +23,11 @@ def fa4_paged_func():
     try:
         from flash_attn.cute import flash_attn_varlen_func
     except ImportError as exc:
-        raise RuntimeError("Cosmos3 Sim requires flash-attn-4 with the CuTe paged-attention API") from exc
+        raise RuntimeError(
+            "The selected paged attention backend requires flash-attn-4 with the CuTe paged-attention API"
+        ) from exc
     logger.info(
-        "Cosmos3 Sim frame pages: flash-attn-4=%s; flash_attn.cute.flash_attn_varlen_func; no fallback",
+        "Paged attention backend: flash-attn-4=%s; flash_attn.cute.flash_attn_varlen_func",
         version("flash-attn-4"),
     )
     return flash_attn_varlen_func
@@ -62,7 +64,7 @@ def _frame_attention(
     scale: float,
 ) -> torch.Tensor:
     if not query.is_cuda:
-        raise RuntimeError("Cosmos3 Sim frame attention requires CUDA and installed FA4; no CPU/dense fallback")
+        raise RuntimeError("The selected paged attention backend requires CUDA tensors")
     flat_key = key_pool.view(-1, *key_pool.shape[2:])
     flat_value = value_pool.view(-1, *value_pool.shape[2:])
     flat_key.index_copy_(0, video_slots, key)
@@ -228,7 +230,7 @@ class FramePageState:
         if self.kv_cache.block_size != self.kv_cache.spec.chunk_size:
             raise ValueError("Cosmos3 Sim only supports one page per latent frame")
         if self.kv_cache.history_staging:
-            raise ValueError("Cosmos3 Sim FA4 does not support gathered history staging")
+            raise ValueError("Frame-page attention does not support gathered history staging")
 
     def __getattr__(self, name):
         return getattr(self.state, name)

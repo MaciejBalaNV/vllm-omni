@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Frame visibility, bounded upstream allocation, and installed FA4 numerics."""
+"""Frame visibility, bounded upstream allocation, and paged-attention numerics."""
 
 import pytest
 import torch
@@ -174,7 +174,7 @@ def test_attention_rejects_missing_frame_pages_before_computing():
         Cosmos3NanoSimBimanualJointAttention,
     )
 
-    with pytest.raises(RuntimeError, match="requires FA4 frame-page inputs"):
+    with pytest.raises(RuntimeError, match="requires frame-page attention inputs"):
         Cosmos3NanoSimBimanualJointAttention.forward(
             SimpleNamespace(),
             torch.zeros(1, 5, 8),

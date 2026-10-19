@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Cosmos Sim rollout with the production frame-page FA4 backend."""
+"""Cosmos Sim rollout with one latent frame per KV page."""
 
 import argparse
 import json
