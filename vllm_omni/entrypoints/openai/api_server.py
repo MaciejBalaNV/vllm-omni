@@ -25,7 +25,6 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-import regex as re
 import torch
 import uvloop
 import vllm.envs as envs
@@ -3047,11 +3046,9 @@ async def download_video(video_id: str) -> Response:
     return response
 
 
-@router.get("/v1/videos/{video_id}/lidar")
+@router.get("/v1/videos/{video_id}/lidar", dependencies=[Depends(_require_single_api_video_store)])
 async def download_video_lidar(video_id: str) -> Response:
     """Download numeric LiDAR for a completed joint generation job."""
-    if re.fullmatch(r"video_gen_[0-9a-f]{32}", video_id) is None:
-        raise HTTPException(status_code=404, detail="Video not found")
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Video not found")

@@ -170,6 +170,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/videos/{video_id}"),
     ("DELETE", "/v1/videos/{video_id}"),
     ("GET", "/v1/videos/{video_id}/content"),
+    ("GET", "/v1/videos/{video_id}/lidar"),
     ("POST", "/v1/omni/sleep"),
     ("POST", "/v1/omni/wakeup"),
 }
@@ -1442,6 +1443,7 @@ def test_api_topology_rejects_inconsistent_launch(requested, config):
         ("GET", "/v1/videos"),
         ("GET", "/v1/videos/job"),
         ("GET", "/v1/videos/job/content"),
+        ("GET", "/v1/videos/job/lidar"),
         ("DELETE", "/v1/videos/job"),
     ],
 )
