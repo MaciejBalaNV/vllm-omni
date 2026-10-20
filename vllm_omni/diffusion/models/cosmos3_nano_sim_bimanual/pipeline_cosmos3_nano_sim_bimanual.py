@@ -27,9 +27,15 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
-    get_cosmos3_ir_op_priority_func,
-    get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
+)
+
+# Re-exported: the registry resolves the process functions on this module.
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    get_cosmos3_ir_op_priority_func as get_cosmos3_ir_op_priority_func,  # noqa: F401
+)
+from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+    get_cosmos3_post_process_func as get_cosmos3_post_process_func,  # noqa: F401
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import (
     domains_for_frames,
@@ -179,17 +185,6 @@ def get_cosmos3_nano_sim_bimanual_pre_process_func(od_config: OmniDiffusionConfi
         return result
 
     return pre_process_func
-
-
-# The registry resolves process funcs by name against this model's own
-# module, so reusing the Cosmos3 implementations means re-exporting them
-# under a Cosmos3-Nano-Sim-Bimanual name rather than registering them directly.
-def get_cosmos3_nano_sim_bimanual_post_process_func(od_config: OmniDiffusionConfig):
-    return get_cosmos3_post_process_func(od_config)
-
-
-def get_cosmos3_nano_sim_bimanual_ir_op_priority_func(od_config: OmniDiffusionConfig):
-    return get_cosmos3_ir_op_priority_func(od_config)
 
 
 class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):

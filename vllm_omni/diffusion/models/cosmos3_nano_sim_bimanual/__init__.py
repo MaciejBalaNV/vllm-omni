@@ -15,7 +15,6 @@ __all__ = [
     "Cosmos3NanoSimBimanualManifest",
     "Cosmos3NanoSimBimanualPipeline",
     "Cosmos3NanoSimBimanualResolutionPolicy",
-    "get_cosmos3_nano_sim_bimanual_post_process_func",
     "get_cosmos3_nano_sim_bimanual_pre_process_func",
     "resolve_cosmos3_nano_sim_bimanual_geometry",
 ]
@@ -25,7 +24,6 @@ def __getattr__(name: str):
     if name in {
         "Cosmos3NanoSimBimanualPipeline",
         "get_cosmos3_nano_sim_bimanual_pre_process_func",
-        "get_cosmos3_nano_sim_bimanual_post_process_func",
     }:
         from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import pipeline_cosmos3_nano_sim_bimanual
 
