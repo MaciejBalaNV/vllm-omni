@@ -67,7 +67,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     TimelineGuideInput,
     _stage_diffusion_model_class_name,
 )
-from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, SaveContext, StorageBaseManager
+from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video_api_utils import (
@@ -84,6 +84,7 @@ from vllm_omni.model_extras.cosmos3 import (
     reject_multiview_negative_fields,
     resolve_multiview_uploads,
 )
+from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
 
 logger = init_logger(__name__)
 
@@ -117,10 +118,6 @@ LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 # Scheduling slack on top of the engine abort budget when DELETE waits for a cancelled job.
 VIDEO_DELETE_TIMEOUT_S = 2.0
-_VIDEO_SAVE_CANCEL_GRACE_S = 1.0
-_VIDEO_CLEANUP_TIMEOUT_S = 1.0
-# Keep unfinished storage operations alive after their request stops waiting.
-_VIDEO_STORAGE_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, list[Any] | None]:
@@ -357,7 +354,7 @@ def _video_error_from_exception(exc: Exception) -> VideoError:
     if isinstance(exc, OmniClientError):
         return VideoError(code=exc.status_code, message=exc.message)
 
-    if isinstance(exc, EngineGenerateError | EngineDeadError):
+    if isinstance(exc, (EngineGenerateError, EngineDeadError)):
         err = create_error_response(exc)
         return VideoError(code=err.error.code, message=err.error.message)
 
@@ -372,80 +369,11 @@ def _lidar_storage_key(video_id: str) -> str:
 
 
 async def _cleanup_video(video_id: str):
-    tasks = []
     for key in (video_id, _lidar_storage_key(video_id)):
-        task = asyncio.create_task(_cleanup_video_artifact(STORAGE_MANAGER, key))
-        _track_video_storage_task(task, key)
-        tasks.append(task)
-    # Start both deletes even if another cancellation interrupts this cleanup.
-    await asyncio.gather(*(asyncio.shield(task) for task in tasks))
-
-
-async def _cleanup_video_artifact(manager: StorageBaseManager, key: str) -> None:
-    try:
-        await _delete_video_artifact(manager, key)
-    except Exception:
-        logger.warning("Failed to cleanup partial video artifact '%s'", key, exc_info=True)
-
-
-def _track_video_storage_task(task: asyncio.Task[Any], key: str) -> None:
-    _VIDEO_STORAGE_TASKS.add(task)
-
-    def completed(done: asyncio.Task[Any]) -> None:
-        _VIDEO_STORAGE_TASKS.discard(done)
-        if not done.cancelled():
-            try:
-                done.result()
-            except Exception:
-                logger.warning("Deferred video storage operation failed for '%s'", key, exc_info=True)
-
-    task.add_done_callback(completed)
-
-
-async def _delete_video_artifact(manager: StorageBaseManager, key: str) -> None:
-    task = asyncio.create_task(manager.delete(key))
-    try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=_VIDEO_CLEANUP_TIMEOUT_S)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        # Cancelling a coroutine cannot stop its filesystem thread. Retain the
-        # deletion so it can finish without blocking request cancellation.
-        _track_video_storage_task(task, key)
-        raise
-
-
-def _cleanup_late_video_save(task: asyncio.Task[SaveContext], manager: StorageBaseManager, key: str) -> None:
-    _track_video_storage_task(task, key)
-
-    def completed(done: asyncio.Task[SaveContext]) -> None:
-        if not done.cancelled():
-            # A backend may publish a file and then raise. Clean up on either
-            # success or failure, using the manager that performed the save.
-            cleanup = asyncio.create_task(_cleanup_video_artifact(manager, key))
-            _track_video_storage_task(cleanup, key)
-
-    task.add_done_callback(completed)
-
-
-async def _save_video_artifact(data: bytes, key: str, *, cancel_grace_s: float = 0.0) -> SaveContext:
-    manager = STORAGE_MANAGER
-    task = asyncio.create_task(manager.save(data, key))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Only joint video/LiDAR jobs request a grace period. Use one deadline
-        # so repeated DELETEEs cannot extend it; ordinary video cancels at once.
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + cancel_grace_s
-        while not task.done() and (remaining := deadline - loop.time()) > 0:
-            try:
-                await asyncio.wait({task}, timeout=remaining)
-            except asyncio.CancelledError:
-                continue
-        if not task.done():
-            _cleanup_late_video_save(task, manager, key)
-        elif not task.cancelled():
-            task.exception()  # Retrieve errors; the cancelled job cleans up below.
-        raise
+        try:
+            await STORAGE_MANAGER.delete(key)
+        except Exception:
+            logger.warning("Failed to cleanup partial video artifact '%s'", key)
 
 
 def _cleanup_video_references(
@@ -529,12 +457,17 @@ async def _run_video_generation_job(
     upload_resources: VideoUploadResources | None = None,
     latent_edit_input: LatentEditInput | None = None,
 ) -> None:
+    job = await VIDEO_STORE.get(video_id)
+    if job is None:
+        logger.warning("Video job %s missing before generation task started; skipping", video_id)
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        if upload_resources is not None:
+            upload_resources.cleanup()
+        _cleanup_timeline_guides(request)
+        return
+
     started_at = time.perf_counter()
     try:
-        job = await VIDEO_STORE.get(video_id)
-        if job is None:
-            logger.warning("Video job %s missing before generation task started; skipping", video_id)
-            return
 
         async def _mark_started() -> None:
             await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
@@ -557,10 +490,9 @@ async def _run_video_generation_job(
                 **result.lidar_metadata,
             )
 
-        cancel_grace_s = _VIDEO_SAVE_CANCEL_GRACE_S if lidar is not None else 0.0
-        save_context = await _save_video_artifact(video_bytes, video_id, cancel_grace_s=cancel_grace_s)
+        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
         if lidar is not None:
-            await _save_video_artifact(result.lidar_bytes, _lidar_storage_key(video_id), cancel_grace_s=cancel_grace_s)
+            await STORAGE_MANAGER.save(result.lidar_bytes, _lidar_storage_key(video_id))
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
         updated_fields = {
@@ -613,10 +545,8 @@ async def _run_video_generation_job(
             },
         )
     except asyncio.CancelledError:
-        try:
-            await _cleanup_video(video_id)
-        finally:
-            await VIDEO_STORE.pop(video_id)
+        await _cleanup_video(video_id)
+        await VIDEO_STORE.pop(video_id)
         raise
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
@@ -1298,7 +1228,7 @@ async def _parse_video_form(
         audio_noise_mask=parsed_audio_noise_mask,
     )
 
-    supports_multiview = bool(getattr(handler, "supports_multiview_reference_inputs", False))
+    supports_multiview = handler.supports_multiview_reference_inputs
     has_indexes = has_multiview_upload_indexes(request.extra_params or {})
     if has_indexes and not supports_multiview:
         raise HTTPException(400, detail="This model does not support multiview uploaded references.")
@@ -1336,8 +1266,6 @@ async def _parse_video_form(
                     raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
                 upload_resources.paths.append(path)
                 if index in lidar_indexes:
-                    from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
-
                     validate_lidar_header(path)
             request.extra_params = resolve_multiview_uploads(request.extra_params or {}, upload_resources.paths)
             return request, handler, effective_model_name, None, None, None, None, upload_resources, None
