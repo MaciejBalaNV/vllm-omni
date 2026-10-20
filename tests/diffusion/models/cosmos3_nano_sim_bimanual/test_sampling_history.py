@@ -26,7 +26,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
-    ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
 
@@ -42,7 +41,6 @@ def methods():
         "_kv_spec_for_geometry",
         "_append_dense_kv",
         "_transformer_forward",
-        "_request_kv_spec",
         "ar_diffusion_request_spec",
         "_validate_bound_kv_geometry",
     }
@@ -54,7 +52,6 @@ def methods():
     namespace = {
         "torch": torch,
         "ARDiffusionKVCacheSpec": ARDiffusionKVCacheSpec,
-        "ARDiffusionRequestKVSpec": ARDiffusionRequestKVSpec,
         "ARDiffusionRequestRejectedError": ARDiffusionRequestRejectedError,
         "resolve_cosmos3_nano_sim_bimanual_geometry": resolve_cosmos3_nano_sim_bimanual_geometry,
         "ARDiffusionKVBranchSpec": ARDiffusionKVBranchSpec,
@@ -156,8 +153,6 @@ def test_full_history_allocation_follows_request(pixels, expected):
     pipe.transformer = Mock(num_hidden_layers=1, num_kv_heads_local=1, head_dim=8)
     pipe._MAIN_BRANCH, pipe._SESSION_CAPACITY = "main", 1
     req = SimpleNamespace(sampling_params=SimpleNamespace(height=32, width=32, num_frames=pixels))
-    spec = pipe.ar_diffusion_request_spec(req)
-    assert spec.kv_spec.window_frames == expected
-    assert spec.geometry_key == ((32, 32), expected)
+    assert pipe.ar_diffusion_request_spec(req).window_frames == expected
     pipe.manifest = replace(pipe.manifest, window_frames=96)
-    assert pipe.ar_diffusion_request_spec(req).kv_spec.window_frames == 96
+    assert pipe.ar_diffusion_request_spec(req).window_frames == 96

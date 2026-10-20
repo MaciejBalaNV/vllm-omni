@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     Cosmos3NanoSimBimanualManifest,
     deploy_option,
     resolve_ar_compile_mode,
+    validate_ar_diffusion_kv_overrides,
     validate_sim_parallel_config,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
@@ -69,7 +70,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
-    ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
@@ -221,6 +221,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         validate_sim_parallel_config(od_config)
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
+        validate_ar_diffusion_kv_overrides(od_config, self.manifest)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "batched")
         self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", True))
         if self.clean_commit_mode not in {"framewise", "batched"}:
@@ -330,26 +331,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         )
 
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        """Return the default-resolution specification for static consumers."""
+        """Return the default-resolution specification that sizes the initial pool."""
 
         geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
         return self._kv_spec_for_geometry(geometry)
 
-    def _request_kv_spec(
-        self, geometry: Cosmos3NanoSimBimanualGeometry, full_history_frames: int = 1
-    ) -> ARDiffusionRequestKVSpec:
-        return ARDiffusionRequestKVSpec(
-            kv_spec=self._kv_spec_for_geometry(geometry, full_history_frames),
-            geometry_key=(geometry.session_key, full_history_frames)
-            if self.manifest.window_frames is None
-            else geometry.session_key,
-        )
-
-    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
-        geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
-        return self._request_kv_spec(geometry)
-
-    def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
+    def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionKVCacheSpec:
         geometry = resolve_cosmos3_nano_sim_bimanual_geometry(request.sampling_params, None, self.resolution_policy)
         frames = 1
         if self.manifest.window_frames is None:
@@ -360,49 +347,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             if pixels <= 0 or (pixels - 1) % factor:
                 raise ValueError(f"Full history requires num_frames = 1 + {factor} * N")
             frames = (pixels - 1) // factor + 1
-        return self._request_kv_spec(geometry, frames)
-
-    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
-        """Yield the largest admitted request after enumerating the policy space."""
-
-        worst = max(
-            self.resolution_policy.iter_valid_geometries(),
-            key=lambda geometry: (geometry.vision_tokens_per_frame, geometry.height * geometry.width),
-        )
-        yield self._request_kv_spec(worst)
-
-    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
-        """Validate runner overrides against immutable model structure at load time."""
-
-        expected = self.ar_diffusion_kv_cache_spec()
-        fields = (
-            "num_layers",
-            "num_kv_heads",
-            "head_size",
-            "frames_per_block",
-            "window_frames",
-            "sink_frames",
-            "reset_at_boundary",
-            "kv_branches",
-            "session_capacity",
-            "cross_attention",
-            "max_model_len",
-            "max_scratch_frames_per_branch",
-            "max_scratch_tokens_per_branch",
-            "model_owned_state_bytes_per_session",
-        )
-        mismatches = {
-            name: (getattr(expected, name), getattr(spec, name))
-            for name in fields
-            if not (name == "window_frames" and self.manifest.window_frames is None)
-            if getattr(expected, name) != getattr(spec, name)
-        }
-        if mismatches:
-            detail = ", ".join(
-                f"{name}=expected {expected_value!r}, got {actual_value!r}"
-                for name, (expected_value, actual_value) in mismatches.items()
-            )
-            raise ValueError(f"Cosmos3-Nano-Sim-Bimanual AR-Diffusion structural specification is invalid ({detail}).")
+        return self._kv_spec_for_geometry(geometry, frames)
 
     def _validate_bound_kv_geometry(
         self,
