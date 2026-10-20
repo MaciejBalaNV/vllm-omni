@@ -4205,6 +4205,61 @@ def test_multiview_uploads_reject_invalid_lidar_condition_reference(lidar, paths
         resolve_multiview_uploads(extra, upload_paths)
 
 
+def test_admit_multiview_uploads_persists_checks_lidar_and_resolves(tmp_path) -> None:
+    import asyncio
+
+    from safetensors.torch import save_file
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    lidar_path = tmp_path / "hdmap.safetensors"
+    save_file({"frames": torch.zeros(3, 2, 128, 1800)}, str(lidar_path))
+    paths = {0: str(tmp_path / "front.mp4"), 1: str(lidar_path)}
+    calls: list[tuple[int, bool]] = []
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        calls.append((index, numeric_lidar))
+        return paths[index]
+
+    resolved = asyncio.run(
+        admit_multiview_uploads(
+            _uploaded_joint_manifest(return_output=True), negative_prompt=None, num_uploads=2, persist=persist
+        )
+    )
+
+    assert calls == [(0, False), (1, True)]
+    assert resolved["multiview"]["views"][0]["control_path"] == paths[0]
+    assert resolved["lidar"] == {"control_path": paths[1], "return_output": True}
+
+
+def test_admit_multiview_uploads_rejects_before_and_after_persisting(tmp_path) -> None:
+    import asyncio
+
+    from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads
+
+    persisted: list[int] = []
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        persisted.append(index)
+        path = tmp_path / f"upload{index}{'.safetensors' if numeric_lidar else '.mp4'}"
+        path.write_bytes(b"not a safetensors header")
+        return str(path)
+
+    with pytest.raises(ValueError, match="does not support request.negative_prompt"):
+        asyncio.run(
+            admit_multiview_uploads(
+                _uploaded_joint_manifest(), negative_prompt="Blurry.", num_uploads=2, persist=persist
+            )
+        )
+    assert persisted == []  # rejected before any upload is written
+
+    with pytest.raises(ValueError, match="Invalid LiDAR safetensors input"):
+        asyncio.run(
+            admit_multiview_uploads(_uploaded_joint_manifest(), negative_prompt=None, num_uploads=2, persist=persist)
+        )
+    assert persisted == [0, 1]  # the caller still owns every persisted file
+
+
 @pytest.mark.parametrize("fail", [False, True])
 def test_diffuse_transfer_releases_unipc_history_on_completion_or_failure(make_cosmos3_pipeline, fail) -> None:
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler

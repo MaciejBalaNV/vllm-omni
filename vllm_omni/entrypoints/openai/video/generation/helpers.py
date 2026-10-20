@@ -76,13 +76,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_input_reference,
 )
 from vllm_omni.errors import OmniClientError
-from vllm_omni.model_extras.cosmos3 import (
-    has_multiview_upload_indexes,
-    multiview_lidar_upload_indexes,
-    reject_multiview_negative_fields,
-    resolve_multiview_uploads,
-)
-from vllm_omni.model_extras.cosmos3_lidar import validate_lidar_header
+from vllm_omni.model_extras.cosmos3 import admit_multiview_uploads, has_multiview_upload_indexes
 
 logger = init_logger(__name__)
 
@@ -689,6 +683,42 @@ def _control_upload_suffix(upload: UploadFile, *, numeric_lidar: bool = False) -
     return suffix
 
 
+async def _admit_multiview_uploads(
+    request: VideoGenerationRequest,
+    input_references: list[UploadFile],
+    upload_resources: VideoUploadResources,
+) -> None:
+    """Persist multiview ``input_references`` and rewrite manifest indexes to their paths.
+
+    The model-specific manifest rules live in ``admit_multiview_uploads``; this
+    wrapper only supplies HTTP upload persistence and error mapping.
+    """
+
+    async def persist(index: int, numeric_lidar: bool) -> str:
+        try:
+            path = await _persist_uploaded_control_reference(
+                input_references[index], max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=numeric_lidar
+            )
+        except HTTPException as exc:
+            raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
+        upload_resources.paths.append(path)
+        return path
+
+    try:
+        request.extra_params = await admit_multiview_uploads(
+            request.extra_params,
+            negative_prompt=request.negative_prompt,
+            num_uploads=len(input_references),
+            persist=persist,
+        )
+    except (TypeError, ValueError) as exc:
+        upload_resources.cleanup()
+        raise HTTPException(400, detail=str(exc)) from exc
+    except BaseException:
+        upload_resources.cleanup()
+        raise
+
+
 def _validate_control_upload(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -1221,36 +1251,8 @@ async def _parse_video_form(
             )
         ):
             raise HTTPException(400, detail="Multiview uploads cannot be combined with generic reference fields.")
-        try:
-            reject_multiview_negative_fields({"negative_prompt": request.negative_prompt}, "request")
-            # Validate all camera/role mappings and media kinds before creating files.
-            # The LiDAR control and the measured LiDAR condition are numeric uploads.
-            lidar_indexes = multiview_lidar_upload_indexes(request.extra_params or {})
-            resolve_multiview_uploads(
-                request.extra_params or {},
-                [
-                    "reference" + _control_upload_suffix(upload, numeric_lidar=index in lidar_indexes)
-                    for index, upload in enumerate(input_references)
-                ],
-            )
-            for index, upload in enumerate(input_references):
-                try:
-                    path = await _persist_uploaded_control_reference(
-                        upload, max_bytes=CONTROL_REFERENCE_MAX_BYTES, numeric_lidar=index in lidar_indexes
-                    )
-                except HTTPException as exc:
-                    raise HTTPException(exc.status_code, detail=f"input_references[{index}]: {exc.detail}") from exc
-                upload_resources.paths.append(path)
-                if index in lidar_indexes:
-                    validate_lidar_header(path)
-            request.extra_params = resolve_multiview_uploads(request.extra_params or {}, upload_resources.paths)
-            return request, handler, effective_model_name, None, None, None, None, upload_resources, None
-        except (TypeError, ValueError) as exc:
-            upload_resources.cleanup()
-            raise HTTPException(400, detail=str(exc)) from exc
-        except BaseException:
-            upload_resources.cleanup()
-            raise
+        await _admit_multiview_uploads(request, input_references, upload_resources)
+        return request, handler, effective_model_name, None, None, None, None, upload_resources, None
 
     normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
     if normalized_control_type is not None:
