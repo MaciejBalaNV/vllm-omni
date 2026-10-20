@@ -46,7 +46,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
 | `/v1/videos` | `GET` | List stored video jobs |
-| `/v1/videos/{video_id}/content` | `GET` | Download generated video content |
+| `/v1/videos/{video_id}/content` | `GET` | Download generated content; `variant=video` (default) returns the MP4, `variant=lidar` returns a job's numeric LiDAR file when its record carries a `lidar` descriptor |
 | `/v1/videos/{video_id}` | `DELETE` | Delete a video job and stored output |
 
 ### Request Parameters

@@ -2837,6 +2837,61 @@ def test_download_completed_job_uses_storage_open_and_download_name(test_client,
     assert file_name in response.headers["content-disposition"]
 
 
+def test_download_variant_serves_lidar_sidecar_and_delete_removes_it(
+    test_client, isolated_video_backends, mocker: MockerFixture
+):
+    _store, _tasks, storage = isolated_video_backends
+    lidar_metadata = {
+        "shape": [3, 2, 128, 1800],
+        "fps": 10.0,
+        "num_frames": 2,
+        "channels": ["range", "intensity", "validity"],
+        "units": ["metres", "unit", "binary"],
+        "apply_validity_mask": True,
+        "validity_threshold": 0.5,
+        "range_projection": {"min_range_m": 0.0, "max_range_m": 80.0},
+    }
+    mocker.patch.object(
+        OmniOpenAIServingVideo,
+        "generate_video_bytes",
+        return_value=EncodedVideoResult(
+            video_bytes=b"mp4",
+            stage_durations={},
+            peak_memory_mb=0.0,
+            lidar_bytes=b"LIDAR",
+            lidar_metadata=lidar_metadata,
+        ),
+    )
+
+    video_id = test_client.post("/v1/videos", data={"prompt": "Joint drive."}).json()["id"]
+    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert final["lidar"]["url"] == f"/v1/videos/{video_id}/content?variant=lidar"
+    assert final["lidar"]["file_name"] == f"{video_id}.lidar.safetensors"
+
+    lidar = test_client.get(final["lidar"]["url"])
+    assert lidar.status_code == 200
+    assert lidar.content == b"LIDAR"
+    assert lidar.headers["content-type"] == "application/octet-stream"
+    assert final["lidar"]["file_name"] in lidar.headers["content-disposition"]
+    assert test_client.get(f"/v1/videos/{video_id}/content").content == b"mp4"
+    assert test_client.get(f"/v1/videos/{video_id}/content?variant=thumbnail").status_code == 422
+
+    assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+    assert not os.path.exists(os.path.join(storage.storage_path, video_id))
+    assert not os.path.exists(os.path.join(storage.storage_path, f"{video_id}.lidar.safetensors"))
+
+
+def test_download_lidar_variant_requires_lidar_output(test_client, mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"mp4")
+    video_id = test_client.post("/v1/videos", data={"prompt": "Camera only."}).json()["id"]
+    final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert final["lidar"] is None
+
+    response = test_client.get(f"/v1/videos/{video_id}/content?variant=lidar")
+    assert response.status_code == 404
+    assert "no LiDAR output" in response.json()["detail"]
+
+
 def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler

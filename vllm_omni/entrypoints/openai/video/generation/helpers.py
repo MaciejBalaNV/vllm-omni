@@ -455,7 +455,7 @@ async def _run_video_generation_job(
         lidar = None
         if result.lidar_bytes is not None:
             lidar = VideoLidarArtifact(
-                url=f"/v1/videos/{video_id}/lidar",
+                url=f"/v1/videos/{video_id}/content?variant=lidar",
                 file_name=_lidar_storage_key(video_id),
                 **result.lidar_metadata,
             )

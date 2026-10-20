@@ -3003,19 +3003,20 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
 
 
 @router.get("/v1/videos/{video_id}/content", dependencies=[Depends(_require_single_api_video_store)])
-async def download_video(video_id: str) -> Response:
-    """Download the generated file for a completed video job.
+async def download_video(video_id: str, variant: Literal["video", "lidar"] = "video") -> Response:
+    """Download a generated file for a completed video job.
 
     Args:
         video_id: Identifier of the video job whose output should be returned.
+        variant: Which downloadable asset to return. ``video`` (default) is the
+            MP4; ``lidar`` is the numeric LiDAR file of a joint generation job.
 
     Returns:
-        A ``FileResponse`` streaming the generated video file from local
-        storage.
+        A ``FileResponse`` streaming the requested file from local storage.
 
     Raises:
-        HTTPException: If the job does not exist, is still in progress, or the
-        generated file is missing from disk.
+        HTTPException: If the job does not exist, failed, is still in progress,
+        has no asset of that variant, or the file is missing from disk.
     """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
@@ -3023,42 +3024,25 @@ async def download_video(video_id: str) -> Response:
 
     if job.status == VideoGenerationStatus.FAILED:
         raise HTTPException(status_code=422, detail="Video generation failed. Check job status for error details.")
-    if not job.file_name:
+    if job.status != VideoGenerationStatus.COMPLETED:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
-    file_handle = await STORAGE_MANAGER.open(video_id)
-    if file_handle is None:
-        raise HTTPException(status_code=404, detail="Generated video file not found on disk")
-
-    file_name = job.file_name or f"{video_id}.{job.file_extension}"
-    if isinstance(file_handle, FileStorageHandle):
-        response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
+    if variant == "lidar":
+        if job.lidar is None:
+            raise HTTPException(status_code=404, detail="This job has no LiDAR output")
+        storage_key, media_type, file_name = _lidar_storage_key(video_id), job.lidar.media_type, job.lidar.file_name
     else:
+        storage_key, media_type = video_id, job.media_type
+        file_name = job.file_name or f"{video_id}.{job.file_extension}"
+
+    file_handle = await STORAGE_MANAGER.open(storage_key)
+    if file_handle is None:
+        raise HTTPException(status_code=404, detail=f"Generated {variant} file not found on disk")
+    if not isinstance(file_handle, FileStorageHandle):
         raise HTTPException(
             status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
         )
-
-    return response
-
-
-@router.get("/v1/videos/{video_id}/lidar", dependencies=[Depends(_require_single_api_video_store)])
-async def download_video_lidar(video_id: str) -> Response:
-    """Download numeric LiDAR for a completed joint generation job."""
-    job = await VIDEO_STORE.get(video_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Video not found")
-    if job.status == VideoGenerationStatus.FAILED:
-        raise HTTPException(status_code=422, detail="Video generation failed. Check job status for error details.")
-    if job.status != VideoGenerationStatus.COMPLETED:
-        raise HTTPException(status_code=404, detail="Generation is still in-progress")
-    if job.lidar is None:
-        raise HTTPException(status_code=404, detail="This job has no LiDAR output")
-    handle = await STORAGE_MANAGER.open(_lidar_storage_key(video_id))
-    if handle is None:
-        raise HTTPException(status_code=404, detail="Generated LiDAR file not found on disk")
-    if not isinstance(handle, FileStorageHandle):
-        raise HTTPException(status_code=500, detail="Unsupported LiDAR storage handle")
-    return FileResponse(path=handle.path, media_type=job.lidar.media_type, filename=job.lidar.file_name)
+    return FileResponse(path=file_handle.path, media_type=media_type, filename=file_name)
 
 
 @profiler_router.post("/start_profile")

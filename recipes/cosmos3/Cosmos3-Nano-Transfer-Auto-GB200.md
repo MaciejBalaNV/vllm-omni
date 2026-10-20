@@ -309,8 +309,8 @@ index.
 
 `/content` returns one camera-major MP4. For joint jobs with
 `lidar.return_output: true`, the completed job carries a `lidar` descriptor and
-`GET /v1/videos/{video_id}/lidar` returns the numeric file. LiDAR output requires the
-asynchronous endpoint; `/v1/videos/sync` rejects it.
+`GET /v1/videos/{video_id}/content?variant=lidar` returns the numeric file. LiDAR
+output requires the asynchronous endpoint; `/v1/videos/sync` rejects it.
 
 ## Verification
 
