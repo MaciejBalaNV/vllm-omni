@@ -195,10 +195,8 @@ from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
     VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
-    VideoUploadResources,
-    _cleanup_timeline_guides,
+    VideoRequestResources,
     _cleanup_video,
-    _cleanup_video_references,
     _lidar_storage_key,
     _parse_video_form,
     _run_video_generation_job,
@@ -2711,8 +2709,7 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
-        VideoUploadResources,
+        VideoRequestResources,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -2728,15 +2725,9 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
-        upload_resources,
+        resources,
         latent_edit_input,
     ) = ctx
-
-    def _cleanup_request_resources() -> None:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
-        upload_resources.cleanup()
-        _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
@@ -2751,21 +2742,20 @@ async def create_video(
                 reference_image,
                 reference_video,
                 reference_audio,
-                control_path,
+                resources=resources,
                 app_state=raw_request.app.state,
-                upload_resources=upload_resources,
                 latent_edit_input=latent_edit_input,
             )
         )
         # A task cancelled before its first step never enters its finally block.
-        task.add_done_callback(lambda _: _cleanup_request_resources())
+        task.add_done_callback(lambda _: resources.cleanup())
         await VIDEO_TASKS.upsert(ref.id, task)
     except BaseException:
         if task is not None:
             task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await task
-        _cleanup_request_resources()
+        resources.cleanup()
         if ref is not None:
             await VIDEO_STORE.pop(ref.id)
         raise
@@ -2790,8 +2780,7 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
-        VideoUploadResources,
+        VideoRequestResources,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
@@ -2811,8 +2800,7 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
-        upload_resources,
+        resources,
         latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
@@ -2850,9 +2838,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
-        upload_resources.cleanup()
-        _cleanup_timeline_guides(request)
+        resources.cleanup()
     inference_time_s = time.perf_counter() - started_at
 
     return Response(

@@ -2994,7 +2994,9 @@ def test_create_video_rolls_back_job_when_task_registration_fails(test_client, m
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler
     cleanups = []
-    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    monkeypatch.setattr(
+        video_generation_helpers.VideoRequestResources, "cleanup", lambda resources: cleanups.append(resources)
+    )
 
     async def failing_upsert(video_id, task):
         del video_id, task
@@ -3014,7 +3016,9 @@ def test_create_video_cleans_references_when_task_cancelled_before_start(test_cl
     handler = BlockingVideoHandler()
     test_client.app.state.openai_serving_video = handler
     cleanups = []
-    monkeypatch.setattr(api_server, "_cleanup_video_references", lambda *args: cleanups.append(args))
+    monkeypatch.setattr(
+        video_generation_helpers.VideoRequestResources, "cleanup", lambda resources: cleanups.append(resources)
+    )
     original_upsert = api_server.VIDEO_TASKS.upsert
 
     async def cancelling_upsert(video_id, task):

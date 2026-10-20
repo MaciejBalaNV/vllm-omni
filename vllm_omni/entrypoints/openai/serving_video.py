@@ -95,7 +95,6 @@ class ReferenceVideo:
     """Reference video frames for video-conditioned generation."""
 
     data: list[Image.Image] | list[str]
-    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -103,7 +102,6 @@ class ReferenceAudio:
     """Reference audio file path for speech-to-video generation."""
 
     path: str | list[str]
-    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -114,15 +112,13 @@ class LatentEditInput:
     source_audio: str | None = None
     video_noise_mask: Any | None = None
     audio_noise_mask: Any | None = None
-    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
 class TimelineGuideInput:
-    """Resolved timeline guides and the request-owned files they reference."""
+    """Resolved timeline guides forwarded as ``multi_modal_data["timeline_guides"]``."""
 
     guides: list[dict[str, Any]]
-    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
