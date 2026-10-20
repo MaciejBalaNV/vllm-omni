@@ -101,6 +101,13 @@ def test_multiview_contract_rejects_ignored_defaults(field: str) -> None:
         _validate_multiview_contract(contract)
 
 
+def test_multiview_contract_rejects_non_mads_camera() -> None:
+    contract = multiview_contract()
+    contract["cameras"][0] = "camera_unknown"
+    with pytest.raises(ValueError, match=r"must be MADS cameras; unknown: \['camera_unknown'\]"):
+        _validate_multiview_contract(contract)
+
+
 def test_multiview_contract_accepts_camera_only_rig() -> None:
     contract = multiview_contract()
     del contract["lidar"]

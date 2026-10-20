@@ -3673,11 +3673,15 @@ def test_multiview_rig_view_captions_list_request_cameras_in_order() -> None:
         format_rig_view_captions(["only one"], ["camera_rear_right_70fov", "camera_front_tele_30fov"])
 
 
-def test_multiview_rig_view_attributes_cover_every_mads_camera() -> None:
-    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import MADS_CAMERA_ATTRIBUTES
-    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+def test_multiview_control_emphasis_selects_joint_or_single_hint_directive() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import (
+        COSMOS3_AV_JOINT_CONTROL_DIRECTIVE,
+        control_emphasis,
+    )
+    from vllm_omni.diffusion.models.cosmos3.utils import COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE
 
-    assert tuple(MADS_CAMERA_ATTRIBUTES) == COSMOS3_MADS_CAMERAS
+    assert control_emphasis("wsm", joint=True) == COSMOS3_AV_JOINT_CONTROL_DIRECTIVE
+    assert control_emphasis("wsm", joint=False) == COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names="wsm")
 
 
 @pytest.mark.parametrize(("truncate", "expected"), [(False, "6.7"), (True, "6.0")])

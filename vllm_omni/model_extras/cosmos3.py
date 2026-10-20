@@ -127,19 +127,78 @@ def normalize_multiview_aspect_ratio(value: Any) -> str:
     )
 
 
-COSMOS3_MADS_CAMERAS = (
-    "camera_front_wide_120fov",
-    "camera_cross_right_120fov",
-    "camera_rear_right_70fov",
-    "camera_rear_tele_30fov",
-    "camera_rear_left_70fov",
-    "camera_cross_left_120fov",
-    "camera_front_tele_30fov",
-    "camera_front_fisheye_200fov",
-    "camera_left_fisheye_200fov",
-    "camera_right_fisheye_200fov",
-    "camera_rear_fisheye_200fov",
-)
+# The MADS rig, verbatim from the reference camera attributes.
+# Per-view caption headers quote these values, so a drifted copy still produces
+# well-formed captions that describe the wrong rig.
+COSMOS3_MADS_CAMERA_ATTRIBUTES: dict[str, dict[str, str | int]] = {
+    "camera_front_wide_120fov": {
+        "camera_role": "front",
+        "camera_type": "wide",
+        "facing": "forward",
+        "fov_degrees": 120,
+    },
+    "camera_cross_right_120fov": {
+        "camera_role": "right_side",
+        "camera_type": "wide",
+        "facing": "right",
+        "fov_degrees": 120,
+    },
+    "camera_rear_right_70fov": {
+        "camera_role": "rear_right",
+        "camera_type": "standard",
+        "facing": "rear_right",
+        "fov_degrees": 70,
+    },
+    "camera_rear_tele_30fov": {
+        "camera_role": "rear",
+        "camera_type": "telephoto",
+        "facing": "backward",
+        "fov_degrees": 30,
+    },
+    "camera_rear_left_70fov": {
+        "camera_role": "rear_left",
+        "camera_type": "standard",
+        "facing": "rear_left",
+        "fov_degrees": 70,
+    },
+    "camera_cross_left_120fov": {
+        "camera_role": "left_side",
+        "camera_type": "wide",
+        "facing": "left",
+        "fov_degrees": 120,
+    },
+    "camera_front_tele_30fov": {
+        "camera_role": "front",
+        "camera_type": "telephoto",
+        "facing": "forward",
+        "fov_degrees": 30,
+    },
+    "camera_front_fisheye_200fov": {
+        "camera_role": "front",
+        "camera_type": "fisheye",
+        "facing": "forward",
+        "fov_degrees": 200,
+    },
+    "camera_left_fisheye_200fov": {
+        "camera_role": "left_side",
+        "camera_type": "fisheye",
+        "facing": "left",
+        "fov_degrees": 200,
+    },
+    "camera_right_fisheye_200fov": {
+        "camera_role": "right_side",
+        "camera_type": "fisheye",
+        "facing": "right",
+        "fov_degrees": 200,
+    },
+    "camera_rear_fisheye_200fov": {
+        "camera_role": "rear",
+        "camera_type": "fisheye",
+        "facing": "backward",
+        "fov_degrees": 200,
+    },
+}
+COSMOS3_MADS_CAMERAS = tuple(COSMOS3_MADS_CAMERA_ATTRIBUTES)
 # Control and vision per camera, plus the LiDAR control and measured LiDAR condition.
 MULTIVIEW_MAX_UPLOADS = 2 * len(COSMOS3_MADS_CAMERAS) + 2
 # LiDAR upload index field -> the path field it resolves to.
