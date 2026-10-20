@@ -5,10 +5,9 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
 from test_action_schema import manifest
 
-from tests.diffusion.models.cosmos3_nano_sim_bimanual.reference_attention import append_dense_kv_history
+from tests.diffusion.models.cosmos3_nano_sim_bimanual.test_frame_causal_attention import make_state, publish
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     COSMOS3_NANO_SIM_BIMANUAL_ARTIFACT_FIELDS,
     Cosmos3NanoSimBimanualManifest,
@@ -45,19 +44,18 @@ def test_override_preserves_checkpoint_and_separates_sessions(cache_size, sinks)
 
 def test_retained_history_matches_reference_frame_indices():
     effective = Cosmos3NanoSimBimanualManifest.from_od_config(config(kv_cache_inference_size=64, attention_sink_size=8))
-    history = None
-    for frame in range(226):
-        expected = list(range(min(frame, 8))) + list(range(max(8, frame - 55), frame))
-        if history is not None:
-            assert history[0][0].flatten().tolist() == expected
-        value = torch.tensor([[[frame]]])
-        history = append_dense_kv_history(
-            history,
-            [(value, value)],
-            tokens_per_frame=1,
-            sink_frames=effective.sink_frames,
-            window_frames=effective.window_frames,
-        )
+    state = make_state(page=1, window=effective.window_frames, sink=effective.sink_frames)
+    try:
+        for frame in range(226):
+            ctx = state.get_kv_caches("main", 1)[0].forward_ctx
+            pages, _ = ctx.video_block_table()
+            history = [
+                int(state.kv_cache.key_cache(0)[p, 0, 0, 0]) for p in pages if p not in ctx.current_video_block_ids
+            ]
+            assert history == list(range(min(frame, 8))) + list(range(max(8, frame - 55), frame))
+            publish(state, [frame])
+    finally:
+        state.close()
 
 
 @pytest.mark.parametrize(

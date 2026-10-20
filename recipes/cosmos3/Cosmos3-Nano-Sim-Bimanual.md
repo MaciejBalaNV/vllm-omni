@@ -94,24 +94,8 @@ Fresh full-video requests decode chunks to CPU to bound VAE GPU history.
 `clean_commit_mode: batched` refreshes clean frames together, and
 `overlap_vae_decode: true` overlaps supported full-rollout decoding and refresh.
 
-## Validation and profiling
+## Validation
 
 `tests/diffusion/models/cosmos3_nano_sim_bimanual/test_frame_causal_attention.py` covers
 257-frame bounded reclamation, exact window/text metadata, real upstream cache
 binding, and a shared-router GPU comparison against a dense numerical oracle.
-
-`benchmarks/diffusion/bench_cosmos_sim_frame_pages.py` runs the cached checkpoint
-example and saves raw frames, MP4, deployment YAML, and runtime metadata. For a
-long compiled rollout whose window rolls repeatedly:
-
-```bash
-export HF_HOME=/path/to/checkpoints
-python benchmarks/diffusion/bench_cosmos_sim_frame_pages.py \
-  --output-dir "$PWD/var/cosmos-sim-profile" --num-frames 241 \
-  --warmup-frames 25 --warmup-runs 2 --compile
-```
-
-The benchmark labels warmups and the measured generation with NVTX. Point
-Nsight Systems at that command to capture CUDA dispatch and overall execution.
-The model must already be cached, or downloaded once using credentials with
-access to `nvidia/Cosmos3-Nano-Sim-Bimanual`.

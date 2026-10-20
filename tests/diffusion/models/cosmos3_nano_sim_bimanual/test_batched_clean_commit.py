@@ -10,14 +10,11 @@ import pytest
 import torch
 from torch import nn
 
-from tests.diffusion.models.cosmos3_nano_sim_bimanual.reference_attention import (
-    ReferenceJointAttention,
-    append_dense_kv_history,
-)
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_causal_attention import FrameCausalAttentionState
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualGenDecoderLayer,
+    Cosmos3NanoSimBimanualJointAttention,
     Cosmos3NanoSimBimanualTransformer,
 )
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
@@ -34,13 +31,12 @@ def cpu_attention_oracle(monkeypatch, request):
         return
     from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual import transformer_cosmos3_nano_sim_bimanual as module
 
-    def oracle(inputs, q, k, v, tk, tv, scale, **kwargs):
+    def oracle(inputs, q, k, v, tk, tv, scale):
         assert q.device.type == "cpu"
         size = inputs.block_size
         for pool, values, text in [(inputs.key_pool, k, tk), (inputs.value_pool, v, tv)]:
-            flat = pool
-            flat.index_copy_(0, inputs.video_slots, values)
-            flat.index_copy_(0, inputs.action_slots, text)
+            pool.index_copy_(0, inputs.video_slots, values)
+            pool.index_copy_(0, inputs.action_slots, text)
         result = []
         for row, length in enumerate(inputs.seq_lens.tolist()):
             pages = inputs.block_table[row, : (length + size - 1) // size].long()
@@ -61,18 +57,11 @@ def cpu_attention_oracle(monkeypatch, request):
     monkeypatch.setattr(module, "paged_write_attn", oracle)
 
 
-class DenseAttention(nn.Module):
-    def forward(self, q, k, v):
-        return torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), enable_gqa=True
-        ).transpose(1, 2)
-
-
 def layers(device, dtype):
     """Use production forward methods with small weights; no distributed init."""
     result = nn.ModuleList()
     for _ in range(LAYERS):
-        attn = ReferenceJointAttention.__new__(ReferenceJointAttention)
+        attn = Cosmos3NanoSimBimanualJointAttention.__new__(Cosmos3NanoSimBimanualJointAttention)
         nn.Module.__init__(attn)
         attn.num_heads_local, attn.num_kv_heads_local, attn.head_dim = 4, 2, HEAD
         attn.qk_norm = True
@@ -80,7 +69,6 @@ def layers(device, dtype):
         attn.to_out = nn.Linear(4 * HEAD, WIDTH, bias=False)
         attn.norm_q, attn.norm_k = nn.RMSNorm(HEAD), nn.RMSNorm(HEAD)
         attn.norm_q.variance_epsilon = attn.norm_k.variance_epsilon = 1e-6
-        attn.attn = DenseAttention()
         layer = Cosmos3NanoSimBimanualGenDecoderLayer.__new__(Cosmos3NanoSimBimanualGenDecoderLayer)
         nn.Module.__init__(layer)
         layer.cross_attention = attn
@@ -113,70 +101,34 @@ def state(device, dtype, window, sink, page_size=None):
 
 
 @torch.no_grad()
-def run_forward(
-    net,
-    h,
-    text,
-    start,
-    *,
-    paged=None,
-    dense=None,
-    batched=False,
-    window=5,
-    sink=0,
-    commit=True,
-):
+def run_forward(net, h, text, start, *, paged, batched=False, window=5, sink=0, commit=True):
     frames = h.shape[1] // BLOCK
     nulls = tuple(i for i in range(frames) if (start + i) % 3 == 0)
     positions = torch.arange(start * BLOCK, (start + frames) * BLOCK, device=h.device).float()
     phases = positions.view(1, -1, 1, 1) * torch.arange(1, HEAD + 1, device=h.device).view(1, 1, 1, -1) * 0.001
     cos, sin = phases.cos().to(h.dtype), phases.sin().to(h.dtype)
-    contexts = None
-    if paged is not None:
-        contexts = paged.get_kv_caches(
-            "main",
-            seq_len=frames * BLOCK,
-            commit_current=commit,
-            extra_visible_tokens=BLOCK if batched else frames * BLOCK,
-            frame_causal=batched,
-        )
-        contexts[0].forward_ctx.prepare(device=h.device, action_len=text[0][0].shape[1], query_len=h.shape[1])
-    current = []
+    contexts = paged.get_kv_caches("main", frames * BLOCK, commit_current=commit, frame_causal=batched)
+    contexts[0].forward_ctx.prepare(device=h.device, action_len=text[0][0].shape[1], query_len=h.shape[1])
     for index, layer in enumerate(net):
-        h, k, v = layer(
+        h, _, _ = layer(
             h,
             text_k=text[index][0],
             text_v=text[index][1],
             real_text_kv_len=text[index][0].shape[1],
             freqs_cos=cos,
             freqs_sin=sin,
-            dense_history=None if dense is None else dense[index],
-            paged_context=None if contexts is None else contexts[index].to_layer_inputs(),
+            paged_context=contexts[index].to_layer_inputs(),
             num_frames=frames,
             tokens_per_frame=BLOCK,
             action_tokens_per_frame=2,
             null_action_frame_indexes=nulls,
             clean_history_window=(sink, window) if batched else None,
         )
-        current.append((k, v))
-    if paged is not None:
-        paged.commit_paged_context("main")
-    elif commit:
-        for offset in range(frames):
-            dense = append_dense_kv_history(
-                dense,
-                [
-                    (k[:, offset * BLOCK : (offset + 1) * BLOCK], v[:, offset * BLOCK : (offset + 1) * BLOCK])
-                    for k, v in current
-                ],
-                tokens_per_frame=BLOCK,
-                sink_frames=sink,
-                window_frames=window,
-            )
-    return h, dense
+    paged.commit_paged_context("main")
+    return h
 
 
-def compare(*, device, dtype, history, window, sink, frames, paged, page_size=None):
+def compare(*, device, dtype, history, window, sink, frames, page_size=None):
     torch.manual_seed(123)
     net = layers(device, dtype)
     text = [
@@ -184,75 +136,55 @@ def compare(*, device, dtype, history, window, sink, frames, paged, page_size=No
         for _ in net
     ]
     inputs = torch.randn(1, (history + frames + 1) * BLOCK, WIDTH, device=device, dtype=dtype)
-    a, b = (
-        (state(device, dtype, window, sink, page_size), state(device, dtype, window, sink, page_size))
-        if paged
-        else (None, None)
-    )
-    da = db = None
+    a, b = [state(device, dtype, window, sink, page_size) for _ in range(2)]
     tolerance = 5e-2 if dtype == torch.bfloat16 else 2e-5
     try:
         for i in range(history):
             x = inputs[:, i * BLOCK : (i + 1) * BLOCK]
-            _, da = run_forward(net, x, text, i, paged=a, dense=da, window=window, sink=sink)
-            _, db = run_forward(net, x, text, i, paged=b, dense=db, window=window, sink=sink)
-        sequential = []
-        for i in range(history, history + frames):
-            output, da = run_forward(
-                net, inputs[:, i * BLOCK : (i + 1) * BLOCK], text, i, paged=a, dense=da, window=window, sink=sink
-            )
-            sequential.append(output)
-        actual, db = run_forward(
+            for cache in (a, b):
+                run_forward(net, x, text, i, paged=cache, window=window, sink=sink)
+        sequential = [
+            run_forward(net, inputs[:, i * BLOCK : (i + 1) * BLOCK], text, i, paged=a, window=window, sink=sink)
+            for i in range(history, history + frames)
+        ]
+        actual = run_forward(
             net,
             inputs[:, history * BLOCK : (history + frames) * BLOCK],
             text,
             history,
             paged=b,
-            dense=db,
             batched=True,
             window=window,
             sink=sink,
         )
         torch.testing.assert_close(actual, torch.cat(sequential, dim=1), atol=tolerance, rtol=tolerance)
-        if paged:
-            assert a is not None and b is not None
-            assert a.adapter("main").completed_chunks == b.adapter("main").completed_chunks == history + frames
-            for layer in range(LAYERS):
-                ia = a.kv_cache.window_block_ids(a.adapter("main"))
-                ib = b.kv_cache.window_block_ids(b.adapter("main"))
-                assert len(ia) == len(ib)
-                for accessor in ("key_cache", "value_cache"):
-                    ka = getattr(a.kv_cache, accessor)(layer)[ia].flatten(0, 1)
-                    kb = getattr(b.kv_cache, accessor)(layer)[ib].flatten(0, 1)
-                    tail = a.adapter("main").num_computed_tokens % a.kv_cache.block_size
-                    if tail:
-                        padding = a.kv_cache.block_size - tail
-                        ka, kb = ka[:-padding], kb[:-padding]
-                    torch.testing.assert_close(ka, kb, atol=tolerance, rtol=tolerance)
-        else:
-            assert da is not None and db is not None
-            for pair_a, pair_b in zip(da, db, strict=True):
-                for ka, kb in zip(pair_a, pair_b, strict=True):
-                    torch.testing.assert_close(ka, kb, atol=tolerance, rtol=tolerance)
+        assert a.adapter("main").completed_chunks == b.adapter("main").completed_chunks == history + frames
+        ia, ib = [cache.kv_cache.window_block_ids(cache.adapter("main")) for cache in (a, b)]
+        assert len(ia) == len(ib)
+        for layer in range(LAYERS):
+            for accessor in ("key_cache", "value_cache"):
+                ka = getattr(a.kv_cache, accessor)(layer)[ia]
+                kb = getattr(b.kv_cache, accessor)(layer)[ib]
+                torch.testing.assert_close(ka, kb, atol=tolerance, rtol=tolerance)
         # The next denoising call consumes the newly committed history.
-        x = inputs[:, -BLOCK:]
-        oa, _ = run_forward(net, x, text, history + frames, paged=a, dense=da, window=window, sink=sink, commit=False)
-        ob, _ = run_forward(net, x, text, history + frames, paged=b, dense=db, window=window, sink=sink, commit=False)
-        torch.testing.assert_close(oa, ob, atol=tolerance, rtol=tolerance)
+        outputs = [
+            run_forward(
+                net, inputs[:, -BLOCK:], text, history + frames, paged=cache, window=window, sink=sink, commit=False
+            )
+            for cache in (a, b)
+        ]
+        torch.testing.assert_close(*outputs, atol=tolerance, rtol=tolerance)
     finally:
-        if a is not None:
-            a.close()
-        if b is not None:
-            b.close()
+        a.close()
+        b.close()
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("frames", [1, 3, 4])
 @pytest.mark.parametrize(
     "history,window,sink", [(0, 5, 0), (2, 5, 0), (4, 5, 0), (8, 5, 0), (8, 2, 0), (8, 2, 1), (0, 1, 2)]
 )
-def test_batched_clean_cache_matches_sequential_cpu(history, window, sink, frames, paged):
+def test_batched_clean_cache_matches_sequential_cpu(history, window, sink, frames):
     compare(
         device=torch.device("cpu"),
         dtype=torch.float32,
@@ -260,7 +192,6 @@ def test_batched_clean_cache_matches_sequential_cpu(history, window, sink, frame
         window=window,
         sink=sink,
         frames=frames,
-        paged=paged,
     )
 
 
@@ -275,7 +206,6 @@ def test_batched_clean_cache_matches_sequential_cuda(history, window, sink, fram
         window=window,
         sink=sink,
         frames=frames,
-        paged=True,
     )
 
 
@@ -331,6 +261,22 @@ def test_non_multiple_of_16_frame_geometry_cpu(monkeypatch):
         window=5,
         sink=0,
         frames=2,
-        paged=True,
         page_size=394,
+    )
+
+
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged attention")
+@pytest.mark.parametrize("tokens_per_frame", [394, 924])
+@pytest.mark.parametrize("frames", [3, 4])
+def test_real_frame_geometry_cuda(monkeypatch, tokens_per_frame, frames):
+    monkeypatch.setitem(globals(), "BLOCK", tokens_per_frame)
+    compare(
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        history=4,
+        window=2,
+        sink=1,
+        frames=frames,
+        page_size=tokens_per_frame,
     )

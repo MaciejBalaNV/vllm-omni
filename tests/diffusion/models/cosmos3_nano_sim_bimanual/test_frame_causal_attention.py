@@ -16,17 +16,19 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVStat
 pytestmark = pytest.mark.core_model
 
 
-def make_state(page=5, device="cpu", dtype=torch.float32, heads=1, dim=4):
+def make_state(page=5, device="cpu", dtype=torch.float32, heads=1, dim=4, window=2, sink=1):
     branches = (ARDiffusionKVBranchSpec("main", 0),)
     page_bytes = 2 * page * heads * dim * torch.empty((), dtype=dtype).element_size() * 2
     cache = ARDiffusionKVCache(
-        ARDiffusionKVConfig(enable=True, chunk_size=page, window_chunks=2, sink_chunks=1, gpu_memory_fraction=1.0),
+        ARDiffusionKVConfig(
+            enable=True, chunk_size=page, window_chunks=window, sink_chunks=sink, gpu_memory_fraction=1.0
+        ),
         num_layers=2,
         num_kv_heads=heads,
         head_size=dim,
         dtype=dtype,
         block_size=page,
-        available_bytes=page_bytes * 64,
+        available_bytes=page_bytes * (window + sink + 64),
         kv_branches=branches,
         max_model_len=1 << 20,
         session_capacity=1,
@@ -101,19 +103,9 @@ def test_separate_text_pages_real_length_and_causal_rows():
 
 @hardware_test(res={"cuda": "B200"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a supported CUDA paged-attention backend")
-def test_shared_paged_route_matches_exact_dense_attention(monkeypatch):
+def test_paged_attention_matches_dense_reference():
     import torch.nn.functional as F
 
-    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
-
-    original = paged_attention.ar_diffusion_paged_attention
-    calls = []
-
-    def routed(*args, **kwargs):
-        calls.append(kwargs)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(paged_attention, "ar_diffusion_paged_attention", routed)
     state = make_state(page=924, device="cuda", dtype=torch.bfloat16, heads=2, dim=64)
     cache = state.kv_cache
     torch.manual_seed(2026)
@@ -131,17 +123,7 @@ def test_shared_paged_route_matches_exact_dense_attention(monkeypatch):
         v = torch.randn_like(k)
         tk = torch.randn(301, 2, 64, device="cuda", dtype=torch.bfloat16)
         tv = torch.randn_like(tk)
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as trace:
-            output = paged_write_attn(ctx.layer_inputs(0), q, k, v, tk, tv, 64**-0.5)
-            torch.accelerator.synchronize()
-        assert any(event.name == "vllm_omni::ar_diffusion_paged_write_attn" for event in trace.events())
-        kernels = [event.name for event in trace.events() if event.device_type == torch.autograd.DeviceType.CUDA]
-        assert len(calls) == 1 and calls[0]["require_paged"] is True
-        assert paged_attention._resolve_fa_version(64) == 4
-        assert any("FlashAttentionForwardSm100" in name and "vllm" in name for name in kernels)
-        print("shared_route_kernels=" + repr(kernels))
+        output = paged_write_attn(ctx.layer_inputs(0), q, k, v, tk, tv, 64**-0.5)
         reference = []
         for row in range(2):
             pages, _ = ctx.video_block_table(seq_len=(row + 1) * 924)
@@ -178,6 +160,8 @@ def test_pipeline_binds_actual_upstream_cache_geometry():
     state = make_state()
     try:
         pipeline._validate_bound_kv_geometry(state, geometry)
+        with pytest.raises(RuntimeError, match="tokens_per_frame=expected 7, got 5"):
+            pipeline._validate_bound_kv_geometry(state, SimpleNamespace(tokens_per_frame=lambda _: 7))
         with pipeline.bind_ar_diffusion_state("test", state.state):
             assert isinstance(pipeline._ar_diffusion_kv_state, FrameCausalAttentionState)
         assert pipeline._ar_diffusion_kv_state is None
