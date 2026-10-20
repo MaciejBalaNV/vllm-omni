@@ -286,6 +286,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
+    supports_multiview_reference_inputs = False
     supports_latent_mask_editing = False
     supported_control_upload_types = frozenset()
 
@@ -2570,7 +2571,8 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
     assert failed["error"]["code"] == 500
     assert "GPU exploded" in failed["error"]["message"]
-    delete_spy.assert_called_once_with(video_id)
+    # The LiDAR sidecar key is removed too, whether or not the job produced one.
+    assert [c.args for c in delete_spy.call_args_list] == [(video_id,), (f"{video_id}.lidar.safetensors",)]
 
 
 def test_failed_async_latent_edit_cleans_source_upload(test_client, mocker: MockerFixture):

@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 from torch import nn
 
-from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_contract
+from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_contract, multiview_lidar_contract
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.experimental.world_models.session_state import SessionStateManager
 
@@ -4103,11 +4103,7 @@ def _chunked_lidar_encoder(chunk: int, context: int):
 
     encoder = object.__new__(Cosmos3LidarEncoder)
     nn.Module.__init__(encoder)
-    encoder.config = {
-        "streaming_chunk_frames": chunk,
-        "streaming_context_frames": context,
-        "range_projection": {"semantic_width": 1800, "model_width": 1808, "min_range_m": 0.0, "max_range_m": 100.0},
-    }
+    encoder.config = multiview_lidar_contract(chunk, context)
     encoder.encoder = CausalMean()
     encoder.quant_conv = nn.Identity()
     encoder.coords = torch.zeros(1)
