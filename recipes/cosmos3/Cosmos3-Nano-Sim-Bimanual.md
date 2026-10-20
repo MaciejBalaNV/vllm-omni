@@ -1,22 +1,27 @@
 # Cosmos3-Nano-Sim-Bimanual
 
 The distilled action-conditioned world model uses the checkpoint's sampling
-schedule and normalized unified action schema. Install the `cosmos-sim` extra
-in addition to the CUDA dependencies required by this branch:
+schedule and normalized unified action schema. Install the CUDA dependencies
+required by this branch:
 
 ```bash
-pip install -e '.[cosmos-sim]'
+pip install -e .
 ```
 
 Frame-page attention requires a backend that supports the selected page size,
 physical page tables, and explicit sequence lengths. The cache layout and
 attention visibility contract are independent of the backend implementation.
 
-The current implementation uses installed FA4 through
-`flash_attn.cute.flash_attn_varlen_func`. This backend requires FP16 or BF16 on
-a supported CUDA GPU. Missing dependencies or unsupported kernels raise an
-error; there is no automatic backend fallback. Validation on SM103 used FA4
-`4.0.0b33` without source modifications.
+The model uses the shared AR-Diffusion attention router in
+`experimental/ar_diffusion/kv_cache/paged_attention.py`. On CUDA, the router
+selects a FlashAttention version through vLLM and calls
+`vllm.vllm_flash_attn.flash_attn_varlen_func`. A separate `flash-attn-4`
+installation is not required by the model.
+
+The selected backend must support the complete frame page. For 924-token pages,
+the validated route is vLLM's FA4 on SM103 with FP16 or BF16. Unsupported page
+sizes raise an error. The model requires direct paged attention, so routes that
+gather K/V or use reference attention are rejected.
 
 ## Deployment
 
@@ -90,7 +95,7 @@ Fresh full-video requests decode chunks to CPU to bound VAE GPU history.
 
 `tests/diffusion/models/cosmos3_nano_sim_bimanual/test_frame_pages.py` covers
 257-frame bounded reclamation, exact window/text metadata, real upstream cache
-binding, and an installed-FA4 GPU comparison against a dense numerical oracle.
+binding, and a shared-router GPU comparison against a dense numerical oracle.
 
 `benchmarks/diffusion/bench_cosmos_sim_frame_pages.py` runs the cached checkpoint
 example and saves raw frames, MP4, deployment YAML, and runtime metadata. For a

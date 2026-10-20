@@ -42,7 +42,7 @@ def main():
     for count in (args.num_frames, args.warmup_frames):
         if count and (count < 1 or (count - 1) % 4 or count - 1 > len(sidecar["action"])):
             raise ValueError("Frame counts must be 1 + 4*N and fit the available action rows")
-    mode = "fa4_frame_pages"
+    mode = "frame_pages"
     output_dir = args.output_dir / mode
     output_dir.mkdir(parents=True, exist_ok=True)
     deploy = {
@@ -139,7 +139,7 @@ def main():
             "sink_frames": 1,
             "recent_past_frames": 2,
             "torch": torch.__version__,
-            "flash_attn_4": version("flash-attn-4"),
+            "attention_routing": "shared AR-Diffusion paged attention",
             "vllm": version("vllm"),
             "frame_page_reclamation": "upstream whole-frame eviction",
             "gpu": torch.cuda.get_device_name(0),

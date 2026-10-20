@@ -43,7 +43,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     validate_sim_parallel_config,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import FramePageState, fa4_paged_func
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import FramePageState
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
@@ -214,7 +214,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         validate_sim_parallel_config(od_config)
         if od_config.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("The selected paged attention backend requires float16 or bfloat16")
-        fa4_paged_func()  # Fail before loading weights if the required backend is absent.
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "batched")

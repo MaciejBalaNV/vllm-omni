@@ -8,29 +8,11 @@ frames and compacts metadata. History is never gathered or copied for attention.
 """
 
 from dataclasses import dataclass
-from functools import lru_cache
-from importlib.metadata import version
 from typing import NamedTuple
 
 import torch
-from vllm.logger import init_logger
 
-logger = init_logger(__name__)
-
-
-@lru_cache(maxsize=1)
-def fa4_paged_func():
-    try:
-        from flash_attn.cute import flash_attn_varlen_func
-    except ImportError as exc:
-        raise RuntimeError(
-            "The selected paged attention backend requires flash-attn-4 with the CuTe paged-attention API"
-        ) from exc
-    logger.info(
-        "Paged attention backend: flash-attn-4=%s; flash_attn.cute.flash_attn_varlen_func",
-        version("flash-attn-4"),
-    )
-    return flash_attn_varlen_func
+from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
 
 
 class ARDiffusionPagedLayerInputs(NamedTuple):
@@ -71,19 +53,19 @@ def _frame_attention(
     flat_value.index_copy_(0, video_slots, value)
     flat_key.index_copy_(0, action_slots, text_key)
     flat_value.index_copy_(0, action_slots, text_value)
-    output, _ = fa4_paged_func()(
+    return paged_attention.ar_diffusion_paged_attention(
         query,
         key_pool,
         value_pool,
-        cu_seqlens_q=query_start_loc,
-        seqused_k=seq_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_seq_len,
-        page_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        block_table=block_table,
         softmax_scale=scale,
         causal=False,
+        require_paged=True,
     )
-    return output
 
 
 @_frame_attention.register_fake

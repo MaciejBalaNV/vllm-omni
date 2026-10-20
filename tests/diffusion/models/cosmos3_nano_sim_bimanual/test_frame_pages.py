@@ -94,10 +94,20 @@ def test_separate_text_pages_real_length_and_causal_rows():
 
 
 @hardware_test(res={"cuda": "B200"}, num_cards=1)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires supported CUDA GPU and FA4")
-def test_installed_fa4_matches_exact_dense_attention():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a supported CUDA paged-attention backend")
+def test_shared_paged_route_matches_exact_dense_attention(monkeypatch):
     import torch.nn.functional as F
 
+    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
+
+    original = paged_attention.ar_diffusion_paged_attention
+    calls = []
+
+    def routed(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(paged_attention, "ar_diffusion_paged_attention", routed)
     state = make_state(page=924, device="cuda", dtype=torch.bfloat16, heads=2, dim=64)
     cache = state.kv_cache
     torch.manual_seed(2026)
@@ -121,8 +131,10 @@ def test_installed_fa4_matches_exact_dense_attention():
             output = paged_write_attn(ctx.layer_inputs(0), q, k, v, tk, tv, 64**-0.5)
             torch.accelerator.synchronize()
         kernels = [event.name for event in trace.events() if event.device_type == torch.autograd.DeviceType.CUDA]
-        assert any("FlashAttentionForwardSm100" in name and "vllm" not in name for name in kernels)
-        print("installed_fa4_kernels=" + repr(kernels))
+        assert len(calls) == 1 and calls[0]["require_paged"] is True
+        assert paged_attention._resolve_fa_version(64) == 4
+        assert any("FlashAttentionForwardSm100" in name and "vllm" in name for name in kernels)
+        print("shared_route_kernels=" + repr(kernels))
         reference = []
         for row in range(2):
             pages, _ = ctx.video_block_table(seq_len=(row + 1) * 924)
@@ -187,3 +199,32 @@ def test_attention_rejects_missing_frame_pages_before_computing():
             tokens_per_frame=5,
             action_tokens_per_frame=1,
         )
+
+
+@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_shared_route_rejects_gather_and_unsupported_page_sizes(monkeypatch):
+    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
+    from vllm_omni.experimental.ar_diffusion.kv_cache.config import KV_GATHER_ENV
+
+    query = torch.zeros(924, 1, 64, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(2, 924, 1, 64, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(
+        block_table=torch.tensor([[1]], device="cuda", dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 924], device="cuda", dtype=torch.int32),
+        seq_lens=torch.tensor([924], device="cuda", dtype=torch.int32),
+        max_query_len=924,
+        max_seq_len=924,
+        softmax_scale=64**-0.5,
+        require_paged=True,
+    )
+    with monkeypatch.context() as patch:
+        patch.setenv(KV_GATHER_ENV, "1")
+        with pytest.raises(RuntimeError, match="Direct paged attention is required"):
+            paged_attention.ar_diffusion_paged_attention(query, cache, cache, **kwargs)
+    monkeypatch.delenv(KV_GATHER_ENV, raising=False)
+    for version in (2, 3):
+        with monkeypatch.context() as patch:
+            patch.setattr(paged_attention, "_resolve_fa_version", lambda head, v=version: v)
+            with pytest.raises(ValueError, match=f"FlashAttention {version}.*divisible by 16"):
+                paged_attention.ar_diffusion_paged_attention(query, cache, cache, **kwargs)
