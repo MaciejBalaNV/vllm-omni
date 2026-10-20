@@ -28,7 +28,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import suppress
 from http import HTTPStatus
 from numbers import Integral
@@ -50,7 +50,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
     TimelineGuide,
-    VideoAction,
     VideoError,
     VideoGenerationRequest,
     VideoGenerationStatus,
@@ -58,7 +57,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.serving_video import (
-    EncodedVideoResult,
     LatentEditInput,
     OmniOpenAIServingVideo,
     ReferenceAudio,
@@ -408,27 +406,6 @@ def _cleanup_timeline_guides(request: VideoGenerationRequest) -> None:
             os.unlink(path)
 
 
-def _unpack_video_generation_result(
-    result: Sequence[object] | EncodedVideoResult,
-) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
-    if isinstance(result, EncodedVideoResult):
-        return result.video_bytes, result.stage_durations, result.peak_memory_mb, result.action, result.video_metadata
-    video_metadata: dict[str, object] = {}
-    if len(result) == 5:
-        video_bytes, stage_durations, peak_memory_mb, action, raw_metadata = result
-        if isinstance(raw_metadata, dict):
-            video_metadata = {str(key): value for key, value in raw_metadata.items()}
-    else:
-        video_bytes, stage_durations, peak_memory_mb, action = result
-    return (
-        cast(bytes, video_bytes),
-        cast(dict[str, float], stage_durations),
-        float(cast(float, peak_memory_mb)),
-        cast(VideoAction | None, action),
-        video_metadata,
-    )
-
-
 @dataclasses.dataclass
 class VideoUploadResources:
     """Files owned by this request, never caller-supplied paths from extra_params."""
@@ -481,17 +458,16 @@ async def _run_video_generation_job(
             on_started=_mark_started,
             latent_edit_input=latent_edit_input,
         )
-        video_bytes, stage_durations, peak_memory_mb, action, video_metadata = _unpack_video_generation_result(result)
         lidar = None
-        if isinstance(result, EncodedVideoResult):
+        if result.lidar_bytes is not None:
             lidar = VideoLidarArtifact(
                 url=f"/v1/videos/{video_id}/lidar",
                 file_name=_lidar_storage_key(video_id),
                 **result.lidar_metadata,
             )
 
-        save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
-        if lidar is not None:
+        save_context = await STORAGE_MANAGER.save(result.video_bytes, video_id)
+        if result.lidar_bytes is not None:
             await STORAGE_MANAGER.save(result.lidar_bytes, _lidar_storage_key(video_id))
         logger.info("Video request %s persisted %s output file.", video_id, save_context.key)
 
@@ -501,12 +477,12 @@ async def _run_video_generation_job(
             "file_name": f"{video_id}.{job.file_extension}",
             "completed_at": save_context.created_at,
             "inference_time_s": time.perf_counter() - started_at,
-            "stage_durations": stage_durations,
-            "peak_memory_mb": peak_memory_mb,
-            "action": action,
+            "stage_durations": result.stage_durations,
+            "peak_memory_mb": result.peak_memory_mb,
+            "action": result.action,
             "lidar": lidar,
         }
-        updated_fields.update({key: value for key, value in video_metadata.items() if value is not None})
+        updated_fields.update({key: value for key, value in result.video_metadata.items() if value is not None})
         if save_context.expires_at is not None:
             updated_fields["expires_at"] = save_context.expires_at
 

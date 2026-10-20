@@ -203,7 +203,6 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _parse_video_form,
     _run_video_generation_job,
     _status_code_for_video_failure,
-    _unpack_video_generation_result,
     video_response_from_request,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
@@ -2823,18 +2822,16 @@ async def create_video_sync(
     try:
         if lidar_output_requested(request.extra_params):
             raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
-        video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
-            await asyncio.wait_for(
-                handler.generate_video_bytes(
-                    request,
-                    request_id,
-                    reference_image=reference_image,
-                    reference_video=reference_video,
-                    reference_audio=reference_audio,
-                    latent_edit_input=latent_edit_input,
-                ),
-                timeout=VIDEO_SYNC_TIMEOUT_S,
+        result = await asyncio.wait_for(
+            handler.generate_video_bytes(
+                request,
+                request_id,
+                reference_image=reference_image,
+                reference_video=reference_video,
+                reference_audio=reference_audio,
+                latent_edit_input=latent_edit_input,
             ),
+            timeout=VIDEO_SYNC_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
@@ -2861,14 +2858,14 @@ async def create_video_sync(
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
-        content=video_bytes,
+        content=result.video_bytes,
         media_type="video/mp4",
         headers={
             "X-Request-Id": request_id,
             "X-Model": effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
-            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
-            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
+            "X-Stage-Durations": json.dumps(result.stage_durations, separators=(",", ":")),
+            "X-Peak-Memory-MB": f"{result.peak_memory_mb:.3f}",
         },
     )
 

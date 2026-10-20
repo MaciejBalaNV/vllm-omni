@@ -37,7 +37,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video import EncodedVideoResult, OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
@@ -242,18 +242,19 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     encoder = mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes")
     try:
         result = asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="test"), "preencoded"))
-        assert result == (
-            preencoded,
-            {"decode": 0.5},
-            123.0,
-            None,
-            {
+        assert result == EncodedVideoResult(
+            video_bytes=preencoded,
+            stage_durations={"decode": 0.5},
+            peak_memory_mb=123.0,
+            action=None,
+            video_metadata={
                 "fps": 24.0,
                 "num_frames": 7,
                 "duration_s": 7 / 24.0,
                 "metrics": {"generation_time": 1.25},
             },
         )
+        assert result.lidar_bytes is None
         encoder.assert_not_called()
     finally:
         handler.shutdown()
@@ -354,7 +355,7 @@ class CompletingDuringAbortHandler(BlockingVideoHandler):
             await on_started()
         self.started.set()
         await self._finish.wait()
-        return b"late-complete", {}, 0.0, None
+        return EncodedVideoResult(video_bytes=b"late-complete", stage_durations={}, peak_memory_mb=0.0)
 
     async def abort_request(self, request_id):
         self._finish.set()

@@ -143,15 +143,19 @@ class VideoGenerationArtifacts:
 
 @dataclass
 class EncodedVideoResult:
-    """Binary artifacts kept separate from public JSON job metadata."""
+    """Encoded outputs of one video request, kept separate from public JSON job metadata.
+
+    ``video_bytes`` is empty for action-only requests. ``lidar_bytes`` is set
+    only when the request asked for numeric LiDAR output.
+    """
 
     video_bytes: bytes
     stage_durations: dict[str, float]
     peak_memory_mb: float
-    action: VideoAction | None
-    video_metadata: dict[str, object]
-    lidar_bytes: bytes
-    lidar_metadata: dict[str, Any]
+    action: VideoAction | None = None
+    video_metadata: dict[str, object] = field(default_factory=dict)
+    lidar_bytes: bytes | None = None
+    lidar_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[str, object]:
@@ -659,7 +663,7 @@ class OmniOpenAIServingVideo:
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
         latent_edit_input: LatentEditInput | None = None,
-    ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]] | EncodedVideoResult:
+    ) -> EncodedVideoResult:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
             request,
@@ -683,52 +687,42 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
-        action = artifacts.actions[0]
-        video_metadata = _video_metadata_from_artifacts(artifacts)
-        if action is not None and isinstance(artifacts.videos[0], dict):
+        result = EncodedVideoResult(
+            video_bytes=b"",
+            stage_durations=artifacts.stage_durations,
+            peak_memory_mb=artifacts.peak_memory_mb,
+            action=artifacts.actions[0],
+            video_metadata=_video_metadata_from_artifacts(artifacts),
+        )
+        if result.action is not None and isinstance(artifacts.videos[0], dict):
             if artifacts.lidar is not None:
                 raise ValueError("LiDAR output requires video; action-only output with LiDAR is unsupported.")
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
-            return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
+            return result
 
         encoding_options: dict[str, Any] = self._video_encoding_options()
         if audio is not None:
             encoding_options.update(audio=audio, audio_sample_rate=artifacts.audio_sample_rate)
         _t_encode_start = time.perf_counter()
         if isinstance(artifacts.videos[0], bytes):
-            video_bytes = artifacts.videos[0]
+            result.video_bytes = artifacts.videos[0]
             _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
             logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
-            return (
-                video_bytes,
-                artifacts.stage_durations,
-                artifacts.peak_memory_mb,
-                artifacts.actions[0],
-                video_metadata,
+        else:
+            result.video_bytes = _encode_video_bytes(
+                artifacts.videos[0],
+                fps=artifacts.output_fps,
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+                **encoding_options,
             )
-        video_bytes = _encode_video_bytes(
-            artifacts.videos[0],
-            fps=artifacts.output_fps,
-            video_codec_options=video_codec_options,
-            frame_converter=self._video_frame_converter,
-            **encoding_options,
-        )
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
+            _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
+            logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
         if artifacts.lidar is not None:
-            lidar_bytes, lidar_metadata = await asyncio.to_thread(
+            result.lidar_bytes, result.lidar_metadata = await asyncio.to_thread(
                 serialize_lidar_output, artifacts.lidar, artifacts.lidar_metadata
             )
-            return EncodedVideoResult(
-                video_bytes=video_bytes,
-                stage_durations=artifacts.stage_durations,
-                peak_memory_mb=artifacts.peak_memory_mb,
-                action=action,
-                video_metadata=video_metadata,
-                lidar_bytes=lidar_bytes,
-                lidar_metadata=lidar_metadata,
-            )
-        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0], video_metadata
+        return result
 
     @staticmethod
     def _resolve_video_fps_multiplier(result: object) -> int:
