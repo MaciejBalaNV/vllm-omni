@@ -221,7 +221,6 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.model_extras.cosmos3_lidar import lidar_output_requested
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -2820,8 +2819,7 @@ async def create_video_sync(
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
-        if lidar_output_requested(request.extra_params):
-            raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
+        handler.reject_async_only_outputs(request)
         result = await asyncio.wait_for(
             handler.generate_video_bytes(
                 request,

@@ -317,6 +317,16 @@ class OmniOpenAIServingVideo:
             supported.update(item.supported_control_upload_types)
         return frozenset(supported)
 
+    @staticmethod
+    def reject_async_only_outputs(request: VideoGenerationRequest) -> None:
+        """Reject requests whose outputs only the async job endpoints can deliver.
+
+        ``POST /v1/videos/sync`` and the JSON response carry one MP4. Numeric
+        LiDAR is a separate file served from a completed ``POST /v1/videos`` job.
+        """
+        if lidar_output_requested(request.extra_params):
+            raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
+
     @classmethod
     def for_diffusion(
         cls,
@@ -605,8 +615,7 @@ class OmniOpenAIServingVideo:
         reference_audio: ReferenceAudio | None = None,
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationResponse:
-        if lidar_output_requested(request.extra_params):
-            raise HTTPException(status_code=400, detail="LiDAR output requires asynchronous POST /v1/videos.")
+        self.reject_async_only_outputs(request)
         artifacts = await self._run_and_extract(
             request,
             reference_id,

@@ -2473,6 +2473,19 @@ def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
     assert "does not support request.negative_prompt" in response.json()["detail"]
 
 
+def test_sync_rejects_lidar_output_before_generation(test_client, mocker: MockerFixture):
+    generate = mocker.patch.object(OmniOpenAIServingVideo, "generate_video_bytes")
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "extra_params": json.dumps({"lidar": {"return_output": True}})},
+    )
+
+    assert response.status_code == 400
+    assert "requires asynchronous POST /v1/videos" in response.json()["detail"]
+    generate.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:
