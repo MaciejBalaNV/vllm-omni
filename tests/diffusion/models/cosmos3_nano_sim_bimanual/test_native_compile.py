@@ -10,6 +10,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     validate_sim_parallel_config,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 @pytest.mark.parametrize("source", ["direct", "model_config", "custom_pipeline_args"])
 @pytest.mark.parametrize("enabled,mode", [(False, "default"), (True, "reduce-overhead")])

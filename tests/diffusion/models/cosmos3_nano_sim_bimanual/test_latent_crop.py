@@ -12,6 +12,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualResolutionPolicy,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def params() -> SimpleNamespace:
     return SimpleNamespace(height=None, width=None, extra_args={})

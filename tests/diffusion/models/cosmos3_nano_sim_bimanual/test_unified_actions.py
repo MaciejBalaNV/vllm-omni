@@ -15,6 +15,8 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_schema import (
     Cosmos3NanoSimBimanualActionSchema,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def production():
     schema = json.loads((Path(__file__).parent / "fixtures/unified_action_schema.json").read_text())
