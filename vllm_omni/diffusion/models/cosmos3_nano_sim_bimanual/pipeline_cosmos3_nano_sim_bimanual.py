@@ -43,7 +43,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     validate_sim_parallel_config,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import FramePageState
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_causal_attention import FrameCausalAttentionState
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
@@ -464,7 +464,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 f"Cosmos3-Nano-Sim-Bimanual bound session mismatch: {state.session_id!r} != {session_id!r}."
             )
         self._validate_bound_kv_geometry(state)
-        self._ar_diffusion_kv_state = FramePageState(state)
+        self._ar_diffusion_kv_state = FrameCausalAttentionState(state)
         self._bound_session_id = str(session_id)
         try:
             yield

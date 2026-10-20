@@ -16,7 +16,10 @@ The model uses the shared AR-Diffusion attention router in
 `experimental/ar_diffusion/kv_cache/paged_attention.py`. On CUDA, the router
 selects a FlashAttention version through vLLM and calls
 `vllm.vllm_flash_attn.flash_attn_varlen_func`. A separate `flash-attn-4`
-installation is not required by the model.
+installation is not required by the model. The model also reuses the shared
+`paged_write_attn` custom op. Its local `frame_causal_attention.py` supplies
+frame visibility metadata and delayed clean-frame publication through the
+upstream cache manager.
 
 The selected backend must support the complete frame page. For 924-token pages,
 the validated route is vLLM's FA4 on SM103 with FP16 or BF16. Unsupported page
@@ -93,7 +96,7 @@ Fresh full-video requests decode chunks to CPU to bound VAE GPU history.
 
 ## Validation and profiling
 
-`tests/diffusion/models/cosmos3_nano_sim_bimanual/test_frame_pages.py` covers
+`tests/diffusion/models/cosmos3_nano_sim_bimanual/test_frame_causal_attention.py` covers
 257-frame bounded reclamation, exact window/text metadata, real upstream cache
 binding, and a shared-router GPU comparison against a dense numerical oracle.
 

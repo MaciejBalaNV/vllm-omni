@@ -6,10 +6,11 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import FramePageState, paged_write_attn
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_causal_attention import FrameCausalAttentionState
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = pytest.mark.core_model
@@ -35,7 +36,7 @@ def make_state(page=5, device="cpu", dtype=torch.float32, heads=1, dim=4):
         device=torch.device(device),
     )
     state = ARDiffusionKVState(cache, "test", {"main": cache.begin_request("test-main")}, num_layers=2)
-    return FramePageState(state)
+    return FrameCausalAttentionState(state)
 
 
 def publish(state, values):
@@ -81,6 +82,11 @@ def test_separate_text_pages_real_length_and_causal_rows():
         publish(state, [2])
         ctx = state.get_kv_caches("main", 10, commit_current=True, frame_causal=True)[0].forward_ctx
         ctx.prepare("cpu", action_len=8, query_len=10)
+        inputs = ctx.layer_inputs(0)
+        assert inputs.require_paged is True
+        assert inputs.key_pool.ndim == 3
+        assert inputs.key_pool.data_ptr() == state.kv_cache.key_cache(0).data_ptr()
+        assert inputs.value_pool.data_ptr() == state.kv_cache.value_cache(0).data_ptr()
         assert ctx.seq_lens.tolist() == [28, 28]
         assert ctx.query_start_loc.tolist() == [0, 5, 10]
         assert ctx.action_slots[0] % 5 == 0
@@ -130,6 +136,7 @@ def test_shared_paged_route_matches_exact_dense_attention(monkeypatch):
         ) as trace:
             output = paged_write_attn(ctx.layer_inputs(0), q, k, v, tk, tv, 64**-0.5)
             torch.accelerator.synchronize()
+        assert any(event.name == "vllm_omni::ar_diffusion_paged_write_attn" for event in trace.events())
         kernels = [event.name for event in trace.events() if event.device_type == torch.autograd.DeviceType.CUDA]
         assert len(calls) == 1 and calls[0]["require_paged"] is True
         assert paged_attention._resolve_fa_version(64) == 4
@@ -172,7 +179,7 @@ def test_pipeline_binds_actual_upstream_cache_geometry():
     try:
         pipeline._validate_bound_kv_geometry(state, geometry)
         with pipeline.bind_ar_diffusion_state("test", state.state):
-            assert isinstance(pipeline._ar_diffusion_kv_state, FramePageState)
+            assert isinstance(pipeline._ar_diffusion_kv_state, FrameCausalAttentionState)
         assert pipeline._ar_diffusion_kv_state is None
     finally:
         state.close()
@@ -228,3 +235,17 @@ def test_shared_route_rejects_gather_and_unsupported_page_sizes(monkeypatch):
             patch.setattr(paged_attention, "_resolve_fa_version", lambda head, v=version: v)
             with pytest.raises(ValueError, match=f"FlashAttention {version}.*divisible by 16"):
                 paged_attention.ar_diffusion_paged_attention(query, cache, cache, **kwargs)
+
+
+@pytest.mark.cpu
+def test_shared_write_op_preserves_direct_paged_requirement():
+    state = make_state()
+    try:
+        ctx = state.get_kv_caches("main", 5)[0].forward_ctx
+        ctx.prepare("cpu", action_len=3, query_len=5)
+        frame = torch.zeros(5, 1, 4)
+        text = torch.zeros(3, 1, 4)
+        with pytest.raises(RuntimeError, match="Direct paged attention is required"):
+            paged_write_attn(ctx.layer_inputs(0), frame, frame, frame, text, text, 0.5)
+    finally:
+        state.close()

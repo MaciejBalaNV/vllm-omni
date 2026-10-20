@@ -20,16 +20,16 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     _tf_config_get,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import (
-    ARDiffusionPagedLayerInputs,
-    paged_write_attn,
-)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import Cosmos3NanoSimBimanualGeometry
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import (
     build_interleaved_mrope_position_ids,
     interleave_action_vision_tokens,
     split_interleaved_action_vision_tokens,
     zero_null_action_values,
+)
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedLayerInputs,
+    paged_write_attn,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -98,7 +98,6 @@ class Cosmos3NanoSimBimanualJointAttention(Cosmos3CrossAttention):
             text_k[0, :real_text_kv_len],
             text_v[0, :real_text_kv_len],
             self.head_dim**-0.5,
-            framewise_attention=clean_history_window is not None,
         ).unsqueeze(0)
 
         return self.to_out(output.reshape(batch, seq_len, -1)), k, v

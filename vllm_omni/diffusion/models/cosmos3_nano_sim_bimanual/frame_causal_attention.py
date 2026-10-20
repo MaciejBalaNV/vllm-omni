@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Frame-page attention using upstream AR-Diffusion allocation and session lifetime.
+"""Frame-causal attention contexts using upstream AR-Diffusion allocation and lifetime.
 
 Only current frames are staged. Once every layer finishes a clean forward,
 publish those pages through the upstream allocator, which reclaims whole old
@@ -8,89 +8,13 @@ frames and compacts metadata. History is never gathered or copied for attention.
 """
 
 from dataclasses import dataclass
-from typing import NamedTuple
 
 import torch
 
-from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
-
-
-class ARDiffusionPagedLayerInputs(NamedTuple):
-    key_pool: torch.Tensor
-    value_pool: torch.Tensor
-    video_slots: torch.Tensor
-    action_slots: torch.Tensor
-    block_table: torch.Tensor
-    query_start_loc: torch.Tensor
-    seq_lens: torch.Tensor
-    max_query_len: int
-    max_seq_len: int
-
-
-@torch.library.custom_op("vllm_omni::cosmos_sim_frame_attention", mutates_args=("key_pool", "value_pool"))
-def _frame_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    text_key: torch.Tensor,
-    text_value: torch.Tensor,
-    key_pool: torch.Tensor,
-    value_pool: torch.Tensor,
-    video_slots: torch.Tensor,
-    action_slots: torch.Tensor,
-    block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_query_len: int,
-    max_seq_len: int,
-    scale: float,
-) -> torch.Tensor:
-    if not query.is_cuda:
-        raise RuntimeError("The selected paged attention backend requires CUDA tensors")
-    flat_key = key_pool.view(-1, *key_pool.shape[2:])
-    flat_value = value_pool.view(-1, *value_pool.shape[2:])
-    flat_key.index_copy_(0, video_slots, key)
-    flat_value.index_copy_(0, video_slots, value)
-    flat_key.index_copy_(0, action_slots, text_key)
-    flat_value.index_copy_(0, action_slots, text_value)
-    return paged_attention.ar_diffusion_paged_attention(
-        query,
-        key_pool,
-        value_pool,
-        query_start_loc=query_start_loc,
-        seq_lens=seq_lens,
-        max_query_len=max_query_len,
-        max_seq_len=max_seq_len,
-        block_table=block_table,
-        softmax_scale=scale,
-        causal=False,
-        require_paged=True,
-    )
-
-
-@_frame_attention.register_fake
-def _fake_frame_attention(
-    query,
-    key,
-    value,
-    text_key,
-    text_value,
-    key_pool,
-    value_pool,
-    video_slots,
-    action_slots,
-    block_table,
-    query_start_loc,
-    seq_lens,
-    max_query_len,
-    max_seq_len,
-    scale,
-):
-    return torch.empty_like(query)
-
-
-def paged_write_attn(inputs, query, key, value, text_key, text_value, scale, *, framewise_attention=False):
-    return _frame_attention(query, key, value, text_key, text_value, *inputs, scale)
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    ARDiffusionPagedLayerInputs,
+    _layer_idx_tensor,
+)
 
 
 def _device(value, device, dtype=torch.int32):
@@ -100,7 +24,7 @@ def _device(value, device, dtype=torch.int32):
     return tensor.to(device)
 
 
-class FramePageForwardContext:
+class FrameCausalAttentionForwardContext:
     def __init__(self, state, branch, seq_len, commit_current, frame_causal):
         self.state = state
         self.kv_cache = state.kv_cache
@@ -181,28 +105,32 @@ class FramePageForwardContext:
         if not self._prepared:
             raise RuntimeError("Frame-page metadata must be prepared before compiled blocks execute")
         return ARDiffusionPagedLayerInputs(
-            self.kv_cache.key_cache(layer_idx),
-            self.kv_cache.value_cache(layer_idx),
-            self.video_slots,
-            self.action_slots,
-            self.block_table,
-            self.query_start_loc,
-            self.seq_lens,
-            self.max_query_len,
-            self.max_seq_len,
+            layer_idx=_layer_idx_tensor(layer_idx),
+            key_pool=self.kv_cache.key_cache(layer_idx).flatten(0, 1),
+            value_pool=self.kv_cache.value_cache(layer_idx).flatten(0, 1),
+            block_size=self.block_size,
+            seq_len=self.seq_len,
+            video_slots=self.video_slots,
+            action_slots=self.action_slots,
+            block_table=self.block_table,
+            query_start_loc=self.query_start_loc,
+            seq_lens=self.seq_lens,
+            max_query_len=self.max_query_len,
+            max_seq_len=self.max_seq_len,
+            require_paged=True,
         )
 
 
 @dataclass
-class FramePageLayerContext:
+class FrameCausalAttentionLayerContext:
     layer_idx: int
-    forward_ctx: FramePageForwardContext
+    forward_ctx: FrameCausalAttentionForwardContext
 
     def to_layer_inputs(self):
         return self.forward_ctx.layer_inputs(self.layer_idx)
 
 
-class FramePageState:
+class FrameCausalAttentionState:
     """Model-local attention adapter; upstream retains ownership of all pages."""
 
     def __init__(self, state):
@@ -218,9 +146,9 @@ class FramePageState:
         return getattr(self.state, name)
 
     def get_kv_caches(self, branch, seq_len, commit_current=False, *, extra_visible_tokens=None, frame_causal=False):
-        context = FramePageForwardContext(self, branch, seq_len, commit_current, frame_causal)
+        context = FrameCausalAttentionForwardContext(self, branch, seq_len, commit_current, frame_causal)
         self.pending[branch] = context
-        return [FramePageLayerContext(index, context) for index in range(self.num_layers)]
+        return [FrameCausalAttentionLayerContext(index, context) for index in range(self.num_layers)]
 
     def commit_paged_context(self, branch):
         context = self.pending.pop(branch)

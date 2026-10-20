@@ -15,7 +15,7 @@ from tests.diffusion.models.cosmos3_nano_sim_bimanual.reference_attention import
     append_dense_kv_history,
 )
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import FramePageState
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_causal_attention import FrameCausalAttentionState
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualGenDecoderLayer,
     Cosmos3NanoSimBimanualTransformer,
@@ -36,16 +36,16 @@ def cpu_attention_oracle(monkeypatch, request):
 
     def oracle(inputs, q, k, v, tk, tv, scale, **kwargs):
         assert q.device.type == "cpu"
-        size = inputs.key_pool.shape[1]
+        size = inputs.block_size
         for pool, values, text in [(inputs.key_pool, k, tk), (inputs.value_pool, v, tv)]:
-            flat = pool.flatten(0, 1)
+            flat = pool
             flat.index_copy_(0, inputs.video_slots, values)
             flat.index_copy_(0, inputs.action_slots, text)
         result = []
         for row, length in enumerate(inputs.seq_lens.tolist()):
             pages = inputs.block_table[row, : (length + size - 1) // size].long()
-            key = inputs.key_pool[pages].flatten(0, 1)[:length]
-            value = inputs.value_pool[pages].flatten(0, 1)[:length]
+            key = inputs.key_pool.unflatten(0, (-1, size))[pages].flatten(0, 1)[:length]
+            value = inputs.value_pool.unflatten(0, (-1, size))[pages].flatten(0, 1)[:length]
             start, end = inputs.query_start_loc[row : row + 2].tolist()
             result.append(
                 torch.nn.functional.scaled_dot_product_attention(
@@ -107,7 +107,9 @@ def state(device, dtype, window, sink, page_size=None):
         max_scratch_tokens_per_branch=BLOCK,
         device=device,
     )
-    return FramePageState(ARDiffusionKVState(cache, "test", {"main": cache.begin_request("main")}, num_layers=LAYERS))
+    return FrameCausalAttentionState(
+        ARDiffusionKVState(cache, "test", {"main": cache.begin_request("main")}, num_layers=LAYERS)
+    )
 
 
 @torch.no_grad()

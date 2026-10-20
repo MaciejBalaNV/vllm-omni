@@ -75,6 +75,8 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     # Index of the current chunk's first block within the staged window: right after the visible history,
     # which is not the end of the padded block table (that carries at least one action-capacity block).
     stage_first_block: int = 0
+    # Require a backend that consumes the physical page table directly.
+    require_paged: bool = False
 
 
 @dataclass
@@ -945,6 +947,7 @@ def _paged_write_attn_impl(
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
     stage_first_block: int = 0,
+    require_paged: bool = False,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
@@ -969,6 +972,7 @@ def _paged_write_attn_impl(
         reuse_history=reuse_history,
         current_tokens=int(k_curr.shape[0]),
         stage_first_block=stage_first_block,
+        require_paged=require_paged,
     )
 
 
@@ -1003,6 +1007,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value: torch.Tensor | None,
         reuse_history: bool,
         stage_first_block: int,
+        require_paged: bool,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -1025,6 +1030,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             stage_value,
             reuse_history,
             stage_first_block,
+            require_paged,
         )
 
     @_paged_write_attn_op.register_fake
@@ -1049,6 +1055,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value=None,
         reuse_history=False,
         stage_first_block=0,
+        require_paged=False,
     ):
         return torch.empty_like(query)
 
@@ -1078,4 +1085,5 @@ def paged_write_attn(
         inputs.stage_value,
         inputs.reuse_history,
         inputs.stage_first_block,
+        inputs.require_paged,
     )

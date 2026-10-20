@@ -108,7 +108,7 @@ def test_dense_model_does_not_claim_expert_parallelism():
 def test_committed_history_survives_reuse_of_graph_output_storage(frame_causal):
     import torch
 
-    from tests.diffusion.models.cosmos3_nano_sim_bimanual.test_frame_pages import make_state
+    from tests.diffusion.models.cosmos3_nano_sim_bimanual.test_frame_causal_attention import make_state
 
     state = make_state()
     cache = state.kv_cache

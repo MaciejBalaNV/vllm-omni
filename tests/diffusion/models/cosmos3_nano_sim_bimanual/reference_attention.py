@@ -8,11 +8,11 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _apply_rotary_pos_emb
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_pages import ARDiffusionPagedLayerInputs
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualJointAttention,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.utils import zero_null_action_values
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import ARDiffusionPagedLayerInputs
 
 
 def _dense_clean_kv(text, history, current, start, end, sink_tokens, tail_tokens):
