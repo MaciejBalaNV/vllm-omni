@@ -54,7 +54,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim
     Cosmos3NanoSimBimanualSessionState,
     append_dense_kv_history,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.streaming_vae import decode_wan_causal_chunk
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import parse_cosmos3_nano_sim_bimanual_tick
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualTransformer,
@@ -73,6 +72,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
+from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionChunkMetadata,
     ARDiffusionTickRequest,
@@ -214,6 +214,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
+    _streaming_decoder: WanStreamingDecoder | None = None
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         self._ar_compile_mode = resolve_ar_compile_mode(od_config)
@@ -509,8 +510,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def _drop_session(self, session_id: str) -> None:
         state = self._states.pop(str(session_id or "default"), None)
         if state is not None:
-            if state.vae_decoder_initialized:
-                self.vae.clear_cache()
             state.reset()
 
     def _sync_for_tick_timing(self, enabled: bool) -> None:
@@ -1007,17 +1006,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> torch.Tensor:
         """Decode a new causal block with session-owned Wan features."""
 
-        result = decode_wan_causal_chunk(
-            self.vae,
-            self._denormalize_vae_latents(latents),
-            feature_cache=state.vae_decoder_feat_cache,
-            initialized=state.vae_decoder_initialized,
-        )
-        state.record_incremental_decode(
-            input_frames=int(latents.shape[2]),
-            feature_cache=result.feature_cache,
-        )
-        return result.video
+        if self._streaming_decoder is None:
+            self._streaming_decoder = WanStreamingDecoder(self.vae)
+        if state.vae_decode is None:
+            state.vae_decode = self._streaming_decoder.new_decode_state(state.session_id)
+        video = self._streaming_decoder.decode_chunk(self._denormalize_vae_latents(latents), state.vae_decode)
+        state.record_incremental_decode(input_frames=int(latents.shape[2]))
+        return video
 
     # -- Generation --------------------------------------------------------
 

@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import (
     parse_cosmos3_nano_sim_bimanual_tick,
 )
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
+from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionChunkMetadata, ARDiffusionTickRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -160,8 +161,11 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
         return state
 
     def decode(state: Any, latent: torch.Tensor) -> torch.Tensor:
-        frames = latent.shape[2] * 4 - (0 if state.vae_decoder_initialized else 3)
-        state.record_incremental_decode(input_frames=latent.shape[2], feature_cache=[])
+        if state.vae_decode is None:
+            state.vae_decode = StreamingDecodeState(state.session_id, feat_map=[])
+        frames = latent.shape[2] * 4 - (3 if not state.vae_decode.started else 0)
+        state.vae_decode.frames_decoded += latent.shape[2]
+        state.record_incremental_decode(input_frames=latent.shape[2])
         return torch.zeros(1, 3, frames, 32, 32)
 
     pipe._get_or_create_state = create_state
