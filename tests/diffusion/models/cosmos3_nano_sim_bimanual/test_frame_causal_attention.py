@@ -4,16 +4,31 @@
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_causal_attention import FrameCausalAttentionState
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
+from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = pytest.mark.core_model
+
+
+@pytest.fixture
+def fa4_config(monkeypatch):
+    config = create_diffusion_vllm_config(
+        torch.device("cuda"),
+        OmniDiffusionConfig.from_kwargs(model="test", ar_attention_config={"flash_attn_version": 4}),
+    )
+    monkeypatch.setattr(paged_attention, "_FA_VERSION_BY_HEAD_SIZE", {})
+    with set_current_vllm_config(config):
+        yield config
 
 
 def make_state(page=5, device="cpu", dtype=torch.float32, heads=1, dim=4, window=2, sink=1):
@@ -101,9 +116,9 @@ def test_separate_text_pages_real_length_and_causal_rows():
         state.close()
 
 
-@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a supported CUDA paged-attention backend")
-def test_paged_attention_matches_dense_reference():
+def test_paged_attention_matches_dense_reference(fa4_config):
     import torch.nn.functional as F
 
     state = make_state(page=924, device="cuda", dtype=torch.bfloat16, heads=2, dim=64)
@@ -192,7 +207,7 @@ def test_attention_rejects_missing_frame_pages_before_computing():
         )
 
 
-@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_shared_route_rejects_gather_and_unsupported_page_sizes(monkeypatch):
     from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention

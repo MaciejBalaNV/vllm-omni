@@ -32,6 +32,7 @@ def test_deployment_discovery(model_type: str) -> None:
     assert pipeline.model_arch == pipeline.diffusers_class_name
     assert pipeline.stages[0].model_arch == pipeline.model_arch
     assert deploy["stages"][0]["model_class_name"] == pipeline.model_arch
+    assert deploy["stages"][0]["ar_attention_config"]["flash_attn_version"] == 4
 
     folder, module_name, class_name = _DIFFUSION_MODELS[pipeline.model_arch]
     module = importlib.import_module(f"vllm_omni.diffusion.models.{folder}.{module_name}")

@@ -11,6 +11,8 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
+    ar_attention_config:
+      flash_attn_version: 4
     enforce_eager: true
     model_class_name: Cosmos3NanoSimBimanualPipeline
     engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine

@@ -21,10 +21,10 @@ installation is not required by the model. The model also reuses the shared
 frame visibility metadata and delayed clean-frame publication through the
 upstream cache manager.
 
-The selected backend must support the complete frame page. For 924-token pages,
-the validated route is vLLM's FA4 on SM103 with FP16 or BF16. Unsupported page
-sizes raise an error. The model requires direct paged attention, so routes that
-gather K/V or use reference attention are rejected.
+The configured autoregressive attention backend must support the complete frame
+page. By default, we select FlashAttention 4 to support arbitrary page sizes.
+Unsupported page sizes raise an error. The model features multi-frame causal
+structure, so routes that gather K/V or use reference attention are rejected.
 
 ## Deployment
 

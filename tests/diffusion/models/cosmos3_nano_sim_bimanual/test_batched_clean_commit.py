@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.diffusion.models.cosmos3_nano_sim_bimanual.test_frame_causal_attention import fa4_config as fa4_config
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.frame_causal_attention import FrameCausalAttentionState
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.transformer_cosmos3_nano_sim_bimanual import (
@@ -195,9 +196,10 @@ def test_batched_clean_cache_matches_sequential_cpu(history, window, sink, frame
     )
 
 
-@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged FlashAttention")
 @pytest.mark.parametrize("history,window,sink,frames", [(0, 5, 0, 4), (4, 5, 0, 4), (8, 2, 0, 3), (8, 2, 1, 4)])
+@pytest.mark.usefixtures("fa4_config")
 def test_batched_clean_cache_matches_sequential_cuda(history, window, sink, frames):
     compare(
         device=torch.device("cuda"),
@@ -265,10 +267,11 @@ def test_non_multiple_of_16_frame_geometry_cpu(monkeypatch):
     )
 
 
-@hardware_test(res={"cuda": "B200"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA paged attention")
 @pytest.mark.parametrize("tokens_per_frame", [394, 924])
 @pytest.mark.parametrize("frames", [3, 4])
+@pytest.mark.usefixtures("fa4_config")
 def test_real_frame_geometry_cuda(monkeypatch, tokens_per_frame, frames):
     monkeypatch.setitem(globals(), "BLOCK", tokens_per_frame)
     compare(
