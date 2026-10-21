@@ -96,6 +96,7 @@ from vllm_omni.model_extras.ming_image import (
 from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
+from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -281,6 +282,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     **{
         model_class_name: {
             "reference_image_size_resolver": _always_preserve_reference_image_size,
+            "transformer_config_subfolder_resolver": minimax_h3_transformer_subfolder,
         }
         for model_class_name in (
             "MiniMaxH3Pipeline",
