@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +17,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
-    ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
@@ -43,7 +41,7 @@ def platform_synchronize_calls(monkeypatch) -> list[None]:
     calls: list[None] = []
     monkeypatch.setattr(
         "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
-        SimpleNamespace(synchronize=lambda: calls.append(None), empty_cache=lambda: None),
+        SimpleNamespace(synchronize=lambda: calls.append(None)),
     )
     return calls
 
@@ -119,20 +117,6 @@ class CapablePipeline:
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self.closes.append(session_id)
-
-
-class DynamicPipeline(CapablePipeline):
-    """Sizes the window from each request, like a full-history checkpoint."""
-
-    def ar_diffusion_request_spec(self, request) -> ARDiffusionKVCacheSpec:
-        return replace(self.spec, window_frames=request.sampling_params.extra_args["frames"])
-
-
-def dynamic_request(session_id: str, frames: int, *, reset: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(
-        request_id=f"{session_id}-{frames}",
-        sampling_params=SimpleNamespace(extra_args={"session_id": session_id, "frames": frames, "reset": reset}),
-    )
 
 
 class WarmupPipeline(CapablePipeline):
@@ -214,8 +198,6 @@ def make_runner(
     runner._ar_diffusion_kv_cache_spec = None
     runner._sessions = OrderedDict()
     runner._session_capacity = 0
-    runner._available_memory_budget = None
-    runner._cache_failure = None
     runner._perf_e2e_times = []
     runner._stepwise_chunk_started = {}
     runner._active_stepwise_request_id = None
@@ -224,66 +206,6 @@ def make_runner(
     if preallocate:
         runner._preallocate_kv_cache(available_bytes=available_bytes)
     return runner
-
-
-def test_allocation_does_not_pin_later_request_window():
-    pipeline = CapablePipeline(tiny_spec())
-    runner = make_runner(pipeline)
-    assert runner.ar_diffusion_kv_config.window_chunks is None
-    larger = replace(pipeline.spec, window_frames=226)
-    effective, config = runner._effective_spec(larger)
-    assert effective.window_frames == config.window_chunks == 226
-
-
-def test_dynamic_request_replaces_pool_for_a_new_geometry(monkeypatch):
-    pipeline = DynamicPipeline(lingbot_like_spec(capacity=1))
-    runner = make_runner(pipeline)
-    monkeypatch.setattr(DiffusionModelRunner, "execute_model", lambda self, req, **kwargs: object())
-    runner.execute_model(dynamic_request("a", 5))
-    original = runner.kv_cache
-
-    runner.execute_model(dynamic_request("b", 9))
-
-    assert runner.kv_cache is not original
-    assert runner.kv_cache.spec.window_chunks == 9
-    assert list(runner._sessions) == ["b"]
-    assert pipeline.closes == ["a"]
-
-
-def test_dynamic_request_cannot_discard_its_live_session_without_reset(monkeypatch):
-    pipeline = DynamicPipeline(lingbot_like_spec(capacity=1))
-    runner = make_runner(pipeline)
-    monkeypatch.setattr(DiffusionModelRunner, "execute_model", lambda self, req, **kwargs: object())
-    runner.execute_model(dynamic_request("a", 5))
-    pool = runner.kv_cache
-
-    with pytest.raises(ARDiffusionRequestRejectedError, match="reset is required"):
-        runner.execute_model(dynamic_request("a", 9))
-    assert runner.kv_cache is pool
-    assert list(runner._sessions) == ["a"]
-    assert not pipeline.closes
-
-    runner.execute_model(dynamic_request("a", 9, reset=True))
-    assert runner.kv_cache.spec.window_chunks == 9
-
-
-def test_dynamic_request_that_cannot_fit_is_rejected_before_teardown(monkeypatch):
-    pipeline = DynamicPipeline(lingbot_like_spec(capacity=1))
-    runner = make_runner(pipeline)
-    monkeypatch.setattr(DiffusionModelRunner, "execute_model", lambda self, req, **kwargs: object())
-    runner.execute_model(dynamic_request("a", 5))
-    pool = runner.kv_cache
-
-    with pytest.raises(ARDiffusionRequestRejectedError, match="cannot fit one session"):
-        runner.execute_model(dynamic_request("b", 1 << 20, reset=True))
-
-    # The live pool, session, and later requests are unaffected.
-    assert runner.kv_cache is pool
-    assert list(runner._sessions) == ["a"]
-    assert not pipeline.closes
-    assert runner._cache_failure is None
-    runner.execute_model(dynamic_request("b", 9))
-    assert runner.kv_cache.spec.window_chunks == 9
 
 
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
@@ -356,7 +278,6 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert kv is not None
     assert kv.num_local_kv_branches == 1
     assert kv.frames_per_block == 3
-    assert kv.max_scratch_frames_per_branch == 3
     assert kv.spec.window_chunks == 5
     assert kv.spec.sink_chunks == 1
     assert kv.cross_attention_lengths == {"text": 8}

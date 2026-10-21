@@ -50,11 +50,12 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.tick_adapter import (
     build_cosmos3_nano_sim_bimanual_action_control,
     parse_cosmos3_nano_sim_bimanual_tick,
 )
-from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionRequestRejectedError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.streaming_decode import StreamingDecodeState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionChunkMetadata, ARDiffusionTickRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+ARDiffusionRequestRejectedError = OmniClientError
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "vllm_omni/diffusion/models/cosmos3_nano_sim_bimanual"
 
@@ -136,8 +137,6 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
     pipe._states = {}
-    pipe._bound_session_id = None
-    pipe._ar_diffusion_kv_state = None
     pipe._distilled_num_steps = 4
     pipe.default_domain_id = 15
     pipe.default_fps = 30
@@ -223,6 +222,16 @@ def test_latent_output_keeps_existing_path() -> None:
     assert output.shape == (1, 3, 16, 2, 2) and state.latents
     pipe._decode_live_latents.assert_not_called()
     pipe._decode_latents.assert_not_called()
+
+
+def test_dense_rollout_is_not_capped_by_manifest_cache_length() -> None:
+    pipe, state = fake_pipeline()
+    token_ids = torch.arange(513).unsqueeze(0)
+    pipe._tokenize_prompt.return_value = (token_ids, torch.ones_like(token_ids))
+
+    pipe.forward(request(5, output_type="latent"))
+
+    assert state.fingerprint.real_text_kv_lengths == (("main", 513),)
 
 
 @pytest.mark.parametrize("frames", [5, 17, 21, 61])

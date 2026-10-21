@@ -73,33 +73,6 @@ declares the maximum model-specific tokens, such as action/state registers, that
 must coexist with it. `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` may increase
 that derived minimum for deployment experiments but cannot reduce it.
 
-## Admission rejection vs. forward failure
-
-A pipeline that rejects a request during validation — before touching session
-state or the KV pool — should raise `ARDiffusionRequestRejectedError`. The runner
-surfaces the error without releasing the session, so the client keeps its
-accumulated KV history and can retry a corrected request (or reset
-explicitly). Any other exception from a forward is treated as a failure of
-unknown extent: the runner releases the session's KV and notifies the pipeline
-to drop its model-owned state, because partially committed pages cannot be
-trusted. Pipelines must therefore complete every fail-closed check (session
-fingerprint, chunk-index ordering, prompt-length, resolution, action coverage)
-before their first side effect.
-
-## Per-request KV geometry
-
-A pipeline whose KV geometry depends on the request, for example on its
-resolution or full-history length, also implements
-`SupportsDynamicARDiffusion.ar_diffusion_request_spec(request)`.
-`ar_diffusion_kv_cache_spec()` still sizes the initial pool. When a request
-resolves to a different spec, the runner releases every session and replaces
-the pool within the load-time memory budget. Before releasing anything, it
-rejects the request with `ARDiffusionRequestRejectedError` if the request's own
-session is live without `reset`, or if one session of the new geometry cannot
-fit that budget. Session changes that keep the same spec, such as a transposed
-resolution with the same token count, are left to the pipeline's own admission
-checks.
-
 ## DreamZero adapter
 
 DreamZero implements the capability directly on `DreamZeroPipeline`. Its adapter
