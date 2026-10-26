@@ -494,6 +494,8 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
     supports_running_prefix_cache_reset: bool = True
+    supports_pending_generation: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -879,6 +881,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
@@ -987,6 +990,9 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        parse_reference_kv_config(normalized.get("kv_offload_config"))
         return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:
@@ -1423,7 +1429,9 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_arch",
         "model_stage",
         "retains_state_across_chunks",
+        "supports_pending_generation",
         "supports_running_prefix_cache_reset",
+        "recompute_preemption",
         "scheduler_cls",
         "stage_connector_spec",
         "worker_type",
@@ -2091,8 +2099,13 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    kwargs["supports_pending_generation"] = topology.supports_pending_generation
     if not topology.supports_running_prefix_cache_reset:
         kwargs["supports_running_prefix_cache_reset"] = False
+    # AR-only capability: diffusion stages have no KV-recompute preemption and
+    # reject unknown config fields.
+    if topology.execution_type is StageExecutionType.LLM_AR and topology.recompute_preemption != "allow":
+        kwargs["recompute_preemption"] = topology.recompute_preemption
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
