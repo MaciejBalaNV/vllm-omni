@@ -62,6 +62,27 @@ class Formatter(conditioning.Cosmos3Conditioning):
         self.device = torch.device("cpu")
 
 
+@pytest.mark.parametrize("initialized,rank", [(False, None), (True, 0), (True, 1)])
+def test_conditioning_warnings_only_on_rank_zero(monkeypatch, caplog, initialized, rank):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized)
+
+    def get_rank():
+        assert initialized
+        return rank
+
+    monkeypatch.setattr(torch.distributed, "get_rank", get_rank)
+    formatter = Formatter()
+    formatter._format_and_tokenize_prompts(
+        '{"caption":"A robot","aspect_ratio":"4,3"}', "", 48, 24, 720, 1280, 17, Params()
+    )
+    prompt = json.loads(formatter.tokenizer.conversations[0][0]["content"])
+    assert prompt["aspect_ratio"] == "16,9"
+    messages = [record.getMessage() for record in caplog.records if record.name == conditioning.logger.name]
+    should_warn = not initialized or rank == 0
+    assert any("conflicts with the generated 1280x720 canvas" in message for message in messages) == should_warn
+    assert any("shortened to max_sequence_length" in message for message in messages) == should_warn
+
+
 @pytest.mark.parametrize(
     "image,frames,expected", [(True, 1, {"H": 1024, "W": 1024}), (False, 189, {"H": 720, "W": 1280})]
 )

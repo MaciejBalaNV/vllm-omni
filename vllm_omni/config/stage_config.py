@@ -1093,6 +1093,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "async_chunk": raw_dict.get("async_chunk"),
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
+        "cfg_companion_wait_timeout_s": raw_dict.get("cfg_companion_wait_timeout_s"),
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),

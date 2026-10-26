@@ -13,6 +13,16 @@ from vllm_omni.outputs.stage_capabilities import stage_output_types
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize(
+    "setting,expected",
+    [("", None), ("cfg_companion_wait_timeout_s: null\n", None), ("cfg_companion_wait_timeout_s: 12.5\n", 12.5)],
+)
+def test_companion_timeout_preserves_disabled_default_and_fractional_values(tmp_path, setting, expected):
+    path = tmp_path / "deploy.yaml"
+    path.write_text("stages: []\n" + setting)
+    assert load_deploy_config(path).cfg_companion_wait_timeout_s == expected
+
+
 def test_shared_und_is_opt_in_and_defaults_survive_both_config_builders():
     deploy = load_deploy_config(Path(__file__).parents[2] / "vllm_omni/deploy/cosmos3_shared_und.yaml")
     pipeline = resolve_pipeline_config(deploy.pipeline)

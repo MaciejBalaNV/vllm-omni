@@ -1975,12 +1975,13 @@ def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata_
 ) -> None:
     import json
 
-    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+    from vllm_omni.diffusion.models.cosmos3 import conditioning
 
     pipeline = make_cosmos3_pipeline()
     calls = _capture_tokenize_calls(pipeline)
-    monkeypatch.setattr(pipeline_cosmos3, "_is_rank_zero", lambda: rank_zero)
-    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0 if rank_zero else 1)
+    warning = mocker.patch.object(conditioning.logger, "warning")
 
     pipeline._format_and_tokenize_prompts(
         '{"caption": "A robot", "aspect_ratio": "4,3"}',
@@ -1996,6 +1997,7 @@ def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata_
 
     assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
     if rank_zero:
+        warning.assert_called_once()
         rendered_warning = warning.call_args.args[0] % warning.call_args.args[1:]
         assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in rendered_warning
     else:
@@ -2018,11 +2020,11 @@ def test_format_and_tokenize_prompts_keeps_nearest_canonical_aspect_ratio(
 ) -> None:
     import json
 
-    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+    from vllm_omni.diffusion.models.cosmos3 import conditioning
 
     pipeline = make_cosmos3_pipeline()
     calls = _capture_tokenize_calls(pipeline)
-    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
+    warning = mocker.patch.object(conditioning.logger, "warning")
 
     pipeline._format_and_tokenize_prompts(
         json.dumps({"caption": "A robot", "aspect_ratio": aspect_ratio}),

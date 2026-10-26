@@ -227,7 +227,9 @@ class Cosmos3Conditioning:
             self.tokenizer.apply_chat_template(conversations, tokenize=True, add_generation_prompt=True)
         )
         original_token_count = len(token_ids)
-        if original_token_count > max_sequence_length:
+        if original_token_count > max_sequence_length and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
             logger.warning(
                 "Cosmos3 prompt token_ids shortened to max_sequence_length: "
                 "original_token_count=%d, max_sequence_length=%d, removed_token_count=%d",
@@ -374,14 +376,15 @@ class Cosmos3Conditioning:
             aspect_ratio_source = (
                 "requested aspect_ratio" if requested_aspect_ratio is not None else "JSON prompt aspect_ratio"
             )
-            logger.warning(
-                "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
-                aspect_ratio_source,
-                metadata_aspect_ratio,
-                width,
-                height,
-                canvas_aspect_ratio,
-            )
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
+                    aspect_ratio_source,
+                    metadata_aspect_ratio,
+                    width,
+                    height,
+                    canvas_aspect_ratio,
+                )
             metadata_aspect_ratio = canvas_aspect_ratio
         elif aspect_ratio_override is not None:
             metadata_aspect_ratio = aspect_ratio_override
