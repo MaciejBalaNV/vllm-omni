@@ -28,6 +28,10 @@ asynchronous AR scheduling are enabled. Inter-stage asynchronous chunking is
 disabled and diffusion runs eagerly. Shared-memory transfers copy K/V from GPU
 to host and back to GPU.
 
+Stage 1 skips the generic standalone diffusion warmup because it requires real
+stage-0 conditioning exports. The first media request warms GEN and the VAE
+through the full two-stage path; include it before collecting steady-state timings.
+
 Chat defaults to text output and terminates at stage 0, including streaming
 chat with image inputs. Use `/v1/images/generations` for T2I and the existing
 synchronous or asynchronous video routes for T2V/I2V. Media requests must select
@@ -107,6 +111,7 @@ With the repository vLLM environment, also run:
 ```bash
 python -m pytest \
   tests/config/test_cosmos3_shared_und.py \
+  tests/diffusion/test_diffusion_engine_dummy_run.py \
   tests/engine/test_cfg_companion_tracker.py \
   tests/engine/test_cfg_companion_lifecycle.py \
   tests/engine/test_stage_pool_release_batching.py \

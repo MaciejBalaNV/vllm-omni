@@ -1716,6 +1716,10 @@ class DiffusionEngine:
         if model_class_name is None:
             raise RuntimeError("Dummy request requires a resolved model_class_name")
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+        if num_frames is None:
+            num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input, self.od_config)
+        if num_frames <= 0:
+            return None
         if supports_image_input:
             color_format = image_color_format(model_class_name)
             images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
@@ -1725,10 +1729,6 @@ class DiffusionEngine:
             audio_sr = 16000
             prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
-        if num_frames is None:
-            num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
-        if num_frames <= 0:
-            return None
         return OmniDiffusionRequest(
             prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,

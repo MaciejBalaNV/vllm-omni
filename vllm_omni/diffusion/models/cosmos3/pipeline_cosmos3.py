@@ -947,6 +947,12 @@ class Cosmos3OmniDiffusersPipeline(
     _resident_modules: ClassVar[list[str]] = []
     sampling_dtype: ClassVar[torch.dtype] = torch.float32
 
+    @staticmethod
+    def get_dummy_run_num_frames(od_config: OmniDiffusionConfig) -> int:
+        # Shared UND needs real stage-0 exports; the standalone GEN warmup
+        # bypasses admission and cannot supply canonical conditioning.
+        return 0 if (od_config.model_config or {}).get("external_und", False) else 1
+
     @classmethod
     def reference_video_decode_spec(
         cls,

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -33,6 +33,27 @@ def test_observation_conditioned_startup_skips_generic_warmup(model_class_name: 
     engine.close.assert_not_called()
 
 
+@pytest.mark.parametrize("external_und", [False, True])
+def test_cosmos3_startup_warmup_requires_local_und(monkeypatch: pytest.MonkeyPatch, external_und: bool) -> None:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = "Cosmos3OmniDiffusersPipeline"
+    engine.od_config.model_config = {"external_und": external_und}
+    engine.add_req_and_wait_for_response = Mock(return_value=DiffusionOutput())
+    engine.close = Mock()
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda _: (False, False))
+
+    engine.run_startup_warmup()
+
+    if external_und:
+        engine.add_req_and_wait_for_response.assert_not_called()
+    else:
+        engine.add_req_and_wait_for_response.assert_called_once()
+        request = engine.add_req_and_wait_for_response.call_args.args[0]
+        assert request.sampling_params.num_frames == 1
+    engine.close.assert_not_called()
+
+
 @pytest.mark.parametrize("step_execution", [False, True])
 def test_dummy_run_uses_enough_steps_for_execution_mode(
     monkeypatch: pytest.MonkeyPatch,
@@ -54,7 +75,7 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     )
     monkeypatch.setattr(
         "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
-        lambda model_class_name, supports_audio_input: 1,
+        lambda model_class_name, supports_audio_input, od_config: 1,
     )
 
     def run_request(request):

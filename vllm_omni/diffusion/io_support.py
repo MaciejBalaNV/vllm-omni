@@ -55,10 +55,21 @@ def get_diffusion_output_type(model_class_name: str | None) -> str:
     return "image"
 
 
-def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
-    """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
+def get_dummy_run_num_frames(
+    model_class_name: str,
+    supports_audio_input: bool,
+    od_config: OmniDiffusionConfig | None = None,
+) -> int:
+    """Get warmup frames, allowing a model to resolve its policy from config.
+
+    Returns 0 to skip warmup. Models without a config policy retain their
+    declared ``dummy_run_num_frames`` or the audio/image default.
+    """
 
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    warmup_policy = getattr(model_cls, "get_dummy_run_num_frames", None)
+    if od_config is not None and warmup_policy is not None:
+        return int(warmup_policy(od_config))
     if model_cls is not None and hasattr(model_cls, "dummy_run_num_frames"):
         return int(getattr(model_cls, "dummy_run_num_frames"))
     return 2 if supports_audio_input or supports_audio_output(model_class_name) else 1

@@ -277,19 +277,51 @@ def test_capabilities_preserve_legacy_scalar_and_include_media_variants():
     ) == ("image", "video")
 
 
-def _source_definitions(path, names, namespace):
+def _source_definitions(path, names, namespace, *, class_name=None):
     """Exercise CPU definitions without loading their GPU-only import graph."""
     import __future__
 
     import ast
 
     tree = ast.parse((ROOT / path).read_text())
+    if class_name is not None:
+        tree = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
     selected = [node for node in tree.body if isinstance(node, ast.ClassDef | ast.FunctionDef) and node.name in names]
     code = compile(
         ast.Module(body=selected, type_ignores=[]), str(ROOT / path), "exec", flags=__future__.annotations.compiler_flag
     )
     exec(code, namespace)
     return namespace
+
+
+@pytest.mark.parametrize(
+    "model_config,expected_frames", [(None, 1), ({}, 1), ({"external_und": False}, 1), ({"external_und": True}, 0)]
+)
+def test_startup_warmup_policy_requires_local_und(model_config, expected_frames):
+    @dataclass
+    class Config:
+        model_config: dict | None
+
+    policy = _source_definitions(
+        "vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py",
+        {"get_dummy_run_num_frames"},
+        {},
+        class_name="Cosmos3OmniDiffusersPipeline",
+    )
+    pipeline_cls = type("Cosmos3Policy", (), {"get_dummy_run_num_frames": policy["get_dummy_run_num_frames"]})
+
+    class Registry:
+        @staticmethod
+        def _try_load_model_cls(name):
+            assert name == "Cosmos3OmniDiffusersPipeline"
+            return pipeline_cls
+
+    resolver = _source_definitions(
+        "vllm_omni/diffusion/io_support.py",
+        {"get_dummy_run_num_frames", "supports_audio_output"},
+        {"DiffusionModelRegistry": Registry},
+    )["get_dummy_run_num_frames"]
+    assert resolver("Cosmos3OmniDiffusersPipeline", False, Config(model_config)) == expected_frames
 
 
 @dataclass
