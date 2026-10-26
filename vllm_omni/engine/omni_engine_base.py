@@ -17,11 +17,11 @@ from pathlib import Path
 from typing import Any, cast
 
 import janus
-from vllm import envs as vllm_envs
 from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm import envs as vllm_envs
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
@@ -278,6 +278,7 @@ class OmniEngineBase:
                 self._config_resolution.config_path,
             )
 
+        self.default_output_modalities = list(getattr(self.pipeline_config, "default_output_modalities", ()))
         self.num_stages = len(self.stage_configs)
         self.async_chunk = any(
             bool(
@@ -425,6 +426,8 @@ class OmniEngineBase:
         self.prompt_transform_func = (
             getattr(self.stage_clients[0], "prompt_transform_func", None) if self.stage_clients else None
         )
+        if isinstance(self.prompt_transform_func, type):
+            self.prompt_transform_func = self.prompt_transform_func(self.stage_vllm_configs[0])
         self.prompt_expand_func = next(
             (
                 getattr(client, "prompt_expand_func", None)
@@ -438,6 +441,7 @@ class OmniEngineBase:
             StageRuntimeInfo(
                 final_output=client.final_output,
                 final_output_type=client.final_output_type,
+                final_output_types=tuple(getattr(client, "final_output_types", ()) or ()),
                 stage_type=client.stage_type,
                 model_stage=getattr(client, "model_stage", None),
             )
@@ -468,6 +472,7 @@ class OmniEngineBase:
             membership_controller = self._runtime.create_membership_controller()
 
             orchestrator = self._create_orchestrator(
+                cfg_companion_wait_timeout_s=getattr(self.deploy_config, "cfg_companion_wait_timeout_s", None),
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self._output_sink,
                 rpc_async_queue=self.rpc_output_queue.async_q,

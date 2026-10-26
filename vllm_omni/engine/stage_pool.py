@@ -144,7 +144,7 @@ class StagePool:
         )
         # Per-replica release batching: ids waiting for the replica's next RPC
         # and the task sending them (also the strong reference keeping it alive).
-        self._pending_releases: dict[int, dict[str, None]] = {}
+        self._pending_releases: dict[int, dict[str, bool]] = {}
         self._release_flushers: dict[int, asyncio.Task[None]] = {}
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
@@ -1070,7 +1070,16 @@ class StagePool:
                     affinity_request_id=affinity_request_id,
                 )
             client = self._diffusion_client(replica_id)
+            if getattr(req_state, "terminating", False):
+                self.release_binding(request_id)
+                return replica_id
             await client.add_request_async(request_id, request, params, **submit_kwargs)
+            if getattr(req_state, "terminating", False):
+                await self.abort_requests([request_id])
+                self.schedule_release_request_resources(
+                    [request_id], release_kv=getattr(req_state, "wait_for_processed_kv_output", False)
+                )
+                self.release_binding(request_id)
             return replica_id
 
         if pinned_replica_id is not None:
@@ -1090,6 +1099,9 @@ class StagePool:
             )
         if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        if getattr(req_state, "terminating", False):
+            self.release_binding(request_id)
+            return replica_id
         try:
             self.output_processor.add_request(
                 request=request,
@@ -1104,6 +1116,9 @@ class StagePool:
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+            if getattr(req_state, "terminating", False):
+                await self.abort_requests([request_id])
+                self.release_binding(request_id)
         except BaseException:
             # Sending can fail or be cancelled after the engine accepted the
             # request. Abort while its replica binding is still available.
@@ -1399,7 +1414,7 @@ class StagePool:
 
         return abort_outputs
 
-    def schedule_release_request_resources(self, request_ids: list[str]) -> None:
+    def schedule_release_request_resources(self, request_ids: list[str], *, release_kv: bool = False) -> None:
         """Queue a best-effort release of *request_ids* on every live replica.
 
         Broadcast rather than binding-routed: the orchestrator releases route
@@ -1411,7 +1426,7 @@ class StagePool:
         hung replica delays only its own batches (bounded by
         ``RELEASE_RPC_TIMEOUT_S`` per RPC).
         """
-        if not request_ids or not self._has_chunk_transfer_adapter:
+        if not request_ids or not (self._has_chunk_transfer_adapter or release_kv):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1424,7 +1439,8 @@ class StagePool:
             return
         for replica_id in self.live_replica_ids():
             pending = self._pending_releases.setdefault(replica_id, {})
-            pending.update(dict.fromkeys(request_ids))
+            for request_id in request_ids:
+                pending[request_id] = pending.get(request_id, False) or release_kv
             if replica_id not in self._release_flushers:
                 self._release_flushers[replica_id] = loop.create_task(self._flush_replica_releases(replica_id))
 
@@ -1435,16 +1451,23 @@ class StagePool:
                 # Let completions handled in this loop pass join the batch.
                 await asyncio.sleep(0)
                 ids = list(pending)
+                kv_ids = [rid for rid, release_kv in pending.items() if release_kv]
                 pending.clear()
                 # Resolve the client per RPC: the replica may have been removed or replaced.
                 client = self.clients[replica_id] if replica_id < len(self.clients) else None
-                call = getattr(client, "call_utility_async", None)
-                if call is None:
+                if client is None:
                     return
                 try:
-                    await asyncio.wait_for(
-                        call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S
-                    )
+                    if self._has_chunk_transfer_adapter:
+                        call = getattr(client, "call_utility_async", None)
+                        if call is not None:
+                            await asyncio.wait_for(
+                                call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S
+                            )
+                    if kv_ids:
+                        await client.collective_rpc_async(
+                            "omni_release_kv_resources", timeout=self.RELEASE_RPC_TIMEOUT_S, args=(kv_ids,)
+                        )
                 except Exception as e:
                     logger.warning(
                         "[StagePool-%s] release_request_resources on replica %s failed: %r",

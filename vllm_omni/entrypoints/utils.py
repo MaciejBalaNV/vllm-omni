@@ -14,6 +14,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm_omni.config.config_factory import with_trust_remote_code_override
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.outputs.stage_capabilities import stage_output_types
 
 logger = init_logger(__name__)
 
@@ -173,9 +174,8 @@ def get_final_stage_id_for_e2e(
     try:
         final_stage_id_for_e2e = last_stage_id
         for _sid in range(last_stage_id, -1, -1):
-            if (
-                getattr(stage_list[_sid], "final_output", False)
-                and stage_list[_sid].final_output_type in output_modalities
+            if getattr(stage_list[_sid], "final_output", False) and bool(
+                set(stage_output_types(stage_list[_sid])) & set(output_modalities)
             ):
                 final_stage_id_for_e2e = _sid
                 break

@@ -58,6 +58,7 @@ class InlineStageDiffusionClient(StageClientBase):
         self.stage_id = metadata.stage_id
         self.replica_id = metadata.replica_id
         self.final_output = metadata.final_output
+        self.final_output_types = getattr(metadata, "final_output_types", ())
         self.final_output_type = metadata.final_output_type
         self.model_stage = getattr(metadata, "model_stage", None)
         self.default_sampling_params = metadata.default_sampling_params

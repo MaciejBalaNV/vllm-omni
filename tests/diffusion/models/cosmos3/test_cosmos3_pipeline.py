@@ -3430,3 +3430,84 @@ def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
         open_guidance_interval=open_interval,
     )
     assert cfg_calls == [True] * (1 if open_interval else 3)
+
+
+def test_external_branch_load_requires_complete_state_without_session_manager(make_cosmos3_pipeline):
+    from vllm_omni.diffusion.models.cosmos3.external_und import ExternalBranch
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.external_und = True
+    positive = ExternalBranch(3, [(torch.ones(1, 3, 2, 4), torch.zeros(1, 3, 2, 4))])
+    negative = ExternalBranch(7, [(torch.zeros(1, 7, 2, 4), torch.ones(1, 7, 2, 4))])
+    pipeline._external_branches = {False: positive, True: negative}
+    with pytest.raises(ValueError, match="rotary frequencies"):
+        pipeline._kv_load_und(None, False)
+    positive.freqs = (torch.ones(1, 4, 1, 4), torch.zeros(1, 4, 1, 4))
+    negative.freqs = (torch.zeros(1, 4, 1, 4), torch.ones(1, 4, 1, 4))
+    for is_negative in (False, True, False, True, False):
+        assert pipeline._kv_load_und(None, is_negative)
+        branch = pipeline._external_branches[is_negative]
+        assert pipeline.transformer.cached_kv is branch.kv
+        assert pipeline.transformer.cached_freqs_gen is branch.freqs
+
+
+@pytest.mark.parametrize(
+    "guidance,interval,expected_order",
+    [
+        (3.0, None, [False, True, False, True]),
+        (3.0, (500, 1000), [False, True, False]),
+        (1.0, None, [False, False]),
+    ],
+)
+def test_external_diffuse_installs_each_pair_after_reset(
+    make_cosmos3_pipeline, monkeypatch, guidance, interval, expected_order
+):
+    from vllm_omni.diffusion.models.cosmos3.external_und import ExternalBranch
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.external_und = True
+    transformer = pipeline.transformer
+    monkeypatch.setattr(transformer, "_pad_to_patch_size", lambda h, w: (h, w, h, w), raising=False)
+    original_forward = transformer.forward
+    seen = []
+
+    def compute(mask, frames, hp, wp, fps, device, dtype):
+        assert transformer.cached_kv is None and transformer.cached_freqs_gen is None
+        value = torch.tensor([mask.shape[1], frames, hp, wp, fps], dtype=dtype, device=device)
+        return (None, None), (value, -value)
+
+    monkeypatch.setattr(transformer, "_compute_rope_freqs", compute, raising=False)
+
+    def forward(**kwargs):
+        negative = kwargs["text_ids"][0, 0].item() == 1
+        branch = pipeline._external_branches[negative]
+        assert transformer.cached_kv is branch.kv
+        assert transformer.cached_freqs_gen is branch.freqs
+        seen.append(negative)
+        return original_forward(**kwargs)
+
+    monkeypatch.setattr(transformer, "forward", forward)
+    for positive_length, negative_length, frames, height, fps in ((7, 3, 1, 2, 24), (4, 9, 2, 3, 15)):
+        pipeline._external_branches = {
+            negative: ExternalBranch(length, [(torch.zeros(1, length, 1, 4), torch.zeros(1, length, 1, 4))])
+            for negative, length in ((False, positive_length), (True, negative_length))
+            if not negative or guidance > 1
+        }
+        seen.clear()
+        pipeline.diffuse(
+            latents=torch.zeros(1, 2, frames, height, 2),
+            timesteps=torch.tensor([900, 100]),
+            cond_ids=torch.full((1, positive_length), 2),
+            cond_mask=torch.ones(1, positive_length),
+            uncond_ids=torch.ones(1, negative_length, dtype=torch.long),
+            uncond_mask=torch.ones(1, negative_length),
+            guidance_scale=guidance,
+            guidance_interval=interval,
+            shared_kwargs={"video_shape": (frames, height, 2), "fps": fps},
+        )
+        assert seen == expected_order
+        for branch in pipeline._external_branches.values():
+            torch.testing.assert_close(
+                branch.freqs[0], torch.tensor([branch.expected_length, frames, height, 2, fps], dtype=torch.float32)
+            )
+    assert transformer.reset_calls == 2

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -1066,6 +1066,7 @@ class OmniKVTransferManager:
         Returns:
             KVCacheTransferData if extraction successful, None otherwise
         """
+        strict_conditioning = bool((custom_metadata or {}).get("cosmos3_conditioning_length"))
         num_layers = len(kv_caches)
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
@@ -1073,9 +1074,13 @@ class OmniKVTransferManager:
         for layer_idx, layer_kv in enumerate(kv_caches):
             kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx, block_size=block_size)
             if kv_pair is None:
+                if strict_conditioning:
+                    raise ValueError(f"Incomplete conditioning K/V layer {layer_idx}")
                 continue
             key_blocks, value_blocks = kv_pair
 
+            if strict_conditioning and key_blocks.shape != value_blocks.shape:
+                raise ValueError(f"Mismatched conditioning K/V blocks at layer {layer_idx}")
             if key_blocks.shape[0] != value_blocks.shape[0]:
                 logger.warning(
                     f"Layer {layer_idx} for request {req_id} has mismatched KV block counts: "
@@ -1085,6 +1090,8 @@ class OmniKVTransferManager:
             # Validate block IDs - shape: [num_blocks, block_size, n_heads, head_dim]
             max_block = min(key_blocks.shape[0], value_blocks.shape[0]) - 1
             valid_ids = [bid for bid in block_ids if 0 <= bid <= max_block]
+            if strict_conditioning and (len(valid_ids) != len(block_ids) or len(valid_ids) * block_size < seq_len):
+                raise ValueError(f"Partial conditioning K/V extraction at layer {layer_idx}")
             if not valid_ids:
                 continue
 
@@ -1364,6 +1371,37 @@ class OmniKVTransferManager:
             return
         if not fut.cancel():
             fut.add_done_callback(_drop_prefetch_result)
+
+    def release_requests(self, request_ids: list[str]) -> None:
+        """Release request-owned dense transfers after the consumer has finished.
+
+        Called through serialized worker RPCs, after abort/extraction. Both
+        endpoints can unlink SHM keys, so a surviving receiver also reclaims
+        an unconsumed export when its sender has died.
+        """
+        connector = self.connector
+        if connector is None:
+            return
+        for request_id in request_ids:
+            self._discard_future(request_id)
+            keys: set[str] = set()
+            from_stage, to_stage = self.send_stages
+            if self.config.need_send_cache and from_stage is not None and to_stage is not None:
+                keys.update(
+                    build_rank_aware_send_keys(
+                        request_id, from_stage, to_stage, self._tp_topo, hook=self.kv_send_key_builder
+                    )
+                )
+            from_stage, to_stage = self.recv_stages
+            if self.config.need_recv_cache and from_stage is not None and to_stage is not None:
+                keys.update(
+                    key
+                    for key, _ in build_rank_aware_recv_keys(
+                        request_id, from_stage, to_stage, self._tp_topo, hook=self.kv_recv_key_builder
+                    )
+                )
+            for key in keys:
+                connector.cleanup(key)
 
     def shutdown_prefetch(self) -> None:
         """Cancel pending prefetches and stop the executor (call on teardown)."""

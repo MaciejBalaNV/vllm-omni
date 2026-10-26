@@ -9,6 +9,7 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "OmniCosmos3ForConditionalGeneration": ("cosmos3", "cosmos3", "OmniCosmos3ForConditionalGeneration"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
@@ -538,6 +539,7 @@ _OMNI_MODELS = {
 
 
 _VLLM_OMNI_MODELS = {
+    "OmniCosmos3ForConditionalGeneration": ("cosmos3", "cosmos3", "OmniCosmos3ForConditionalGeneration"),
     **_VLLM_MODELS,
     **_OMNI_MODELS,
 }

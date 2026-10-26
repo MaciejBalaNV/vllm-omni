@@ -1406,22 +1406,27 @@ class Cosmos3VFMTransformer(nn.Module):
             )
         _validate_mixed_precision_runtime(mixed_precision_config, od_config)
 
-        self.language_model = self._language_model_cls(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            num_hidden_layers=self.num_hidden_layers,
-            num_attention_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
-            vocab_size=self.vocab_size,
-            rms_norm_eps=self.rms_norm_eps,
-            rope_theta=self.rope_theta,
-            mrope_section=self.mrope_section,
-            quant_config=language_model_quant_config,
-            release_completed_blocks_to_meta=release_completed_blocks_to_meta,
-            prefix="language_model",
-            **self._language_model_kwargs(),
+        self.external_und = bool(_od_config_get(od_config, "external_und", False))
+        self.rotary_emb = Qwen3VLTextRotaryEmbedding(
+            head_dim=self.head_dim, rope_theta=self.rope_theta, mrope_section=self.mrope_section
         )
+        if not self.external_und:
+            self.language_model = self._language_model_cls(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                num_hidden_layers=self.num_hidden_layers,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                vocab_size=self.vocab_size,
+                rms_norm_eps=self.rms_norm_eps,
+                rope_theta=self.rope_theta,
+                mrope_section=self.mrope_section,
+                quant_config=language_model_quant_config,
+                release_completed_blocks_to_meta=release_completed_blocks_to_meta,
+                prefix="language_model",
+                **self._language_model_kwargs(),
+            )
 
         # Video projection layers are small; not worth quantizing.
         self.proj_in = nn.Linear(self.patch_latent_dim, self.hidden_size)
@@ -1494,7 +1499,7 @@ class Cosmos3VFMTransformer(nn.Module):
     def _model_cpu_offload_components(self) -> dict[str, list[nn.Module]]:
         """Cosmos3's mutually-exclusive reasoner/generator component sets."""
         return {
-            "reasoner": [self.language_model.layers],
+            "reasoner": [self.language_model.layers] if hasattr(self, "language_model") else [],
             "generator": [self.gen_layers],
         }
 
@@ -1763,7 +1768,7 @@ class Cosmos3VFMTransformer(nn.Module):
         text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
         gen_pos_ids = torch.stack(gen_pos_list, dim=1).to(device)  # [3, B, S_gen]
 
-        rotary_emb = self.language_model.rotary_emb
+        rotary_emb = self.rotary_emb
         _dummy = torch.tensor([], dtype=dtype, device=device)
         cos_und, sin_und = rotary_emb(_dummy, position_ids=text_pos_ids)
         cos_gen, sin_gen = rotary_emb(_dummy, position_ids=gen_pos_ids)
@@ -2078,6 +2083,8 @@ class Cosmos3VFMTransformer(nn.Module):
         # freqs_gen (M-RoPE cos/sin) is derived purely from shape/fps and is
         # cached alongside UND K/V by both the bespoke and session-state paths.
         need_kv = self.cached_kv is None
+        if self.external_und and (need_kv or self.cached_freqs_gen is None):
+            raise ValueError("External Cosmos3 conditioning requires both UND K/V and GEN rotary frequencies")
         if need_kv or self.cached_freqs_gen is None:
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,

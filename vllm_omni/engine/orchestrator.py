@@ -66,7 +66,7 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
@@ -243,6 +243,8 @@ class OrchestratorRequestState:
     prompt: Any = None
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
+    terminating: bool = False
+    wait_for_processed_kv_output: bool = False
     # Stage the request was admitted to; > 0 when the stages before it are bypassed.
     entry_stage_id: int = 0
     final_output_stage_ids: set[int] = field(default_factory=set)
@@ -353,6 +355,7 @@ class OrchestratorBase:
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
+        cfg_companion_wait_timeout_s: float | None = None,
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
@@ -405,7 +408,7 @@ class OrchestratorBase:
             log_stats=log_stats,
         )
 
-        self._cfg_tracker = CfgCompanionTracker()
+        self._cfg_tracker = CfgCompanionTracker(cfg_companion_wait_timeout_s)
         self._stage_input_processors: dict[int, Any] = {}
         self._prompt_processing_lock = threading.RLock()
         self._stage_input_submission_locks: dict[int, asyncio.Lock] = {}
@@ -512,6 +515,8 @@ class OrchestratorBase:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        if self._cfg_tracker.wait_timeout_s is not None:
+            tasks.append(asyncio.create_task(self._cfg_liveness_loop(), name="orchestrator-cfg-liveness"))
         for index, coro in enumerate(self._background_tasks()):
             tasks.append(asyncio.create_task(coro, name=f"orchestrator-background-{index}"))
         if membership_watcher is not None:
@@ -697,12 +702,19 @@ class OrchestratorBase:
             for output_msg in abort_outputs:
                 await self.output_async_queue.put(output_msg)
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+    async def _abort_request_ids(
+        self, request_ids: list[str], *, output_request_ids: set[str] | None = None
+    ) -> list[OutputMessage]:
         """Forward abort requests to all stage pools.
 
         Collects final-stage AR abort outputs (partial tokens) while request
         state is still available for stage-id filtering. Diffusion pools do
         not contribute abort outputs.
+
+        ``output_request_ids`` identifies the requests whose abort outcome was
+        claimed by the calling cleanup before setting ``terminating``. Other
+        requests are still aborted, but cannot emit another terminal response.
+        Without this set, only requests that are not terminating emit outputs.
         """
         if not request_ids:
             return []
@@ -714,6 +726,11 @@ class OrchestratorBase:
                 for orch_req_id, request_output in stage_outputs:
                     req_state = self.request_states.get(orch_req_id)
                     if req_state is None:
+                        continue
+                    if output_request_ids is not None:
+                        if orch_req_id not in output_request_ids:
+                            continue
+                    elif getattr(req_state, "terminating", False):
                         continue
                     final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
                     if pool.stage_id not in final_stage_ids:
@@ -757,8 +774,17 @@ class OrchestratorBase:
         """
         if not request_ids:
             return
+        # Completed companions still own K/V needed by the parent. Parent
+        # cleanup removes their tracker entries and releases the whole bundle.
+        request_ids = [rid for rid in request_ids if not self._cfg_tracker.is_companion(rid)]
+        release_kv = any(
+            getattr(self.request_states.get(rid), "wait_for_processed_kv_output", False) for rid in request_ids
+        )
         for pool in self.stage_pools:
-            pool.schedule_release_request_resources(request_ids)
+            if release_kv:
+                pool.schedule_release_request_resources(request_ids, release_kv=True)
+            else:
+                pool.schedule_release_request_resources(request_ids)
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -890,7 +916,7 @@ class OrchestratorBase:
                 )
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
-            if req_state is None:
+            if req_state is None or getattr(req_state, "terminating", False):
                 # Stage 0's sender lives on the frontend. Deliver its cache
                 # feedback even after cancellation; consumers may drop the error
                 # only after the engine has invalidated those stale entries.
@@ -1444,7 +1470,7 @@ class OrchestratorBase:
         pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
-            if req_state is None:
+            if req_state is None or getattr(req_state, "terminating", False):
                 logger.warning(
                     "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
                     output.request_id,
@@ -1472,12 +1498,59 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
+    async def _cfg_liveness_loop(self) -> None:
+        """Independent of either output loop and of worker output arrivals."""
+        while not self._shutdown_event.is_set():
+            await asyncio.sleep(1.0)
+            await self._check_cfg_liveness()
+
+    async def _check_cfg_liveness(self) -> None:
+        for parent_id in self._cfg_tracker.pending_parents():
+            state = self.request_states.get(parent_id)
+            if state is None or getattr(state, "terminating", False):
+                continue
+            reason = None
+            if self._cfg_tracker.expired(parent_id):
+                reason = "Timed out waiting for processed CFG companion outputs"
+            else:
+                pool = self.stage_pools[0]
+                live = pool.live_replica_ids()
+                for companion_id in self._cfg_tracker.get_companion_request_ids(parent_id).values():
+                    if self._cfg_tracker.is_companion_done(companion_id):
+                        continue
+                    companion = self.request_states.get(companion_id)
+                    bound = pool.get_bound_replica_id(companion_id)
+                    if not live or (bound is not None and bound not in live):
+                        reason = f"CFG companion {companion_id} lost its stage replica"
+                        break
+                    # Admission can still be queued. Only a submitted, unbound
+                    # companion is known lost; the deadline bounds silent gaps.
+                    if companion is not None and companion.stage_submit_ts and bound is None:
+                        reason = f"CFG companion {companion_id} lost its binding"
+                        break
+            if reason is not None:
+                await self._fail_cfg_parent(parent_id, reason)
+
+    async def _fail_cfg_parent(self, parent_id: str, reason: str) -> None:
+        state = self.request_states.get(parent_id)
+        if state is None or getattr(state, "terminating", False):
+            return
+        # Claim the terminal result before the first await. Output routing and
+        # late completions must not race cleanup into another GEN submission.
+        state.terminating = True
+        await self.output_async_queue.put(ErrorMessage(request_id=parent_id, stage_id=0, error=reason))
+        await self._cleanup_request_ids([parent_id], abort=True, release_owners=True)
+
     async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
+        state = self.request_states.get(parent_id)
+        if state is None or getattr(state, "terminating", False):
+            return
+        state.terminating = True
         await self.output_async_queue.put(
             ErrorMessage(
                 request_id=parent_id,
@@ -1566,6 +1639,12 @@ class OrchestratorBase:
                 continue
             bound = pool.get_bound_replica_id(req_id)
             if bound == replica_id or not stage_has_live:
+                parent_id = self._cfg_tracker.get_parent_id(req_id)
+                if parent_id is not None or self._cfg_tracker.has_companions(req_id):
+                    await self._fail_cfg_parent(parent_id or req_id, str(error))
+                    continue
+                if getattr(req_state, "terminating", False):
+                    continue
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error=str(error),
@@ -1823,6 +1902,10 @@ class OrchestratorBase:
             if pid is not None and pid not in batch and not self._cfg_tracker.is_companion_done(rid):
                 orphaned_parents.setdefault(pid, rid)
         for pid, cid in orphaned_parents.items():
+            parent = self.request_states.get(pid)
+            if parent is None or getattr(parent, "terminating", False):
+                continue
+            parent.terminating = True
             deferred = self._cfg_tracker.pop_pending_parent(pid)
             await self.output_async_queue.put(
                 ErrorMessage(
@@ -1833,14 +1916,29 @@ class OrchestratorBase:
             )
             batch.add(pid)
             cleanup_ids.append(pid)
+        # Capture ownership before fencing output routing and before removing
+        # companion identities. Internal companions and parents already failed
+        # above must not leak an abort output alongside the parent's error.
+        abort_output_ids = {
+            rid
+            for rid in request_ids
+            if abort
+            and (state := self.request_states.get(rid)) is not None
+            and not getattr(state, "terminating", False)
+            and not self._cfg_tracker.is_companion(rid)
+        }
         for rid in list(cleanup_ids):
             for cid in self._cfg_tracker.cleanup_parent(rid):
                 if cid not in batch:
                     batch.add(cid)
                     cleanup_ids.append(cid)
+        for request_id in cleanup_ids:
+            state = self.request_states.get(request_id)
+            if state is not None:
+                state.terminating = True
         abort_outputs: list[OutputMessage] = []
         if abort:
-            abort_outputs = await self._abort_request_ids(cleanup_ids)
+            abort_outputs = await self._abort_request_ids(cleanup_ids, output_request_ids=abort_output_ids)
         self._release_request_bindings(cleanup_ids)
         self._release_stage_transfer_resources(cleanup_ids)
         for request_id in cleanup_ids:
@@ -2039,11 +2137,15 @@ class OrchestratorBase:
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
         req_id = output.request_id
+        if getattr(req_state, "terminating", False):
+            return
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
+        if self._cfg_tracker.is_companion(req_id) and not finished:
+            return
         if finished and self._cfg_tracker.is_companion(req_id):
             self._cfg_tracker.set_companion_output(req_id, output)
             await self._handle_cfg_companion_ready(req_id)
@@ -2061,7 +2163,9 @@ class OrchestratorBase:
         if req_state.session_owned:
             # Session-owned outputs are delivered through the session interceptor.
             pass
-        elif self.stage_pools[stage_id].final_output:
+        elif self.stage_pools[stage_id].final_output and not (
+            getattr(req_state, "wait_for_processed_kv_output", False) and stage_id == 0
+        ):
             message = OutputMessage(
                 request_id=req_id,
                 stage_id=stage_id,
@@ -2084,6 +2188,8 @@ class OrchestratorBase:
                 req_state.pending_final_output = message
                 request_finished = False
             else:
+                if request_finished:
+                    req_state.terminating = True
                 await self.output_async_queue.put(message)
         elif stage_metrics is not None:
             await self.output_async_queue.put(
@@ -2103,6 +2209,8 @@ class OrchestratorBase:
             req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
 
         if await self._intercept_stage_output(stage_id, replica_id, output, req_state, stage_metrics, submit_ts):
+            return
+        if getattr(req_state, "terminating", False) and not request_finished:
             return
 
         if (
@@ -2489,7 +2597,7 @@ class OrchestratorBase:
             return
 
         parent_state = self.request_states.get(parent_id)
-        if parent_state is None:
+        if parent_state is None or getattr(parent_state, "terminating", False):
             return
 
         stage_id = deferred["stage_id"]
@@ -2519,7 +2627,9 @@ class OrchestratorBase:
 
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
-            if req_state is None:
+            if req_state is None or getattr(req_state, "terminating", False):
+                continue
+            if getattr(req_state, "wait_for_processed_kv_output", False):
                 continue
             if self._cfg_tracker.is_companion(req_id):
                 # kv_ready only says the companion's KV hit the connector; its
@@ -2658,6 +2768,8 @@ class OrchestratorBase:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
+        if getattr(req_state, "terminating", False):
+            return
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
         pinned_replica_id = self._session_route(next_logical, req_state)
@@ -2705,19 +2817,9 @@ class OrchestratorBase:
                     len(companion_outputs),
                     expected,
                 )
-                await self.output_async_queue.put(
-                    ErrorMessage(
-                        request_id=req_id,
-                        stage_id=src_stage_id,
-                        error=(
-                            f"CFG companion outputs incomplete ({len(companion_outputs)}/{expected}); "
-                            "request aborted to avoid degraded CFG conditioning"
-                        ),
-                    )
-                )
-                await self._cleanup_request_ids(
-                    [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                    abort=True,
+                await self._fail_cfg_parent(
+                    req_id,
+                    f"CFG companion outputs incomplete ({len(companion_outputs)}/{expected}); request aborted",
                 )
                 return
             diffusion_source_outputs = [output, *companion_outputs]
@@ -2825,6 +2927,8 @@ class OrchestratorBase:
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                     **route_kwargs,
                 )
+            if getattr(req_state, "terminating", False):
+                return
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -3481,6 +3585,9 @@ class Orchestrator(OrchestratorBase):
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
+        for role, companion_id in (msg.cfg_companion_ids or {}).items():
+            self._cfg_tracker.register_companion(request_id, role, companion_id)
+
         if not self.stage_pools[stage_id].live_replica_ids():
             # The entry stage lost all replicas between the HTTP-layer errored check and
             # dispatch. Runs before request state / running counter registration,
@@ -3516,6 +3623,11 @@ class Orchestrator(OrchestratorBase):
 
         req_state = OrchestratorRequestState(
             request_id=request_id,
+            wait_for_processed_kv_output=bool(
+                deserialize_additional_information(getattr(prompt, "additional_information", None)).get(
+                    "omni_wait_for_processed_kv_output", False
+                )
+            ),
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
@@ -3635,7 +3747,7 @@ class Orchestrator(OrchestratorBase):
         sampling_params_list = msg.sampling_params_list
 
         parent_state = self.request_states.get(parent_id)
-        if parent_state is None:
+        if parent_state is None or getattr(parent_state, "terminating", False):
             logger.info(
                 "[Orchestrator] Dropping CFG companion %s (role=%s): parent %s is no longer active",
                 companion_id,

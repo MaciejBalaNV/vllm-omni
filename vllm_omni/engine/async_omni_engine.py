@@ -31,7 +31,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 
 logger = init_logger(__name__)
@@ -238,10 +238,26 @@ class AsyncOmniEngine(OmniEngineBase):
         if isinstance(prompt, dict):
             raw_info = prompt.get("additional_information")
             if isinstance(raw_info, dict):
+                # Only a trusted prompt transform may hide conditioning output.
+                # Strip caller metadata before that transform runs, while
+                # preserving the caller's dictionary and unrelated fields.
+                if "omni_wait_for_processed_kv_output" in raw_info:
+                    raw_info = dict(raw_info)
+                    raw_info.pop("omni_wait_for_processed_kv_output")
+                    prompt = {**prompt, "additional_information": raw_info}
                 raw_meta = raw_info.get("meta")
                 if isinstance(raw_meta, dict):
                     for key in TRANSFORM_OWNED_META_KEYS:
                         raw_meta.pop(key, None)
+        elif isinstance(prompt, OmniEngineCoreRequest):
+            # Preprocessed requests bypass the input processor and transform,
+            # but are still caller input at this admission boundary.
+            raw_info = deserialize_additional_information(prompt.additional_information)
+            if "omni_wait_for_processed_kv_output" in raw_info:
+                raw_info = dict(raw_info)
+                raw_info.pop("omni_wait_for_processed_kv_output")
+                prompt = copy.copy(prompt)
+                prompt.additional_information = serialize_additional_information(raw_info)
         original_prompt = prompt
         preselected_stage0_replica: int | None = None
         request_artifact_dirs: list[str] = []
@@ -295,6 +311,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 prompt,
             )
 
+            params = effective_sampling_params_list[0]
             # Full input processing (tokenization, multimodal, etc.)
             assert self.input_processor is not None
             _t_preprocess = time.perf_counter()
@@ -541,6 +558,7 @@ class AsyncOmniEngine(OmniEngineBase):
                         request_id, msg.original_prompt, stage0_params, effective_spl
                     )
 
+            msg.cfg_companion_ids = {companion.role: companion.companion_id for companion in companions}
             self.request_queue.sync_q.put(msg)
         except BaseException:
             for artifact_dir in msg.request_artifact_dirs or ():

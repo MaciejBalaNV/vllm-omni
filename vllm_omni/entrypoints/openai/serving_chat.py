@@ -782,8 +782,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Some models will return a list like ["text", None, "audio"], better
         # to strip None in the list
         engine_output_modalities = [x for x in self.engine_client.output_modalities if x is not None]
-        output_modalities = getattr(request, "modalities", engine_output_modalities)
-        request.modalities = output_modalities if output_modalities is not None else engine_output_modalities
+        default_modalities = getattr(self.engine_client, "default_output_modalities", None) or engine_output_modalities
+        output_modalities = getattr(request, "modalities", None) or default_modalities
+        request.modalities = output_modalities
 
         if not isinstance(request.modalities, list) or not all(isinstance(m, str) for m in request.modalities):
             return self.create_error_response("'modalities' must be a list of strings.")
@@ -795,6 +796,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return self.create_error_response(
                 f"Unsupported output modalities {', '.join(sorted(unsupported))} for this model. "
                 f"Supported modalities: {', '.join(sorted(allowed_modalities))}",
+            )
+
+        # Stage capabilities also advertise video for the dedicated video API.
+        # This chat path cannot render video responses or construct their raw
+        # conditioning prompts, even when the model supports video generation.
+        if "video" in request.modalities:
+            return self.create_error_response(
+                "Video generation is not supported by /v1/chat/completions. Use /v1/videos or /v1/videos/sync instead."
             )
 
         if request.modalities and "audio" in request.modalities:
@@ -3406,7 +3415,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         build_kwargs: dict[str, Any] = {}
         ar_stop_token_ids: list[int] | None = None
 
-        if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
+        if (
+            bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None
+        ) and model_class_name not in {"Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"}:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,

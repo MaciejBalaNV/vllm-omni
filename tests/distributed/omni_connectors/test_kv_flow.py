@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import struct
 
@@ -606,3 +609,40 @@ def test_manager_extraction_no_connector(kv_config, common_constants):
     )
 
     assert req_id in processed
+
+
+@pytest.mark.parametrize("block_ids", [[0, 9], [0], [-1, 1]])
+def test_conditioning_extraction_rejects_partial_blocks(kv_config, block_ids):
+    manager = OmniKVTransferManager(kv_config)
+    cache = torch.randn(2, 2, 16, 2, 4)
+    with pytest.raises(ValueError, match="Partial conditioning"):
+        manager._extract_kv_cache(
+            "conditioning",
+            block_ids,
+            17,
+            [cache],
+            16,
+            "float32",
+            {"cosmos3_conditioning_length": 17},
+        )
+
+
+@pytest.mark.parametrize("sender", [True, False])
+def test_dense_transfer_cleanup_from_either_endpoint(sender):
+    from unittest.mock import Mock
+
+    manager = OmniKVTransferManager(
+        OmniKVCacheConfig(
+            from_stage="0",
+            to_stage="1",
+            stage_id="0" if sender else "1",
+            need_send_cache=sender,
+            need_recv_cache=not sender,
+        )
+    )
+    manager._connector = Mock()
+    manager.release_requests(["parent", "negative"])
+    assert [call.args[0] for call in manager._connector.cleanup.call_args_list] == [
+        "omni_0_to_1_kv_cache_parent",
+        "omni_0_to_1_kv_cache_negative",
+    ]

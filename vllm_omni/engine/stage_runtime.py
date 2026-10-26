@@ -89,6 +89,7 @@ class StageRuntimeInfo:
     final_output_type: FinalOutputModalityType | None
     stage_type: str
     model_stage: str | None = None
+    final_output_types: tuple[str, ...] = ()
 
 
 @dataclass

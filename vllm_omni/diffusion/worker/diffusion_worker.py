@@ -891,6 +891,12 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def omni_release_kv_resources(self, request_ids: list[str]) -> None:
+        """Release unconsumed dense transfers, including a dead sender's SHM."""
+        manager = getattr(self.model_runner, "kv_transfer_manager", None)
+        if manager is not None:
+            manager.release_requests(request_ids)
+
     def release_step_requests(self, request_ids: list[str]) -> None:
         """Retire cancelled step state at the serialized worker-call boundary."""
         assert self.model_runner is not None, "Model runner not initialized"

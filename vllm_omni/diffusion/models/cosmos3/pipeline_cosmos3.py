@@ -65,6 +65,78 @@ from vllm_omni.diffusion.media import (
     VideoValueRange,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_DURATION_TEMPLATE as COSMOS3_DURATION_TEMPLATE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE as COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_INVERSE_DURATION_TEMPLATE as COSMOS3_INVERSE_DURATION_TEMPLATE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE as COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_INVERSE_RESOLUTION_TEMPLATE as COSMOS3_INVERSE_RESOLUTION_TEMPLATE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_RESOLUTION_TEMPLATE as COSMOS3_RESOLUTION_TEMPLATE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_SYSTEM_PROMPT as COSMOS3_SYSTEM_PROMPT,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_DEFAULT_FLOW_SHIFT as COSMOS3_T2I_DEFAULT_FLOW_SHIFT,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL as COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE as COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_DEFAULT_HEIGHT as COSMOS3_T2I_DEFAULT_HEIGHT,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS as COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_DEFAULT_WIDTH as COSMOS3_T2I_DEFAULT_WIDTH,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2I_SYSTEM_PROMPT as COSMOS3_T2I_SYSTEM_PROMPT,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE as COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2V_DEFAULT_HEIGHT as COSMOS3_T2V_DEFAULT_HEIGHT,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2V_DEFAULT_NUM_FRAMES as COSMOS3_T2V_DEFAULT_NUM_FRAMES,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS as COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_T2V_DEFAULT_WIDTH as COSMOS3_T2V_DEFAULT_WIDTH,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT as COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    Cosmos3Conditioning,
+    _ceil_video_num_frames,
+    _json_object_aspect_ratio,
+    _normalize_aspect_ratio,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    _aspect_ratio_for_dimensions as _aspect_ratio_for_dimensions,
+)
+from vllm_omni.diffusion.models.cosmos3.conditioning import (
+    _format_json_object_prompt as _format_json_object_prompt,
+)
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
     SupportImageInput,
@@ -168,33 +240,10 @@ COSMOS3_DEFAULT_CONDITION_PIXEL_FRAMES = (
     max(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION) * COSMOS3_VAE_TEMPORAL_COMPRESSION + 1
 )
 COSMOS3_V2V_DEFAULT_FLOW_SHIFT = 10.0
-COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
-COSMOS3_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
-COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
-COSMOS3_INVERSE_DURATION_TEMPLATE = "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
-COSMOS3_INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
-COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{width} resolution."
-# NOTE: Intentional typo in "give" instead of "given" to match training setup.
-COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
-COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
 COSMOS3_TRANSFER_SYSTEM_PROMPT = (
     "You are a helpful assistant that generates images or videos following the user's instructions"
     " and control signals (edge maps, blur, depth, or segmentation)."
 )
-
-COSMOS3_T2V_DEFAULT_HEIGHT = 720
-COSMOS3_T2V_DEFAULT_WIDTH = 1280
-COSMOS3_T2V_DEFAULT_NUM_FRAMES = 189
-COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS = 35
-COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE = 6.0
-COSMOS3_VIDEO_DEFAULT_FLOW_SHIFT = 10.0
-
-COSMOS3_T2I_DEFAULT_HEIGHT = 1024
-COSMOS3_T2I_DEFAULT_WIDTH = 1024
-COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS = 50
-COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE = 7.0
-COSMOS3_T2I_DEFAULT_FLOW_SHIFT = 3.0
-COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL: tuple[float, float] = (400.0, 1000.0)
 
 COSMOS3_EDGE_T2V_DEFAULT_HEIGHT = 480
 COSMOS3_EDGE_T2V_DEFAULT_WIDTH = 832
@@ -210,92 +259,6 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
-
-
-def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
-    """Round a video length up to the causal VAE's ``factor * k + 1`` grid."""
-    if temporal_compression_factor <= 0:
-        raise ValueError(f"Cosmos3 temporal_compression_factor must be positive, got {temporal_compression_factor}.")
-    if num_frames <= 1:
-        return num_frames
-    latent_frames = math.ceil((num_frames - 1) / temporal_compression_factor)
-    return latent_frames * temporal_compression_factor + 1
-
-
-def _format_json_object_prompt(
-    prompt: str,
-    *,
-    num_frames: int,
-    frame_rate: float,
-    height: int,
-    width: int,
-    aspect_ratio: str | None,
-) -> str | None:
-    """Match Imaginaire4 metadata injection for JSON-object prompts."""
-    try:
-        prompt_obj = json.loads(prompt)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(prompt_obj, dict):
-        return None
-
-    metadata: dict[str, Any] = {}
-    if num_frames > 1:
-        duration_seconds = int(num_frames / frame_rate) if frame_rate > 0 else 0
-        metadata.update({"duration": f"{duration_seconds}s", "fps": float(frame_rate)})
-    else:
-        prompt_obj.pop("duration", None)
-        prompt_obj.pop("fps", None)
-    metadata["resolution"] = {"H": int(height), "W": int(width)}
-    if aspect_ratio is not None:
-        metadata["aspect_ratio"] = aspect_ratio
-
-    prompt_obj.update(metadata)
-    return json.dumps(prompt_obj)
-
-
-def _json_object_aspect_ratio(prompt: str) -> Any | None:
-    """Return an aspect-ratio field from a JSON-object prompt, if present."""
-    try:
-        prompt_obj = json.loads(prompt)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(prompt_obj, dict):
-        return None
-    return prompt_obj.get("aspect_ratio")
-
-
-def _normalize_aspect_ratio(value: Any) -> str | None:
-    """Normalize supported ratio spellings for comparison and prompt metadata."""
-    if value is None:
-        return None
-    parts = str(value).strip().replace(":", ",").split(",")
-    if len(parts) != 2:
-        return None
-    try:
-        width, height = (int(part.strip()) for part in parts)
-    except ValueError:
-        return None
-    if width <= 0 or height <= 0:
-        return None
-    divisor = math.gcd(width, height)
-    return f"{width // divisor},{height // divisor}"
-
-
-def _aspect_ratio_for_dimensions(width: int, height: int) -> str:
-    """Return the nearest supported Cosmos aspect-ratio label."""
-    if width <= 0 or height <= 0:
-        raise ValueError(f"Cosmos3 canvas dimensions must be positive, got {width}x{height}.")
-    canvas_ratio = width / height
-
-    def ratio_value(label: str) -> float:
-        ratio_width, ratio_height = (int(part) for part in label.split(","))
-        return ratio_width / ratio_height
-
-    return min(
-        (label for sizes in VIDEO_RES_SIZE_INFO.values() for label in sizes),
-        key=lambda label: abs(canvas_ratio - ratio_value(label)),
-    )
 
 
 def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransformer]:
@@ -928,6 +891,7 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 # Pipeline
 # ---------------------------------------------------------------------------
 class Cosmos3OmniDiffusersPipeline(
+    Cosmos3Conditioning,
     nn.Module,
     CFGParallelMixin,
     SupportImageInput,
@@ -1034,6 +998,20 @@ class Cosmos3OmniDiffusersPipeline(
             )
         self.device = get_local_device()
         self.dtype = od_config.dtype
+        self.external_und = bool((od_config.model_config or {}).get("external_und", False))
+        if self.external_und:
+            if self.dtype != torch.bfloat16 or od_config.quantization_config is not None:
+                raise ValueError("Shared Cosmos3 UND requires BF16 without quantization")
+            if resolved_offload.strategy is not OffloadStrategy.NONE or od_config.lora_path:
+                raise ValueError("Shared Cosmos3 UND does not support offloading or LoRA")
+            if od_config.cache_backend not in (None, "none"):
+                raise ValueError("Shared Cosmos3 UND requires diffusion caching disabled")
+            if od_config.parallel_config.world_size != 1:
+                raise ValueError("Shared Cosmos3 UND supports a single GPU with TP=1")
+            if resolve_cosmos3_transformer_cls(od_config.tf_model_config) is not Cosmos3VFMTransformer:
+                raise ValueError("Shared Cosmos3 UND does not support Edge checkpoints")
+            self._dit_modules = ["transformer"]
+        self._external_branches = {}
 
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
@@ -1044,8 +1022,11 @@ class Cosmos3OmniDiffusersPipeline(
             model_path,
             subfolder="scheduler",
             local_files_only=local_files_only,
+            revision=getattr(od_config, "revision", None),
         )
         self.is_distilled_model = scheduler_config.get("_class_name") == COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS
+        if self.external_und and self.is_distilled_model:
+            raise ValueError("Shared Cosmos3 UND does not support distilled checkpoints")
         if self.is_distilled_model and od_config.parallel_config.cfg_parallel_size > 1:
             raise ValueError(
                 "Distilled Cosmos3 checkpoints run without classifier-free guidance. "
@@ -1057,6 +1038,7 @@ class Cosmos3OmniDiffusersPipeline(
             model_path,
             subfolder="text_tokenizer",
             local_files_only=local_files_only,
+            revision=getattr(od_config, "revision", None),
         )
 
         # --- VAE ---
@@ -1065,6 +1047,7 @@ class Cosmos3OmniDiffusersPipeline(
             subfolder="vae",
             torch_dtype=self.dtype,
             local_files_only=local_files_only,
+            revision=getattr(od_config, "revision", None),
         ).to(self.device)
 
         if not hasattr(self.vae.config, "scale_factor_temporal"):
@@ -1146,9 +1129,21 @@ class Cosmos3OmniDiffusersPipeline(
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model_path,
                 subfolder="transformer",
-                revision=None,
+                revision=getattr(od_config, "revision", None),
                 prefix="transformer.",
-                fall_back_to_pt=True,
+                fall_back_to_pt=not self.external_und,
+                weight_name_patterns=(
+                    "*proj_in.*",
+                    "*proj_out.*",
+                    "*time_embedder.*",
+                    "*norm_moe_gen.*",
+                    "*layers.*.self_attn.add_*",
+                    "*layers.*.self_attn.to_add_out.*",
+                    "*layers.*.self_attn.norm_added_*",
+                    "*layers.*.*_moe_gen.*",
+                )
+                if self.external_und
+                else None,
             ),
         ]
 
@@ -1502,30 +1497,6 @@ class Cosmos3OmniDiffusersPipeline(
         Returns False when cache-dit is not active, preserving the skip speedup.
         """
         return self._cache_dit_requires_paired_cfg
-
-    @staticmethod
-    def _get_sp_param(sp: OmniDiffusionSamplingParams, key: str, default: Any = None) -> Any:
-        """Read a runtime control from sampling params.
-
-        Order of precedence:
-            1. ``sp.extra_args[key]`` - preferred path; the OpenAI image/video
-               endpoints surface custom controls here (see e.g.
-               ``serving_video.py`` writing ``extra_args['flow_shift']``).
-            2. direct attribute on ``sp`` - backward compat for callers that
-               set attributes directly.
-            3. ``default``.
-
-        Skipping this helper would cause API-driven overrides like
-        ``request.flow_shift`` (forwarded as ``extra_args['flow_shift']``) to
-        be silently ignored.
-        """
-        extra = sp.extra_args or {}
-        if extra.get(key) is not None:
-            return extra[key]
-        val = getattr(sp, key, None)
-        if val is not None:
-            return val
-        return default
 
     def _get_robolab_transform(self, *, format_prompt_as_json: bool = False):
         transforms = getattr(self, "_robolab_transforms", None)
@@ -2057,145 +2028,6 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Prompt formatting -----------------------------------------------------
 
-    @staticmethod
-    def _apply_metadata_templates(
-        prompt: str,
-        num_frames: int,
-        frame_rate: float,
-        height: int,
-        width: int,
-        duration_template: str | None = COSMOS3_DURATION_TEMPLATE,
-        resolution_template: str | None = COSMOS3_RESOLUTION_TEMPLATE,
-        force_duration_template: bool = False,
-    ) -> str:
-        """
-        Append duration and resolution metadata to a prompt.
-        """
-        prompt = prompt.strip()
-        if duration_template is None and resolution_template is None:
-            return prompt
-
-        parts: list[str] = []
-        head = prompt.rstrip(".").strip()
-        if head:
-            parts.append(head)
-        if duration_template is not None and (num_frames > 1 or force_duration_template):
-            duration = num_frames / frame_rate
-            parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
-        if resolution_template is not None:
-            parts.append(resolution_template.format(height=height, width=width).rstrip("."))
-        if not parts:
-            return ""
-        return ". ".join(parts) + "."
-
-    # -- Tokenization --------------------------------------------------------
-
-    def _tokenize_prompt(
-        self,
-        text: str,
-        max_sequence_length: int,
-        use_system_prompt: bool = False,
-        system_prompt: str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize a prompt using the Qwen2 chat template.
-
-        Returns (input_ids, attention_mask) as [1, S] tensors on device.
-        """
-        conversations = []
-        if use_system_prompt:
-            conversations.append(
-                {
-                    "role": "system",
-                    "content": system_prompt or COSMOS3_SYSTEM_PROMPT,
-                }
-            )
-        conversations.append({"role": "user", "content": text})
-
-        token_ids = self._normalize_token_ids(
-            self.tokenizer.apply_chat_template(conversations, tokenize=True, add_generation_prompt=True)
-        )
-        original_token_count = len(token_ids)
-        if original_token_count > max_sequence_length and _is_rank_zero():
-            logger.warning(
-                "Cosmos3 prompt token_ids shortened to max_sequence_length: "
-                "original_token_count=%d, max_sequence_length=%d, removed_token_count=%d",
-                original_token_count,
-                max_sequence_length,
-                original_token_count - max_sequence_length,
-            )
-        token_ids = token_ids[:max_sequence_length]
-        token_ids.append(self.tokenizer.eos_token_id)  # 151645
-        token_ids.append(self.tokenizer.convert_tokens_to_ids("<|vision_start|>"))  # 151652
-        seq_len = len(token_ids)
-
-        # No right-padding: the prompt is tokenized to its natural length.
-        # The UND pathway uses causal self-attention with no padding mask and
-        # the GEN cross-attention K/V is trimmed to the real text length, so
-        # padding to a fixed length only added dead compute and never changed
-        # the output.  ``max_sequence_length`` is kept purely as a truncation
-        # cap (above).  The mask is therefore all ones.
-        attention_mask = [1] * seq_len
-
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-        attention_mask = torch.tensor([attention_mask], dtype=torch.long, device=self.device)
-        return input_ids, attention_mask
-
-    @staticmethod
-    def _normalize_token_ids(tokenized_output: object) -> list[int]:
-        """Normalize tokenizer outputs into a flat ``list[int]``.
-
-        Different Transformers/tokenizers versions can return ``list[int]``,
-        a mapping/BatchEncoding with ``input_ids``, tensors, or
-        ``tokenizers.Encoding`` objects from ``apply_chat_template``.
-        """
-        token_ids = tokenized_output
-        while True:
-            if isinstance(token_ids, dict) and "input_ids" in token_ids:
-                token_ids = token_ids["input_ids"]
-            elif hasattr(token_ids, "input_ids"):
-                token_ids = token_ids.input_ids
-            elif hasattr(token_ids, "ids"):
-                token_ids = token_ids.ids
-            elif hasattr(token_ids, "tolist"):
-                token_ids = token_ids.tolist()
-            elif isinstance(token_ids, tuple):
-                token_ids = list(token_ids)
-            elif isinstance(token_ids, list) and len(token_ids) == 1:
-                first = token_ids[0]
-                if isinstance(first, list | tuple):
-                    token_ids = list(first)
-                elif hasattr(first, "ids") or hasattr(first, "input_ids"):
-                    token_ids = first
-                elif hasattr(first, "tolist"):
-                    first_list = first.tolist()
-                    if isinstance(first_list, list | tuple):
-                        token_ids = list(first_list)
-                    else:
-                        break
-                else:
-                    break
-            else:
-                break
-
-        if not isinstance(token_ids, list):
-            raise TypeError(
-                "Cosmos3 tokenizer must return token IDs as a list-like value; "
-                f"got {type(token_ids).__name__}: {token_ids!r}"
-            )
-
-        normalized_ids = []
-        for idx, token_id in enumerate(token_ids):
-            if hasattr(token_id, "item"):
-                token_id = token_id.item()
-            try:
-                normalized_ids.append(int(token_id))
-            except (TypeError, ValueError) as exc:
-                raise TypeError(
-                    "Cosmos3 tokenizer returned a non-integer token at "
-                    f"index {idx}: {type(token_id).__name__}: {token_id!r}"
-                ) from exc
-        return normalized_ids
-
     # -- Latent preparation --------------------------------------------------
 
     def _prepare_latents(
@@ -2319,146 +2151,6 @@ class Cosmos3OmniDiffusersPipeline(
         return audio.detach().cpu()
 
     # -- Prompt formatting + tokenization (shared by T2V and I2V) ------------
-
-    def _format_and_tokenize_prompts(
-        self,
-        prompt: str,
-        negative_prompt: str,
-        num_frames: int,
-        frame_rate: float,
-        height: int,
-        width: int,
-        max_sequence_length: int,
-        sp: OmniDiffusionSamplingParams,
-        use_system_prompt: bool = False,
-        is_t2i: bool = False,
-        system_prompt: str | None = None,
-        prompt_suffix: str | None = None,
-        use_duration_template: bool | None = None,
-        use_resolution_template: bool | None = None,
-        negative_metadata_mode: str | None = None,
-        aspect_ratio_override: str | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Format prompts with metadata templates and tokenize.
-
-        Returns (cond_ids, cond_mask, uncond_ids, uncond_mask).
-
-        For T2I (``is_t2i=True``) the duration template is suppressed (no FPS
-        or duration concept for a single image) and the image-flavored
-        resolution template is used. ``prompt_suffix`` is appended only to the
-        positive prompt, after metadata formatting. ``negative_metadata_mode``
-        controls whether the negative branch receives no metadata, the same
-        metadata as the positive branch, or inverse metadata.
-        """
-        # Route cosmos3-specific controls through ``_get_sp_param`` so they
-        # are picked up from ``extra_args`` (OpenAI endpoint path) as well
-        # as from direct attributes.
-        if use_duration_template is None:
-            use_duration_template = bool(self._get_sp_param(sp, "use_duration_template", False))
-        if use_resolution_template is None:
-            use_resolution_template = bool(self._get_sp_param(sp, "use_resolution_template", False))
-        if negative_metadata_mode is None:
-            negative_metadata_mode = str(self._get_sp_param(sp, "negative_metadata_mode", "inverse"))
-        negative_metadata_mode = negative_metadata_mode.strip().lower()
-        if negative_metadata_mode not in {"none", "same", "inverse"}:
-            raise ValueError(
-                "Cosmos3 negative_metadata_mode must be one of 'none', 'same', or 'inverse'; "
-                f"got {negative_metadata_mode!r}."
-            )
-
-        use_duration_template = use_duration_template and not is_t2i
-        dur_tmpl = COSMOS3_DURATION_TEMPLATE if use_duration_template else None
-        if use_resolution_template:
-            res_tmpl = COSMOS3_IMAGE_RESOLUTION_TEMPLATE if is_t2i else COSMOS3_RESOLUTION_TEMPLATE
-        else:
-            res_tmpl = None
-        requested_aspect_ratio = self._get_sp_param(sp, "aspect_ratio", None)
-        prompt_aspect_ratio = _json_object_aspect_ratio(prompt)
-        metadata_aspect_ratio = requested_aspect_ratio if requested_aspect_ratio is not None else prompt_aspect_ratio
-        canvas_aspect_ratio = aspect_ratio_override or _aspect_ratio_for_dimensions(width, height)
-        normalized_metadata_ratio = _normalize_aspect_ratio(metadata_aspect_ratio)
-        has_aspect_ratio_conflict = (
-            aspect_ratio_override is None
-            and metadata_aspect_ratio is not None
-            and normalized_metadata_ratio != canvas_aspect_ratio
-        )
-        if has_aspect_ratio_conflict:
-            aspect_ratio_source = (
-                "requested aspect_ratio" if requested_aspect_ratio is not None else "JSON prompt aspect_ratio"
-            )
-            if _is_rank_zero():
-                logger.warning(
-                    "Cosmos3 %s=%r conflicts with the generated %dx%d canvas (WxH); using %s for prompt metadata.",
-                    aspect_ratio_source,
-                    metadata_aspect_ratio,
-                    width,
-                    height,
-                    canvas_aspect_ratio,
-                )
-            metadata_aspect_ratio = canvas_aspect_ratio
-        elif aspect_ratio_override is not None:
-            metadata_aspect_ratio = aspect_ratio_override
-
-        json_prompt = _format_json_object_prompt(
-            prompt,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            height=height,
-            width=width,
-            aspect_ratio=metadata_aspect_ratio,
-        )
-        if json_prompt is not None:
-            prompt = json_prompt
-        else:
-            prompt = self._apply_metadata_templates(
-                prompt,
-                num_frames,
-                frame_rate,
-                height,
-                width,
-                duration_template=dur_tmpl,
-                resolution_template=res_tmpl,
-            )
-        if prompt_suffix:
-            prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
-        if _is_rank_zero():
-            logger.debug("Final prompt: '%s'", prompt)
-
-        if negative_metadata_mode == "none":
-            negative_dur_tmpl = None
-            negative_res_tmpl = None
-        elif negative_metadata_mode == "same":
-            negative_dur_tmpl = dur_tmpl
-            negative_res_tmpl = res_tmpl
-        else:
-            negative_dur_tmpl = COSMOS3_INVERSE_DURATION_TEMPLATE if dur_tmpl else None
-            if res_tmpl is None:
-                negative_res_tmpl = None
-            elif is_t2i:
-                negative_res_tmpl = COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE
-            else:
-                negative_res_tmpl = COSMOS3_INVERSE_RESOLUTION_TEMPLATE
-        negative_prompt = self._apply_metadata_templates(
-            negative_prompt,
-            num_frames,
-            frame_rate,
-            height,
-            width,
-            duration_template=negative_dur_tmpl,
-            resolution_template=negative_res_tmpl,
-            force_duration_template=negative_metadata_mode == "inverse",
-        )
-
-        if system_prompt is None:
-            default_sys_prompt = COSMOS3_T2I_SYSTEM_PROMPT if is_t2i else COSMOS3_SYSTEM_PROMPT
-            system_prompt = self._get_sp_param(sp, "system_prompt", default_sys_prompt) or default_sys_prompt
-        cond_ids, cond_mask = self._tokenize_prompt(
-            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
-        )
-        uncond_ids, uncond_mask = self._tokenize_prompt(
-            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
-        )
-        return cond_ids, cond_mask, uncond_ids, uncond_mask
 
     # -- I2V latent preparation ---------------------------------------------
 
@@ -2779,6 +2471,13 @@ class Cosmos3OmniDiffusersPipeline(
         Returns True if the session/BDE path handled the load (caller skips the
         bespoke ``cond_cache`` assignment), False for the bespoke path.
         """
+        if getattr(self, "external_und", False):
+            branch = self._external_branches.get(is_negative)
+            if branch is None or branch.freqs is None:
+                raise ValueError("Missing external Cosmos3 branch K/V or rotary frequencies")
+            self.transformer.cached_kv = branch.kv
+            self.transformer.cached_freqs_gen = branch.freqs
+            return True
         if getattr(self, "_bde_kv_state", None) is not None:
             raise NotImplementedError("BDE pool path for Cosmos3 UND K/V is Stage C/D")
         if state is not None:
@@ -2863,8 +2562,14 @@ class Cosmos3OmniDiffusersPipeline(
         cfg_parallel = self._cfg_parallel_active() and do_cfg
         step_scheduler = scheduler if scheduler is not None else self.scheduler
         # Session-keyed UND K/V (RFC #4480); None => bespoke transformer-instance cache.
-        kv_state = self._new_cosmos3_state(session_id)
+        kv_state = None if getattr(self, "external_und", False) else self._new_cosmos3_state(session_id)
         self._kv_reset_und(kv_state)
+        if getattr(self, "external_und", False):
+            from .external_und import prepare_branch_frequencies
+
+            prepare_branch_frequencies(
+                self.transformer, self._external_branches, latents, shared_kwargs.get("fps"), dtype=self.dtype
+            )
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
             if guidance_interval is None:
@@ -3795,7 +3500,15 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- Forward (main generation entry point) -------------------------------
 
-    def forward(
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        try:
+            return self._forward_request(req)
+        finally:
+            if getattr(self, "external_und", False):
+                self._external_branches.clear()
+                self.transformer.reset_cache()
+
+    def _forward_request(
         self,
         req: DiffusionRequestBatch,
     ) -> DiffusionOutput:
@@ -3809,6 +3522,8 @@ class Cosmos3OmniDiffusersPipeline(
         sp = req.sampling_params
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
+            if getattr(self, "external_und", False):
+                raise ValueError("Shared UND does not support policy requests")
             return self._forward_robolab_policy(
                 sp,
                 robolab_inputs,
@@ -3839,6 +3554,15 @@ class Cosmos3OmniDiffusersPipeline(
         transfer_config = resolve_transfer_config(sp, prompt_data)
         action_video_tensor = video_tensor if action_enabled else None
         is_v2v = video_tensor is not None and not is_t2i and not action_enabled
+        if getattr(self, "external_und", False) and (
+            sound_enabled
+            or action_enabled
+            or is_v2v
+            or transfer_config is not None
+            or (sp.num_outputs_per_prompt or 1) != 1
+            or (is_t2i and image_tensor is not None)
+        ):
+            raise ValueError("Shared UND supports only T2I, T2V and I2V with one output")
         self._validate_distilled_generation_mode(
             is_t2i=is_t2i,
             image_tensor=image_tensor,
@@ -4016,20 +3740,36 @@ class Cosmos3OmniDiffusersPipeline(
         if generator is None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Format prompts & tokenize (B=1; reused across loop iterations
-        # for T2I num_outputs_per_prompt > 1) ---
-        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
-            prompt,
-            negative_prompt,
-            num_frames,
-            frame_rate,
-            height,
-            width,
-            max_sequence_length,
-            sp,
-            use_system_prompt,
-            is_t2i=is_t2i,
-        )
+        if getattr(self, "external_und", False):
+            from .conditioning import checkpoint_identity
+            from .external_und import load_external_branches
+
+            self._external_branches = load_external_branches(
+                sp,
+                self.transformer,
+                guidance_scale > 1.0,
+                self.dtype,
+                checkpoint=checkpoint_identity(self.od_config.model, self.od_config.revision),
+            )
+            positive = self._external_branches[False]
+            negative = self._external_branches.get(True, positive)
+            cond_ids, cond_mask = positive.text_tensors(self.device)
+            uncond_ids, uncond_mask = negative.text_tensors(self.device)
+        else:
+            # --- Format prompts & tokenize (B=1; reused across loop iterations
+            # for T2I num_outputs_per_prompt > 1) ---
+            cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+                prompt,
+                negative_prompt,
+                num_frames,
+                frame_rate,
+                height,
+                width,
+                max_sequence_length,
+                sp,
+                use_system_prompt,
+                is_t2i=is_t2i,
+            )
 
         # --- Prepare latents (T2I, T2V, or I2V) ---
         # T2I shares _prepare_latents with T2V; the math collapses cleanly

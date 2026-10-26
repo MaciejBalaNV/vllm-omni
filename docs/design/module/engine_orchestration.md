@@ -134,6 +134,10 @@ propagate worker exceptions rather than returning `{"supported": False}`.
 When a request has multiple final output stages, only the last abort message
 is request-terminal. Output-processor abort state is committed only after the
 physical EngineCore abort succeeds.
+Cleanup claims abort-output ownership before fencing late output and dispatch.
+That cleanup may deliver the generated prefix while the request is terminating;
+internal companions and requests with an already-claimed terminal outcome do
+not emit an additional abort output.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 
@@ -154,3 +158,24 @@ keeps its existing semantics.
   in the cited validation paths.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
+
+## CFG companion completion and liveness
+
+Companions are built before the parent is queued. The parent submission carries
+its expected companion IDs, which the orchestrator registers before submitting
+the parent to stage 0. The AR scheduler still admits each request independently.
+Processed companion outputs must be stored before completion is recorded.
+Requests declaring `omni_wait_for_processed_kv_output` also require the parent's
+processed output before forwarding; raw K/V readiness does not satisfy this gate.
+This flag is internal: frontend admission removes caller-supplied values before
+running the trusted prompt transform, which may set it for conditioning requests.
+Preprocessed caller requests are sanitized at the same boundary.
+
+When `cfg_companion_wait_timeout_s` is configured, the first parent deferral
+starts a monotonic, non-renewing deadline. A one-second background task owned by
+the orchestrator runs independently of polling and event-driven output loops.
+It checks pending companions against bindings and replica membership, and fails
+silent stalls at the deadline. Failure claims terminal state before awaiting
+cleanup, aborts remaining companions, and releases tracker, binding, transfer,
+and request state. Late outputs cannot forward work after this claim. This
+wait is distinct from the receive timeout inside the K/V transfer manager.

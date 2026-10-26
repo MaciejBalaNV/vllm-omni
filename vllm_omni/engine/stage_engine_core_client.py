@@ -148,6 +148,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.requires_multimodal_data = metadata.requires_multimodal_data
             self.engine_input_source = metadata.engine_input_source
             self.final_output = metadata.final_output
+            self.final_output_types = getattr(metadata, "final_output_types", ())
             self.final_output_type = metadata.final_output_type
             self.default_sampling_params = metadata.default_sampling_params
             self.prompt_transform_func = metadata.prompt_transform_func

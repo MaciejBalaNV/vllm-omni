@@ -13,7 +13,7 @@ from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
-from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
@@ -169,6 +169,77 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_not_called()
+
+
+@pytest.mark.parametrize("preprocessed", [False, True])
+@pytest.mark.parametrize("flag", [True, False, "true", 1])
+@pytest.mark.parametrize("keep_metadata", [False, True])
+def test_build_add_request_message_strips_caller_wait_flag(mocker: MockerFixture, preprocessed, flag, keep_metadata):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.stage_metadata = [StageRuntimeInfo(final_output=True, final_output_type="text", stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request()
+    info = {"omni_wait_for_processed_kv_output": flag}
+    if keep_metadata:
+        info["speaker"] = ["vivian"]
+    if preprocessed:
+        prompt = OmniEngineCoreRequest.from_request(
+            _make_engine_core_request(), additional_information=serialize_additional_information(info)
+        )
+    else:
+        prompt = {"prompt_token_ids": [1, 1, 1], "additional_information": info}
+
+    message = engine._build_add_request_message("req-1", prompt, sampling_params_list=[params])
+
+    metadata = deserialize_additional_information(message.prompt.additional_information)
+    assert "omni_wait_for_processed_kv_output" not in metadata
+    assert metadata.get("speaker") == (["vivian"] if keep_metadata else None)
+    # Sanitization must not alter the caller's metadata or preprocessed request.
+    original = deserialize_additional_information(prompt.additional_information) if preprocessed else info
+    assert original["omni_wait_for_processed_kv_output"] == flag
+    if preprocessed:
+        engine.input_processor.process_inputs.assert_not_called()
+    else:
+        forwarded = engine.input_processor.process_inputs.call_args.kwargs["prompt"]
+        assert "omni_wait_for_processed_kv_output" not in forwarded["additional_information"]
+
+
+@pytest.mark.parametrize("caller_flag", [None, True, False])
+def test_build_add_request_message_preserves_transform_wait_flag(mocker: MockerFixture, caller_flag):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=1)
+    engine.stage_metadata = [StageRuntimeInfo(final_output=True, final_output_type="text", stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request()
+    info: dict[str, object] = {"speaker": ["vivian"]}
+    if caller_flag is not None:
+        info["omni_wait_for_processed_kv_output"] = caller_flag
+
+    def transform(prompt, sampling_params):
+        assert "omni_wait_for_processed_kv_output" not in prompt["additional_information"]
+        return {
+            "prompt_token_ids": [1, 1, 1],
+            "additional_information": {
+                "cosmos3_conditioning_length": 3,
+                "omni_wait_for_processed_kv_output": True,
+            },
+        }
+
+    engine.prompt_transform_func = transform
+    message = engine._build_add_request_message(
+        "req-1",
+        {"prompt": "A crane flies", "modalities": ["video"], "additional_information": info},
+        sampling_params_list=[params],
+        final_stage_id=1,
+    )
+
+    metadata = deserialize_additional_information(message.prompt.additional_information)
+    assert metadata["omni_wait_for_processed_kv_output"] is True
+    assert metadata["cosmos3_conditioning_length"] == 3
+    assert metadata["omni_final_stage_id"] == 1
 
 
 def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade(mocker):

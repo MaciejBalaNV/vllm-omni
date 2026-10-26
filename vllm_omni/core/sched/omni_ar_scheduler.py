@@ -2102,11 +2102,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # 2. Omni Specific: Check if we need to transfer KV
             if self._should_transfer_kv_for_request(request_id):
                 already_triggered = request_id in self.transfer_triggered_requests
-                is_active = request_id in self.active_kv_transfers
+                is_active = request_id in self.active_kv_transfers or request_id in self.requests_needing_kv_transfer
 
                 if already_triggered:
                     if is_active:
-                        # It triggered but hasn't finished yet. We MUST wait.
+                        # Queued and in-flight extractions both still own blocks.
                         logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                         self.waiting_for_transfer_free.add(request_id)
                         self._kv_wait_start_ts[request_id] = time.monotonic()
@@ -2120,7 +2120,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
                             "Freeing immediately."
                         )
-                else:
+                elif status != RequestStatus.FINISHED_ABORTED:
+                    # An abort can arrive while queued or midway through prefill.
+                    # There is no downstream consumer left, and the snapshot may
+                    # not cover the canonical conditioning prompt. Start no new
+                    # export or transfer hold; fall through to normal block
+                    # cleanup. Already-triggered extraction above keeps its hold.
                     self.waiting_for_transfer_free.add(request_id)
                     self._kv_wait_start_ts[request_id] = time.monotonic()
                     confirmed_computed = self._get_confirmed_num_computed_tokens(request)
@@ -2174,6 +2179,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return
 
         if self._should_transfer_kv_for_request(req_id):
+            request = self.requests.get(req_id)
+            info = deserialize_additional_information(getattr(request, "additional_information", None))
+            expected = info.get("cosmos3_conditioning_length")
+            custom_metadata = {}
+            if expected is not None:
+                if expected != request.num_prompt_tokens or seq_len < expected:
+                    raise ValueError("Cosmos3 conditioning export does not cover the canonical prompt")
+                # Async decode can run ahead. Select only the canonical prefix
+                # for conditioning; other models retain their original snapshot.
+                custom_metadata = {"cosmos3_conditioning_length": expected, "confirmed_computed": seq_len}
+                seq_len = expected
             # [Omni] Get block IDs from KVCacheManager
             try:
                 block_ids_tuple = self.kv_cache_manager.get_block_ids(req_id)
@@ -2208,6 +2224,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 block_ids = []
 
             self.requests_needing_kv_transfer[req_id] = {"seq_len": seq_len, "block_ids": block_ids}
+            if custom_metadata:
+                self.requests_needing_kv_transfer[req_id]["custom_metadata"] = custom_metadata
             logger.debug(f"Marked request {req_id} for KV cache transfer (len={seq_len}, blocks={len(block_ids)})")
 
     def _should_transfer_kv_for_request(self, req_id: str) -> bool:

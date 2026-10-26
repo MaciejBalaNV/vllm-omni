@@ -346,6 +346,7 @@ class StagePipelineConfig:
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
+    final_output_types: tuple[str, ...] = ()
     owns_tokenizer: bool = False
     requires_multimodal_data: bool = False
     hf_config_name: str | None = None
@@ -464,6 +465,7 @@ class PipelineConfig:
     default_deploy_config_name: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
+    default_output_modalities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         errors = self.get_validation_errors()
@@ -824,6 +826,7 @@ class DeployConfig:
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    cfg_companion_wait_timeout_s: float | None = None
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
     cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
@@ -1544,6 +1547,7 @@ def merge_pipeline_deploy(
                 custom_process_input_func=input_proc,
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
+                final_output_types=ps.final_output_types,
                 worker_type=worker_type,
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
@@ -1573,6 +1577,7 @@ class StageConfig:
     custom_process_input_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None
+    final_output_types: tuple[str, ...] = ()
     worker_type: str | None = None
     scheduler_cls: str | None = None
     hf_config_name: str | None = None
@@ -1660,6 +1665,7 @@ class StageConfig:
             "engine_input_source": self.input_sources,  # Legacy field name
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
+            "final_output_types": list(self.final_output_types),
             "is_comprehension": self.is_comprehension,
             "sampling_constraints": dict(self.sampling_constraints),
         }

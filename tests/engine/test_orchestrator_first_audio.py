@@ -432,7 +432,7 @@ async def test_invalid_first_audio_reports_error_and_releases_request(audio, cod
     assert isinstance(error, ErrorMessage)
     assert error.request_id == "r" and "first-audio" in error.error
     assert not first.outputs and set(obj.request_states) == {"healthy"}
-    obj._abort_request_ids.assert_awaited_once_with(["r"])
+    obj._abort_request_ids.assert_awaited_once_with(["r"], output_request_ids=set())
     obj._release_request_bindings.assert_called_once_with(["r"])
     await obj._route_upstream_first_audio(0, 0, _raw(first=True))
     assert obj.output_async_queue.empty()

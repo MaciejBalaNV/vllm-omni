@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """CFG companion request tracker for the Omni orchestrator.
 
 Encapsulates all bookkeeping for Classifier-Free Guidance companion
@@ -8,6 +11,9 @@ deferred forwarding, and cleanup).
 from __future__ import annotations
 
 import logging
+import math
+import time
+from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -16,7 +22,12 @@ logger = logging.getLogger(__name__)
 class CfgCompanionTracker:
     """Manages CFG companion request lifecycle in the orchestrator scheduling loop."""
 
-    def __init__(self) -> None:
+    def __init__(self, wait_timeout_s: float | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+        if wait_timeout_s is not None and (not math.isfinite(wait_timeout_s) or wait_timeout_s <= 0):
+            raise ValueError("cfg_companion_wait_timeout_s must be finite and positive")
+        self.wait_timeout_s = wait_timeout_s
+        self._clock = clock
+        self._deadlines: dict[str, float] = {}
         self._companion_map: dict[str, dict[str, str]] = {}  # parent -> {role: companion_id}
         self._companion_ids: set[str] = set()
         self._companion_to_parent: dict[str, str] = {}  # companion -> parent
@@ -55,7 +66,8 @@ class CfgCompanionTracker:
 
     def set_companion_output(self, companion_id: str, output: Any) -> None:
         """Stash companion engine output for the parent to bundle at forward time."""
-        self._companion_outputs[companion_id] = output
+        if companion_id in self._companion_ids:
+            self._companion_outputs[companion_id] = output
 
     def get_companion_outputs(self, parent_id: str) -> list[Any]:
         """Return companion outputs (role-registration order) for bundling.
@@ -82,7 +94,7 @@ class CfgCompanionTracker:
     def on_companion_completed(self, companion_id: str) -> str | None:
         """Mark done. Returns parent_id only if parent is pending and all companions finished."""
         parent_id = self._companion_to_parent.get(companion_id)
-        if parent_id is None:
+        if parent_id is None or companion_id not in self._companion_outputs:
             return None
         done_set = self._done.get(parent_id)
         assert done_set is not None, f"Companion {companion_id} completed before parent {parent_id} was registered"
@@ -95,19 +107,21 @@ class CfgCompanionTracker:
         return None
 
     def defer_parent(self, parent_id: str, engine_outputs: Any, stage_id: int) -> None:
-        """Hold parent result while waiting for companions to finish.
-
-        Deferred parents are released when their companions' processed outputs
-        arrive, and failed by the orchestrator when a companion errors or is
-        aborted. TODO: a deadline for deferred parents and detection of a
-        companion replica dying silently (no error output, no abort) still
-        need a liveness owner in the orchestrator loop.
-        """
+        """Hold output; the first deferral starts a non-renewing deadline."""
+        if self.wait_timeout_s is not None:
+            self._deadlines.setdefault(parent_id, self._clock() + self.wait_timeout_s)
         self._pending_parents[parent_id] = {
             "engine_outputs": engine_outputs,
             "stage_id": stage_id,
         }
         logger.debug("Parent %s deferred, waiting for CFG companions", parent_id)
+
+    def pending_parents(self) -> tuple[str, ...]:
+        return tuple(self._pending_parents)
+
+    def expired(self, parent_id: str) -> bool:
+        deadline = self._deadlines.get(parent_id)
+        return deadline is not None and self._clock() >= deadline
 
     def pop_pending_parent(self, parent_id: str) -> dict[str, Any] | None:
         return self._pending_parents.pop(parent_id, None)
@@ -118,6 +132,7 @@ class CfgCompanionTracker:
             self._companion_ids.discard(companion_id)
             self._companion_to_parent.pop(companion_id, None)
             self._companion_outputs.pop(companion_id, None)
+        self._deadlines.pop(parent_id, None)
         self._done.pop(parent_id, None)
         self._pending_parents.pop(parent_id, None)
         return companion_ids

@@ -1452,7 +1452,7 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     rotary = FakeRotary()
     model = object.__new__(Cosmos3VFMTransformer)
     nn.Module.__init__(model)
-    model.language_model = SimpleNamespace(rotary_emb=rotary)
+    model.rotary_emb = rotary
     model.temporal_modality_margin = 100
     model.base_fps = 24.0
     model.temporal_compression_factor = 4
@@ -1600,3 +1600,33 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+@pytest.mark.parametrize("length,frames,height,width,fps", [(5, 1, 4, 4, 24), (19, 3, 6, 4, 15), (7, 1, 2, 6, 30)])
+def test_external_und_rotary_matches_internal_without_language_weights(length, frames, height, width, fps):
+    from dataclasses import dataclass, field
+
+    from vllm_omni.diffusion.models.cosmos3.external_und import ExternalBranch, prepare_branch_frequencies
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    @dataclass
+    class Config:
+        tf_model_config: dict = field(default_factory=_tiny_cosmos3_config)
+        model_config: dict = field(default_factory=dict)
+        dtype: torch.dtype = torch.float32
+
+    internal = Cosmos3VFMTransformer(Config())
+    external = Cosmos3VFMTransformer(Config(model_config={"external_und": True}))
+    assert not hasattr(external, "language_model")
+    assert not any("language_model" in name for name, _ in external.named_parameters())
+    latents = torch.zeros(1, 2, frames, height, width)
+    branches = {False: ExternalBranch(length, []), True: ExternalBranch(length + 4, [])}
+    external.reset_cache()
+    prepare_branch_frequencies(external, branches, latents, fps, dtype=torch.bfloat16)
+    hp, wp, _, _ = internal._pad_to_patch_size(height, width)
+    for branch in branches.values():
+        _, mask = branch.text_tensors(torch.device("cpu"))
+        _, expected = internal._compute_rope_freqs(mask, frames, hp, wp, fps, torch.device("cpu"), torch.bfloat16)
+        torch.testing.assert_close(branch.freqs[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(branch.freqs[1], expected[1], rtol=0, atol=0)
+    assert not torch.equal(branches[False].freqs[0], branches[True].freqs[0])

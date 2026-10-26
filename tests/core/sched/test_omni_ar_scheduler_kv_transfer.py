@@ -4,12 +4,13 @@
 from types import SimpleNamespace
 
 import pytest
-from vllm import SamplingParams
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm import SamplingParams
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -227,3 +228,147 @@ def test_omits_cache_misses_when_payload_object_is_replaced():
     request.additional_information = {"omni_final_stage_id": 1}
 
     assert not scheduler._request_omits_chunk_transfer_to_next_stage(request)
+
+
+@pytest.mark.parametrize("length,confirmed", [(15, 15), (16, 17), (17, 20), (31, 33), (32, 34), (33, 33)])
+def test_conditioning_snapshot_selects_exact_prompt_without_clamping_reasoning(length, confirmed):
+    from dataclasses import dataclass
+
+    @dataclass
+    class RequestView:
+        num_prompt_tokens: int
+        additional_information: dict
+
+    @dataclass
+    class CacheConfig:
+        block_size: int = 16
+
+    class Blocks:
+        def get_block_ids(self, _):
+            return ([1, 2, 3],)
+
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.requests_needing_kv_transfer = {}
+    scheduler.requests = {
+        "conditioning": RequestView(length, {"cosmos3_conditioning_length": length}),
+        "reasoning": RequestView(length, {}),
+    }
+    scheduler._should_transfer_kv_for_request = lambda _: True
+    scheduler.cache_config = CacheConfig()
+    scheduler.kv_cache_manager = Blocks()
+    scheduler._mark_request_for_kv_transfer("conditioning", confirmed)
+    scheduler._mark_request_for_kv_transfer("reasoning", confirmed)
+    selected = scheduler.requests_needing_kv_transfer["conditioning"]
+    assert selected["seq_len"] == length
+    assert selected["custom_metadata"]["confirmed_computed"] == confirmed
+    assert len(selected["block_ids"]) == (length + 15) // 16
+    assert scheduler.requests_needing_kv_transfer["reasoning"]["seq_len"] == confirmed
+    scheduler.requests_needing_kv_transfer.clear()
+    with pytest.raises(ValueError, match="does not cover"):
+        scheduler._mark_request_for_kv_transfer("conditioning", length - 1)
+
+
+def _conditioning_abort_scheduler(mocker, scheduler_cls, *, computed, placeholders, companion=False):
+    """Use real request queues and finish/free methods; fake only cache storage."""
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    request = Request(
+        request_id="conditioning",
+        prompt_token_ids=list(range(32)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    request.additional_information = {
+        "cosmos3_conditioning_length": 32,
+        "omni_final_stage_id": 0 if companion else 1,
+        "omni_force_kv_transfer": companion,
+    }
+    request.num_computed_tokens = computed + placeholders
+    request.num_output_placeholders = placeholders
+    request.status = RequestStatus.RUNNING if computed else RequestStatus.WAITING
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = [request] if computed else []
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    if not computed:
+        scheduler.waiting.add_request(request)
+    scheduler.deferred_waiting = set()
+    scheduler.num_waiting_for_streaming_input = 0
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = mocker.Mock()
+    scheduler._omits_kv_transfer_cache = {}
+    scheduler._omni_kv_config = {"need_send_cache": True}
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0), kv_transfer_config=None)
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.encoder_cache_manager = mocker.Mock()
+    scheduler.kv_cache_manager = mocker.Mock()
+    scheduler.kv_cache_manager.get_block_ids.return_value = ([1, 2],)
+    scheduler.cache_config = SimpleNamespace(block_size=16)
+    scheduler.defer_block_free = False
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler._new_prompt_len_snapshot = {}
+    scheduler.transfer_triggered_requests = set()
+    scheduler.active_kv_transfers = set()
+    scheduler.waiting_for_transfer_free = set()
+    scheduler.pending_stop_after_extraction = set()
+    scheduler.requests_needing_kv_transfer = {}
+    scheduler._kv_wait_start_ts = {}
+    return scheduler, request
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniARAsyncScheduler])
+@pytest.mark.parametrize("computed,placeholders", [(0, 0), (15, 0), (16, 1), (17, 2), (32, 0)])
+@pytest.mark.parametrize("companion", [False, True])
+def test_abort_conditioning_before_export_frees_request(mocker, scheduler_cls, computed, placeholders, companion):
+    scheduler, request = _conditioning_abort_scheduler(
+        mocker, scheduler_cls, computed=computed, placeholders=placeholders, companion=companion
+    )
+
+    assert scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED) == [request]
+
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    assert not scheduler.requests
+    assert not scheduler.running
+    assert not scheduler.waiting
+    assert not scheduler.waiting_for_transfer_free
+    assert not scheduler._has_pending_kv_work()
+    assert not scheduler._kv_wait_start_ts
+    assert scheduler.finished_req_ids == {request.request_id}
+    scheduler.kv_cache_manager.free.assert_called_once_with(request)
+    scheduler.encoder_cache_manager.free.assert_called_once_with(request)
+    scheduler.input_coordinator.free_finished_request.assert_any_call(request.request_id)
+
+    # A subsequent request still takes the normal prefill-finished export path.
+    next_request = Request(
+        request_id="next-conditioning",
+        prompt_token_ids=list(range(32)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    next_request.additional_information = request.additional_information
+    scheduler.requests[next_request.request_id] = next_request
+    scheduler._commit_kv_transfer_trigger(next_request.request_id, 32, True)
+    assert scheduler.requests_needing_kv_transfer[next_request.request_id]["seq_len"] == 32
+
+
+@pytest.mark.parametrize("scheduler_cls", [OmniARScheduler, OmniARAsyncScheduler])
+@pytest.mark.parametrize("extraction_started", [False, True])
+def test_abort_conditioning_preserves_triggered_extraction_hold(mocker, scheduler_cls, extraction_started):
+    scheduler, request = _conditioning_abort_scheduler(mocker, scheduler_cls, computed=32, placeholders=0)
+    scheduler._commit_kv_transfer_trigger(request.request_id, 32, True)
+    if extraction_started:
+        scheduler.get_finished_requests_needing_kv_transfer()
+
+    scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+
+    if extraction_started:
+        assert request.request_id in scheduler.waiting_for_transfer_free
+        assert request.request_id in scheduler.active_kv_transfers
+        scheduler.kv_cache_manager.free.assert_not_called()
+    else:
+        # A trigger queued for extraction also owns the blocks until the runner
+        # has consumed it, even if cancellation precedes the runner's next step.
+        assert request.request_id in scheduler.waiting_for_transfer_free
+        assert request.request_id in scheduler.requests_needing_kv_transfer
+        scheduler.kv_cache_manager.free.assert_not_called()

@@ -42,6 +42,7 @@ from vllm_omni.metrics.utils import (
 )
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.stage_capabilities import stage_output_types
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 if TYPE_CHECKING:
@@ -242,9 +243,14 @@ class OmniBase(PDDisaggregationMixin):
         self.sampling_constraints_list = self._get_sampling_constraints_list(self.engine.stage_configs)
         if not self.output_modalities:
             self.output_modalities = [
-                self.engine.get_stage_metadata(i).final_output_type for i in range(self.engine.num_stages)
+                modality
+                for i in range(self.engine.num_stages)
+                for modality in stage_output_types(self.engine.get_stage_metadata(i))
             ]
 
+        self.default_output_modalities = (
+            getattr(self.engine, "default_output_modalities", None) or self.output_modalities
+        )
         self._stage_meta_list = [self.engine.get_stage_metadata(i) for i in range(self.engine.num_stages)]
 
         logger.info(
@@ -461,20 +467,21 @@ class OmniBase(PDDisaggregationMixin):
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
-            output_modalities,
+            output_modalities or getattr(self, "default_output_modalities", self.output_modalities),
             self.output_modalities,
             self._stage_meta_list,
         )
 
     def _compute_final_output_stage_ids(self, output_modalities: list[str] | None) -> list[int]:
-        requested_modalities = output_modalities or self.output_modalities
+        requested_modalities = output_modalities or getattr(self, "default_output_modalities", self.output_modalities)
         requested_modalities = [m for m in requested_modalities if m in self.output_modalities]
         if not requested_modalities:
             requested_modalities = self.output_modalities
         return [
             sid
             for sid, stage in enumerate(self._stage_meta_list)
-            if getattr(stage, "final_output", False) and stage.final_output_type in requested_modalities
+            if getattr(stage, "final_output", False)
+            and bool(set(stage_output_types(stage)) & set(requested_modalities))
         ]
 
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:

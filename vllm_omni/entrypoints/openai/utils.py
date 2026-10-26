@@ -24,6 +24,7 @@ from typing import Any
 
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.outputs.stage_capabilities import stage_output_types
 
 
 def get_stage_type(stage_cfg: Any) -> str:
@@ -43,27 +44,21 @@ def is_image_generation_stage(stage_cfg: Any) -> bool:
 
     Covers both classical diffusion stages (``stage_type == "diffusion"``) and
     generation-LLM stages that emit images (``stage_type == "llm"`` with
-    ``final_output_type == "image"`` — the legacy topology MammothModa2 used
     before #7134 migrated it to the shared diffusion runtime). Serving
     endpoints use this so image routes accept either topology.
     """
     if get_stage_type(stage_cfg) == "diffusion":
         return True
-    final_output_type = None
     if isinstance(stage_cfg, dict):
         final_output = stage_cfg.get("final_output", False)
-        final_output_type = stage_cfg.get("final_output_type")
     elif hasattr(stage_cfg, "get"):
         try:
             final_output = stage_cfg.get("final_output", False)
-            final_output_type = stage_cfg.get("final_output_type")
         except Exception:
             final_output = getattr(stage_cfg, "final_output", False)
-            final_output_type = getattr(stage_cfg, "final_output_type", None)
     else:
         final_output = getattr(stage_cfg, "final_output", False)
-        final_output_type = getattr(stage_cfg, "final_output_type", None)
-    return bool(final_output) and final_output_type in {"image", "images"}
+    return bool(final_output) and bool(set(stage_output_types(stage_cfg)) & {"image", "images"})
 
 
 def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
@@ -71,18 +66,14 @@ def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
     for stage in stage_configs or ():
         if isinstance(stage, dict):
             final_output = stage.get("final_output", False)
-            final_output_type = stage.get("final_output_type")
         elif hasattr(stage, "get"):
             try:
                 final_output = stage.get("final_output", False)
-                final_output_type = stage.get("final_output_type")
             except Exception:
                 final_output = getattr(stage, "final_output", False)
-                final_output_type = getattr(stage, "final_output_type", None)
         else:
             final_output = getattr(stage, "final_output", False)
-            final_output_type = getattr(stage, "final_output_type", None)
-        if final_output and final_output_type in {"video", "videos"}:
+        if final_output and set(stage_output_types(stage)) & {"video", "videos"}:
             return True
     return False
 

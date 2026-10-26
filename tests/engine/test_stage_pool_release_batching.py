@@ -87,3 +87,17 @@ async def test_replica_exit_clears_pending_releases(monkeypatch, make_pool, remo
     assert len(warn) == (0 if removed else 2)
     if not removed:
         assert replica.calls == [["a"], ["b"], ["c"]]
+
+
+@pytest.mark.asyncio
+async def test_dense_kv_release_without_async_chunks():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    replica = SimpleNamespace(collective_rpc_async=AsyncMock())
+    pool = StagePool(0, [replica])
+    pool.schedule_release_request_resources(["parent", "negative"], release_kv=True)
+    await _settle(pool)
+    replica.collective_rpc_async.assert_awaited_once_with(
+        "omni_release_kv_resources", timeout=pool.RELEASE_RPC_TIMEOUT_S, args=(["parent", "negative"],)
+    )

@@ -36,6 +36,7 @@ class StageClient(Protocol):
     stage_type: str
     model_stage: str | None
     final_output: bool
+    final_output_types: tuple[str, ...]
     final_output_type: FinalOutputModalityType | None
     default_sampling_params: OmniSamplingParams
     prompt_transform_func: Any | None

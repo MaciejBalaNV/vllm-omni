@@ -18,7 +18,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
-from vllm import TokensPrompt
 from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -29,6 +28,7 @@ from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 
+from vllm import TokensPrompt
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage
@@ -243,6 +243,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             # Track per-request metrics
             wall_start_ts = float(arrival_time) if arrival_time is not None else time.time()
             req_start_ts: dict[str, float] = {}
+
+            # A prompt modality is explicit routing, including multi-output stages.
+            if output_modalities is None and isinstance(prompt, dict):
+                output_modalities = prompt.get("modalities")
+            elif output_modalities is not None and set(output_modalities) & {"image", "video"}:
+                if isinstance(prompt, str):
+                    prompt = {"prompt": prompt, "modalities": output_modalities}
+                elif isinstance(prompt, dict) and "modalities" not in prompt:
+                    prompt = {**prompt, "modalities": output_modalities}
 
             # Determine the final stage for E2E stats
             final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)

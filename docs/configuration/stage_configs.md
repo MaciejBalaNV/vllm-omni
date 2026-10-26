@@ -16,6 +16,7 @@ Common `PipelineConfig` fields include:
 | Field | Description |
 | ------- | ------------- |
 | `model_type` | Pipeline identifier used during model and config resolution. |
+| `default_output_modalities` | Optional default request modalities; capability discovery still includes every stage output. |
 | `default_deploy_config_name` | Bundled deploy YAML loaded when the user does not pass `deploy_config`. |
 | `duplex_plugin` | Dotted path of the model's `DuplexModelPlugin`. Set only for full-duplex models; it makes `vllm-omni serve` run the model through `DuplexOmni` (a server whose every surface runs on a duplex session) and the engine host a `DuplexOrchestrator` with the plugin loaded. |
 | `model_arch` | Default Hugging Face architecture for the pipeline. |
@@ -33,6 +34,7 @@ Common `StagePipelineConfig` fields include:
 | `execution_type` | `LLM_AR`, `LLM_GENERATION`, or `DIFFUSION`. |
 | `input_sources` | Upstream stage IDs that provide this stage's inputs. |
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
+| `final_output_types` | Optional additional output capabilities (for example image and video); scalar `final_output_type` remains supported. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
 | `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
@@ -816,3 +818,10 @@ stereo; benchmark raw PCM with `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
 `VLLM_OMNI_BENCH_AUDIO_CHANNELS=2`. See the
 [MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-unified-deployment-and-slot-attention)
 for the execution path and configuration overrides.
+
+## Shared Cosmos3 UND
+
+The opt-in [shared UND deployment](../user_guide/cosmos3/shared_und.md) uses one
+AR understanding stage for chat and generation conditioning, plus a GEN-only
+diffusion stage. Its `cfg_companion_wait_timeout_s: 300` bounds deferred CFG
+parents; omitting this option preserves existing deployments.

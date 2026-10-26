@@ -572,6 +572,7 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    final_output_types: tuple[str, ...] = ()
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
@@ -679,6 +680,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             engine_input_source=engine_input_source,
             final_output=final_output,
             final_output_type=final_output_type,
+            final_output_types=tuple(_get_attr_or_item(stage_config, "final_output_types") or ()),
             default_sampling_params=default_params,
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
@@ -700,6 +702,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         engine_input_source=engine_input_source,
         final_output=final_output,
         final_output_type=final_output_type,
+        final_output_types=tuple(_get_attr_or_item(stage_config, "final_output_types") or ()),
         default_sampling_params=default_params,
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
@@ -747,6 +750,7 @@ def extract_stage_metadata_from_omni_stage_config(
             engine_input_source=stage_config.input_sources,
             final_output=stage_config.final_output,
             final_output_type=stage_config.final_output_type,
+            final_output_types=stage_config.final_output_types,
             default_sampling_params=sampling_params,
             custom_process_input_func=custom_process_input_func,
             model_stage=stage_config.model_stage,
@@ -764,6 +768,7 @@ def extract_stage_metadata_from_omni_stage_config(
         engine_input_source=stage_config.input_sources,
         final_output=stage_config.final_output,
         final_output_type=stage_config.final_output_type,
+        final_output_types=stage_config.final_output_types,
         default_sampling_params=sampling_params,
         custom_process_input_func=custom_process_input_func,
         model_stage=stage_config.model_stage,

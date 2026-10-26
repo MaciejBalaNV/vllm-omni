@@ -85,7 +85,7 @@ class Cosmos3MixedPrecisionRuntime:
         components: dict[PrecisionPath, torch.nn.Module] = {
             "generation": transformer.gen_layers,
         }
-        if self.config.reasoner == "a16":
+        if self.config.reasoner == "a16" and hasattr(transformer, "language_model"):
             components["reasoner"] = transformer.language_model.layers
 
         wrapped_count = 0

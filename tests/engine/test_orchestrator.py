@@ -1468,7 +1468,8 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
 
 
 @pytest.mark.asyncio
-async def test_abort_marks_only_last_final_stage_output_finished() -> None:
+@pytest.mark.parametrize("rpc_id", [None, "abort-two"])
+async def test_abort_marks_only_last_final_stage_output_finished(rpc_id) -> None:
     """A request with two final AR stages must keep earlier abort outputs unfinished."""
     stages = [
         FakeStageClient(stage_type="llm", final_output=True),
@@ -1494,10 +1495,94 @@ async def test_abort_marks_only_last_final_stage_output_finished() -> None:
         final_output_stage_ids={0, 1},
     )
 
-    outputs = await orchestrator._abort_request_ids(["req-two"])
+    await orchestrator._handle_abort(AbortRequestMessage(request_ids=["req-two"], rpc_id=rpc_id))
+    if rpc_id is not None:
+        result = orchestrator.rpc_async_queue.get_nowait()
+        assert result.success
+        outputs = result.abort_outputs
+        assert orchestrator.output_async_queue.empty()
+    else:
+        outputs = [orchestrator.output_async_queue.get_nowait() for _ in range(2)]
+        assert orchestrator.rpc_async_queue.empty()
     assert [(msg.stage_id, msg.finished) for msg in outputs] == [(0, False), (1, True)]
     assert list(outputs[0].engine_outputs.outputs[0].token_ids) == [1]
     assert list(outputs[1].engine_outputs.outputs[0].token_ids) == [2]
+    assert all(msg.engine_outputs.outputs[0].finish_reason == "abort" for msg in outputs)
+    assert "req-two" not in orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_abort_keeps_termination_fence_while_preserving_prefix(monkeypatch) -> None:
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    pools = _build_stage_pools([[stage]])
+    pools[0]._request_bindings["req"] = 0
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    state = OrchestratorRequestState(request_id="req", final_stage_id=0)
+    orchestrator.request_states["req"] = state
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_abort = stage.abort_requests_async
+
+    async def slow_abort(request_ids):
+        entered.set()
+        await release.wait()
+        await original_abort(request_ids)
+
+    monkeypatch.setattr(stage, "abort_requests_async", slow_abort)
+    task = asyncio.create_task(orchestrator._handle_abort(AbortRequestMessage(request_ids=["req"])))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert state.terminating
+        # A normal completion or error arriving during physical abort cannot
+        # claim the outcome or enqueue any further work.
+        await orchestrator._route_output(0, 0, _build_request_output("req"), state, None)
+        await orchestrator._handle_stage_error(0, SimpleNamespace(request_id="req", error="late error"))
+        assert orchestrator.output_async_queue.empty()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    output = orchestrator.output_async_queue.get_nowait()
+    assert list(output.engine_outputs.outputs[0].token_ids) == [1, 2]
+    assert output.engine_outputs.outputs[0].finish_reason == "abort"
+    assert output.finished
+    assert orchestrator.output_async_queue.empty()
+    assert not orchestrator.request_states
+
+
+@pytest.mark.asyncio
+async def test_abort_hides_companions_and_previously_claimed_terminal_outputs() -> None:
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    pools = _build_stage_pools([[stage]])
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    for rid in ("parent", "negative", "failed", "visible"):
+        pools[0]._request_bindings[rid] = 0
+        orchestrator.request_states[rid] = OrchestratorRequestState(
+            request_id=rid, final_stage_id=1 if rid == "parent" else 0, terminating=rid == "failed"
+        )
+    orchestrator._cfg_tracker.register_companion("parent", "negative", "negative")
+
+    await orchestrator._handle_abort(
+        AbortRequestMessage(request_ids=["parent", "negative", "failed", "visible"], rpc_id="abort-batch")
+    )
+
+    result = orchestrator.rpc_async_queue.get_nowait()
+    assert result.success
+    assert [msg.request_id for msg in result.abort_outputs] == ["visible"]
+    assert set(stage.abort_calls[0]) == {"parent", "negative", "failed", "visible"}
+    assert not orchestrator.request_states
+    assert not orchestrator._cfg_tracker.is_companion("negative")
+    assert orchestrator.output_async_queue.empty()
 
 
 @pytest.mark.asyncio

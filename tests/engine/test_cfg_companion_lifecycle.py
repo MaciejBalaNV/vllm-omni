@@ -82,6 +82,7 @@ class _FakePool:
         self.stage_type = stage_type
         self.stage_client = SimpleNamespace(requires_multimodal_data=False, custom_process_input_func=None)
         self.aborted: list[list[str]] = []
+        self.released: list[tuple[list[str], bool]] = []
 
     def live_replica_ids(self) -> list[int]:
         # Single always-live replica: these tests cover CFG bundling, not
@@ -94,8 +95,8 @@ class _FakePool:
     def release_bindings(self, request_ids):
         pass
 
-    def schedule_release_request_resources(self, request_ids):
-        pass
+    def schedule_release_request_resources(self, request_ids, *, release_kv=False):
+        self.released.append((list(request_ids), release_kv))
 
 
 def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
@@ -340,3 +341,130 @@ async def test_parent_abort_still_expands_to_companions():
     assert not orch._cfg_tracker.is_companion("p__neg")
     aborted = {rid for pool in orch.stage_pools for batch in pool.aborted for rid in batch}
     assert {"p", "p__neg"} <= aborted
+
+
+@pytest.mark.asyncio
+async def test_timeout_claims_terminal_before_cleanup_and_ignores_late_completion(monkeypatch):
+    from vllm_omni.engine.orchestrator import OrchestratorRequestState
+
+    now = [0.0]
+    orch = _make_orchestrator()
+    orch._cfg_tracker = CfgCompanionTracker(300, lambda: now[0])
+    orch.request_states["p"] = OrchestratorRequestState(request_id="p", final_stage_id=1)
+    orch.request_states["p__neg"] = OrchestratorRequestState(request_id="p__neg", final_stage_id=0)
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.defer_parent("p", {}, 0)
+    now[0] = 300
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = orch._cleanup_request_ids
+
+    async def slow_cleanup(ids, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(ids, **kwargs)
+
+    monkeypatch.setattr(orch, "_cleanup_request_ids", slow_cleanup)
+    timeout = asyncio.create_task(orch._check_cfg_liveness())
+    await entered.wait()
+    assert orch.request_states["p"].terminating
+    orch._cfg_tracker.set_companion_output("p__neg", {})
+    await orch._handle_cfg_companion_ready("p__neg")
+    await orch._check_cfg_liveness()
+    assert orch.output_async_queue.qsize() == 1
+    release.set()
+    await timeout
+    assert not orch.request_states
+    assert not orch._cfg_tracker.pending_parents()
+    orch._cfg_tracker.set_companion_output("p__neg", {})
+    assert not orch._cfg_tracker._companion_outputs
+
+
+@pytest.mark.asyncio
+async def test_liveness_fails_lost_binding_before_deadline(monkeypatch):
+    from vllm_omni.engine.orchestrator import OrchestratorRequestState
+
+    orch = _make_orchestrator()
+    orch._cfg_tracker = CfgCompanionTracker(300, lambda: 0)
+    orch.request_states["p"] = OrchestratorRequestState(request_id="p", final_stage_id=1)
+    orch.request_states["p__neg"] = OrchestratorRequestState(request_id="p__neg", stage_submit_ts={0: 1})
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.defer_parent("p", {}, 0)
+    monkeypatch.setattr(orch.stage_pools[0], "get_bound_replica_id", lambda _: None, raising=False)
+    await orch._check_cfg_liveness()
+    assert "lost its binding" in (await orch.output_async_queue.get()).error
+    assert not orch.request_states
+
+
+@pytest.mark.asyncio
+async def test_conditioning_parent_kv_ready_waits_for_processed_output():
+    from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+    from vllm_omni.engine.orchestrator import OrchestratorRequestState
+
+    orch = _make_orchestrator()
+    orch.request_states["p"] = OrchestratorRequestState(
+        request_id="p",
+        final_stage_id=1,
+        wait_for_processed_kv_output=True,
+    )
+    raw = OmniEngineCoreOutput(request_id="p", new_token_ids=[], kv_transfer_params={"kv_ready": True})
+    await orch._handle_kv_ready_raw_outputs(0, OmniEngineCoreOutputs(outputs=[raw]))
+    assert orch.request_states["p"].stage_submit_ts == {}
+    assert not orch._cfg_tracker.pending_parents()
+
+
+@pytest.mark.asyncio
+async def test_companion_transfer_is_held_until_parent_cleanup():
+    orch = _make_orchestrator()
+    parent = _req_state()
+    parent.wait_for_processed_kv_output = True
+    orch.request_states["p"] = parent
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.set_companion_output("p__neg", {})
+    orch._cfg_tracker.on_companion_completed("p__neg")
+    await orch._cleanup_request_ids(["p__neg"])
+    assert all(not ids for pool in orch.stage_pools for ids, _ in pool.released)
+    await orch._cleanup_request_ids(["p"], abort=True)
+    for pool in orch.stage_pools:
+        assert pool.released[-1] == (["p", "p__neg"], True)
+
+
+@pytest.mark.asyncio
+async def test_internal_conditioning_outputs_are_hidden(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from vllm_omni.engine.orchestrator import OrchestratorRequestState
+
+    orch = _make_orchestrator()
+    orch.stage_pools[0].final_output = True
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    parent = OrchestratorRequestState(
+        request_id="p", final_stage_id=1, final_output_stage_ids={1}, wait_for_processed_kv_output=True
+    )
+    orch.request_states["p"] = parent
+    monkeypatch.setattr(orch, "_intercept_stage_output", AsyncMock(return_value=False))
+    for finished in (False, True):
+        await orch._route_output(0, 0, SimpleNamespace(request_id="p", finished=finished), parent, None)
+    assert orch.output_async_queue.empty()
+    assert orch._cfg_tracker.pending_parents() == ("p",)
+
+
+@pytest.mark.asyncio
+async def test_liveness_tick_does_not_need_worker_outputs(monkeypatch):
+    now = [0.0]
+    orch = _make_orchestrator()
+    orch._shutdown_event = asyncio.Event()
+    orch._cfg_tracker = CfgCompanionTracker(300, lambda: now[0])
+    orch.request_states["p"] = _req_state()
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch._cfg_tracker.defer_parent("p", {}, 0)
+
+    async def tick(delay):
+        assert delay == 1.0
+        now[0] = 300
+        orch._shutdown_event.set()
+
+    monkeypatch.setattr("vllm_omni.engine.orchestrator.asyncio.sleep", tick)
+    await orch._cfg_liveness_loop()
+    assert "Timed out" in orch.output_async_queue.get_nowait().error
+    assert not orch.request_states

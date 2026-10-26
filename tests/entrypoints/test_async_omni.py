@@ -87,6 +87,38 @@ def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) ->
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    "prompt,modalities",
+    [
+        ("Draw a crane", ["image"]),
+        ({"prompt": "A crane flies", "modalities": ["video"]}, None),
+    ],
+)
+def test_media_routing_reaches_prompt_transform(prompt, modalities):
+    submitted = []
+    routed = []
+
+    async def add(**kwargs):
+        submitted.append(kwargs["prompt"])
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=add)
+        omni._compute_final_stage_id = lambda outputs: routed.append(outputs) or 0
+        async for _ in omni.generate(
+            prompt=prompt,
+            request_id="media-route",
+            output_modalities=modalities,
+            sampling_params_list=[SimpleNamespace()],
+        ):
+            pass
+
+    asyncio.run(run())
+    expected = modalities or prompt["modalities"]
+    assert routed == [expected]
+    assert submitted[0]["modalities"] == expected
+
+
+@pytest.mark.cpu
 def test_generate_submits_randomized_id_to_engine():
     """Ensure the engine receives a UUID-suffixed ID, not the raw request ID"""
 

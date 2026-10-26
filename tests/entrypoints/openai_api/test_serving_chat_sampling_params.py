@@ -262,6 +262,51 @@ def test_pure_consumer_preserves_defaults_and_separate_cfg_owners(mock_engine_cl
     assert response.error.message == "No output generated from AsyncOmni"
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("modalities", [["video"], ["text", "video"], None])
+@pytest.mark.parametrize("rendered_text", [None, "<|im_start|>user\nA crane flies<|im_end|>"])
+def test_multistage_video_chat_is_rejected_before_generation(
+    mock_engine_client, mocker: MockerFixture, stream, modalities, rendered_text
+):
+    mock_engine_client.stage_configs = [SimpleNamespace(stage_type="llm"), SimpleNamespace(stage_type="diffusion")]
+    mock_engine_client.output_modalities = ["text", "image", "video"]
+    mock_engine_client.default_output_modalities = ["video"]
+    mock_engine_client.errored = False
+    mock_engine_client.resolve_entry_stage_id.return_value = 0
+    mock_engine_client.renderer = SimpleNamespace(get_tokenizer=lambda: object(), tokenizer=None)
+    mock_engine_client.generate = mocker.Mock()
+    serving_chat = build_serving_chat(
+        engine_client=mock_engine_client,
+        models=SimpleNamespace(model_name=lambda _: "test"),
+        online_renderer=SimpleNamespace(validate_chat_template=lambda **_: None),
+        trust_request_chat_template=True,
+    )
+    serving_chat._diffusion_mode = False
+    serving_chat._diffusion_extra_body_params = frozenset()
+    rendered_prompt: dict[str, object] = {"prompt_token_ids": [1, 2, 3]}
+    if rendered_text is not None:
+        rendered_prompt["prompt"] = rendered_text
+    mocker.patch.multiple(
+        serving_chat,
+        _check_model=mocker.AsyncMock(return_value=None),
+        _maybe_get_adapters=mocker.Mock(return_value=None),
+        _effective_chat_template_kwargs=mocker.Mock(return_value={}),
+        _preprocess_chat=mocker.AsyncMock(return_value=([], [rendered_prompt])),
+        _base_request_id=mocker.Mock(return_value="test"),
+    )
+    request = ChatCompletionRequest(
+        model="test", messages=[{"role": "user", "content": "A crane flies"}], modalities=modalities, stream=stream
+    )
+
+    response = asyncio.run(serving_chat._create_chat_completion(request))
+
+    assert response.error.code == 400
+    assert "Video generation is not supported by /v1/chat/completions" in response.error.message
+    assert "/v1/videos" in response.error.message
+    assert "/v1/videos/sync" in response.error.message
+    mock_engine_client.generate.assert_not_called()
+
+
 def test_mixed_consumer_keeps_root_common_args_with_nested_extras(mock_engine_client, mocker: MockerFixture):
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 

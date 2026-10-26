@@ -97,6 +97,7 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
     {
         "final_output",
         "final_output_type",
+        "final_output_types",
         "is_comprehension",
     }
 )
@@ -1740,6 +1741,10 @@ class BaseVllmOmniStageConfig:
     @property
     def final_output_type(self) -> str | None:
         return self.stage_pipeline_config.final_output_type
+
+    @property
+    def final_output_types(self) -> tuple[str, ...]:
+        return self.stage_pipeline_config.final_output_types
 
     @property
     def hf_config_name(self) -> str | None:

@@ -25,6 +25,12 @@ class OmniWorkerMixin:
 
             install_mooncake_cfg_fanout(get_kv_transfer_group())
 
+    def omni_release_kv_resources(self, request_ids: list[str]) -> None:
+        """Release dense transfers at the serialized worker-call boundary."""
+        manager = getattr(getattr(self, "model_runner", None), "kv_transfer_manager", None)
+        if manager is not None:
+            manager.release_requests(request_ids)
+
 
 def maybe_unpad_input_ids(model, input_ids, num_tokens_unpadded):
     """Trim cudagraph-bucket padding for models that split a flat ``input_ids``

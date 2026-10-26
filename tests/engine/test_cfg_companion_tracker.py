@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -51,6 +54,7 @@ def test_companion_completion_flushes_deferred_parent():
     tracker.defer_parent("req1", {"out": 123}, stage_id=0)
 
     assert not tracker.all_companions_done("req1")
+    tracker.set_companion_output("req1__cfg_text", {"out": 1})
     assert tracker.on_companion_completed("req1__cfg_text") == "req1"
     assert tracker.all_companions_done("req1")
 
@@ -65,5 +69,6 @@ def test_companion_completion_without_registered_parent_asserts():
     tracker._companion_ids.add("req1__cfg_text")
     tracker._companion_to_parent["req1__cfg_text"] = "req1"
 
+    tracker.set_companion_output("req1__cfg_text", {"out": 1})
     with pytest.raises(AssertionError, match="completed before parent req1 was registered"):
         tracker.on_companion_completed("req1__cfg_text")
