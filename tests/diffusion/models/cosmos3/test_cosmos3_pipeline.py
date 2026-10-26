@@ -3663,7 +3663,11 @@ def test_image_edit_defaults_and_overrides(make_cosmos3_pipeline):
     assert formats[-1][1]["negative_metadata_mode"] == "same"
 
 
-def test_image_edit_parallel_cfg_supplies_source_to_both_branches(make_cosmos3_pipeline):
+@pytest.mark.parametrize("cfg_rank", [0, 1])
+def test_image_edit_parallel_cfg_supplies_source_to_both_branches(make_cosmos3_pipeline, monkeypatch, cfg_rank):
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(pipeline_cosmos3, "get_classifier_free_guidance_rank", lambda: cfg_rank)
     pipeline = make_cosmos3_pipeline()
     pipeline._cfg_parallel_active = lambda: True
     source = torch.ones(1, 2, 1, 4, 4)
