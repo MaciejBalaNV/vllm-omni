@@ -19,10 +19,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
-from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
+from vllm import SamplingParams
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -2689,3 +2689,122 @@ def test_is_image_generation_stage_matrix():
     assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type="text"))
     assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=False))
     assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type=None))
+
+
+@pytest.fixture
+def cosmos3_edit_client(test_client, mock_async_diffusion):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    config = SimpleNamespace(
+        model_class_name="Cosmos3OmniDiffusersPipeline", cache_backend="none", model_config={"guardrails": False}
+    )
+    mock_async_diffusion.od_config = config
+    preprocess = get_cosmos3_pre_process_func(config)
+
+    async def generate(**kwargs):
+        sp = kwargs["sampling_params_list"][0]
+        mock_async_diffusion.captured_sampling_params_list = [sp]
+        request = SimpleNamespace(prompt=kwargs["prompt"], sampling_params=sp)
+        preprocess(request)
+        mock_async_diffusion.generate_calls += 1
+        if "image" in request.prompt.get("multi_modal_data", {}):
+            tensor = request.prompt["additional_information"]["preprocessed_image"]
+            assert tuple(tensor.shape[-2:]) == (sp.height, sp.width)
+        yield MockGenerationResult([Image.new("RGB", (sp.width, sp.height)) for _ in range(sp.num_outputs_per_prompt)])
+
+    mock_async_diffusion.generate = generate
+    test_client.app.state.args.max_generated_image_size = 1048576
+    return test_client
+
+
+def _edit_upload(size=(65, 33)):
+    buffer = io.BytesIO()
+    Image.new("RGBA", size, color="red").save(buffer, format="PNG")
+    return ("source.png", buffer.getvalue(), "image/png")
+
+
+@pytest.mark.parametrize("alias", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
+@pytest.mark.parametrize(
+    "source,size,expected",
+    [
+        ((4032, 3024), "auto", (1152, 864)),
+        ((1920, 1080), "auto", (1344, 768)),
+        ((641, 481), "auto", (640, 480)),
+        ((65, 33), "64x64", (64, 64)),
+    ],
+)
+def test_cosmos3_edit_multipart_canvas(cosmos3_edit_client, mock_async_diffusion, alias, source, size, expected):
+    mock_async_diffusion.od_config.model_class_name = alias
+    response = cosmos3_edit_client.post(
+        "/v1/images/edits", data={"prompt": "Make it blue", "size": size, "n": 2}, files={"image": _edit_upload(source)}
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["size"] == f"{expected[0]}x{expected[1]}"
+    assert len(payload["data"]) == 2
+    for item in payload["data"]:
+        assert Image.open(io.BytesIO(base64.b64decode(item["b64_json"]))).size == expected
+    params = mock_async_diffusion.captured_sampling_params_list[0]
+    assert (params.width, params.height) == expected
+    assert params.width_not_provided == (size == "auto")
+
+
+@pytest.mark.parametrize(
+    "fields,source",
+    [
+        ({"size": "33x32"}, (65, 33)),
+        ({"size": "2048x2048"}, (65, 33)),
+        ({"strength": "0.5"}, (65, 33)),
+        ({"n": "0"}, (65, 33)),
+        ({}, (4032, 3024)),
+    ],
+)
+def test_cosmos3_edit_invalid_canvas_and_options(cosmos3_edit_client, mock_async_diffusion, fields, source):
+    if not fields:
+        cosmos3_edit_client.app.state.args.max_generated_image_size = 512 * 512
+    response = cosmos3_edit_client.post(
+        "/v1/images/edits", data={"prompt": "Edit", **fields}, files={"image": _edit_upload(source)}
+    )
+    assert response.status_code == 400, response.text
+    assert mock_async_diffusion.generate_calls == 0
+
+
+@pytest.mark.parametrize(
+    "backend", ["cache_dit", "tea_cache", "mag_cache", "sea_cache", "step_cache", "stepcache", "step_cache_dit"]
+)
+def test_cosmos3_edit_cache_http400_and_recovery(cosmos3_edit_client, mock_async_diffusion, backend):
+    mock_async_diffusion.od_config.cache_backend = backend
+    response = cosmos3_edit_client.post("/v1/images/edits", data={"prompt": "Edit"}, files={"image": _edit_upload()})
+    assert response.status_code == 400, response.text
+    assert "cache_backend='none'" in response.json()["detail"]
+    assert mock_async_diffusion.generate_calls == 0
+    response = cosmos3_edit_client.post("/v1/images/generations", json={"prompt": "A blue car", "size": "64x64"})
+    assert response.status_code == 200, response.text
+    assert mock_async_diffusion.od_config.cache_backend == backend
+
+
+def test_cosmos3_edit_multiple_sources_rejected(cosmos3_edit_client):
+    response = cosmos3_edit_client.post(
+        "/v1/images/edits", data={"prompt": "Edit"}, files=[("image", _edit_upload()), ("image", _edit_upload())]
+    )
+    assert response.status_code == 400, response.text
+    assert "exactly one" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["mask_image", "reference_image"])
+def test_cosmos3_edit_rejects_auxiliary_uploads(cosmos3_edit_client, mock_async_diffusion, field):
+    response = cosmos3_edit_client.post(
+        "/v1/images/edits", data={"prompt": "Edit"}, files={"image": _edit_upload(), field: _edit_upload()}
+    )
+    assert response.status_code == 400, response.text
+    assert "masks or auxiliary reference" in response.json()["detail"]
+    assert mock_async_diffusion.generate_calls == 0
+
+
+def test_cosmos3_edit_explicit_canvas_can_exceed_automatic_budget(cosmos3_edit_client):
+    cosmos3_edit_client.app.state.args.max_generated_image_size = 2048 * 2048
+    response = cosmos3_edit_client.post(
+        "/v1/images/edits", data={"prompt": "Edit", "size": "2048x2048"}, files={"image": _edit_upload()}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["size"] == "2048x2048"

@@ -356,6 +356,8 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
         "height": None,
         "width": None,
+        "width_not_provided": False,
+        "height_not_provided": False,
         "num_frames": None,
         "num_inference_steps": None,
         "guidance_scale": None,
@@ -3430,3 +3432,312 @@ def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
         open_guidance_interval=open_interval,
     )
     assert cfg_calls == [True] * (1 if open_interval else 3)
+
+
+@pytest.mark.parametrize("singleton", [False, True])
+@pytest.mark.parametrize("color_mode", ["L", "RGBA", "RGB"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_image_edit_preprocessing(singleton, color_mode, explicit):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    source = Image.fromarray(np.tile(np.arange(65, dtype=np.uint8), (33, 1))).convert(color_mode)
+    sp = make_sampling_params(
+        width=32 if explicit else 65,
+        height=32 if explicit else 33,
+        width_not_provided=not explicit,
+        height_not_provided=not explicit,
+    )
+    request = SimpleNamespace(
+        prompt={
+            "prompt": "Edit",
+            "modalities": ["image"],
+            "multi_modal_data": {"image": [source] if singleton else source},
+        },
+        sampling_params=sp,
+    )
+    get_cosmos3_pre_process_func(SimpleNamespace())(request)
+    tensor = request.prompt["additional_information"]["preprocessed_image"]
+    assert (sp.width, sp.height) == ((32, 32) if explicit else (64, 32))
+    assert tensor.shape == (1, 3, sp.height, sp.width)
+    assert tensor.min() >= -1 and tensor.max() <= 1
+    # Automatic sizing retains both edges; explicit square sizing crops them.
+    first_pixel = (tensor[0, 0, 0, 0].item() + 1) * 127.5
+    assert first_pixel > 10 if explicit else first_pixel < 2
+
+
+@pytest.mark.parametrize("images", [[], [Image.new("RGB", (32, 32))] * 2])
+def test_image_edit_rejects_source_lists(images):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    request = SimpleNamespace(
+        prompt={"modalities": ["image"], "multi_modal_data": {"image": images}}, sampling_params=make_sampling_params()
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        get_cosmos3_pre_process_func(SimpleNamespace())(request)
+
+
+@pytest.mark.parametrize(
+    "backend", ["cache_dit", "tea_cache", "mag_cache", "sea_cache", "step_cache", "stepcache", "step_cache_dit"]
+)
+def test_image_edit_cache_rejected_before_media_work(make_cosmos3_pipeline, backend):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.od_config.cache_backend = backend
+    # An invalid image path would fail if the cache check ran after media work.
+    prompt = {"modalities": ["image"], "multi_modal_data": {"image": "/missing/source.png"}}
+    sp = make_sampling_params()
+    preprocess = get_cosmos3_pre_process_func(pipeline.od_config)
+    request = SimpleNamespace(prompt=prompt, sampling_params=sp)
+    for run in (lambda: preprocess(request), lambda: pipeline.forward(make_request_batch(prompt, sp))):
+        with pytest.raises(OmniClientError, match="cache_backend='none'") as error:
+            run()
+        assert error.value.status_code == 400
+    assert not pipeline.vae.encode_input_shapes
+    assert not pipeline.transformer.calls
+    # Rejection leaves the engine setting and supported T2I route intact.
+    assert pipeline.od_config.cache_backend == backend
+    TestForwardRouting()._install_forward_stubs(pipeline)
+    assert "image" in pipeline.forward(make_request_batch({"modalities": ["image"]}, sp)).output
+
+
+def test_image_edit_uses_preprocessed_canvas(make_cosmos3_pipeline, sequential_cfg_parallel):
+    pipeline = make_cosmos3_pipeline()
+    texts = _capture_tokenize_calls(pipeline)
+    pipeline._decode_latents = lambda latents: latents
+    original_forward = pipeline.transformer.forward
+
+    def check_latent_shapes(**kwargs):
+        assert kwargs["hidden_states"].shape == kwargs["control_latents"][0].shape
+        return original_forward(**kwargs)
+
+    pipeline.transformer.forward = check_latent_shapes
+    prompt = {
+        "prompt": "Make it red",
+        "modalities": ["image"],
+        "multi_modal_data": {"image": Image.new("RGB", (64, 32))},
+        "additional_information": {"preprocessed_image": torch.zeros(1, 3, 32, 64)},
+    }
+    output = pipeline.forward(
+        make_request_batch(prompt, make_sampling_params(width=96, height=64, num_inference_steps=1))
+    )
+
+    assert output.output["image"].shape == (1, 2, 1, 4, 8)
+    assert "32x64 resolution" in texts[0]["text"]
+
+
+@pytest.mark.parametrize("backend", [None, "none"])
+@pytest.mark.parametrize("guidance", [1.0, 6.0])
+def test_image_edit_source_reuse_cfg_and_fresh_requests(
+    make_cosmos3_pipeline, sequential_cfg_parallel, backend, guidance
+):
+    pipeline = make_cosmos3_pipeline()
+    pipeline.od_config.cache_backend = backend
+    texts = _capture_tokenize_calls(pipeline)
+    pipeline._decode_latents = lambda latents: latents
+    recorded_sources = []
+    original_forward = pipeline.transformer.forward
+
+    def record_forward(**kwargs):
+        sources = kwargs["control_latents"]
+        recorded_sources.append(sources[0])
+        assert kwargs["transfer_share_vision_temporal_positions"] is False
+        assert "noisy_frame_mask" not in kwargs
+        assert kwargs["hidden_states"].shape == sources[0].shape
+        return original_forward(**kwargs)
+
+    pipeline.transformer.forward = record_forward
+    prompt = {
+        "prompt": "Make it red",
+        "modalities": ["image"],
+        "multi_modal_data": {"image": Image.new("RGB", (32, 32))},
+        "additional_information": {"preprocessed_image": torch.zeros(1, 3, 32, 32)},
+    }
+
+    def run():
+        texts.clear()
+        return pipeline.forward(
+            make_request_batch(
+                prompt,
+                make_sampling_params(
+                    height=32,
+                    width=32,
+                    num_outputs_per_prompt=2,
+                    num_inference_steps=2,
+                    guidance_scale=guidance,
+                    guidance_scale_provided=True,
+                ),
+            )
+        ).output["image"]
+
+    first = run()
+    assert pipeline.vae.encode_input_shapes == [(1, 3, 1, 32, 32)]
+    assert first.shape == (2, 2, 1, 4, 4)
+    assert not torch.equal(first[0], first[1])
+    assert len(recorded_sources) == (8 if guidance > 1 else 4)
+    assert all(source is recorded_sources[0] for source in recorded_sources)
+    torch.testing.assert_close(recorded_sources[0], torch.ones_like(recorded_sources[0]))
+    assert "resolution" in texts[0]["text"].lower()
+    assert texts[1]["text"] == ""
+    assert all(call["use_system_prompt"] for call in texts)
+    assert "edit images" in texts[0]["system_prompt"]
+    assert pipeline._current_flow_shift == 5.0
+    torch.testing.assert_close(run(), first)
+    assert len(pipeline.vae.encode_input_shapes) == 2
+    assert pipeline.transformer.reset_calls == 4
+
+
+@pytest.mark.parametrize(
+    "extra,media",
+    [
+        ({"strength": 0.5}, {}),
+        ({}, {"mask_image": object()}),
+        ({}, {"reference_image": object()}),
+        ({}, {"video": object()}),
+        ({"generate_sound": True}, {}),
+        ({"action_mode": "policy"}, {}),
+        ({"edge": True}, {}),
+    ],
+)
+def test_image_edit_rejects_unsupported_options(make_cosmos3_pipeline, extra, media):
+    pipeline = make_cosmos3_pipeline()
+    prompt = {"modalities": ["image"], "multi_modal_data": {"image": object(), **media}}
+    with pytest.raises(ValueError):
+        pipeline.forward(make_request_batch(prompt, make_sampling_params(extra_args=extra)))
+    assert not pipeline.vae.encode_input_shapes
+    assert not pipeline.transformer.calls
+
+
+@pytest.mark.parametrize("flag", ["is_edge_model", "is_distilled_model"])
+def test_image_edit_rejects_unsupported_checkpoints(make_cosmos3_pipeline, flag):
+    pipeline = make_cosmos3_pipeline()
+    setattr(pipeline, flag, True)
+    with pytest.raises(ValueError, match="standard Nano or Super"):
+        pipeline.forward(
+            make_request_batch(
+                {"modalities": ["image"], "multi_modal_data": {"image": object()}}, make_sampling_params()
+            )
+        )
+
+
+def test_image_edit_defaults_and_overrides(make_cosmos3_pipeline):
+    pipeline = make_cosmos3_pipeline()
+    captured = TestForwardRouting()._install_forward_stubs(pipeline)
+    formats = []
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (
+        formats.append((args, kwargs)) or (_ids(2), _mask(), _ids(1), _mask())
+    )
+    prompt = {
+        "modalities": ["image"],
+        "multi_modal_data": {"image": object()},
+        "additional_information": {"preprocessed_image": torch.zeros(1, 3, 32, 32)},
+    }
+    pipeline.forward(make_request_batch(prompt, make_sampling_params()))
+    call = captured["diffuse_calls"][-1]
+    assert len(call["timesteps"]) == 35
+    assert call["guidance_scale"] == 6.0 and call["guidance_interval"] is None
+    assert call["velocity_mask"] is None and call["image_latent"] is None
+    pipeline.forward(
+        make_request_batch(
+            prompt,
+            make_sampling_params(
+                num_inference_steps=3,
+                guidance_scale=2.0,
+                guidance_scale_provided=True,
+                extra_args={
+                    "flow_shift": 4.0,
+                    "use_system_prompt": False,
+                    "system_prompt": "Custom",
+                    "negative_metadata_mode": "same",
+                    "use_resolution_template": False,
+                    "negative_prompt": "blurry",
+                },
+            ),
+        )
+    )
+    assert captured["diffuse_calls"][-1]["guidance_scale"] == 2.0
+    assert captured["flow_shifts"] == [5.0, 4.0]
+    assert formats[-1][0][1] == "blurry" and formats[-1][0][-1] is False
+    assert formats[-1][1]["system_prompt"] == "Custom"
+    assert formats[-1][1]["negative_metadata_mode"] == "same"
+
+
+def test_image_edit_parallel_cfg_supplies_source_to_both_branches(make_cosmos3_pipeline):
+    pipeline = make_cosmos3_pipeline()
+    pipeline._cfg_parallel_active = lambda: True
+    source = torch.ones(1, 2, 1, 4, 4)
+    calls = []
+
+    def paired_prediction(**kwargs):
+        positive, negative = kwargs["positive_kwargs"], kwargs["negative_kwargs"]
+        assert positive["control_latents"][0] is source
+        assert negative["control_latents"][0] is source
+        assert positive["hidden_states"] is negative["hidden_states"]
+        calls.append(kwargs)
+        return torch.zeros_like(positive["hidden_states"])
+
+    pipeline.predict_noise_maybe_with_cfg = paired_prediction
+    target = torch.randn_like(source)
+    result = pipeline.diffuse(
+        latents=target,
+        timesteps=torch.tensor([900, 100]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=6.0,
+        shared_kwargs={
+            "video_shape": (1, 4, 4),
+            "fps": 24.0,
+            "control_latents": [source],
+            "transfer_share_vision_temporal_positions": False,
+        },
+    )
+    assert len(calls) == 2
+    torch.testing.assert_close(result, target)
+    torch.testing.assert_close(source, torch.ones_like(source))
+
+
+@pytest.mark.parametrize("env_key", ["DIFFUSION_CACHE_BACKEND", "DIFFUSION_CACHE_ADAPTER"])
+def test_image_edit_rejects_environment_cache(make_cosmos3_pipeline, monkeypatch, env_key):
+    from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+
+    monkeypatch.delenv("DIFFUSION_CACHE_BACKEND", raising=False)
+    monkeypatch.delenv("DIFFUSION_CACHE_ADAPTER", raising=False)
+    monkeypatch.setenv(env_key, "tea_cache")
+    config = normalize_omni_diffusion_kwargs({})
+    pipeline = make_cosmos3_pipeline()
+    pipeline.od_config.cache_backend = config["cache_backend"]
+    with pytest.raises(ValueError, match="cache_backend='none'"):
+        pipeline.forward(
+            make_request_batch(
+                {"modalities": ["image"], "multi_modal_data": {"image": object()}}, make_sampling_params()
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "modalities,expected", [(None, "video"), (["video"], "video"), (["image"], "i2i"), ("image", "i2i")]
+)
+def test_source_image_classification_preserves_video_default(modalities, expected):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import classify_cosmos3_request
+
+    prompt = {"modalities": modalities, "multi_modal_data": {"image": object()}}
+    assert classify_cosmos3_request(prompt) == expected
+    prompt["multi_modal_data"] = {}
+    assert classify_cosmos3_request(prompt) == ("t2i" if expected == "i2i" else "video")
+
+
+@pytest.mark.parametrize("size,expected", [((1, 1), (32, 32)), ((1, 100000), (32, 32768))])
+def test_image_edit_preprocessing_tiny_and_extreme(size, expected):
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    request = SimpleNamespace(
+        prompt={"modalities": ["image"], "multi_modal_data": {"image": Image.new("RGB", size)}},
+        sampling_params=make_sampling_params(),
+    )
+    get_cosmos3_pre_process_func(SimpleNamespace())(request)
+    sp = request.sampling_params
+    assert (sp.width, sp.height) == expected
+    assert request.prompt["additional_information"]["preprocessed_image"].shape == (1, 3, expected[1], expected[0])

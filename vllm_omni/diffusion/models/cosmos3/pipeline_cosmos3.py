@@ -5,7 +5,7 @@
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
 mainly by ``prompt["modalities"]``:
 
-* ``"image"`` selects T2I (text-to-image) and forces a single visual frame.
+* ``"image"`` selects T2I, or I2I editing when a source image is supplied.
 * ``"video"`` or omitted modalities select video generation.
 * ``"audio"`` is accepted for compatibility but does not request sound by
   itself; sound is enabled with ``generate_sound`` or ``sound_gen``.
@@ -83,6 +83,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames, is_video_file_path
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.entrypoints.openai.video_api_utils import positive_float
+from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.world_models.adapters.state_cosmos3_adapter import (
     Cosmos3StateAdapter,
 )
@@ -91,6 +92,7 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_extras.cosmos3 import resolve_image_edit_size
 
 from .action import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -177,6 +179,7 @@ COSMOS3_INVERSE_IMAGE_RESOLUTION_TEMPLATE = "This image is not of {height}x{widt
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
 COSMOS3_SYSTEM_PROMPT = "You are a helpful assistant who will generate videos from a give prompt."
 COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate images from a give prompt."
+COSMOS3_I2I_SYSTEM_PROMPT = "You are a helpful assistant who will edit images based on the user's instructions."
 COSMOS3_TRANSFER_SYSTEM_PROMPT = (
     "You are a helpful assistant that generates images or videos following the user's instructions"
     " and control signals (edge maps, blur, depth, or segmentation)."
@@ -311,6 +314,50 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
 # ---------------------------------------------------------------------------
 # Post-process function (registered in registry.py)
 # ---------------------------------------------------------------------------
+def classify_cosmos3_request(prompt: str | dict) -> str:
+    """Classify output and source without changing the request or loading media."""
+    modalities = (prompt.get("modalities") or []) if isinstance(prompt, dict) else []
+    if isinstance(modalities, str):
+        modalities = [modalities]
+    if "image" in modalities and "video" in modalities:
+        raise ValueError("Cosmos3 prompt modalities cannot request both image and video output.")
+    accepted_modalities = ["image", "video", "text", "audio"]
+    if any(value not in accepted_modalities for value in modalities):
+        raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
+    if "image" not in modalities:
+        return "video"
+    media = prompt.get("multi_modal_data") or {}
+    return "i2i" if media.get("image") is not None else "t2i"
+
+
+def _validate_image_edit_request(od_config: OmniDiffusionConfig, prompt: dict, sp: OmniDiffusionSamplingParams) -> None:
+    # Use the resolved engine configuration, including environment defaults.
+    if getattr(od_config, "cache_backend", None) not in (None, "none"):
+        raise OmniClientError(
+            "Cosmos3 image editing does not support diffusion caching yet. Start the engine with cache_backend='none'."
+        )
+    media = prompt.get("multi_modal_data") or {}
+    source = media.get("image")
+    if isinstance(source, list) and len(source) != 1:
+        raise OmniClientError("Cosmos3 image editing requires exactly one source image.")
+    if any(media.get(key) is not None for key in ("mask", "mask_image", "reference_image")):
+        raise OmniClientError("Cosmos3 image editing does not support masks or auxiliary reference images.")
+    pipeline = Cosmos3OmniDiffusersPipeline
+    if pipeline._get_sp_param(sp, "strength") is not None:
+        raise OmniClientError("Cosmos3 image editing does not support strength; omit this parameter.")
+    if sp.num_outputs_per_prompt is not None and sp.num_outputs_per_prompt < 1:
+        raise OmniClientError("Cosmos3 image editing requires at least one output (n >= 1).")
+    if (
+        media.get("video") is not None
+        or pipeline._get_action_mode(prompt, sp) is not None
+        or pipeline._is_sound_request(prompt, sp)
+        or resolve_transfer_config(sp, prompt) is not None
+    ):
+        raise OmniClientError(
+            "Cosmos3 image editing cannot be combined with video input, actions, sound, or transfer hints."
+        )
+
+
 def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     """Build the request preprocessor for Cosmos3 image/video inputs.
 
@@ -549,6 +596,11 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         action_mode = _request_action_mode(request)
         prompt = request.prompt
+        mode = classify_cosmos3_request(prompt)
+        if mode == "i2i":
+            _validate_image_edit_request(od_config, prompt, request.sampling_params)
+            if is_edge_model:
+                raise OmniClientError("Cosmos3 Edge checkpoints do not support image editing.")
         if is_guardrails_enabled(od_config, request.sampling_params):
             text = prompt if isinstance(prompt, str) else prompt.get("prompt", "")
             check_text_safety(text)
@@ -558,6 +610,24 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
         multi_modal_data = prompt.get("multi_modal_data", {}) or {}
         raw_image = multi_modal_data.get("image")
         raw_video = multi_modal_data.get("video")
+        if mode == "i2i":
+            sp = request.sampling_params
+            image = _pil_to_rgb(raw_image[0] if isinstance(raw_image, list) else raw_image)
+            width, height, is_explicit = resolve_image_edit_size(
+                image.size,
+                sp.width,
+                sp.height,
+                width_not_provided=sp.width_not_provided,
+                height_not_provided=sp.height_not_provided,
+            )
+            if is_explicit:
+                image_tensor = _preprocess_condition_image(image, height, width)
+            else:
+                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+                image_tensor = video_processor.preprocess(image, height=height, width=width)
+            sp.width, sp.height = width, height
+            prompt.setdefault("additional_information", {})["preprocessed_image"] = image_tensor
+            return request
         if raw_image is None and raw_video is None:
             return request
         if raw_image is not None and raw_video is not None and action_mode is None:
@@ -942,13 +1012,16 @@ class Cosmos3OmniDiffusersPipeline(
     - Generation pathway: cross-attention on visual latents and optional
       transfer-control, action, and sound latents (runs each step)
 
-    Supports T2V, I2V, V2V, T2I, transfer, sound-enabled video, and action
+    Supports T2V, I2V, V2V, T2I, I2I, transfer, sound-enabled video, and action
     generation from the same class. Mode is selected at runtime:
 
-    * **T2I** when ``prompt["modalities"]`` contains ``"image"``.  Latent
+    * **T2I** when ``prompt["modalities"]`` contains ``"image"`` without a source image. Latent
       T-dim is forced to 1, T2I-specific scheduler defaults are applied (50 steps,
       flow_shift=3.0, guidance_interval=[400, 1000]), the duration
       template is suppressed, and post-process emits PIL images.
+    * **I2I** when image output and a single source image are supplied. The
+      clean source precedes a one-frame noisy target with sequential positions.
+      Defaults are 35 steps, guidance 6, shift 5, and the editing system prompt.
     * **I2V** when the request supplies a preprocessed image via
       ``multi_modal_data['image']`` (handled by
       :func:`get_cosmos3_pre_process_func`) and the requested output modality
@@ -1895,32 +1968,6 @@ class Cosmos3OmniDiffusersPipeline(
 
             self._sound_tokenizer = Cosmos3SoundTokenizer.from_config(self.od_config)
         return self._sound_tokenizer
-
-    @staticmethod
-    def _is_t2i_request(req: DiffusionRequestBatch) -> bool:
-        """Return whether request-level modalities select image output.
-
-        Only ``"image"`` switches Cosmos3 into T2I. ``"video"`` and omitted
-        modalities select video output. ``"text"`` and ``"audio"`` are accepted
-        compatibility values for callers that share prompt schemas, but they do
-        not select text or audio output in this pipeline. ``"image"`` and
-        ``"video"`` cannot be requested together.
-        """
-        if not req.prompts:
-            return False
-        first_prompt = req.prompts[0]
-        modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
-        if modalities is None:
-            modalities = []
-        if isinstance(modalities, str):
-            modalities = [modalities]
-        if "image" in modalities and "video" in modalities:
-            raise ValueError("Cosmos3 prompt modalities cannot request both image and video output.")
-
-        accepted_modalities = ["image", "video", "text", "audio"]
-        if any(x not in accepted_modalities for x in modalities):
-            raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
-        return "image" in modalities
 
     def _set_timesteps(self, num_inference_steps: int, device: str | torch.device, shift: float) -> None:
         if self.is_distilled_model:
@@ -3807,6 +3854,15 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError("Cosmos3OmniDiffusersPipeline currently supports a single prompt per request.")
 
         sp = req.sampling_params
+        mode = classify_cosmos3_request(prompt_data)
+        is_i2i = mode == "i2i"
+        if is_i2i:
+            _validate_image_edit_request(self.od_config, prompt_data, sp)
+            if self.is_edge_model or self.is_distilled_model:
+                raise OmniClientError(
+                    "Cosmos3 image editing requires standard Nano or Super checkpoints; "
+                    "Edge and distilled checkpoints are unsupported."
+                )
         robolab_inputs = self._build_robolab_policy_inputs(sp, prompt_data, getattr(req, "request_id", None))
         if robolab_inputs is not None:
             return self._forward_robolab_policy(
@@ -3832,15 +3888,15 @@ class Cosmos3OmniDiffusersPipeline(
             transfer_video_tensor = additional_info.get("preprocessed_transfer_video")
             transfer_input_fps = positive_float(additional_info.get("transfer_input_fps"))
 
-        is_t2i = self._is_t2i_request(req)
+        is_image_output = mode in {"t2i", "i2i"}
         sound_enabled = self._is_sound_request(prompt_data, sp)
         action_mode = self._get_action_mode(prompt_data, sp)
         action_enabled = action_mode is not None
         transfer_config = resolve_transfer_config(sp, prompt_data)
         action_video_tensor = video_tensor if action_enabled else None
-        is_v2v = video_tensor is not None and not is_t2i and not action_enabled
+        is_v2v = video_tensor is not None and not is_image_output and not action_enabled
         self._validate_distilled_generation_mode(
-            is_t2i=is_t2i,
+            is_t2i=is_image_output,
             image_tensor=image_tensor,
             action_enabled=action_enabled,
             transfer_config=transfer_config,
@@ -3853,13 +3909,13 @@ class Cosmos3OmniDiffusersPipeline(
             sound_enabled=sound_enabled,
         )
         if transfer_config is not None:
-            if is_t2i:
+            if is_image_output:
                 raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
             if action_enabled:
                 raise ValueError("Cosmos3 transfer inference cannot be combined with action generation.")
             if sound_enabled:
                 raise ValueError("Cosmos3 transfer inference cannot be combined with sound generation.")
-        if action_enabled and is_t2i:
+        if action_enabled and is_image_output:
             raise ValueError("Cosmos3 action generation is supported only for video outputs.")
         if action_enabled and sound_enabled:
             raise ValueError("Cosmos3 action+sound joint generation is not supported in this phase.")
@@ -3869,7 +3925,7 @@ class Cosmos3OmniDiffusersPipeline(
                 "initialized without action modules. Check that the checkpoint config "
                 "enables action_gen and includes action weights."
             )
-        if sound_enabled and is_t2i:
+        if sound_enabled and is_image_output:
             raise ValueError(
                 "Cosmos3 sound generation is supported only for video outputs in "
                 "this phase; text-to-image with sound is unsupported."
@@ -3897,7 +3953,7 @@ class Cosmos3OmniDiffusersPipeline(
             )
         if image_tensor is not None and video_tensor is not None and not action_enabled:
             raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
-        if video_tensor is not None and is_t2i:
+        if video_tensor is not None and is_image_output:
             raise ValueError("Cosmos3 video-to-video generation is supported only for video outputs.")
 
         # T2I and T2V share the same model and forward path; their defaults are:
@@ -3906,7 +3962,18 @@ class Cosmos3OmniDiffusersPipeline(
         #   T2V: 189 frames and 35 steps; regular guidance=6, shift=10;
         #        Edge guidance=5, shift=3;
         #        no guidance interval
-        if is_t2i:
+        if is_i2i:
+            if image_tensor is None:
+                raise OmniClientError("Cosmos3 image editing requires a preprocessed source image.")
+            height, width = image_tensor.shape[-2:]
+            num_frames = 1
+            num_inference_steps = sp.num_inference_steps or 35
+            guidance_scale = self._resolve_guidance_scale(sp, 6.0)
+            default_flow_shift = 5.0
+            default_guidance_interval = None
+            batch_size = max(1, int(sp.num_outputs_per_prompt or 1))
+            negative_prompt = self._get_sp_param(sp, "negative_prompt", negative_prompt)
+        elif is_image_output:
             height = sp.height or (
                 COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT
             )
@@ -3915,7 +3982,7 @@ class Cosmos3OmniDiffusersPipeline(
             num_inference_steps = sp.num_inference_steps or COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS
             guidance_scale = self._resolve_guidance_scale(sp, COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE)
             default_flow_shift = COSMOS3_T2I_DEFAULT_FLOW_SHIFT
-            default_guidance_interval: tuple[float, float] | None = COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL
+            default_guidance_interval = COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL
             batch_size = max(1, int(sp.num_outputs_per_prompt or 1))
         else:
             height = sp.height or (
@@ -3954,7 +4021,7 @@ class Cosmos3OmniDiffusersPipeline(
             guidance_scale = self._resolve_guidance_scale(sp, 1.0)
             default_flow_shift = 5.0
 
-        if not is_t2i and not action_enabled:
+        if not is_image_output and not action_enabled:
             requested_num_frames = int(num_frames)
             num_frames = _ceil_video_num_frames(
                 requested_num_frames,
@@ -3986,7 +4053,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v or is_i2i))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
@@ -4018,6 +4085,13 @@ class Cosmos3OmniDiffusersPipeline(
 
         # --- Format prompts & tokenize (B=1; reused across loop iterations
         # for T2I num_outputs_per_prompt > 1) ---
+        edit_prompt_kwargs = {}
+        if is_i2i:
+            edit_prompt_kwargs = dict(
+                system_prompt=self._get_sp_param(sp, "system_prompt", COSMOS3_I2I_SYSTEM_PROMPT),
+                use_resolution_template=bool(self._get_sp_param(sp, "use_resolution_template", True)),
+                negative_metadata_mode=self._get_sp_param(sp, "negative_metadata_mode", "none"),
+            )
         cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
             prompt,
             negative_prompt,
@@ -4028,7 +4102,8 @@ class Cosmos3OmniDiffusersPipeline(
             max_sequence_length,
             sp,
             use_system_prompt,
-            is_t2i=is_t2i,
+            is_t2i=is_image_output,
+            **edit_prompt_kwargs,
         )
 
         # --- Prepare latents (T2I, T2V, or I2V) ---
@@ -4110,7 +4185,7 @@ class Cosmos3OmniDiffusersPipeline(
                 condition_frame_indexes_vision,
             )
             image_latent = None
-        elif image_tensor is not None and not is_t2i:
+        elif image_tensor is not None and not is_image_output:
             latents, velocity_mask, image_latent = self._prepare_latents_i2v(
                 image_tensor,
                 height,
@@ -4143,6 +4218,13 @@ class Cosmos3OmniDiffusersPipeline(
 
         # --- Denoising loop ---
         shared_kwargs = dict(video_shape=video_shape, fps=frame_rate)
+        if is_i2i:
+            # Clean source precedes an independently noised target. Both CFG
+            # branches see the same source; only the target is stepped/decoded.
+            shared_kwargs.update(
+                control_latents=[self._encode_conditioning_image_latent(image_tensor)],
+                transfer_share_vision_temporal_positions=False,
+            )
         if velocity_mask is not None:
             shared_kwargs["noisy_frame_mask"] = velocity_mask
         if action_enabled:
@@ -4183,7 +4265,7 @@ class Cosmos3OmniDiffusersPipeline(
                 generator=generator,
             )
 
-        if is_t2i and batch_size > 1:
+        if is_image_output and batch_size > 1:
             # Generate N independent images by re-running the full diffusion
             # loop with different noise seeds.  The first sample reuses
             # ``latents`` already drawn from ``generator``; subsequent
@@ -4254,7 +4336,7 @@ class Cosmos3OmniDiffusersPipeline(
             )
 
         return _cosmos3_media_output(
-            output={"image": video} if is_t2i else {"video": video},
+            output={"image": video} if is_image_output else {"video": video},
             od_config=self.od_config,
             sampling_params=sp,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

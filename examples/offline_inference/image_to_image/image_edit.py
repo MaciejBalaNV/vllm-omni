@@ -334,10 +334,11 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
+        choices=["none", "cache_dit", "tea_cache"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Options: 'none' (disabled), 'cache_dit' (DBCache + SCM + TaylorSeer), "
+            "'tea_cache' (Timestep Embedding Aware Cache). "
             "Default: None (no cache acceleration)."
         ),
     )

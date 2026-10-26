@@ -16,8 +16,96 @@ Use this recipe to deploy the 64B `nvidia/Cosmos3-Super` for the highest-quality
 Cosmos3 generation. It shares the same `Cosmos3OmniDiffusersPipeline` and request
 formats as [Cosmos3-Nano](./Cosmos3-Nano.md) — only the checkpoint size and the
 recommended parallelism differ. Mode is selected per request (T2I →
-`/v1/images/generations`; T2V/I2V/V2V → `/v1/videos/sync`; add
+`/v1/images/generations`; I2I → `/v1/images/edits`; T2V/I2V/V2V → `/v1/videos/sync`; add
 `generate_sound=true` for audio).
+
+## Single-image editing
+
+Standard `nvidia/Cosmos3-Super` supports instruction-based editing through
+`/v1/images/edits` and offline Python inference. Supply one RGB-compatible image
+and `modalities=["image"]`; omitting the output modality retains image-to-video
+behavior. Edge and distilled checkpoints, masks, auxiliary reference images,
+`strength`, video inputs, sound, actions, and transfer hints are unsupported for
+editing.
+
+Editing defaults are 35 steps, guidance 6.0, flow shift 5.0, no guidance interval,
+and an empty negative prompt. The editing system prompt and positive image
+resolution metadata are enabled; duration and negative metadata are omitted.
+Existing explicit sampling and prompt overrides still apply. Multiple outputs
+reuse the source encoding and generate independent targets sequentially.
+
+Start the engine with `--cache-backend none` (Python: `cache_backend="none"`).
+Editing rejects every enabled diffusion cache backend, including settings from
+`DIFFUSION_CACHE_BACKEND` or `DIFFUSION_CACHE_ADAPTER`, with HTTP 400 online.
+The engine configuration is preserved, so supported non-editing requests can
+continue using caching. Cosmos3 text/understanding KV reuse is unaffected.
+Removing this restriction requires editing-specific cache correctness and
+quality validation.
+
+With `size=auto` or omitted offline width/height, the canvas follows the source,
+scales down to at most **1,048,576 pixels**, and rounds down to multiples of 32.
+Automatic sizing resizes directly with Lanczos and does not crop. Dimensions
+below 32 grow to 32, the exception to no upscaling. Examples (width × height):
+
+| Source | Automatic canvas |
+|---|---|
+| 4032×3024 | 1152×864 |
+| 1920×1080 | 1344×768 |
+| 1024×1024 | 1024×1024 |
+| 640×480 | 640×480 |
+| 641×481 | 640×480 |
+
+Explicit dimensions must both be positive multiples of 32. They override the
+automatic pixel budget and use aspect-preserving resize followed by center crop.
+Offline requests with only one dimension are rejected. The API applies
+`--max-generated-image-size` to the resolved output canvas, including explicit
+sizes, rather than the uploaded source size.
+
+Use the shared offline example from the repository root (it otherwise defaults
+to 50 inference steps):
+
+```bash
+python examples/offline_inference/image_to_image/image_edit.py \
+  --model nvidia/Cosmos3-Super \
+  --image source.png \
+  --prompt "Change the car to red." \
+  --num-inference-steps 35 \
+  --cache-backend none \
+  --output edited.png
+```
+
+For Super, add the deployment's parallelism flags, for example
+`--cfg-parallel-size 2 --ulysses-degree 4`, or supply `--deploy-config`.
+Add `--width 1024 --height 1024` for an explicit square crop, or
+`--num-outputs-per-prompt 2` for two outputs.
+
+The equivalent offline request passed to `omni.generate` is:
+
+```python
+{
+    "prompt": "Change the car to red.",
+    "modalities": ["image"],
+    "multi_modal_data": {"image": source_image},
+}
+```
+
+After starting the Super server with `--cache-backend none`, submit a multipart
+request (the returned `data` contains PNG images in `b64_json`):
+
+```bash
+curl http://localhost:8000/v1/images/edits \
+  -F model=nvidia/Cosmos3-Super \
+  -F image=@source.png \
+  -F prompt="Change the car to red." \
+  -F size=auto \
+  -F n=2 \
+  -F num_inference_steps=35 \
+  -F seed=42
+```
+
+Use `-F size=1024x1024` for explicit sizing. Functional smoke checks should verify
+decodable images, dimensions/count, instruction following, and sequential
+T2I → I2I → I2V requests. Numerical comparison with cosmos-framework is deferred.
 
 ## References
 

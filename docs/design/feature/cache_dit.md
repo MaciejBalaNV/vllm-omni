@@ -2,6 +2,13 @@
 
 This section describes how to add cache-dit acceleration to a new diffusion pipeline. We use the Qwen-Image pipeline and LongCat-Image pipeline as reference implementations.
 
+Cosmos3 image editing currently rejects all diffusion cache backends, including
+Cache-DiT. Its clean-source/noisy-target path requires separate cache correctness
+and quality validation. Start editing engines with `--cache-backend none`.
+This request-level restriction preserves text/understanding KV reuse and the
+engine's cache configuration for supported non-editing modes. See the
+[Cosmos3 editing recipe](../../../recipes/cosmos3/Cosmos3-Nano.md#single-image-editing).
+
 ---
 
 ## Table of Contents

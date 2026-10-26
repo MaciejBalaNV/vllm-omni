@@ -124,3 +124,95 @@ def test_video_generation_modes_001(omni_server: OmniServer, online_client: Onli
             **case,
         }
         online_client.send_video_diffusion_request(request_config)
+
+
+@pytest.mark.full_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(model=MODEL, server_args=[*SERVER_ARGS, "--cache-backend", "none"]),
+            id="nano_edit",
+            marks=SINGLE_CARD_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL, server_args=[*SERVER_ARGS, "--cache-backend", "none", "--cfg-parallel-size", "2"]
+            ),
+            id="nano_edit_cfg",
+            marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
+        ),
+        pytest.param(
+            OmniServerParams(
+                model="nvidia/Cosmos3-Super",
+                server_args=[
+                    *SERVER_ARGS,
+                    "--cache-backend",
+                    "none",
+                    "--cfg-parallel-size",
+                    "2",
+                    "--ulysses-degree",
+                    "4",
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "8",
+                    "--init-timeout",
+                    "1800",
+                ],
+            ),
+            id="super_edit_cfg",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=8),
+        ),
+    ],
+    indirect=True,
+)
+def test_image_edit_sequence(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    """Uncached T2I → I2I → I2V, including CFG-parallel deployments."""
+    import io
+
+    import pybase64
+    from PIL import Image
+
+    generated = online_client.send_images_generations_http_request(
+        {
+            "json": {
+                "model": omni_server.model,
+                "prompt": "A red car parked on a quiet street.",
+                "size": "256x256",
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+                "seed": 42,
+            }
+        }
+    )[0]
+    assert generated.success, generated.error_message
+    source = pybase64.b64decode(generated.json_body["data"][0]["b64_json"])
+    edited = online_client.send_images_edits_http_request(
+        {
+            "data": {
+                "model": omni_server.model,
+                "prompt": "Change the car to blue.",
+                "size": "auto",
+                "n": 2,
+                "num_inference_steps": 35,
+                "seed": 42,
+            },
+            "files": {"image": ("source.png", source, "image/png")},
+            "timeout": 1800,
+        }
+    )[0]
+    assert edited.success, edited.error_message
+    assert edited.json_body["size"] == "256x256"
+    assert len(edited.json_body["data"]) == 2
+    for output in edited.json_body["data"]:
+        image = Image.open(io.BytesIO(pybase64.b64decode(output["b64_json"])))
+        image.load()
+        assert image.size == (256, 256)
+    online_client.send_video_diffusion_request(
+        {
+            "model": omni_server.model,
+            "form_data": {**VIDEO_SHAPE, "prompt": "The car drives slowly forward."},
+            "image_reference": f"data:image/png;base64,{edited.json_body['data'][0]['b64_json']}",
+        }
+    )

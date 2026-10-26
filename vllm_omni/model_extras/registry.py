@@ -24,6 +24,8 @@ from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.cosmos3 import build_image_to_image_prompt as build_cosmos3_image_to_image_prompt
+from vllm_omni.model_extras.cosmos3 import resolve_image_edit_size as resolve_cosmos3_image_edit_size
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -145,6 +147,20 @@ class ReferenceImageSizeResolver(Protocol):
     ) -> bool: ...
 
 
+class ImageEditSizeResolver(Protocol):
+    """Resolve the canvas as (width, height, is_explicit)."""
+
+    def __call__(
+        self,
+        source_size: tuple[int, int],
+        width: int | None = None,
+        height: int | None = None,
+        *,
+        width_not_provided: bool = False,
+        height_not_provided: bool = False,
+    ) -> tuple[int, int, bool]: ...
+
+
 class TransformerConfigSubfolderResolver(Protocol):
     def __call__(
         self,
@@ -238,11 +254,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3OmniDiffusersPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
-        # The shared T2I example already supplies modalities=["image"].
+        "image_to_image_prompt_builder": build_cosmos3_image_to_image_prompt,
+        "image_edit_size_resolver": resolve_cosmos3_image_edit_size,
     },
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+        "image_to_image_prompt_builder": build_cosmos3_image_to_image_prompt,
+        "image_edit_size_resolver": resolve_cosmos3_image_edit_size,
     },
     "Magi2Pipeline": {
         "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,
@@ -496,6 +515,12 @@ def build_text_to_image_prompt(
         height,
         width,
     )
+
+
+def get_image_edit_size_resolver(model_class_name: str | None) -> ImageEditSizeResolver | None:
+    """Return a lightweight model-owned canvas resolver, if one is needed."""
+    spec = _get_spec(model_class_name)
+    return spec.get("image_edit_size_resolver") if spec else None
 
 
 def build_image_to_image_prompt(

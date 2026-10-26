@@ -1523,6 +1523,21 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
 
+    rotary.position_ids.clear()
+    model._compute_rope_freqs(
+        text_mask=torch.tensor([[1, 1]], dtype=torch.long),
+        t=1,
+        hp=2,
+        wp=2,
+        fps=24.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        num_vision_items=2,
+        share_vision_temporal_positions=False,
+    )
+    _, edit_gen_pos = rotary.position_ids
+    assert edit_gen_pos[0, 0].tolist() == [102] * 4 + [103] * 4
+
 
 def test_shard_gen_prep_rejects_inputs_already_in_execution_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
@@ -1600,3 +1615,48 @@ def test_shared_gen_stack_preserves_control_metadata_sharding_and_wrapped_output
     output = model._run_gen_layers(inputs, gather_output=False, **kwargs)
     torch.testing.assert_close(output, torch.full_like(inputs, 4 if already_sharded else 5))
     assert len(gathered) == 1
+
+
+def test_image_edit_clean_source_and_target_only_output(monkeypatch):
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    source = torch.ones(1, 2, 1, 2, 2)
+    target = torch.zeros_like(source)
+    kwargs = dict(
+        hidden_states=target,
+        text_ids=torch.tensor([[1, 2]]),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 2, 2),
+        fps=24.0,
+        control_latents=[source],
+        transfer_share_vision_temporal_positions=False,
+    )
+    early = model._gen_preprocess(timestep=torch.tensor([900.0]), **kwargs)
+    late = model._gen_preprocess(timestep=torch.tensor([100.0]), **kwargs)
+    assert early.s_control == early.s_video == 4
+    torch.testing.assert_close(early.hidden_gen[:, :4], late.hidden_gen[:, :4])
+    torch.testing.assert_close(early.hidden_gen[:, :4], model.proj_in(model.patchify(source, 1, 2, 2)))
+    assert not torch.equal(early.hidden_gen[:, 4:], late.hidden_gen[:, 4:])
+    # The real output projection must discard the source tokens.
+    output = model._gen_postprocess(early.hidden_gen, early)
+    assert output.shape == target.shape
+    changed_source = early.hidden_gen.clone()
+    changed_source[:, :4] += 100
+    torch.testing.assert_close(model._gen_postprocess(changed_source, early), output)
+    torch.testing.assert_close(source, torch.ones_like(source))
+
+    # Exercise source-sensitive predictions with a small CPU attention layer.
+    class SourceAttention(nn.Module):
+        def forward(self, hidden, **kwargs):
+            return torch.nn.functional.scaled_dot_product_attention(hidden, hidden, hidden)
+
+    model.gen_layers = nn.ModuleList([SourceAttention()])
+    first = model(timestep=torch.tensor([1.0]), **kwargs)
+    model.reset_cache()
+    kwargs["control_latents"] = [torch.zeros_like(source)]
+    second = model(timestep=torch.tensor([1.0]), **kwargs)
+    assert not torch.allclose(first, second)

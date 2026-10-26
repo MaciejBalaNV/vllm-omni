@@ -115,6 +115,7 @@ from vllm_omni.entrypoints.openai.app_state import (
     OmniBatchChat,
     Omnichat,
     Omnispeech,
+    _get_diffusion_od_config,
     _get_engine_and_model,
 )
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
@@ -220,6 +221,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.model_extras.registry import get_image_edit_size_resolver
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -2538,6 +2540,17 @@ async def edit_images(
             # else: let pipeline calculate dimensions based on resolution
         else:
             width, height = parse_size(size)
+
+        od_config = _get_diffusion_od_config(raw_request, engine_client)
+        size_resolver = get_image_edit_size_resolver(getattr(od_config, "model_class_name", None))
+        if size_resolver is not None:
+            width, height, _ = size_resolver(
+                pil_images[0].size,
+                width,
+                height,
+                width_not_provided=size_was_auto,
+                height_not_provided=size_was_auto,
+            )
 
         _check_max_generated_image_size(app_state_args, width, height, resolution)
 
