@@ -49,6 +49,7 @@ from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
     DiffusionPayloadValue,
+    valid_frame_counts,
 )
 
 logger = init_logger(__name__)
@@ -133,6 +134,7 @@ class VideoGenerationArtifacts:
     stage_durations: dict[str, float]
     peak_memory_mb: float
     metrics: dict[str, object] | None = None
+    video_frame_counts: list[int] | None = None
     lidar: DiffusionPayloadValue | None = None
     lidar_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -165,7 +167,8 @@ def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[
     video = artifacts.videos[0]
     # Pre-encoded outputs arrive as MP4 bytes, which carry no tensor shape.
     if isinstance(video, (bytes, bytearray, memoryview)):
-        num_frames = count_mp4_frames(bytes(video))
+        counts = artifacts.video_frame_counts
+        num_frames = counts[0] if counts else count_mp4_frames(bytes(video))
     else:
         num_frames = count_video_frames(video)
     if num_frames is not None and num_frames > 0:
@@ -588,6 +591,10 @@ class OmniOpenAIServingVideo:
         if lidar_output_requested(request.extra_params) and lidar is None:
             raise ValueError("The requested LiDAR output was not returned by the model.")
         lidar_metadata = metadata.get("lidar", {}) if isinstance(metadata, Mapping) else {}
+        video_metadata = metadata.get("video") if isinstance(metadata, Mapping) else None
+        frame_counts = video_metadata.get("frame_counts") if isinstance(video_metadata, Mapping) else None
+        if not valid_frame_counts(frame_counts, len(cast(list[DiffusionPayloadValue], videos))):
+            frame_counts = None
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -599,6 +606,7 @@ class OmniOpenAIServingVideo:
             metrics=metrics,
             lidar=lidar,
             lidar_metadata=dict(lidar_metadata),
+            video_frame_counts=list(frame_counts) if frame_counts is not None else None,
         )
 
     async def generate_videos(
