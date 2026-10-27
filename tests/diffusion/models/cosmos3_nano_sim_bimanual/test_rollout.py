@@ -304,6 +304,25 @@ def test_failed_decoder_releases_session() -> None:
     assert pipe._states == {}
 
 
+def test_failed_typed_tick_releases_its_session() -> None:
+    pipe, state = fake_pipeline()
+    pipe._decode_live_latents.side_effect = RuntimeError("decoder failure")
+    tick = ARDiffusionTickRequest(
+        session_id="robot",
+        request_id="tick-0",
+        chunk_index=0,
+        controls=(build_cosmos3_nano_sim_bimanual_action_control(torch.zeros(8, 59)),),
+    )
+    req = request()
+    req.sampling_params.extra_args = tick.to_extra_args()
+    with pytest.raises(RuntimeError, match="decoder failure"):
+        pipe.forward(req)
+    # KV commit and frame position advanced before decode failed.
+    assert state.next_frame_idx == 3
+    pipe._drop_session.assert_called_once_with("robot")
+    assert pipe._states == {}
+
+
 def test_unified_actions_reach_transformer() -> None:
     pipe, state = fake_pipeline()
     action = torch.arange(8 * 59, dtype=torch.float32).reshape(8, 59) / 100

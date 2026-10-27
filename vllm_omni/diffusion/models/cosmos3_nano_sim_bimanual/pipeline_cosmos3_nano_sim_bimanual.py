@@ -200,6 +200,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     clean_commit_mode: str = "batched"
     overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
+    _request_session_id: str | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
     _streaming_decoder: WanStreamingDecoder | None = None
 
@@ -875,10 +876,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             # survives for a corrected retry or an explicit reset.
             raise
         except Exception:
-            extra = req.sampling_params.extra_args or {}
-            session_id = str(extra.get("session_id") or "default")
-            self._drop_session(session_id)
+            # Use the normalized ID: typed ticks carry it inside
+            # extra_args["ar_diffusion_tick"], not at the top level.
+            if self._request_session_id is not None:
+                self._drop_session(self._request_session_id)
             raise
+        finally:
+            self._request_session_id = None
 
     def _forward_impl(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # ---- Admission (pure) ------------------------------------------------
@@ -916,6 +920,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     "Cosmos3-Nano-Sim-Bimanual ar_diffusion_tick.prompt must match the standard request prompt."
                 )
         session_id = controls.session_id
+        self._request_session_id = session_id
 
         reset = controls.reset
         close_session = controls.close_session
