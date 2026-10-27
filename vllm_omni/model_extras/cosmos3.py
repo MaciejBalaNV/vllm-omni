@@ -226,13 +226,56 @@ def path_media_kind(value: Any) -> str:
     return "image" if Path(value).suffix.lower() in MULTIVIEW_IMAGE_EXTENSIONS else "video"
 
 
+# Aliases for the one camera rate that drives generation and MP4 encoding.
+COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS = ("resolved_frame_rate", "frame_rate", "fps")
+
+
+def parse_multiview_frame_rate(value: Any, name: str = "FPS") -> float:
+    """Return a requested camera rate as a finite positive float."""
+    if isinstance(value, bool):
+        raise TypeError(f"Cosmos3 multiview {name} must be a number, not a boolean.")
+    try:
+        frame_rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Cosmos3 multiview {name} must be a number, got {value!r}.") from exc
+    if not math.isfinite(frame_rate) or frame_rate <= 0:
+        raise ValueError(f"Cosmos3 multiview {name} must be finite and positive, got {value!r}.")
+    return frame_rate
+
+
+def _reject_conflicting_frame_rates(
+    extra: Mapping[str, Any], sampling_frame_rates: Mapping[str, Any] | None = None
+) -> None:
+    """Reject requests whose rate aliases disagree.
+
+    The pipeline would generate at one alias while serving encodes the MP4 at
+    another, so the video would play at the wrong speed against its LiDAR.
+    """
+    supplied = {}
+    for location, source in (("extra_args", extra), ("sampling_params", sampling_frame_rates or {})):
+        for field in COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS:
+            if (value := source.get(field)) is not None:
+                supplied[f"{location}.{field}"] = value
+    rates = {parse_multiview_frame_rate(value, name) for name, value in supplied.items()}
+    if len(rates) > 1:
+        listed = ", ".join(f"{name}={value!r}" for name, value in supplied.items())
+        raise ValueError(f"Cosmos3 multiview frame rates disagree: {listed}. Supply a single camera frame rate.")
+
+
 def validate_multiview_request(
     extra: Mapping[str, Any],
     cameras: Sequence[str] = COSMOS3_MADS_CAMERAS,
     *,
     media_kind: Callable[[Any], str] = path_media_kind,
+    sampling_frame_rates: Mapping[str, Any] | None = None,
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
+    """Validate a multiview manifest.
+
+    ``sampling_frame_rates`` holds rate aliases set outside ``extra``, such as
+    the video API's top-level ``fps``. All supplied rates must agree.
+    """
     reject_multiview_negative_fields(extra, "extra_args")
+    _reject_conflicting_frame_rates(extra, sampling_frame_rates)
     negative = extra.get("per_view_negative_prompt")
     if negative is not None and not isinstance(negative, str):
         raise ValueError("Cosmos3 per_view_negative_prompt must be a string.")

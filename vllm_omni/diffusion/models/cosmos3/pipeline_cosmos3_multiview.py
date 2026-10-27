@@ -24,9 +24,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.cosmos3 import (
+    COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS,
     COSMOS3_MULTIVIEW_UNSUPPORTED_NEGATIVE_FIELDS,
     COSMOS3_TRANSFER_HINT_KEYS,
     normalize_multiview_aspect_ratio,
+    parse_multiview_frame_rate,
     path_media_kind,
     reject_multiview_negative_fields,
     validate_multiview_request,
@@ -220,14 +222,7 @@ def _resolve_multiview_frame_rate(value: Any, default_fps: float) -> float:
     temporal mRoPE, the prompt metadata, and the mask timestamps. Rates outside
     the recommended range are allowed with a warning.
     """
-    if isinstance(value, bool):
-        raise TypeError("Cosmos3 multiview FPS must be a number, not a boolean.")
-    try:
-        frame_rate = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"Cosmos3 multiview FPS must be a number, got {value!r}.") from exc
-    if not math.isfinite(frame_rate) or frame_rate <= 0:
-        raise ValueError(f"Cosmos3 multiview FPS must be finite and positive, got {value!r}.")
+    frame_rate = parse_multiview_frame_rate(value)
     low, high = COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE
     if not low <= frame_rate <= high:
         logger.warning(
@@ -517,6 +512,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
             extra,
             self.multiview_cameras,
             media_kind=_media_kind,
+            sampling_frame_rates={field: getattr(sp, field, None) for field in COSMOS3_MULTIVIEW_FRAME_RATE_FIELDS},
         )
 
     @staticmethod

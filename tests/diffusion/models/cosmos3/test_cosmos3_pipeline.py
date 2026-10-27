@@ -4128,15 +4128,15 @@ def test_multiview_output_reports_generated_rate_as_video_fps(
     assert OmniOpenAIServingVideo._resolve_fps(result) == expected_fps
 
 
-@pytest.mark.parametrize(("rate_args", "expected_fps"), [({}, 30.0), ({"resolved_frame_rate": 12}, 12.0)])
-def test_multiview_serving_encodes_generated_rate_without_request_fps(
-    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, rate_args: dict[str, Any], expected_fps: float
-) -> None:
-    """Without a top-level FPS, the MP4 and job metadata follow the generated camera rate.
-
-    The engine runs the real forward() on the sampling params serving built, so
-    the request's extras reach the pipeline exactly as in production.
-    """
+def _generate_multiview_mp4(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    encoded_fps: list[float],
+    *,
+    fps: float | None,
+    rate_args: dict[str, Any],
+) -> Any:
+    """Serve one T2V request whose engine runs the real forward() on serving's sampling params."""
     import asyncio
 
     from vllm_omni.entrypoints.openai import serving_video
@@ -4158,31 +4158,95 @@ def test_multiview_serving_encodes_generated_rate_without_request_fps(
             output = pipeline.forward(make_request_batch(prompt, sampling_params))
             yield _format_multiview_output(output, sampling_params)
 
-    encoded_fps = []
-
     def encode(video, *, fps, **kwargs):
         encoded_fps.append(fps)
         return b"mp4"
 
     monkeypatch.setattr(serving_video, "_encode_video_bytes", encode)
     handler = serving_video.OmniOpenAIServingVideo.for_diffusion(MultiviewEngine(), model_name="multiview")
-    views = _t2v_multiview_views()
     request = VideoGenerationRequest(
         prompt="Driving.",
         num_frames=_T2V_MULTIVIEW_FRAMES,
         num_inference_steps=1,
-        extra_params={"multiview": {"views": views}, **rate_args},
+        fps=fps,
+        extra_params={"multiview": {"views": _t2v_multiview_views()}, **rate_args},
     )
     try:
-        result = asyncio.run(handler.generate_video_bytes(request, "multiview-fps"))
+        return asyncio.run(handler.generate_video_bytes(request, "multiview-fps"))
     finally:
         handler.shutdown()
 
-    total_frames = len(views) * _T2V_MULTIVIEW_FRAMES
+
+@pytest.mark.parametrize(
+    ("fps", "rate_args", "expected_fps"),
+    [
+        (None, {}, 30.0),
+        (None, {"resolved_frame_rate": 12}, 12.0),
+        (12, {"resolved_frame_rate": 12}, 12.0),
+    ],
+)
+def test_multiview_serving_encodes_generated_rate(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    fps: float | None,
+    rate_args: dict[str, Any],
+    expected_fps: float,
+) -> None:
+    """The MP4 and job metadata follow the generated camera rate, with or without a top-level FPS."""
+    encoded_fps: list[float] = []
+
+    result = _generate_multiview_mp4(make_cosmos3_pipeline, monkeypatch, encoded_fps, fps=fps, rate_args=rate_args)
+
+    total_frames = len(_t2v_multiview_views()) * _T2V_MULTIVIEW_FRAMES
     assert encoded_fps == [expected_fps]
     assert result.video_metadata["fps"] == expected_fps
     assert result.video_metadata["num_frames"] == total_frames
     assert result.video_metadata["duration_s"] == pytest.approx(total_frames / expected_fps)
+
+
+def test_multiview_serving_rejects_top_level_fps_conflicting_with_extras(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Serving would encode at the top-level 24 FPS while the pipeline generated at 12."""
+    encoded_fps: list[float] = []
+
+    with pytest.raises(ValueError, match=r"frame rates disagree: extra_args\.resolved_frame_rate=12"):
+        _generate_multiview_mp4(
+            make_cosmos3_pipeline, monkeypatch, encoded_fps, fps=24, rate_args={"resolved_frame_rate": 12}
+        )
+
+    assert encoded_fps == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "sampling", "expected"),
+    [
+        # Aliases agree after numeric parsing, including JSON strings.
+        ({"fps": 30, "frame_rate": "30", "resolved_frame_rate": 30.0}, {}, None),
+        ({"resolved_frame_rate": 12}, {"fps": 12, "frame_rate": 12.0, "resolved_frame_rate": 12.0}, None),
+        ({}, {"fps": 24, "frame_rate": 24.0}, None),
+        # Any disagreement, within one location or across both.
+        ({"fps": 24, "resolved_frame_rate": 30}, {}, (ValueError, "frame rates disagree")),
+        ({"resolved_frame_rate": 30}, {"fps": 24, "frame_rate": 24.0}, (ValueError, "frame rates disagree")),
+        ({}, {"fps": 24, "frame_rate": 30}, (ValueError, "frame rates disagree")),
+        # Every supplied alias is validated, not only the one the pipeline reads.
+        ({"fps": "fast", "resolved_frame_rate": 30}, {}, (TypeError, r"extra_args\.fps must be a number")),
+        ({"frame_rate": True}, {}, (TypeError, r"extra_args\.frame_rate must be a number, not a boolean")),
+        ({}, {"fps": float("nan")}, (ValueError, r"sampling_params\.fps must be finite and positive")),
+    ],
+)
+def test_multiview_admission_requires_one_frame_rate(
+    extra: dict[str, Any], sampling: dict[str, Any], expected: tuple[type[Exception], str] | None
+) -> None:
+    from vllm_omni.model_extras.cosmos3 import validate_multiview_request
+
+    request = {"multiview": {"views": _t2v_multiview_views()}, **extra}
+    if expected is None:
+        validate_multiview_request(request, sampling_frame_rates=sampling)
+        return
+    error, match = expected
+    with pytest.raises(error, match=match):
+        validate_multiview_request(request, sampling_frame_rates=sampling)
 
 
 @pytest.mark.parametrize("negative", [[], {}, 42, True])
