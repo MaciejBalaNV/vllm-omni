@@ -54,6 +54,7 @@ from .mixed_precision import (
     resolve_mixed_precision_config,
 )
 from .norm import RMSNorm
+from .rope import fused_rotary_pos_emb
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -464,6 +465,9 @@ def _apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
+    fused = fused_rotary_pos_emb(q, k, cos, sin)
+    if fused is not None:
+        return fused
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
