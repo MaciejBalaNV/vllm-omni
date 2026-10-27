@@ -1494,6 +1494,7 @@ def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypat
             yield np.full((4, 4, 3), idx, dtype=np.uint8)
 
     monkeypatch.setattr(iio, "imiter", fake_imiter)
+    monkeypatch.setitem(sys.modules, "av", None)  # Exercise the imageio path.
 
     first = decode_path_video_frames(source, max_frames=5, keep="first")
     assert len(first) == 5
@@ -1507,6 +1508,28 @@ def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypat
     assert seen["n"] == 20
     assert last[0][0, 0, 0] == 15
     assert last[-1][0, 0, 0] == 19
+
+
+def test_decode_path_video_frames_pyav_matches_imageio(tmp_path) -> None:
+    pytest.importorskip("av")
+    pytest.importorskip("imageio.v3")
+    import imageio.v3 as iio
+
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+
+    source = tmp_path / "clip.mp4"
+    rng = np.random.default_rng(0)
+    iio.imwrite(source, rng.integers(0, 256, (12, 32, 48, 3), dtype=np.uint8), plugin="pyav", codec="libx264", fps=8)
+    reference = list(iio.imiter(source))
+
+    first = decode_path_video_frames(source, max_frames=5, keep="first")
+    last = decode_path_video_frames(source, max_frames=5, keep="last")
+    full = decode_path_video_frames(source)
+    for decoded, expected in ((first, reference[:5]), (last, reference[-5:]), (full, reference)):
+        assert len(decoded) == len(expected)
+        for frame, ref in zip(decoded, expected, strict=True):
+            assert frame.dtype == np.uint8 and frame.shape == ref.shape
+            np.testing.assert_array_equal(frame, ref)
 
 
 def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
@@ -1537,6 +1560,7 @@ def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
         return frames
 
     monkeypatch.setattr(iio, "imiter", fake_imiter)
+    monkeypatch.setitem(sys.modules, "av", None)  # Exercise the imageio path.
     monkeypatch.setattr(cosmos_pipeline, "decode_path_video_frames", spy_decode)
 
     preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
