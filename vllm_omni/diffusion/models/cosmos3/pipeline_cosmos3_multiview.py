@@ -1055,6 +1055,9 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 "payload": payload,
                 "metadata": {
                     **lidar_metadata,
+                    # Serving encodes the MP4 at video.fps; without it the
+                    # camera clip would play at the generic fallback rate.
+                    "video": {"fps": frame_rate},
                     "multiview": {
                         "cameras": [view["camera_key"] for view in views],
                         "frames_per_view": num_frames,

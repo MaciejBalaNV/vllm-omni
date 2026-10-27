@@ -4035,6 +4035,156 @@ def test_multiview_forward_per_view_negative_captions(
     assert ("lidar" in output.output["payload"]) is joint
 
 
+# -- Multiview output rate -----------------------------------------------------
+
+_T2V_MULTIVIEW_FRAMES = 29
+
+
+def _t2v_multiview_views(num_views: int = 2) -> list[dict[str, str]]:
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    return [{"camera_key": camera, "prompt": "A car drives."} for camera in COSMOS3_MADS_CAMERAS[:num_views]]
+
+
+def _t2v_multiview_pipeline(make_cosmos3_pipeline, num_views: int = 2):
+    """A multiview pipeline whose real forward() runs around stubbed denoise and decode."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    latent_t = num_views * ((_T2V_MULTIVIEW_FRAMES - 1) // 4 + 1)
+    pipeline = make_cosmos3_pipeline()
+    pipeline.__class__ = Cosmos3MultiviewPipeline
+    pipeline.multiview_config = multiview_contract()
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    pipeline.multiview_cross_view_past_window_seconds = 0.4
+    pipeline.multiview_backend = "triton"
+    pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
+    pipeline._prepare_multiview_latents = lambda **kwargs: (
+        torch.zeros(1, 2, latent_t, 1, 1),
+        torch.ones(1, 1, latent_t, 1, 1),
+        torch.zeros(1, 2, latent_t, 1, 1),
+    )
+    pipeline.diffuse_transfer = lambda **kwargs: kwargs["latents"]
+    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(
+        1, 3, num_views * _T2V_MULTIVIEW_FRAMES, 4, 4
+    )
+    _capture_tokenize_calls(pipeline)
+    return pipeline
+
+
+def _format_multiview_output(output: Any, sampling_params: Any) -> Any:
+    """Apply the registered postprocess and the shared output formatter, as the engine does."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import get_cosmos3_multiview_post_process_func
+    from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    postprocess = get_cosmos3_multiview_post_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    processed = postprocess(output.output, output_type="np", sampling_params=sampling_params)
+    (result,) = format_diffusion_outputs(
+        request=OmniDiffusionRequest(
+            prompt="Driving.",
+            request_id="multiview-fps",
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        ),
+        od_config=SimpleNamespace(model_class_name="Cosmos3MultiviewPipeline"),
+        diffusion_output=output,
+        output_data=processed,
+        postprocess_output=normalize_diffusion_postprocess_output(processed),
+    )
+    return result
+
+
+@pytest.mark.parametrize(
+    ("rate_args", "expected_fps"),
+    [
+        ({}, 30.0),
+        ({"resolved_frame_rate": 12}, 12.0),
+        ({"frame_rate": 12}, 12.0),
+        ({"fps": 12}, 12.0),
+    ],
+)
+def test_multiview_output_reports_generated_rate_as_video_fps(
+    make_cosmos3_pipeline, rate_args: dict[str, Any], expected_fps: float
+) -> None:
+    """Serving reads only the canonical video FPS; the multiview group keeps its copy.
+
+    Neither expected rate is the generic 24 FPS serving fallback.
+    """
+    from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+
+    pipeline = _t2v_multiview_pipeline(make_cosmos3_pipeline)
+    sp = make_sampling_params(
+        num_frames=_T2V_MULTIVIEW_FRAMES,
+        num_inference_steps=1,
+        latents=None,
+        extra_args={"multiview": {"views": _t2v_multiview_views()}, **rate_args},
+    )
+
+    result = _format_multiview_output(pipeline.forward(make_request_batch({"prompt": "Driving."}, sp)), sp)
+
+    assert result.multimodal_output["metadata"]["video"] == {"fps": expected_fps}
+    assert result.multimodal_output["metadata"]["multiview"]["fps"] == expected_fps
+    assert OmniOpenAIServingVideo._resolve_fps(result) == expected_fps
+
+
+@pytest.mark.parametrize(("rate_args", "expected_fps"), [({}, 30.0), ({"resolved_frame_rate": 12}, 12.0)])
+def test_multiview_serving_encodes_generated_rate_without_request_fps(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, rate_args: dict[str, Any], expected_fps: float
+) -> None:
+    """Without a top-level FPS, the MP4 and job metadata follow the generated camera rate.
+
+    The engine runs the real forward() on the sampling params serving built, so
+    the request's extras reach the pipeline exactly as in production.
+    """
+    import asyncio
+
+    from vllm_omni.entrypoints.openai import serving_video
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = _t2v_multiview_pipeline(make_cosmos3_pipeline)
+
+    class MultiviewEngine:
+        stage_configs = [SimpleNamespace(stage_type="diffusion", final_output=True, final_output_type="video")]
+        default_sampling_params_list = [OmniDiffusionSamplingParams()]
+
+        @staticmethod
+        def get_diffusion_od_config():
+            return SimpleNamespace(model_class_name="Cosmos3MultiviewPipeline")
+
+        async def generate(self, prompt, request_id, sampling_params_list):
+            (sampling_params,) = sampling_params_list
+            output = pipeline.forward(make_request_batch(prompt, sampling_params))
+            yield _format_multiview_output(output, sampling_params)
+
+    encoded_fps = []
+
+    def encode(video, *, fps, **kwargs):
+        encoded_fps.append(fps)
+        return b"mp4"
+
+    monkeypatch.setattr(serving_video, "_encode_video_bytes", encode)
+    handler = serving_video.OmniOpenAIServingVideo.for_diffusion(MultiviewEngine(), model_name="multiview")
+    views = _t2v_multiview_views()
+    request = VideoGenerationRequest(
+        prompt="Driving.",
+        num_frames=_T2V_MULTIVIEW_FRAMES,
+        num_inference_steps=1,
+        extra_params={"multiview": {"views": views}, **rate_args},
+    )
+    try:
+        result = asyncio.run(handler.generate_video_bytes(request, "multiview-fps"))
+    finally:
+        handler.shutdown()
+
+    total_frames = len(views) * _T2V_MULTIVIEW_FRAMES
+    assert encoded_fps == [expected_fps]
+    assert result.video_metadata["fps"] == expected_fps
+    assert result.video_metadata["num_frames"] == total_frames
+    assert result.video_metadata["duration_s"] == pytest.approx(total_frames / expected_fps)
+
+
 @pytest.mark.parametrize("negative", [[], {}, 42, True])
 def test_multiview_admission_rejects_non_string_per_view_negative_prompt(negative) -> None:
     from vllm_omni.model_extras.cosmos3 import validate_multiview_request
