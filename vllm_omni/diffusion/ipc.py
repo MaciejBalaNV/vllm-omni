@@ -82,21 +82,30 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
         raise TypeError("NumPy object arrays cannot be transferred through raw shared memory")
 
     array = np.ascontiguousarray(array)
-    shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
     try:
-        # torch.from_numpy warns on read-only arrays and rejects some dtypes.
-        source = torch.from_numpy(array) if array.flags.writeable else None
+        # Torch rejects non-native byte order and some NumPy dtypes, and warns
+        # on read-only arrays. Keep those on the dtype-preserving NumPy path.
+        source = torch.from_numpy(array) if array.flags.writeable and array.dtype.isnative else None
     except TypeError:
         source = None
-    if source is None:
-        np.copyto(shm_array, array)
-    else:
-        # Torch copies (and faults in the fresh SHM pages) on all intra-op
-        # threads; np.copyto does both on a single thread.
-        torch.from_numpy(shm_array).copy_(source)
-        del source
-    del shm_array
-    shm.close()
+    shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
+    destination = None
+    try:
+        try:
+            if source is None:
+                np.copyto(shm_array, array)
+            else:
+                # Torch copies (and faults in the fresh SHM pages) on all
+                # intra-op threads; np.copyto does both on a single thread.
+                destination = torch.from_numpy(shm_array)
+                destination.copy_(source)
+        finally:
+            del destination, shm_array
+            shm.close()
+    except BaseException:
+        # The caller cannot track this segment until we return its handle.
+        shm.unlink()
+        raise
     return handle
 
 
