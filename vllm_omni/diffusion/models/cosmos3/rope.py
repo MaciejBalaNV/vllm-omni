@@ -3,7 +3,9 @@
 """Fused Qwen3-style RoPE for Cosmos3 Q/K tensors."""
 
 import torch
+
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm_omni.platforms import current_omni_platform
 
 if HAS_TRITON:
 
@@ -113,12 +115,13 @@ def _broadcast_table(table: torch.Tensor, batch: int, seq_len: int, head_dim: in
 def fused_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """``(x * cos) + (rotate_half(x) * sin)`` for Q and K in one kernel, bit-exact with eager.
+    """Apply bit-exact eager-style Q/K RoPE in one NVIDIA CUDA kernel.
 
     Returns ``None`` when the inputs are outside the fused kernel's contract.
     """
     if (
         not HAS_TRITON
+        or not current_omni_platform.is_cuda()
         or not q.is_cuda
         or torch.compiler.is_compiling()
         or (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, cos, sin)))
