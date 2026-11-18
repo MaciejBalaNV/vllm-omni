@@ -23,7 +23,7 @@ import hashlib
 import json
 import math
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, ClassVar
 
@@ -31,6 +31,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group, model_parallel_is_initialized
 from vllm_omni.diffusion.models.cosmos3.fixed_step_sde import fixed_step_sample, initial_noise
 from vllm_omni.diffusion.models.cosmos3.lidar_vae import Cosmos3LidarDecoder, Cosmos3LidarEncoder
 from vllm_omni.diffusion.models.cosmos3.multiview_maskless_attention import resolve_maskless_kernel
@@ -96,6 +97,7 @@ from .layout import (
     chunk_token_metadata,
     committed_metadata,
 )
+from .parallel import for_each_camera_tensor
 from .state_cosmos3_nano_sim_auto import Cosmos3NanoSimAutoSessionState, DenseReplayRing, ring_slot_for_step
 from .transformer_cosmos3_nano_sim_auto import (
     CausalMasklessRuntime,
@@ -414,6 +416,18 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
     def _view_value(view: Mapping[str, Any], field: str) -> Any:
         return view.get(f"{field}_path", view.get(field))
 
+    def _for_each_camera_vae(
+        self,
+        num_cameras: int,
+        compute: Callable[[int], torch.Tensor],
+        consume: Callable[[int, torch.Tensor], None],
+    ) -> None:
+        # Validation permits only TP x Ulysses within a worker: every rank has
+        # the same request and a complete local VAE. Independent requests use
+        # separate stage replicas; VAE patch parallelism is rejected.
+        group = get_world_group() if model_parallel_is_initialized() else None
+        for_each_camera_tensor(num_cameras, compute, consume, group)
+
     def _encode_camera_major(
         self,
         views: Sequence[Mapping[str, Any]],
@@ -424,14 +438,18 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         num_frames: int,
     ) -> torch.Tensor:
         """Encode one media field of every camera independently: ``[1, C, V*T_lat, h, w]``."""
-        latents = []
-        for view in views:
+
+        def encode(camera: int) -> torch.Tensor:
+            view = views[camera]
             value = self._view_value(view, field)
             if value is None:
                 raise ValueError(f"Camera {view['camera_key']!r} is missing {field} input.")
             frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=num_frames)
             frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)))
+            return self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype))
+
+        latents: list[torch.Tensor] = []
+        self._for_each_camera_vae(len(views), encode, lambda _, latent: latents.append(latent))
         lengths = {int(latent.shape[2]) for latent in latents}
         if len(lengths) != 1:
             raise ValueError(f"Per-camera VAE encodes have unequal latent lengths: {lengths}.")
@@ -439,12 +457,15 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _encode_first_frames(self, views: Sequence[Mapping[str, Any]], *, height: int, width: int) -> torch.Tensor:
         """Latent 0 of every camera from its first RGB frame (the causal Wan encoder makes it exact)."""
-        latents = []
-        for view in views:
-            value = self._view_value(view, "vision")
+
+        def encode(camera: int) -> torch.Tensor:
+            value = self._view_value(views[camera], "vision")
             frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=1)
             frames = _pad_multiview_view_video(frames, num_frames=1, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype))[:, :, :1])
+            return self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype))[:, :, :1]
+
+        latents: list[torch.Tensor] = []
+        self._for_each_camera_vae(len(views), encode, lambda _, latent: latents.append(latent))
         return torch.cat(latents, dim=2)
 
     def _encode_lidar_condition(self, lidar_request: Mapping[str, Any], *, num_sweeps: int) -> torch.Tensor:
@@ -1153,13 +1174,17 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         return_latents: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         assert state.rgb_target_latents is not None
+        target_latents = state.rgb_target_latents
         num_views = state.num_views
-        frames_per_view = state.rgb_target_latents.shape[2] // num_views
-        decoded = None
-        for view in range(num_views):
-            clip = self._decode_latents(
-                state.rgb_target_latents.narrow(2, view * frames_per_view, frames_per_view)
-            ).clamp_(-1, 1)
+        frames_per_view = target_latents.shape[2] // num_views
+
+        def decode(view: int) -> torch.Tensor:
+            return self._decode_latents(target_latents.narrow(2, view * frames_per_view, frames_per_view)).clamp_(-1, 1)
+
+        decoded: torch.Tensor | None = None
+
+        def copy_to_cpu(view: int, clip: torch.Tensor) -> None:
+            nonlocal decoded
             if decoded is None:
                 decoded = torch.empty(
                     (clip.shape[0], clip.shape[1], num_views * clip.shape[2], *clip.shape[3:]),
@@ -1167,7 +1192,8 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
                     device="cpu",
                 )
             decoded.narrow(2, view * clip.shape[2], clip.shape[2]).copy_(clip)
-            del clip
+
+        self._for_each_camera_vae(num_views, decode, copy_to_cpu)
         assert decoded is not None
         payload: dict[str, Any] = {"video": decoded}
         if return_latents:

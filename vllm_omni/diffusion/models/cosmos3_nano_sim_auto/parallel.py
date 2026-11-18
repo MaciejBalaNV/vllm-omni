@@ -16,11 +16,80 @@ is the same as on one GPU.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+
+
+def for_each_camera_tensor(
+    num_cameras: int,
+    compute: Callable[[int], torch.Tensor],
+    consume: Callable[[int, torch.Tensor], None],
+    group: GroupCoordinator | None,
+) -> None:
+    """Run each independent camera once, then consume results in camera order.
+
+    The caller supplies replicas of one request and a local (non-distributed)
+    VAE. Results must have the same shape, dtype and device type. Rank r owns
+    cameras r, r + W, ...; one padded, rank-major gather restores every camera
+    on every rank. Packing retains a full rig of results on each device.
+    Ordinary producer errors are agreed before entering the tensor collective.
+    """
+    if num_cameras < 1:
+        raise ValueError("Camera VAE execution requires at least one camera.")
+    if group is None or group.world_size == 1:
+        for camera in range(num_cameras):
+            consume(camera, compute(camera))
+        return
+
+    slots = (num_cameras + group.world_size - 1) // group.world_size
+    local = None
+    metadata = None
+    error: Exception | None = None
+    try:
+        for slot, camera in enumerate(range(group.rank_in_group, num_cameras, group.world_size)):
+            tensor = compute(camera)
+            descriptor = (tensor.shape, tensor.dtype, tensor.device.type)
+            if local is None:
+                metadata = descriptor
+                local = tensor.new_zeros((slots, *tensor.shape))
+            elif descriptor != metadata:
+                raise ValueError("Per-camera VAE results must have matching shapes, dtypes and device types.")
+            local[slot].copy_(tensor)
+            del tensor
+    except Exception as exc:
+        # A local media/VAE failure must not leave peers waiting in all-gather.
+        error = exc
+
+    statuses: list[tuple[tuple[torch.Size, torch.dtype, str] | None, str | None]] = [
+        (None, None) for _ in range(group.world_size)
+    ]
+    dist.all_gather_object(
+        statuses,
+        (metadata, None if error is None else f"{type(error).__name__}: {error}"),
+        group=group.cpu_group,
+    )
+    for rank, (_, failure) in enumerate(statuses):
+        if failure is not None:
+            raise RuntimeError(f"Camera VAE producer failed on rank {rank}: {failure}") from error
+    expected = statuses[0][0]  # Camera zero always belongs to rank zero.
+    assert expected is not None
+    if any(value is not None and value != expected for value, _ in statuses):
+        raise ValueError("Per-camera VAE results must have matching shapes, dtypes and device types across ranks.")
+    if local is None:
+        shape, dtype, device_type = expected
+        local = torch.zeros((slots, *shape), dtype=dtype, device=group.device if device_type != "cpu" else "cpu")
+    gathered = group.all_gather(local, dim=0)
+    assert isinstance(gathered, torch.Tensor)
+    del local
+    for camera in range(num_cameras):
+        consume(camera, gathered[(camera % group.world_size) * slots + camera // group.world_size])
 
 
 @dataclass(frozen=True, eq=False)

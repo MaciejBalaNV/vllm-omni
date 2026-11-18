@@ -111,10 +111,14 @@ def test_latents_are_opt_in_and_survive_postprocessing(monkeypatch, joint: bool)
         manifest=SimpleNamespace(frames_per_chunk=3, checkpoint_id="test"),
         _decode_latents=lambda value: torch.zeros(1, 3, value.shape[2], 2, 2),
     )
-    args = (host, state, {} if joint else None, [], "480", "16,9")
-    payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(*args)
+    host._for_each_camera_vae = pipeline.Cosmos3NanoSimAutoPipeline._for_each_camera_vae.__get__(host)
+    payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(
+        host, state, {} if joint else None, [], "480", "16,9"
+    )
     assert "latents" not in payload
-    payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(*args, return_latents=True)
+    payload, metadata = pipeline.Cosmos3NanoSimAutoPipeline._build_payload(
+        host, state, {} if joint else None, [], "480", "16,9", return_latents=True
+    )
     # Generic multiview processing returns video/LiDAR only; the Sim-Auto wrapper retains latents.
     monkeypatch.setattr(
         pipeline,
