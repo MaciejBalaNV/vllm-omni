@@ -22,10 +22,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
 
 import torch
 from vllm.logger import init_logger
@@ -105,6 +106,9 @@ from .transformer_cosmos3_nano_sim_auto import (
 
 logger = init_logger(__name__)
 
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
 _SYSTEM_PROMPTS = {
     "av_multiview_transfer": COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
     "av_joint_camera_lidar_transfer": COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
@@ -140,6 +144,28 @@ def _first_not_none(*values: Any) -> Any:
 
 def _reject(message: str) -> ARDiffusionRequestRejectedError:
     return ARDiffusionRequestRejectedError(f"Cosmos3-Nano-Sim-Auto: {message}")
+
+
+def _prefetch_in_order(load: Callable[[_T], _R], inputs: Sequence[_T], *, depth: int = 1) -> Iterator[_R]:
+    """Yield ``load(x)`` for ``inputs`` in order, loading up to ``depth`` items ahead on a host thread.
+
+    Per-camera media decode and resize are CPU work; running them on a worker
+    thread overlaps them with the GPU VAE encode of the previous camera. Each
+    item is loaded exactly as it would be serially, so results are unchanged.
+    """
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="cosmos3-sim-auto-media") as pool:
+        pending: deque[Future[_R]] = deque(pool.submit(load, item) for item in inputs[: depth + 1])
+        queued = len(pending)
+        try:
+            while pending:
+                result = pending.popleft().result()
+                if queued < len(inputs):
+                    pending.append(pool.submit(load, inputs[queued]))
+                    queued += 1
+                yield result
+        finally:
+            for future in pending:
+                future.cancel()
 
 
 class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
@@ -424,14 +450,19 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
         num_frames: int,
     ) -> torch.Tensor:
         """Encode one media field of every camera independently: ``[1, C, V*T_lat, h, w]``."""
-        latents = []
+        values = []
         for view in views:
             value = self._view_value(view, field)
             if value is None:
                 raise ValueError(f"Camera {view['camera_key']!r} is missing {field} input.")
+            values.append(value)
+
+        def load(value: Any) -> torch.Tensor:
             frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=num_frames)
             frames = _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)))
+            return uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)
+
+        latents = [self._encode_video_tensor(video) for video in _prefetch_in_order(load, values)]
         lengths = {int(latent.shape[2]) for latent in latents}
         if len(lengths) != 1:
             raise ValueError(f"Per-camera VAE encodes have unequal latent lengths: {lengths}.")
@@ -439,12 +470,13 @@ class Cosmos3NanoSimAutoPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _encode_first_frames(self, views: Sequence[Mapping[str, Any]], *, height: int, width: int) -> torch.Tensor:
         """Latent 0 of every camera from its first RGB frame (the causal Wan encoder makes it exact)."""
-        latents = []
-        for view in views:
-            value = self._view_value(view, "vision")
-            frames = media_to_uint8_cthw(value, height=height, width=width, max_frames=1)
+
+        def load(view: Mapping[str, Any]) -> torch.Tensor:
+            frames = media_to_uint8_cthw(self._view_value(view, "vision"), height=height, width=width, max_frames=1)
             frames = _pad_multiview_view_video(frames, num_frames=1, height=height, width=width)
-            latents.append(self._encode_video_tensor(uint8_cthw_to_normalized_5d(frames, dtype=self.dtype))[:, :, :1])
+            return uint8_cthw_to_normalized_5d(frames, dtype=self.dtype)
+
+        latents = [self._encode_video_tensor(video)[:, :, :1] for video in _prefetch_in_order(load, views)]
         return torch.cat(latents, dim=2)
 
     def _encode_lidar_condition(self, lidar_request: Mapping[str, Any], *, num_sweeps: int) -> torch.Tensor:
