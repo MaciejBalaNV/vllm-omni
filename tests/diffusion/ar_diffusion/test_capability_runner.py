@@ -19,6 +19,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
@@ -281,6 +282,7 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert kv is not None
     assert kv.num_local_kv_branches == 1
     assert kv.frames_per_block == 3
+    assert kv.max_scratch_frames_per_branch == 3
     assert kv.spec.window_chunks == 5
     assert kv.spec.sink_chunks == 1
     assert kv.cross_attention_lengths == {"text": 8}
@@ -515,6 +517,25 @@ def test_error_output_releases_only_failed_session(monkeypatch, status_code):
     runner.close_session("healthy")
     assert not kv._adapters and not kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_serialized_admission_rejection_retains_session(monkeypatch):
+    pipeline = CapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    session = commit_one_frame(runner, "retained", "main")
+    output = DiffusionOutput.from_exception(ARDiffusionRequestRejectedError("out of order"))
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", lambda *args, **kwargs: output)
+    request = OmniDiffusionRequest(
+        prompt="test",
+        request_id="rejected-request",
+        sampling_params=OmniDiffusionSamplingParams(
+            seed=0, extra_args={"session_id": "retained", "close_session": True}
+        ),
+    )
+
+    assert runner.execute_model(request) is output
+    assert runner._sessions["retained"] is session
+    assert pipeline.closes == []
 
 
 def test_decode_failure_after_kv_commit_releases_session(monkeypatch):

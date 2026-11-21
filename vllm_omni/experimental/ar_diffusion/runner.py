@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -23,7 +23,9 @@ from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSche
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, StepRequestState
 from vllm_omni.experimental.ar_diffusion.capability import (
+    AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestRejectedError,
     SupportsARDiffusionNoisyKV,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
@@ -322,6 +324,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             cross_attention_lengths=spec.cross_attention_lengths,
             cross_attention_kv_heads=spec.cross_attention_kv_heads,
             frames_per_block=spec.frames_per_block,
+            max_scratch_frames_per_branch=spec.max_scratch_frames_per_branch,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
             segmented=spec.segmented,
@@ -331,7 +334,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._session_capacity = self.kv_cache.session_capacity
         logger.info(
             "AR-Diffusion KV cache: blocks=%d layers=%d local_kv_heads=%d head_size=%d "
-            "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s "
+            "tokens/frame=%d frames/block=%d scratch-frames/branch=%d window=%d sink=%d kv_branches=%s cross=%s "
             "resident_capacity=%d requested_capacity=%d",
             self.kv_cache.num_blocks,
             spec.num_layers,
@@ -339,6 +342,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             spec.head_size,
             spec.tokens_per_frame,
             spec.frames_per_block,
+            self.kv_cache.max_scratch_frames_per_branch,
             config.window_chunks,
             config.sink_chunks,
             [(kv_branch.name, kv_branch.local_index) for kv_branch in spec.kv_branches],
@@ -429,9 +433,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     @staticmethod
     def _request_session(
         req: OmniDiffusionRequest,
-    ) -> tuple[str, dict, ARDiffusionTickRequest | None]:
-        extra_args = req.sampling_params.extra_args or {}
-        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+    ) -> tuple[str, Mapping, ARDiffusionTickRequest | None]:
+        extra_args = req.sampling_params.extra_args
+        if extra_args is None:
+            extra_args = {}
+        if not isinstance(extra_args, Mapping):
+            raise ARDiffusionRequestRejectedError(
+                f"AR-Diffusion extra_args must be a mapping, got {type(extra_args).__name__}."
+            )
+        try:
+            tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        except ValueError as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if tick is not None:
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None
@@ -446,9 +459,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> Iterator[None]:
         """Bind runner-owned KV for one runner invocation and fail closed.
 
-        The pipeline sees the state only inside this context. On any failure the
-        session is released before the exception propagates, so a later request
-        for the same id cannot resume half-written pages.
+        The pipeline sees the state only inside this context. Execution failures
+        release the session before propagating, so a later request cannot resume
+        half-written pages. Side-effect-free admission rejections retain it.
         """
         capability = self._ar_diffusion_capability
         if capability is None:
@@ -460,6 +473,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             if synchronize:
                 current_omni_platform.synchronize()
                 state.finish_request(session_id)
+        except ARDiffusionRequestRejectedError:
+            # Admission rejection is guaranteed to occur before any session or
+            # KV mutation, so retain the paid-for history for a corrected retry.
+            logger.info(
+                "AR-Diffusion %s rejected at admission for session=%s; session state retained",
+                description,
+                session_id,
+            )
+            raise
         except Exception:
             self._release_session(
                 session_id,
@@ -636,8 +658,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._perf_e2e_times.append(time.perf_counter() - started)
         if getattr(output, "error", None):
             # The base runner serializes OmniClientError into DiffusionOutput,
-            # so _bound_ar_session cannot observe it as a failed forward.
-            self._release_session(session_id, reset_model=False, reason="forward_error", suppress_errors=True)
+            # including admission rejections that must retain the session.
+            if output.error_type != AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE:
+                self._release_session(session_id, reset_model=False, reason="forward_error", suppress_errors=True)
         elif close_session:
             self.close_session(session_id)
         return output
