@@ -11,8 +11,10 @@ Unifying with ``OmniVideoBackend`` / ``_decode_video_bytes`` is a follow-up.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +51,42 @@ def _frame_to_uint8_rgb(value: Any) -> np.ndarray:
     raise TypeError(f"Video decode expected an RGB frame, got {type(value)!r}.")
 
 
+@contextlib.contextmanager
+def _open_video_frames(media_path: Path, iio: Any) -> Iterator[Iterator[np.ndarray]]:
+    """RGB24 frames of ``media_path``, decoded exactly as ``iio.imiter`` does.
+
+    imageio's PyAV plugin decodes with slice threading and ``reformat("rgb24")``,
+    but its ``close`` runs a full ``gc.collect()`` (twice per file, from
+    ``__exit__`` and ``__del__``). In a large process each collection holds the
+    GIL for hundreds of milliseconds, stalling every other Python thread. With
+    PyAV available, decode the same way directly and close without collecting.
+    """
+    try:
+        import av
+    except ImportError:
+        yield iio.imiter(media_path)
+        return
+
+    try:
+        container = av.open(str(media_path))
+    except av.FFmpegError:
+        # Let imageio pick another plugin or raise its usual error.
+        yield iio.imiter(media_path)
+        return
+    try:
+        stream = container.streams.video[0]
+        stream.thread_type = "SLICE"
+        stream.codec_context.thread_count = 0
+        yield (frame.reformat(format="rgb24").to_ndarray() for frame in container.decode(video=0))
+    finally:
+        container.close()
+        # Same as imageio's close: drop PyAV's thread-local swscale worker pool so
+        # it cannot deadlock a later fork.
+        thread_local = getattr(av.video.frame, "_thread_local", None)
+        if getattr(thread_local, "reformatter", None) is not None:
+            del thread_local.reformatter
+
+
 def decode_path_video_frames(
     path: str | Path,
     *,
@@ -75,17 +113,18 @@ def decode_path_video_frames(
         ) from exc
 
     limit = None if max_frames is None else int(max_frames)
-    if keep == "last" and limit is not None:
-        window: deque[np.ndarray] = deque(maxlen=limit)
-        for frame in iio.imiter(media_path):
-            window.append(_frame_to_uint8_rgb(frame))
-        frames = list(window)
-    else:
-        frames = []
-        for frame in iio.imiter(media_path):
-            frames.append(_frame_to_uint8_rgb(frame))
-            if limit is not None and len(frames) >= limit:
-                break
+    with _open_video_frames(media_path, iio) as video_frames:
+        if keep == "last" and limit is not None:
+            window: deque[np.ndarray] = deque(maxlen=limit)
+            for frame in video_frames:
+                window.append(_frame_to_uint8_rgb(frame))
+            frames = list(window)
+        else:
+            frames = []
+            for frame in video_frames:
+                frames.append(_frame_to_uint8_rgb(frame))
+                if limit is not None and len(frames) >= limit:
+                    break
     if not frames:
         raise ValueError(f"Video path produced no frames: {media_path}")
     return frames
