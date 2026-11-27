@@ -62,6 +62,15 @@ _LEGACY_EMBODIMENT_ALIASES = {
 
 @dataclass(frozen=True)
 class RoboLabPolicyInputs:
+    """Policy inputs with physical conditioning frames separate from logical duration.
+
+    ``video_tensor`` is [1, 3, T, H, W] (or [3, T, H, W]), containing raw
+    uint8 pixels or floating-point pixels normalized to [-1, 1]. The builder
+    supplies one physical frame; callers may supply more, but policy uses frame
+    zero only. ``num_frames`` is the logical generated video length and need
+    not equal the number of physical conditioning frames.
+    """
+
     prompt: str
     video_tensor: torch.Tensor
     action_tensor: torch.Tensor

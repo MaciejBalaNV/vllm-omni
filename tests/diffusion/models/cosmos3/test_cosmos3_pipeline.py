@@ -18,6 +18,7 @@ import pytest
 import torch
 from PIL import Image
 from torch import nn
+from vllm.model_executor.layers.fusion.mm_input_norm import FusedMMInputNorm
 
 from tests.diffusion.models.cosmos3.multiview_fixtures import multiview_contract, multiview_lidar_contract
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -336,6 +337,11 @@ def _make_cosmos3_pipeline():
     pipeline.dtype = torch.float32
     pipeline.transformer = StubCosmos3Transformer(latent_channel_size=2)
     pipeline.vae = StubCosmos3VAE(z_dim=2)
+    pipeline._action_input_norm = FusedMMInputNorm(
+        image_mean=[1.0] * 3, image_std=[1.0] * 3, rescale_factor=1.0 / 127.5
+    )
+    # These fixtures run on CPU even when the process uses the CUDA platform.
+    pipeline._action_input_norm.forward = pipeline._action_input_norm.forward_native
     pipeline.vae_scale_factor_temporal = 4
     pipeline.vae_scale_factor_spatial = 8
     pipeline.scheduler = StubScheduler([9, 3], flow_shift=1.0)
@@ -573,10 +579,12 @@ def test_forward_threads_request_id_to_robolab(make_cosmos3_pipeline) -> None:
 
 
 @pytest.mark.parametrize("format_prompt_as_json", [False, True])
+@pytest.mark.parametrize("consumes_frame_count", [False, True])
 def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
     make_cosmos3_pipeline,
     monkeypatch: pytest.MonkeyPatch,
     format_prompt_as_json: bool,
+    consumes_frame_count: bool,
 ) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
 
@@ -589,6 +597,8 @@ def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
         captured["resolution"] = resolution
         captured["video_shape"] = tuple(sample["video"].shape)
         captured["video_num_frames"] = sample["video_num_frames"]
+        if consumes_frame_count:
+            sample.pop("video_num_frames")
         sample["sequence_plan"] = SimpleNamespace(
             condition_frame_indexes_action=[0],
             action_start_frame_offset=1,
@@ -620,6 +630,11 @@ def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
             "format_prompt_as_json": format_prompt_as_json,
         }
     )
+
+    if not consumes_frame_count:
+        with pytest.raises(ValueError, match="did not consume video_num_frames"):
+            pipeline._build_robolab_policy_inputs(sampling_params, request_id="request-1")
+        return
 
     inputs = pipeline._build_robolab_policy_inputs(sampling_params, request_id="request-1")
 
@@ -2104,7 +2119,7 @@ def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     func = get_cosmos3_post_process_func(SimpleNamespace())
     inputs = RoboLabPolicyInputs(
         prompt="Pick the cube.",
-        video_tensor=torch.zeros(1, 3, 3, 16, 16),
+        video_tensor=torch.zeros(1, 3, 1, 16, 16, dtype=torch.uint8),
         action_tensor=torch.zeros(2, 2),
         action_condition_indexes=[0],
         action_start_frame_offset=1,
@@ -2757,6 +2772,61 @@ def test_prepare_action_video_latents_encodes_only_conditioning_frame(make_cosmo
     assert torch.count_nonzero(condition_latents[:, :, 1:]) == 0
     torch.testing.assert_close(latents[:, :, 0:1], condition_latents[:, :, 0:1])
     assert velocity_mask.tolist() == [[[[[0.0]], [[1.0]], [[1.0]]]]]
+
+
+@pytest.mark.parametrize("mode", ["policy", "forward_dynamics", "inverse_dynamics"])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("vae_dtype", [torch.float32, torch.bfloat16])
+def test_prepare_action_video_normalizes_only_raw_pixels(
+    make_cosmos3_pipeline, mode, dtype, batched, vae_dtype
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.vae.dtype = vae_dtype
+    norm = Mock(wraps=pipeline._action_input_norm.forward)
+    pipeline._action_input_norm.forward = norm
+    raw = torch.arange(3 * 9 * 16 * 24).reshape(1, 3, 9, 16, 24).remainder(256).to(torch.uint8)
+    normalized = raw.float() / 127.5 - 1.0
+    video = raw if dtype == torch.uint8 else normalized.to(dtype)
+    captured = []
+    encode = pipeline._encode_video_tensor
+
+    def capture_video(tensor, **kwargs):
+        captured.append(tensor)
+        return encode(tensor, **kwargs)
+
+    pipeline._encode_video_tensor = capture_video
+    pipeline._prepare_latents_action_video(
+        video if batched else video[0], mode, 16, 24, 9, torch.Generator(device="cpu").manual_seed(0)
+    )
+
+    expected = normalized.to(vae_dtype) if dtype == torch.uint8 else video
+    if mode != "inverse_dynamics":
+        expected = expected[:, :, :1]
+    assert len(captured) == 1
+    if dtype == torch.uint8:
+        norm.assert_called_once()
+        assert norm.call_args.args[0].dtype == torch.uint8
+        assert norm.call_args.args[1] == vae_dtype
+        assert captured[0].dtype == vae_dtype
+        # Reciprocal scaling/FMA can differ from eager division/subtraction.
+        torch.testing.assert_close(captured[0], expected, rtol=torch.finfo(vae_dtype).eps, atol=2e-7)
+    else:
+        norm.assert_not_called()
+        torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_prepare_action_video_rejects_empty_or_unsupported_pixels(make_cosmos3_pipeline, batched, empty) -> None:
+    pipeline = make_cosmos3_pipeline()
+    video = torch.zeros(1, 3, 0 if empty else 1, 16, 24, dtype=torch.int32)
+    message = "at least one frame" if empty else "uint8 pixels or floating-point pixels"
+    with pytest.raises(ValueError, match=message):
+        pipeline._prepare_latents_action_video(
+            video if batched else video[0], "policy", 16, 24, 9, torch.Generator(device="cpu").manual_seed(0)
+        )
+    assert pipeline.vae.encode_input_shapes == []
 
 
 def test_prepare_inverse_dynamics_latents_encodes_full_video(make_cosmos3_pipeline) -> None:
@@ -4013,8 +4083,7 @@ class TestForwardRouting:
         assert captured["prepare_action"]["condition_indexes"] == [0]
         assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
         prepared_video = captured["prepare_action_video"]["args"][0]
-        expected = inputs.video_tensor[:, :, :1].float() / 127.5 - 1.0
-        torch.testing.assert_close(prepared_video, expected)
+        assert prepared_video is inputs.video_tensor
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
         assert output.output["payload"]["actions"].shape == (1, 2, 2)
@@ -4103,17 +4172,18 @@ def _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, *,
     return pipeline
 
 
+@pytest.mark.parametrize("batch", [1, 2])
 def test_diffuse_pp_none_branch_unpacks_joint_on_first_rank(
-    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, batch: int
 ) -> None:
     pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
 
     # What the last PP rank sends back to rank 0 after its scheduler step:
     # the packed [video | action | sound] joint tensor, flattened per batch row.
-    video = torch.full((1, 2, 1, 1, 1), 11.0)
-    action = torch.full((1, 3, 4), 22.0)
-    sound = torch.full((1, 3, 2), 33.0)
-    packed = torch.cat([video.reshape(1, -1), action.reshape(1, -1), sound.reshape(1, -1)], dim=1)
+    video = torch.full((batch, 2, 1, 1, 1), 11.0)
+    action = torch.full((batch, 3, 4), 22.0)
+    sound = torch.full((batch, 3, 2), 33.0)
+    packed = torch.cat([video.reshape(batch, -1), action.reshape(batch, -1), sound.reshape(batch, -1)], dim=1)
 
     def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
         assert noise_pred is None
@@ -4122,9 +4192,9 @@ def test_diffuse_pp_none_branch_unpacks_joint_on_first_rank(
     monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
 
     video_out, action_out, sound_out = pipeline.diffuse(
-        latents=torch.zeros(1, 2, 1, 1, 1),
-        action_latents=torch.zeros(1, 3, 4),
-        sound_latents=torch.zeros(1, 3, 2),
+        latents=torch.zeros_like(video),
+        action_latents=torch.zeros_like(action),
+        sound_latents=torch.zeros_like(sound),
         timesteps=torch.tensor([9, 3]),
         cond_ids=_ids(2),
         cond_mask=_mask(),
@@ -4137,6 +4207,25 @@ def test_diffuse_pp_none_branch_unpacks_joint_on_first_rank(
     torch.testing.assert_close(action_out, action)
     torch.testing.assert_close(sound_out, sound)
     assert pipeline.transformer.pp_reset_calls == 1
+
+
+@pytest.mark.parametrize("first", [False, True])
+def test_diffuse_pp_rejects_joint_sizes_not_divisible_by_batch(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, first: bool
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=first, last=False)
+    with pytest.raises(ValueError, match="joint latent sizes must be divisible"):
+        pipeline.diffuse(
+            latents=torch.zeros(2, 2, 1, 1, 1),
+            action_latents=torch.zeros(1, 3, 3),
+            timesteps=torch.tensor([9]),
+            cond_ids=_ids(2),
+            cond_mask=_mask(),
+            uncond_ids=_ids(1),
+            uncond_mask=_mask(),
+            guidance_scale=1.0,
+            shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+        )
 
 
 def test_diffuse_pp_none_branch_keeps_local_latents_on_middle_rank(

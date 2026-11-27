@@ -47,6 +47,7 @@ from torch import nn
 from transformers import AutoTokenizer
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.mm_input_norm import FusedMMInputNorm
 from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
 from vllm.sequence import IntermediateTensors
 
@@ -1251,6 +1252,11 @@ class Cosmos3OmniDiffusersPipeline(
             )
         self.vae_scale_factor_temporal = int(self.vae.config.scale_factor_temporal)
         self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 16)
+        self._action_input_norm = FusedMMInputNorm(
+            image_mean=[1.0] * 3,
+            image_std=[1.0] * 3,
+            rescale_factor=1.0 / 127.5,
+        ).to(self.device)
 
         sound_gen = resolve_sound_gen(od_config)
         sound_dim = None
@@ -1974,11 +1980,17 @@ class Cosmos3OmniDiffusersPipeline(
             sample["history_action"] = history_action
 
         sample = self._get_robolab_transform(format_prompt_as_json=format_prompt_as_json)(sample, resolution)
+        if "video_num_frames" in sample:
+            raise ValueError(
+                "Cosmos3 RoboLab action transform did not consume video_num_frames. "
+                "Install the supported Cosmos Framework revision for compact policy videos."
+            )
         if isinstance(sample.get("ai_caption"), dict):
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
         sequence_plan = sample["sequence_plan"]
         # Preserve raw pixels until the policy's conditioning frame is selected.
         video_tensor = sample["video"]
+        assert video_tensor.dtype == torch.uint8, f"RoboLab transform must return uint8 video, got {video_tensor.dtype}"
         raw_action_dim_tensor = sample.get("raw_action_dim")
         if isinstance(raw_action_dim_tensor, torch.Tensor):
             transformed_raw_action_dim = int(raw_action_dim_tensor.item())
@@ -2076,19 +2088,6 @@ class Cosmos3OmniDiffusersPipeline(
             is_t2i=False,
         )
 
-        action_video_tensor = inputs.video_tensor
-        if action_video_tensor.ndim == 4:
-            action_video_tensor = action_video_tensor.unsqueeze(0)
-        if action_video_tensor.ndim != 5:
-            raise ValueError(
-                "Cosmos3 RoboLab action video tensor must have shape [1, 3, T, H, W] "
-                f"or [3, T, H, W], got {tuple(action_video_tensor.shape)}."
-            )
-        # Policy conditions on frame zero only, regardless of the dtype
-        # returned by the external action transform.
-        frame = action_video_tensor[:, :, 0].contiguous()
-        action_video_tensor = (frame.float() / 127.5 - 1.0).unsqueeze(2)
-
         action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = self._prepare_action_latents(
             mode=action_mode,
             action_chunk_size=action_chunk_size,
@@ -2101,7 +2100,7 @@ class Cosmos3OmniDiffusersPipeline(
         action_offset = int(inputs.action_start_frame_offset)
 
         latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
-            action_video_tensor,
+            inputs.video_tensor,
             action_mode,
             height,
             width,
@@ -2948,6 +2947,7 @@ class Cosmos3OmniDiffusersPipeline(
         The Wan VAE is temporally causal, so encoding only the first pixel
         frame preserves that latent while avoiding unused future-frame work.
         Inverse dynamics conditions every latent and keeps the full encode.
+        Inputs are raw uint8 pixels or floating-point pixels normalized to [-1, 1].
         """
         del height, width
         if video_tensor.ndim == 4:
@@ -2974,6 +2974,12 @@ class Cosmos3OmniDiffusersPipeline(
         )
         condition_indexes = vision_condition_indexes(mode, num_frames, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :1] if condition_indexes == [0] else video_tensor
+        if condition_video.dtype == torch.uint8:
+            # Transfer bytes, then fuse FP32 scale/bias and the VAE dtype cast.
+            pixels = condition_video.to(device=self.device)
+            condition_video = self._action_input_norm(pixels.flatten(1), self.vae.dtype).view(pixels.shape)
+        elif not condition_video.is_floating_point():
+            raise ValueError("Cosmos3 action video must contain uint8 pixels or floating-point pixels in [-1, 1].")
         cond_prefix_latent = self._encode_video_tensor(condition_video, image_size=image_size)
         expected_prefix = (1, C, max(condition_indexes) + 1, H_lat, W_lat)
         if (
@@ -3192,6 +3198,12 @@ class Cosmos3OmniDiffusersPipeline(
         # Joint scheduler step over multiple modalities. Safe for flow-matching schedulers
         # because the update is linear per element; revisit this if Cosmos3 adopts a
         # scheduler with cross-element dependencies (e.g. per-modality timestep).
+        def _joint_layout(tensors: list[torch.Tensor]) -> tuple[list[torch.Size], list[int]]:
+            batch = tensors[0].shape[0]
+            if batch < 1 or any(tensor.shape[0] != batch for tensor in tensors):
+                raise ValueError("Cosmos3 joint latent sizes must be divisible by the nonzero video batch size.")
+            return [tensor.shape for tensor in tensors], [tensor.numel() // batch for tensor in tensors]
+
         def _pack_joint(
             video_tensor: torch.Tensor,
             action_tensor: torch.Tensor | None = None,
@@ -3203,8 +3215,9 @@ class Cosmos3OmniDiffusersPipeline(
                 tensors.append(action_tensor)
             if sound_tensor is not None:
                 tensors.append(sound_tensor)
+            shapes, numels = _joint_layout(tensors)
             flats = [tensor.reshape(batch, -1) for tensor in tensors]
-            return torch.cat(flats, dim=1), [tensor.shape for tensor in tensors], [flat.shape[1] for flat in flats]
+            return torch.cat(flats, dim=1), shapes, numels
 
         def _unpack_joint(
             packed: torch.Tensor,
@@ -3245,8 +3258,7 @@ class Cosmos3OmniDiffusersPipeline(
         _has_multimodal = action_latents is not None or sound_latents is not None
         if _has_multimodal:
             joint_tensors = [tensor for tensor in (latents, action_latents, sound_latents) if tensor is not None]
-            _joint_shapes = [tensor.shape for tensor in joint_tensors]
-            _joint_numels = [tensor.numel() // latents.shape[0] for tensor in joint_tensors]
+            _joint_shapes, _joint_numels = _joint_layout(joint_tensors)
         else:
             _joint_shapes, _joint_numels = None, None
 
