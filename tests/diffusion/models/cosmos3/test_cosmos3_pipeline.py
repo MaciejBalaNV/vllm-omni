@@ -587,6 +587,8 @@ def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
     def fake_transform(sample, resolution):
         captured["sample_mode"] = sample["mode"]
         captured["resolution"] = resolution
+        captured["video_shape"] = tuple(sample["video"].shape)
+        captured["video_num_frames"] = sample["video_num_frames"]
         sample["sequence_plan"] = SimpleNamespace(
             condition_frame_indexes_action=[0],
             action_start_frame_offset=1,
@@ -626,9 +628,13 @@ def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
         "sample_mode": "wam",
         "resolution": "480",
         "format_prompt_as_json": format_prompt_as_json,
+        "video_shape": (3, 1, 16, 16),
+        "video_num_frames": 3,
     }
     assert inputs.domain_id == 8
     assert inputs.raw_action_dim == 8
+    assert inputs.video_tensor.dtype == torch.uint8
+    assert inputs.num_frames == 3
     if format_prompt_as_json:
         assert json.loads(inputs.prompt) == {"actions": {"instruction": "Pick up the cube."}}
     else:
@@ -3920,10 +3926,12 @@ class TestForwardRouting:
         }
         assert "common" not in output.output["metadata"]
 
+    @pytest.mark.parametrize("raw_pixels", [False, True])
     def test_forward_dispatches_robolab_policy_flow(
         self,
         make_cosmos3_pipeline,
         monkeypatch: pytest.MonkeyPatch,
+        raw_pixels: bool,
     ) -> None:
         from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
 
@@ -3936,7 +3944,11 @@ class TestForwardRouting:
 
         inputs = pipeline_cosmos3.RoboLabPolicyInputs(
             prompt="Pick the cube.",
-            video_tensor=torch.zeros(1, 3, 3, 16, 16),
+            video_tensor=(
+                torch.arange(3 * 3 * 16 * 16).reshape(1, 3, 3, 16, 16).to(torch.uint8)
+                if raw_pixels
+                else torch.zeros(1, 3, 3, 16, 16)
+            ),
             action_tensor=torch.zeros(2, 2),
             action_condition_indexes=[0],
             action_start_frame_offset=1,
@@ -4000,6 +4012,9 @@ class TestForwardRouting:
         assert captured["prepare_action"]["clean_action"] is inputs.action_tensor
         assert captured["prepare_action"]["condition_indexes"] == [0]
         assert captured["prepare_action_video"]["kwargs"] == {"image_size": None}
+        prepared_video = captured["prepare_action_video"]["args"][0]
+        expected = inputs.video_tensor[:, :, :1].float() / 127.5 - 1.0
+        torch.testing.assert_close(prepared_video, expected)
         assert captured["diffuse_calls"][-1]["shared_kwargs"]["action_domain_ids"].tolist() == [7]
         assert captured["diffuse_calls"][-1]["timesteps"].tolist() == [4, 3, 2, 1]
         assert output.output["payload"]["actions"].shape == (1, 2, 2)

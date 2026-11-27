@@ -1919,8 +1919,7 @@ class Cosmos3OmniDiffusersPipeline(
             image = resize_rgb_uint8(image, (image_h, image_w))
 
         t_frames = action_chunk_size + 1
-        video = torch.zeros((3, t_frames, image_h, image_w), dtype=torch.uint8)
-        video[:, 0] = torch.from_numpy(image.copy()).permute(2, 0, 1)
+        video = torch.from_numpy(image.copy()).permute(2, 0, 1).unsqueeze(1)
 
         use_state_rows = 1 if use_state else 0
         action = torch.zeros((action_chunk_size + use_state_rows, raw_action_dim), dtype=torch.float32)
@@ -1960,6 +1959,7 @@ class Cosmos3OmniDiffusersPipeline(
         sample: dict[str, Any] = {
             "ai_caption": prompt,
             "video": video,
+            "video_num_frames": t_frames,
             "action": action,
             # Cosmos Framework consumes this as an integer conditioning bucket.
             "conditioning_fps": torch.tensor(fps, dtype=torch.long),
@@ -1977,7 +1977,8 @@ class Cosmos3OmniDiffusersPipeline(
         if isinstance(sample.get("ai_caption"), dict):
             sample["ai_caption"] = json.dumps(sample["ai_caption"])
         sequence_plan = sample["sequence_plan"]
-        video_tensor = sample["video"].float() / 127.5 - 1.0
+        # Preserve raw pixels until the policy's conditioning frame is selected.
+        video_tensor = sample["video"]
         raw_action_dim_tensor = sample.get("raw_action_dim")
         if isinstance(raw_action_dim_tensor, torch.Tensor):
             transformed_raw_action_dim = int(raw_action_dim_tensor.item())
@@ -1996,7 +1997,7 @@ class Cosmos3OmniDiffusersPipeline(
             height=int(video_tensor.shape[-2]),
             width=int(video_tensor.shape[-1]),
             image_size=sample.get("image_size"),
-            num_frames=int(video_tensor.shape[1]),
+            num_frames=t_frames,
             num_inference_steps=int(
                 extra_param_alias("num_inference_steps", "num_steps", ROBOLAB_DEFAULT_NUM_INFERENCE_STEPS)
             ),
@@ -2083,11 +2084,10 @@ class Cosmos3OmniDiffusersPipeline(
                 "Cosmos3 RoboLab action video tensor must have shape [1, 3, T, H, W] "
                 f"or [3, T, H, W], got {tuple(action_video_tensor.shape)}."
             )
-        if action_video_tensor.shape[2] < num_frames:
-            pad = action_video_tensor[:, :, -1:].repeat(1, 1, num_frames - action_video_tensor.shape[2], 1, 1)
-            action_video_tensor = torch.cat([action_video_tensor, pad], dim=2)
-        elif action_video_tensor.shape[2] > num_frames:
-            action_video_tensor = action_video_tensor[:, :, :num_frames]
+        # Policy conditions on frame zero only, regardless of the dtype
+        # returned by the external action transform.
+        frame = action_video_tensor[:, :, 0].contiguous()
+        action_video_tensor = (frame.float() / 127.5 - 1.0).unsqueeze(2)
 
         action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = self._prepare_action_latents(
             mode=action_mode,
@@ -3244,7 +3244,9 @@ class Cosmos3OmniDiffusersPipeline(
 
         _has_multimodal = action_latents is not None or sound_latents is not None
         if _has_multimodal:
-            _, _joint_shapes, _joint_numels = _pack_joint(latents, action_latents, sound_latents)
+            joint_tensors = [tensor for tensor in (latents, action_latents, sound_latents) if tensor is not None]
+            _joint_shapes = [tensor.shape for tensor in joint_tensors]
+            _joint_numels = [tensor.numel() // latents.shape[0] for tensor in joint_tensors]
         else:
             _joint_shapes, _joint_numels = None, None
 
