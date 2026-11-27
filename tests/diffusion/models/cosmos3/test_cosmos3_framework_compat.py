@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from importlib.util import find_spec
 
 import pytest
@@ -142,3 +143,36 @@ def test_real_action_transform_pipeline_matches_droid_policy_contract() -> None:
     assert transformed["sequence_plan"].has_action is True
     assert transformed["mode"] == "wam"
     assert int(transformed["domain_id"].item()) == 8
+
+
+@requires_cosmos_framework
+@pytest.mark.parametrize("format_prompt_as_json", [False, True])
+def test_compact_policy_video_preserves_action_transform(format_prompt_as_json: bool) -> None:
+    from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
+
+    transform = ActionTransformPipeline(
+        max_action_dim=64, cfg_dropout_rate=0.0, format_prompt_as_json=format_prompt_as_json
+    )
+    video = torch.zeros((3, 3, 192, 320), dtype=torch.uint8)
+    video[:, 0] = torch.arange(192 * 320).remainder(256).reshape(192, 320).to(torch.uint8)
+    sample = {
+        "ai_caption": "Pick up the cube.",
+        "video": video,
+        "action": torch.zeros((3, 8), dtype=torch.float32),
+        "conditioning_fps": torch.tensor(15, dtype=torch.long),
+        "mode": "wam",
+        "domain_id": torch.tensor(8, dtype=torch.long),
+        "viewpoint": "concat_view",
+        "additional_view_description": "Wrist view above two exterior views.",
+    }
+    compact = deepcopy(sample)
+    compact["video"] = compact["video"][:, :1].contiguous()
+    compact["video_num_frames"] = video.shape[1]
+    full_output = transform(deepcopy(sample), "256")
+    compact_output = transform(compact, "256")
+
+    assert compact_output["ai_caption"] == full_output["ai_caption"]
+    assert compact_output["sequence_plan"].as_dict() == full_output["sequence_plan"].as_dict()
+    for key in ("action", "image_size", "raw_action_dim"):
+        torch.testing.assert_close(compact_output[key], full_output[key], rtol=0, atol=0)
+    torch.testing.assert_close(compact_output["video"], full_output["video"][:, :1], rtol=0, atol=0)
